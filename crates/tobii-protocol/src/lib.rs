@@ -14,3 +14,4 @@ pub mod commands;
 pub mod md5;
 pub mod realm;
 pub mod parser;
+pub mod gaze;
