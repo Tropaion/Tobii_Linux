@@ -211,7 +211,12 @@ impl Handshake {
                         }
                     };
                     let digest = hmac_md5(REALM_KEY, &challenge);
-                    let f = build_realm_response(self.next_seq(), self.realm_id, self.field_210, &digest);
+                    let f = build_realm_response(
+                        self.next_seq(),
+                        self.realm_id,
+                        self.field_210,
+                        &digest,
+                    );
                     self.state = State::AwaitRealmAuth;
                     return HandshakeAction::Send(f);
                 }
@@ -341,15 +346,14 @@ mod handshake_tests {
     #[test]
     fn no_auth_path_reaches_done() {
         let mut hs = Handshake::new(0x500);
-        let responses = vec![
-            prefixed(&[]),
-            prefixed(&[u32_field(0)]),
-            prefixed(&[]),
-        ];
+        let responses = vec![prefixed(&[]), prefixed(&[u32_field(0)]), prefixed(&[])];
         let (sent, term) = run(&mut hs, responses);
         assert!(matches!(term, HandshakeAction::Done));
         let ops: Vec<u32> = sent.iter().map(|f| op_of(f)).collect();
-        assert_eq!(ops, vec![OP_HELLO, OP_QUERY_REALM, OP_OPEN_REALM, OP_SUBSCRIBE]);
+        assert_eq!(
+            ops,
+            vec![OP_HELLO, OP_QUERY_REALM, OP_OPEN_REALM, OP_SUBSCRIBE]
+        );
     }
 
     #[test]
@@ -376,7 +380,13 @@ mod handshake_tests {
         let ops: Vec<u32> = sent.iter().map(|f| op_of(f)).collect();
         assert_eq!(
             ops,
-            vec![OP_HELLO, OP_QUERY_REALM, OP_OPEN_REALM, OP_REALM_RESPONSE, OP_SUBSCRIBE]
+            vec![
+                OP_HELLO,
+                OP_QUERY_REALM,
+                OP_OPEN_REALM,
+                OP_REALM_RESPONSE,
+                OP_SUBSCRIBE
+            ]
         );
         let realm_resp = &sent[3];
         let expected = hmac_md5(REALM_KEY, &challenge);
