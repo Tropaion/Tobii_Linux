@@ -298,6 +298,17 @@ mod handshake_tests {
     use super::*;
     use crate::frame::{OP_HELLO, OP_OPEN_REALM, OP_QUERY_REALM, OP_REALM_RESPONSE, OP_SUBSCRIBE};
 
+    #[test]
+    fn poll_asks_to_recv_before_any_response() {
+        let mut hs = Handshake::new(0x500);
+        // First poll builds + sends hello.
+        assert!(matches!(hs.poll(), HandshakeAction::Send(_)));
+        // With no response fed yet, the next poll must ask the transport to read.
+        assert!(matches!(hs.poll(), HandshakeAction::Recv));
+        // Still Recv on a repeat call (idempotent until a response arrives).
+        assert!(matches!(hs.poll(), HandshakeAction::Recv));
+    }
+
     fn op_of(frame: &[u8]) -> u32 {
         u32::from_be_bytes([frame[20], frame[21], frame[22], frame[23]])
     }
