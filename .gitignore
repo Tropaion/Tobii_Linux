@@ -1,0 +1,11 @@
+# Large binary installer (input artifact, not tracked)
+ressources/Tobii.EyeTracker5.Offline.Installer_*.msi
+
+# Nested upstream repo kept as local reference, not re-tracked
+ressources/tobiifree/
+
+node_modules/
+*.log
+.direnv/
+zig-cache/
+zig-out/
