@@ -12,6 +12,7 @@ pub mod display;
 pub mod error;
 pub mod frame;
 pub mod gaze;
+pub mod handshake;
 pub mod md5;
 pub mod parser;
 pub mod realm;
