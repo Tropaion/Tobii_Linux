@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tobii-protocol"]
+members = ["crates/tobii-protocol", "crates/tobii-usb"]
 
 [workspace.package]
 edition = "2021"
