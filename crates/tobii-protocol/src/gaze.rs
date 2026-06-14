@@ -50,6 +50,7 @@ pub struct GazeSample {
 }
 
 /// TLV data kind for an unknown column, used to skip it by reading its width.
+#[derive(Clone, Copy)]
 enum Kind {
     S64,
     U32,
@@ -89,7 +90,7 @@ impl GazeSample {
             return None;
         }
         let mut r = Reader::new(payload);
-        r.pos = 2;
+        r.skip(2); // 2-byte payload prefix
         let n_cols = r.read_xds_row().ok()?;
 
         let mut s = GazeSample::default();
@@ -243,37 +244,27 @@ impl GazeSample {
                     }
                     Err(_) => return Some(s),
                 },
+                // Known-but-unmodeled column: read and discard by its kind.
+                // Unknown column (or truncation) stops decoding with a partial.
                 other => match column_kind(other) {
-                    Some(Kind::S64) => {
-                        if r.read_s64().is_err() {
-                            return Some(s);
-                        }
-                    }
-                    Some(Kind::U32) => {
-                        if r.read_u32().is_err() {
-                            return Some(s);
-                        }
-                    }
-                    Some(Kind::Fixed16x16) => {
-                        if r.read_fixed16x16().is_err() {
-                            return Some(s);
-                        }
-                    }
-                    Some(Kind::Point2d) => {
-                        if r.read_point2d().is_err() {
-                            return Some(s);
-                        }
-                    }
-                    Some(Kind::Point3d) => {
-                        if r.read_point3d().is_err() {
-                            return Some(s);
-                        }
-                    }
-                    None => return Some(s),
+                    Some(kind) if skip_column(&mut r, kind) => {}
+                    _ => return Some(s),
                 },
             }
         }
         Some(s)
+    }
+}
+
+/// Read and discard a known-but-unmodeled column of the given kind, advancing
+/// the reader past it. Returns `false` if the column was truncated.
+fn skip_column(r: &mut Reader, kind: Kind) -> bool {
+    match kind {
+        Kind::S64 => r.read_s64().is_ok(),
+        Kind::U32 => r.read_u32().is_ok(),
+        Kind::Fixed16x16 => r.read_fixed16x16().is_ok(),
+        Kind::Point2d => r.read_point2d().is_ok(),
+        Kind::Point3d => r.read_point3d().is_ok(),
     }
 }
 
