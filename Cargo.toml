@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/tobii-protocol"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["Fabian Plaimauer"]
+repository = ""
