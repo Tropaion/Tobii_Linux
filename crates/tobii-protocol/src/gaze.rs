@@ -79,9 +79,11 @@ impl GazeSample {
         self.present_mask & flag != 0
     }
 
-    /// Decode a 0x500 notification payload. Returns `None` if the payload is
-    /// too short, the row header is unreadable, or a modeled column is
-    /// truncated mid-value (the whole frame is dropped).
+    /// Decode a 0x500 notification payload. Returns `None` only if the payload
+    /// is too short or the row header is unreadable. If a column is truncated
+    /// or unknown mid-row, decoding stops and the partial sample collected so
+    /// far is returned (matching the reference decoder); check populated fields
+    /// via [`GazeSample::has`].
     pub fn decode(payload: &[u8]) -> Option<GazeSample> {
         if payload.len() < 2 {
             return None;
@@ -106,66 +108,106 @@ impl GazeSample {
                     }
                     Err(_) => return Some(s),
                 },
-                0x02 => set3(
-                    &mut r,
-                    &mut s.eye_origin_l_mm,
-                    &mut s.present_mask,
-                    present::EYE_ORIGIN_L,
-                )?,
-                0x08 => set3(
-                    &mut r,
-                    &mut s.eye_origin_r_mm,
-                    &mut s.present_mask,
-                    present::EYE_ORIGIN_R,
-                )?,
-                0x04 => set3(
-                    &mut r,
-                    &mut s.gaze_point_3d_l_mm,
-                    &mut s.present_mask,
-                    present::GAZE_3D_L,
-                )?,
-                0x0a => set3(
-                    &mut r,
-                    &mut s.gaze_point_3d_r_mm,
-                    &mut s.present_mask,
-                    present::GAZE_3D_R,
-                )?,
-                0x17 => set3(
-                    &mut r,
-                    &mut s.eye_origin_raw_l_mm,
-                    &mut s.present_mask,
-                    present::EYE_ORIGIN_RAW_L,
-                )?,
-                0x18 => set3(
-                    &mut r,
-                    &mut s.eye_origin_raw_r_mm,
-                    &mut s.present_mask,
-                    present::EYE_ORIGIN_RAW_R,
-                )?,
-                0x05 => set2(
-                    &mut r,
-                    &mut s.gaze_point_2d_l,
-                    &mut s.present_mask,
-                    present::GAZE_2D_L,
-                )?,
-                0x0b => set2(
-                    &mut r,
-                    &mut s.gaze_point_2d_r,
-                    &mut s.present_mask,
-                    present::GAZE_2D_R,
-                )?,
-                0x1c => set2(
-                    &mut r,
-                    &mut s.gaze_point_2d,
-                    &mut s.present_mask,
-                    present::GAZE_2D,
-                )?,
-                0x20 => set2(
-                    &mut r,
-                    &mut s.gaze_point_2d_unfiltered,
-                    &mut s.present_mask,
-                    present::GAZE_2D_UNFILTERED,
-                )?,
+                0x02 => {
+                    if !set3(
+                        &mut r,
+                        &mut s.eye_origin_l_mm,
+                        &mut s.present_mask,
+                        present::EYE_ORIGIN_L,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x08 => {
+                    if !set3(
+                        &mut r,
+                        &mut s.eye_origin_r_mm,
+                        &mut s.present_mask,
+                        present::EYE_ORIGIN_R,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x04 => {
+                    if !set3(
+                        &mut r,
+                        &mut s.gaze_point_3d_l_mm,
+                        &mut s.present_mask,
+                        present::GAZE_3D_L,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x0a => {
+                    if !set3(
+                        &mut r,
+                        &mut s.gaze_point_3d_r_mm,
+                        &mut s.present_mask,
+                        present::GAZE_3D_R,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x17 => {
+                    if !set3(
+                        &mut r,
+                        &mut s.eye_origin_raw_l_mm,
+                        &mut s.present_mask,
+                        present::EYE_ORIGIN_RAW_L,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x18 => {
+                    if !set3(
+                        &mut r,
+                        &mut s.eye_origin_raw_r_mm,
+                        &mut s.present_mask,
+                        present::EYE_ORIGIN_RAW_R,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x05 => {
+                    if !set2(
+                        &mut r,
+                        &mut s.gaze_point_2d_l,
+                        &mut s.present_mask,
+                        present::GAZE_2D_L,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x0b => {
+                    if !set2(
+                        &mut r,
+                        &mut s.gaze_point_2d_r,
+                        &mut s.present_mask,
+                        present::GAZE_2D_R,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x1c => {
+                    if !set2(
+                        &mut r,
+                        &mut s.gaze_point_2d,
+                        &mut s.present_mask,
+                        present::GAZE_2D,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x20 => {
+                    if !set2(
+                        &mut r,
+                        &mut s.gaze_point_2d_unfiltered,
+                        &mut s.present_mask,
+                        present::GAZE_2D_UNFILTERED,
+                    ) {
+                        return Some(s);
+                    }
+                }
                 0x06 => match r.read_fixed16x16() {
                     Ok(v) => {
                         s.pupil_l_mm = v;
@@ -235,25 +277,30 @@ impl GazeSample {
     }
 }
 
-fn set3(r: &mut Reader, dst: &mut [f64; 3], mask: &mut u32, flag: u32) -> Option<()> {
+/// Read a point3d into `dst` and set `flag`. Returns `false` if the column was
+/// truncated, signalling the caller to stop and return the partial sample
+/// (matching the scalar columns and the reference decoder).
+fn set3(r: &mut Reader, dst: &mut [f64; 3], mask: &mut u32, flag: u32) -> bool {
     match r.read_point3d() {
         Ok(v) => {
             *dst = v;
             *mask |= flag;
-            Some(())
+            true
         }
-        Err(_) => None,
+        Err(_) => false,
     }
 }
 
-fn set2(r: &mut Reader, dst: &mut [f64; 2], mask: &mut u32, flag: u32) -> Option<()> {
+/// Read a point2d into `dst` and set `flag`. Returns `false` on truncation
+/// (see [`set3`]).
+fn set2(r: &mut Reader, dst: &mut [f64; 2], mask: &mut u32, flag: u32) -> bool {
     match r.read_point2d() {
         Ok(v) => {
             *dst = v;
             *mask |= flag;
-            Some(())
+            true
         }
-        Err(_) => None,
+        Err(_) => false,
     }
 }
 
@@ -311,5 +358,32 @@ mod tests {
     #[test]
     fn rejects_too_short() {
         assert!(GazeSample::decode(&[0x00]).is_none());
+    }
+
+    #[test]
+    fn returns_partial_sample_on_truncated_point_column() {
+        // Row declares 2 columns: a complete timestamp, then an eye_origin_L
+        // (0x02, point3d) whose body is truncated (prolog tag only, no values).
+        // The decoder must return the partial sample with the timestamp set,
+        // not drop the whole frame.
+        let mut w = Writer::new();
+        w.push_u8(0x00);
+        w.push_u8(0x00);
+        write_tag(&mut w, (2u32 << 16) | 0x0bb8);
+
+        write_tag(&mut w, TAG_XDS_COLUMN);
+        write_u32(&mut w, 0x01);
+        w.push_u8(6);
+        w.push_be32(8);
+        w.push_be64(777i64 as u64);
+
+        write_tag(&mut w, TAG_XDS_COLUMN);
+        write_u32(&mut w, 0x02);
+        write_tag(&mut w, crate::tlv::TAG_POINT3D); // prolog only — no f64 bodies follow
+
+        let s = GazeSample::decode(&w.into_vec()).expect("partial sample");
+        assert!(s.has(present::TIMESTAMP));
+        assert_eq!(s.timestamp_us, 777);
+        assert!(!s.has(present::EYE_ORIGIN_L)); // truncated column not populated
     }
 }
