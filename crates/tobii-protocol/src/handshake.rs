@@ -23,55 +23,47 @@ fn resp_u16_be(data: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([data[at], data[at + 1]])
 }
 
+/// Walk the response field stream after the 2-byte prefix, yielding each
+/// field as `(size, body)`. Header is `[type:u8][pad:u8][size:u16 BE]`;
+/// fields whose declared body runs past the buffer end are skipped.
+fn resp_fields(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    let mut pos = 2usize; // skip 2-byte prefix
+    std::iter::from_fn(move || {
+        while pos + 4 <= data.len() {
+            let size = resp_u16_be(data, pos + 2) as usize;
+            pos += 4;
+            let body = data.get(pos..pos + size);
+            pos += size;
+            if let Some(b) = body {
+                return Some((size, b));
+            }
+        }
+        None
+    })
+}
+
 /// First `size==4` field's u32 value, or 0 if none.
 pub(crate) fn resp_first_u32(data: &[u8]) -> u32 {
-    let mut pos = 2usize; // skip 2-byte prefix
-    while pos + 4 <= data.len() {
-        let size = resp_u16_be(data, pos + 2) as usize;
-        pos += 4;
-        if size == 4 && pos + 4 <= data.len() {
-            return u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        }
-        pos += size;
-    }
-    0
+    resp_fields(data)
+        .find(|(size, _)| *size == 4)
+        .map(|(_, b)| u32::from_be_bytes(b.try_into().unwrap()))
+        .unwrap_or(0)
 }
 
 /// The `index`-th `size==4` field's u32 value, or 0 if out of range.
 pub(crate) fn resp_u32_at(data: &[u8], index: usize) -> u32 {
-    let mut pos = 2usize;
-    let mut found = 0usize;
-    while pos + 4 <= data.len() {
-        let size = resp_u16_be(data, pos + 2) as usize;
-        pos += 4;
-        if size == 4 && pos + 4 <= data.len() {
-            if found == index {
-                return u32::from_be_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                ]);
-            }
-            found += 1;
-        }
-        pos += size;
-    }
-    0
+    resp_fields(data)
+        .filter(|(size, _)| *size == 4)
+        .nth(index)
+        .map(|(_, b)| u32::from_be_bytes(b.try_into().unwrap()))
+        .unwrap_or(0)
 }
 
 /// First field whose `size > 4` — the realm challenge — or None.
 pub(crate) fn resp_extract_challenge(data: &[u8]) -> Option<&[u8]> {
-    let mut pos = 2usize;
-    while pos + 4 <= data.len() {
-        let size = resp_u16_be(data, pos + 2) as usize;
-        pos += 4;
-        if size > 4 && pos + size <= data.len() {
-            return Some(&data[pos..pos + size]);
-        }
-        pos += size;
-    }
-    None
+    resp_fields(data)
+        .find(|(size, _)| *size > 4)
+        .map(|(_, b)| b)
 }
 
 /// What the transport must do next, returned by [`Handshake::poll`].
@@ -170,7 +162,8 @@ impl Handshake {
                 }
                 State::AwaitQueryRealm => match self.resp.take() {
                     Some(r) => {
-                        self.realm_type = if r.len() >= 6 { resp_first_u32(&r) } else { 0 };
+                        // resp_first_u32 returns 0 (== no realm) on a short buffer.
+                        self.realm_type = resp_first_u32(&r);
                         self.state = State::BuildOpenRealm;
                         continue;
                     }
@@ -183,21 +176,25 @@ impl Handshake {
                     return HandshakeAction::Send(f);
                 }
                 State::AwaitOpenRealm => {
-                    // Keep the response: the challenge is read in BuildRealmAuth.
-                    let r = match &self.resp {
-                        Some(r) => r.clone(),
+                    // Read fields through a borrow into locals, then mutate state.
+                    // `self.resp` is intentionally left intact — BuildRealmAuth
+                    // reads the challenge from this same open-realm response.
+                    let (realm_id, field_210) = match self.resp.as_deref() {
                         None => return HandshakeAction::Recv,
+                        Some(_) if self.realm_type == 0 => {
+                            self.state = State::BuildSubscribe;
+                            continue;
+                        }
+                        // Reference-derived minimum length for a valid open-realm
+                        // reply (2-byte prefix + realm_id + field_210 fields).
+                        Some(r) if r.len() < 12 => {
+                            self.state = State::Failed;
+                            return HandshakeAction::Failed;
+                        }
+                        Some(r) => (resp_u32_at(r, 0), resp_u32_at(r, 1)),
                     };
-                    if self.realm_type == 0 {
-                        self.state = State::BuildSubscribe;
-                        continue;
-                    }
-                    if r.len() < 12 {
-                        self.state = State::Failed;
-                        return HandshakeAction::Failed;
-                    }
-                    self.realm_id = resp_u32_at(&r, 0);
-                    self.field_210 = resp_u32_at(&r, 1);
+                    self.realm_id = realm_id;
+                    self.field_210 = field_210;
                     self.state = State::BuildRealmAuth;
                     continue;
                 }
