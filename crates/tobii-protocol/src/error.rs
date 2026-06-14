@@ -47,7 +47,10 @@ mod tests {
 
     #[test]
     fn error_displays_human_text() {
-        let e = ProtocolError::WrongType { expected: 2, found: 5 };
+        let e = ProtocolError::WrongType {
+            expected: 2,
+            found: 5,
+        };
         assert_eq!(format!("{e}"), "wrong TLV type: expected 2, found 5");
         assert!(ProtocolError::ShortRead.to_string().contains("short read"));
     }

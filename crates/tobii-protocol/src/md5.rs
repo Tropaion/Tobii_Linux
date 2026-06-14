@@ -169,7 +169,10 @@ mod tests {
     #[test]
     fn hmac_md5_rfc2202_vectors() {
         let key1 = [0x0bu8; 16];
-        assert_eq!(hex(&hmac_md5(&key1, b"Hi There")), "9294727a3638bb1c13f48ef8158bfc9d");
+        assert_eq!(
+            hex(&hmac_md5(&key1, b"Hi There")),
+            "9294727a3638bb1c13f48ef8158bfc9d"
+        );
         assert_eq!(
             hex(&hmac_md5(b"Jefe", b"what do ya want for nothing?")),
             "750c783e6ab0b503eaa86e310a5db738"

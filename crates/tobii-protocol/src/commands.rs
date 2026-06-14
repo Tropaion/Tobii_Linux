@@ -1,7 +1,9 @@
 //! Outbound command frame builders (v1 subset).
 
 use crate::bytes::Writer;
-use crate::frame::{build_out_frame, OP_GET_DISPLAY_AREA, OP_HELLO, OP_SET_DISPLAY_AREA, OP_SUBSCRIBE};
+use crate::frame::{
+    build_out_frame, OP_GET_DISPLAY_AREA, OP_HELLO, OP_SET_DISPLAY_AREA, OP_SUBSCRIBE,
+};
 use crate::tlv::{write_point, write_tag, write_u32};
 
 /// Captured 47-byte hello payload (op 0x3e8).
@@ -45,8 +47,7 @@ pub fn build_set_display_area(
     let y0 = oy_mm;
     let y1 = oy_mm + h_mm;
     build_set_display_area_corners(
-        seq,
-        x0, y1, z_mm, // TL
+        seq, x0, y1, z_mm, // TL
         x1, y1, z_mm, // TR
         x0, y0, z_mm, // BL
     )
@@ -56,9 +57,15 @@ pub fn build_set_display_area(
 #[allow(clippy::too_many_arguments)]
 pub fn build_set_display_area_corners(
     seq: u32,
-    tl_x: f64, tl_y: f64, tl_z: f64,
-    tr_x: f64, tr_y: f64, tr_z: f64,
-    bl_x: f64, bl_y: f64, bl_z: f64,
+    tl_x: f64,
+    tl_y: f64,
+    tl_z: f64,
+    tr_x: f64,
+    tr_y: f64,
+    tr_z: f64,
+    bl_x: f64,
+    bl_y: f64,
+    bl_z: f64,
 ) -> Vec<u8> {
     let mut pay = Writer::new();
     pay.push_u8(0x00);

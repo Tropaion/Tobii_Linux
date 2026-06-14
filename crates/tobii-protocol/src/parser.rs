@@ -117,7 +117,12 @@ impl Parser {
         }
         let payload = self.acc[ENVELOPE_SIZE + TTP_HDR_SIZE..frame_size].to_vec();
         self.acc.drain(..frame_size);
-        Ok(Some(Frame { magic, seq, op, payload }))
+        Ok(Some(Frame {
+            magic,
+            seq,
+            op,
+            payload,
+        }))
     }
 }
 
@@ -182,7 +187,10 @@ mod tests {
     fn rejects_bad_direction() {
         let mut p = Parser::new();
         let buf = [0x02u8, 0, 0, 0, 0x20, 0, 0, 0];
-        assert_eq!(p.feed(&buf), Err(crate::error::ProtocolError::BadDirection(0x02)));
+        assert_eq!(
+            p.feed(&buf),
+            Err(crate::error::ProtocolError::BadDirection(0x02))
+        );
         assert_eq!(p.buffered(), 0);
     }
 
@@ -190,7 +198,10 @@ mod tests {
     fn rejects_impossibly_small_length() {
         let mut p = Parser::new();
         let buf = [0x01u8, 0, 0, 0, 10, 0, 0, 0]; // len=10 < 8+24
-        assert_eq!(p.feed(&buf), Err(crate::error::ProtocolError::BadLength(10)));
+        assert_eq!(
+            p.feed(&buf),
+            Err(crate::error::ProtocolError::BadLength(10))
+        );
     }
 
     #[test]
