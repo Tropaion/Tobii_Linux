@@ -99,11 +99,17 @@ impl<'a> Reader<'a> {
     pub fn read_prolog_tag(&mut self) -> Result<u32, ProtocolError> {
         let t = self.u8()?;
         if t != 5 {
-            return Err(ProtocolError::WrongType { expected: 5, found: t });
+            return Err(ProtocolError::WrongType {
+                expected: 5,
+                found: t,
+            });
         }
         let s = self.u32_be()?;
         if s != 4 {
-            return Err(ProtocolError::WrongSize { expected: 4, found: s });
+            return Err(ProtocolError::WrongSize {
+                expected: 4,
+                found: s,
+            });
         }
         self.u32_be()
     }
@@ -111,11 +117,17 @@ impl<'a> Reader<'a> {
     pub fn read_u32(&mut self) -> Result<u32, ProtocolError> {
         let t = self.u8()?;
         if t != 2 {
-            return Err(ProtocolError::WrongType { expected: 2, found: t });
+            return Err(ProtocolError::WrongType {
+                expected: 2,
+                found: t,
+            });
         }
         let s = self.u32_be()?;
         if s != 4 {
-            return Err(ProtocolError::WrongSize { expected: 4, found: s });
+            return Err(ProtocolError::WrongSize {
+                expected: 4,
+                found: s,
+            });
         }
         self.u32_be()
     }
@@ -123,11 +135,17 @@ impl<'a> Reader<'a> {
     pub fn read_fixed16x16(&mut self) -> Result<f64, ProtocolError> {
         let t = self.u8()?;
         if t != 3 {
-            return Err(ProtocolError::WrongType { expected: 3, found: t });
+            return Err(ProtocolError::WrongType {
+                expected: 3,
+                found: t,
+            });
         }
         let s = self.u32_be()?;
         if s != 4 {
-            return Err(ProtocolError::WrongSize { expected: 4, found: s });
+            return Err(ProtocolError::WrongSize {
+                expected: 4,
+                found: s,
+            });
         }
         Ok(self.i32_be()? as f64 / 65536.0)
     }
@@ -135,11 +153,17 @@ impl<'a> Reader<'a> {
     pub fn read_fixed22x42(&mut self) -> Result<f64, ProtocolError> {
         let t = self.u8()?;
         if t != 4 {
-            return Err(ProtocolError::WrongType { expected: 4, found: t });
+            return Err(ProtocolError::WrongType {
+                expected: 4,
+                found: t,
+            });
         }
         let s = self.u32_be()?;
         if s != 8 {
-            return Err(ProtocolError::WrongSize { expected: 8, found: s });
+            return Err(ProtocolError::WrongSize {
+                expected: 8,
+                found: s,
+            });
         }
         Ok(self.i64_be()? as f64 / Q42_SCALE)
     }
@@ -147,11 +171,17 @@ impl<'a> Reader<'a> {
     pub fn read_s64(&mut self) -> Result<i64, ProtocolError> {
         let t = self.u8()?;
         if t != 6 {
-            return Err(ProtocolError::WrongType { expected: 6, found: t });
+            return Err(ProtocolError::WrongType {
+                expected: 6,
+                found: t,
+            });
         }
         let s = self.u32_be()?;
         if s != 8 {
-            return Err(ProtocolError::WrongSize { expected: 8, found: s });
+            return Err(ProtocolError::WrongSize {
+                expected: 8,
+                found: s,
+            });
         }
         self.i64_be()
     }
@@ -160,7 +190,10 @@ impl<'a> Reader<'a> {
     pub fn read_xds_row(&mut self) -> Result<u32, ProtocolError> {
         let tag = self.read_prolog_tag()?;
         if tag & 0xffff != TAG_XDS_ROW_MASK {
-            return Err(ProtocolError::WrongTag { expected: TAG_XDS_ROW_MASK, found: tag });
+            return Err(ProtocolError::WrongTag {
+                expected: TAG_XDS_ROW_MASK,
+                found: tag,
+            });
         }
         Ok((tag >> 16) & 0xfff)
     }
@@ -169,7 +202,10 @@ impl<'a> Reader<'a> {
     pub fn read_xds_column(&mut self) -> Result<u32, ProtocolError> {
         let tag = self.read_prolog_tag()?;
         if tag != TAG_XDS_COLUMN {
-            return Err(ProtocolError::WrongTag { expected: TAG_XDS_COLUMN, found: tag });
+            return Err(ProtocolError::WrongTag {
+                expected: TAG_XDS_COLUMN,
+                found: tag,
+            });
         }
         self.read_u32()
     }
@@ -177,15 +213,25 @@ impl<'a> Reader<'a> {
     pub fn read_point3d(&mut self) -> Result<[f64; 3], ProtocolError> {
         let tag = self.read_prolog_tag()?;
         if tag != TAG_POINT3D {
-            return Err(ProtocolError::WrongTag { expected: TAG_POINT3D, found: tag });
+            return Err(ProtocolError::WrongTag {
+                expected: TAG_POINT3D,
+                found: tag,
+            });
         }
-        Ok([self.read_fixed22x42()?, self.read_fixed22x42()?, self.read_fixed22x42()?])
+        Ok([
+            self.read_fixed22x42()?,
+            self.read_fixed22x42()?,
+            self.read_fixed22x42()?,
+        ])
     }
 
     pub fn read_point2d(&mut self) -> Result<[f64; 2], ProtocolError> {
         let tag = self.read_prolog_tag()?;
         if tag != TAG_POINT2D {
-            return Err(ProtocolError::WrongTag { expected: TAG_POINT2D, found: tag });
+            return Err(ProtocolError::WrongTag {
+                expected: TAG_POINT2D,
+                found: tag,
+            });
         }
         Ok([self.read_fixed22x42()?, self.read_fixed22x42()?])
     }

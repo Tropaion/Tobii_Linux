@@ -6,13 +6,18 @@
 //!
 //! Protocol decoded by the `tobiifree` project (GPL-3.0) from USB captures.
 
-pub mod error;
 pub mod bytes;
-pub mod tlv;
-pub mod frame;
 pub mod commands;
-pub mod md5;
-pub mod realm;
-pub mod parser;
-pub mod gaze;
 pub mod display;
+pub mod error;
+pub mod frame;
+pub mod gaze;
+pub mod md5;
+pub mod parser;
+pub mod realm;
+pub mod tlv;
+
+pub use display::DisplayCorners;
+pub use error::ProtocolError;
+pub use gaze::GazeSample;
+pub use parser::{Frame, Parser};

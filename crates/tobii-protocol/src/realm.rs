@@ -2,7 +2,9 @@
 //! challenge is computed with [`crate::md5::hmac_md5`] and the [`REALM_KEY`].
 
 use crate::bytes::Writer;
-use crate::frame::{build_out_frame, OP_CLOSE_REALM, OP_OPEN_REALM, OP_QUERY_REALM, OP_REALM_RESPONSE};
+use crate::frame::{
+    build_out_frame, OP_CLOSE_REALM, OP_OPEN_REALM, OP_QUERY_REALM, OP_REALM_RESPONSE,
+};
 use crate::tlv::write_u32;
 
 /// The realm HMAC key (16 ASCII chars + trailing NUL), as used on the wire.

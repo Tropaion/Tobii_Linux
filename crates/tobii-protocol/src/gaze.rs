@@ -67,8 +67,8 @@ fn column_kind(col: u32) -> Option<Kind> {
         }
         0x05 | 0x0b | 0x1c | 0x20 | 0x19 | 0x1a => Some(Kind::Point2d),
         0x06 | 0x0c | 0x29 | 0x2b => Some(Kind::Fixed16x16),
-        0x07 | 0x0d | 0x0e | 0x11 | 0x14 | 0x15 | 0x16 | 0x1b | 0x1d | 0x1e | 0x1f | 0x21 | 0x23
-        | 0x26 | 0x28 | 0x2a | 0x2c => Some(Kind::U32),
+        0x07 | 0x0d | 0x0e | 0x11 | 0x14 | 0x15 | 0x16 | 0x1b | 0x1d | 0x1e | 0x1f | 0x21
+        | 0x23 | 0x26 | 0x28 | 0x2a | 0x2c => Some(Kind::U32),
         _ => None,
     }
 }
@@ -106,16 +106,66 @@ impl GazeSample {
                     }
                     Err(_) => return Some(s),
                 },
-                0x02 => set3(&mut r, &mut s.eye_origin_l_mm, &mut s.present_mask, present::EYE_ORIGIN_L)?,
-                0x08 => set3(&mut r, &mut s.eye_origin_r_mm, &mut s.present_mask, present::EYE_ORIGIN_R)?,
-                0x04 => set3(&mut r, &mut s.gaze_point_3d_l_mm, &mut s.present_mask, present::GAZE_3D_L)?,
-                0x0a => set3(&mut r, &mut s.gaze_point_3d_r_mm, &mut s.present_mask, present::GAZE_3D_R)?,
-                0x17 => set3(&mut r, &mut s.eye_origin_raw_l_mm, &mut s.present_mask, present::EYE_ORIGIN_RAW_L)?,
-                0x18 => set3(&mut r, &mut s.eye_origin_raw_r_mm, &mut s.present_mask, present::EYE_ORIGIN_RAW_R)?,
-                0x05 => set2(&mut r, &mut s.gaze_point_2d_l, &mut s.present_mask, present::GAZE_2D_L)?,
-                0x0b => set2(&mut r, &mut s.gaze_point_2d_r, &mut s.present_mask, present::GAZE_2D_R)?,
-                0x1c => set2(&mut r, &mut s.gaze_point_2d, &mut s.present_mask, present::GAZE_2D)?,
-                0x20 => set2(&mut r, &mut s.gaze_point_2d_unfiltered, &mut s.present_mask, present::GAZE_2D_UNFILTERED)?,
+                0x02 => set3(
+                    &mut r,
+                    &mut s.eye_origin_l_mm,
+                    &mut s.present_mask,
+                    present::EYE_ORIGIN_L,
+                )?,
+                0x08 => set3(
+                    &mut r,
+                    &mut s.eye_origin_r_mm,
+                    &mut s.present_mask,
+                    present::EYE_ORIGIN_R,
+                )?,
+                0x04 => set3(
+                    &mut r,
+                    &mut s.gaze_point_3d_l_mm,
+                    &mut s.present_mask,
+                    present::GAZE_3D_L,
+                )?,
+                0x0a => set3(
+                    &mut r,
+                    &mut s.gaze_point_3d_r_mm,
+                    &mut s.present_mask,
+                    present::GAZE_3D_R,
+                )?,
+                0x17 => set3(
+                    &mut r,
+                    &mut s.eye_origin_raw_l_mm,
+                    &mut s.present_mask,
+                    present::EYE_ORIGIN_RAW_L,
+                )?,
+                0x18 => set3(
+                    &mut r,
+                    &mut s.eye_origin_raw_r_mm,
+                    &mut s.present_mask,
+                    present::EYE_ORIGIN_RAW_R,
+                )?,
+                0x05 => set2(
+                    &mut r,
+                    &mut s.gaze_point_2d_l,
+                    &mut s.present_mask,
+                    present::GAZE_2D_L,
+                )?,
+                0x0b => set2(
+                    &mut r,
+                    &mut s.gaze_point_2d_r,
+                    &mut s.present_mask,
+                    present::GAZE_2D_R,
+                )?,
+                0x1c => set2(
+                    &mut r,
+                    &mut s.gaze_point_2d,
+                    &mut s.present_mask,
+                    present::GAZE_2D,
+                )?,
+                0x20 => set2(
+                    &mut r,
+                    &mut s.gaze_point_2d_unfiltered,
+                    &mut s.present_mask,
+                    present::GAZE_2D_UNFILTERED,
+                )?,
                 0x06 => match r.read_fixed16x16() {
                     Ok(v) => {
                         s.pupil_l_mm = v;
