@@ -7,3 +7,4 @@
 //! Protocol decoded by the `tobiifree` project (GPL-3.0) from USB captures.
 
 pub mod error;
+pub mod bytes;
