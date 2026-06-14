@@ -21,4 +21,5 @@ pub mod tlv;
 pub use display::DisplayCorners;
 pub use error::ProtocolError;
 pub use gaze::GazeSample;
+pub use handshake::{Handshake, HandshakeAction};
 pub use parser::{Frame, Parser};
