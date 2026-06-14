@@ -49,6 +49,70 @@ pub trait Transport {
     fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Option<usize>;
 }
 
+use rusb::{Direction, GlobalContext, Recipient, RequestType};
+
+const VID: u16 = 0x2104;
+const PID: u16 = 0x0313;
+const IFACE: u8 = 0;
+const EP_OUT: u8 = 0x05;
+const EP_IN: u8 = 0x83;
+const SESSION_OPEN: u8 = 0x41;
+const SESSION_CLOSE: u8 = 0x42;
+
+/// libusb-backed [`Transport`] for the Tobii ET5.
+pub struct UsbTransport {
+    handle: rusb::DeviceHandle<GlobalContext>,
+}
+
+impl UsbTransport {
+    /// Open the device, detach any kernel driver, claim interface 0, and send
+    /// the vendor session-open control transfer.
+    pub fn open() -> Result<Self, UsbError> {
+        let handle = rusb::open_device_with_vid_pid(VID, PID).ok_or(UsbError::DeviceNotFound)?;
+
+        // Best-effort kernel driver detach (ignored if not attached / unsupported).
+        if handle.kernel_driver_active(IFACE).unwrap_or(false) {
+            let _ = handle.detach_kernel_driver(IFACE);
+        }
+        handle.claim_interface(IFACE)?;
+
+        // Vendor session-open: bmRequestType = vendor | host-to-device | interface.
+        let req_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
+        handle.write_control(req_type, SESSION_OPEN, 0, 0, &[], Duration::from_millis(1000))?;
+
+        Ok(Self { handle })
+    }
+}
+
+impl Transport for UsbTransport {
+    fn send(&mut self, data: &[u8]) -> Result<(), UsbError> {
+        let wrote = self.handle.write_bulk(EP_OUT, data, Duration::from_millis(1000))?;
+        if wrote != data.len() {
+            return Err(UsbError::ShortWrite { wrote, expected: data.len() });
+        }
+        Ok(())
+    }
+
+    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Option<usize> {
+        match self.handle.read_bulk(EP_IN, buf, timeout) {
+            Ok(n) if n > 0 => Some(n),
+            // Timeout (expected for polling) or zero-length: nothing this call.
+            _ => None,
+        }
+    }
+}
+
+impl Drop for UsbTransport {
+    fn drop(&mut self) {
+        // Vendor session-close, then release the interface (best effort).
+        let req_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
+        let _ = self
+            .handle
+            .write_control(req_type, SESSION_CLOSE, 0, 0, &[], Duration::from_millis(500));
+        let _ = self.handle.release_interface(IFACE);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

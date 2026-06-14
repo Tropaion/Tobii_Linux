@@ -7,3 +7,4 @@
 //! (Public re-exports are added by later tasks as the items appear.)
 
 mod transport;
+pub use transport::{Transport, UsbError, UsbTransport};
