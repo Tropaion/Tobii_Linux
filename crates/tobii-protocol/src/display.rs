@@ -19,7 +19,7 @@ impl DisplayCorners {
             return None;
         }
         let mut r = Reader::new(payload);
-        r.pos = 2;
+        r.skip(2); // 2-byte payload prefix
         let tl = r.read_point3d().ok()?;
         let tr = r.read_point3d().ok()?;
         let bl = r.read_point3d().ok()?;

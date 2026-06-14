@@ -53,7 +53,7 @@ pub fn write_point(w: &mut Writer, x: f64, y: f64, z: f64) {
 /// Cursor over a TLV byte slice.
 pub struct Reader<'a> {
     buf: &'a [u8],
-    pub pos: usize,
+    pos: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -63,6 +63,12 @@ impl<'a> Reader<'a> {
 
     pub fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
+    }
+
+    /// Advance the cursor by `n` bytes (saturating at the buffer end). Used to
+    /// skip the 2-byte payload prefix before the first TLV field.
+    pub fn skip(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.buf.len());
     }
 
     fn u8(&mut self) -> Result<u8, ProtocolError> {
@@ -95,94 +101,49 @@ impl<'a> Reader<'a> {
         Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    /// Read [type=5][size=4][tag:u32], returning the tag.
-    pub fn read_prolog_tag(&mut self) -> Result<u32, ProtocolError> {
+    /// Read and validate a TLV field header: a 1-byte type and 4-byte BE size,
+    /// erroring if either does not match the expectation.
+    fn read_header(&mut self, expected_type: u8, expected_size: u32) -> Result<(), ProtocolError> {
         let t = self.u8()?;
-        if t != 5 {
+        if t != expected_type {
             return Err(ProtocolError::WrongType {
-                expected: 5,
+                expected: expected_type,
                 found: t,
             });
         }
         let s = self.u32_be()?;
-        if s != 4 {
+        if s != expected_size {
             return Err(ProtocolError::WrongSize {
-                expected: 4,
+                expected: expected_size,
                 found: s,
             });
         }
+        Ok(())
+    }
+
+    /// Read [type=5][size=4][tag:u32], returning the tag.
+    pub fn read_prolog_tag(&mut self) -> Result<u32, ProtocolError> {
+        self.read_header(5, 4)?;
         self.u32_be()
     }
 
     pub fn read_u32(&mut self) -> Result<u32, ProtocolError> {
-        let t = self.u8()?;
-        if t != 2 {
-            return Err(ProtocolError::WrongType {
-                expected: 2,
-                found: t,
-            });
-        }
-        let s = self.u32_be()?;
-        if s != 4 {
-            return Err(ProtocolError::WrongSize {
-                expected: 4,
-                found: s,
-            });
-        }
+        self.read_header(2, 4)?;
         self.u32_be()
     }
 
     pub fn read_fixed16x16(&mut self) -> Result<f64, ProtocolError> {
-        let t = self.u8()?;
-        if t != 3 {
-            return Err(ProtocolError::WrongType {
-                expected: 3,
-                found: t,
-            });
-        }
-        let s = self.u32_be()?;
-        if s != 4 {
-            return Err(ProtocolError::WrongSize {
-                expected: 4,
-                found: s,
-            });
-        }
+        self.read_header(3, 4)?;
         Ok(self.i32_be()? as f64 / 65536.0)
     }
 
     pub fn read_fixed22x42(&mut self) -> Result<f64, ProtocolError> {
-        let t = self.u8()?;
-        if t != 4 {
-            return Err(ProtocolError::WrongType {
-                expected: 4,
-                found: t,
-            });
-        }
-        let s = self.u32_be()?;
-        if s != 8 {
-            return Err(ProtocolError::WrongSize {
-                expected: 8,
-                found: s,
-            });
-        }
+        self.read_header(4, 8)?;
         Ok(self.i64_be()? as f64 / Q42_SCALE)
     }
 
     pub fn read_s64(&mut self) -> Result<i64, ProtocolError> {
-        let t = self.u8()?;
-        if t != 6 {
-            return Err(ProtocolError::WrongType {
-                expected: 6,
-                found: t,
-            });
-        }
-        let s = self.u32_be()?;
-        if s != 8 {
-            return Err(ProtocolError::WrongSize {
-                expected: 8,
-                found: s,
-            });
-        }
+        self.read_header(6, 8)?;
         self.i64_be()
     }
 

@@ -43,10 +43,7 @@ pub fn build_out_frame(seq: u32, op: u32, payload: &[u8]) -> Vec<u8> {
     let ttp = ttp.into_vec();
 
     let mut out = Writer::with_capacity(ENVELOPE_SIZE + ttp.len());
-    out.push_u8(0x00);
-    out.push_u8(0);
-    out.push_u8(0);
-    out.push_u8(0);
+    out.push_be32(0); // dir=0x00 + 3 zero pad bytes
     out.push_le32(ttp.len() as u32);
     out.push_bytes(&ttp);
     out.into_vec()
