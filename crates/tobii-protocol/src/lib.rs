@@ -12,3 +12,4 @@ pub mod tlv;
 pub mod frame;
 pub mod commands;
 pub mod md5;
+pub mod realm;
