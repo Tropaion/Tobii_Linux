@@ -14,6 +14,7 @@ crate).
 - `tlv` — TLV encoders + `Reader` decoders, Q42 fixed-point.
 - `commands` — hello, subscribe, get/set display area.
 - `realm` — query/open/response/close realm + the realm key.
+- `handshake` — `Handshake` connection state machine (hello → realm auth → subscribe).
 - `md5` — MD5 + HMAC-MD5 for realm auth.
 - `parser` — inbound `Parser` → `Frame`s (handles multi-transfer reassembly).
 - `gaze` — `GazeSample::decode` for 0x500 notifications.
