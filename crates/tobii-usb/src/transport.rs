@@ -77,8 +77,16 @@ impl UsbTransport {
         handle.claim_interface(IFACE)?;
 
         // Vendor session-open: bmRequestType = vendor | host-to-device | interface.
-        let req_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
-        handle.write_control(req_type, SESSION_OPEN, 0, 0, &[], Duration::from_millis(1000))?;
+        let req_type =
+            rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
+        handle.write_control(
+            req_type,
+            SESSION_OPEN,
+            0,
+            0,
+            &[],
+            Duration::from_millis(1000),
+        )?;
 
         Ok(Self { handle })
     }
@@ -86,9 +94,14 @@ impl UsbTransport {
 
 impl Transport for UsbTransport {
     fn send(&mut self, data: &[u8]) -> Result<(), UsbError> {
-        let wrote = self.handle.write_bulk(EP_OUT, data, Duration::from_millis(1000))?;
+        let wrote = self
+            .handle
+            .write_bulk(EP_OUT, data, Duration::from_millis(1000))?;
         if wrote != data.len() {
-            return Err(UsbError::ShortWrite { wrote, expected: data.len() });
+            return Err(UsbError::ShortWrite {
+                wrote,
+                expected: data.len(),
+            });
         }
         Ok(())
     }
@@ -105,10 +118,16 @@ impl Transport for UsbTransport {
 impl Drop for UsbTransport {
     fn drop(&mut self) {
         // Vendor session-close, then release the interface (best effort).
-        let req_type = rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
-        let _ = self
-            .handle
-            .write_control(req_type, SESSION_CLOSE, 0, 0, &[], Duration::from_millis(500));
+        let req_type =
+            rusb::request_type(Direction::Out, RequestType::Vendor, Recipient::Interface);
+        let _ = self.handle.write_control(
+            req_type,
+            SESSION_CLOSE,
+            0,
+            0,
+            &[],
+            Duration::from_millis(500),
+        );
         let _ = self.handle.release_interface(IFACE);
     }
 }
@@ -120,8 +139,11 @@ mod tests {
     #[test]
     fn usb_error_displays() {
         assert!(UsbError::DeviceNotFound.to_string().contains("not found"));
-        assert!(UsbError::ShortWrite { wrote: 1, expected: 8 }
-            .to_string()
-            .contains("short"));
+        assert!(UsbError::ShortWrite {
+            wrote: 1,
+            expected: 8
+        }
+        .to_string()
+        .contains("short"));
     }
 }

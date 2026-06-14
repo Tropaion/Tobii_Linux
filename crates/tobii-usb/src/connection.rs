@@ -191,7 +191,10 @@ mod tests {
             inbound(TTP_MAGIC_RSP, 3, 0x76c, &[0x00, 0x00]),
         ]);
         to_recv.push_back(inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload()));
-        let t = MockTransport { sent: Vec::new(), to_recv };
+        let t = MockTransport {
+            sent: Vec::new(),
+            to_recv,
+        };
 
         let mut conn = Connection::connect(t).expect("connect");
         let s = conn.next_gaze().expect("a gaze sample");
