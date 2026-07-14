@@ -53,6 +53,71 @@ impl DisplaySetup {
             offset_z_mm: c.bl[2],
         }
     }
+
+    /// Serialize to a `[display]` TOML section.
+    pub fn to_toml(&self) -> String {
+        format!(
+            "# tobii-linux display setup — edit with `tobii setup`\n\
+             [display]\n\
+             width_mm = {}\n\
+             height_mm = {}\n\
+             tilt_deg = {}\n\
+             offset_x_mm = {}\n\
+             offset_y_mm = {}\n\
+             offset_z_mm = {}\n",
+            self.width_mm,
+            self.height_mm,
+            self.tilt_deg,
+            self.offset_x_mm,
+            self.offset_y_mm,
+            self.offset_z_mm,
+        )
+    }
+
+    /// Parse a `[display]` TOML section. Returns `None` unless all six keys are
+    /// present and parse as `f64`. Ignores comments, blank lines, other sections.
+    pub fn from_toml(s: &str) -> Option<DisplaySetup> {
+        let mut in_display = false;
+        let (mut w, mut h, mut t) = (None, None, None);
+        let (mut ox, mut oy, mut oz) = (None, None, None);
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') {
+                in_display = line == "[display]";
+                continue;
+            }
+            if !in_display {
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let val = val.split('#').next().unwrap_or("").trim();
+            let Ok(v) = val.parse::<f64>() else {
+                continue;
+            };
+            match key.trim() {
+                "width_mm" => w = Some(v),
+                "height_mm" => h = Some(v),
+                "tilt_deg" => t = Some(v),
+                "offset_x_mm" => ox = Some(v),
+                "offset_y_mm" => oy = Some(v),
+                "offset_z_mm" => oz = Some(v),
+                _ => {}
+            }
+        }
+        Some(DisplaySetup {
+            width_mm: w?,
+            height_mm: h?,
+            tilt_deg: t?,
+            offset_x_mm: ox?,
+            offset_y_mm: oy?,
+            offset_z_mm: oz?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +195,41 @@ mod tests {
             assert!((c.tr[i] - GOLDEN.tr[i]).abs() < 1e-6);
             assert!((c.bl[i] - GOLDEN.bl[i]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn toml_roundtrips() {
+        let s = DisplaySetup {
+            width_mm: 931.6,
+            height_mm: 384.5,
+            tilt_deg: 26.0,
+            offset_x_mm: 14.0,
+            offset_y_mm: 68.0,
+            offset_z_mm: -11.0,
+        };
+        let text = s.to_toml();
+        assert!(text.contains("[display]"));
+        assert_eq!(DisplaySetup::from_toml(&text), Some(s));
+    }
+
+    #[test]
+    fn from_toml_ignores_comments_blanks_and_inline_comments() {
+        let text = "# my monitor\n\n\
+                    [display]\n\
+                    width_mm = 800.0   # active area\n\
+                    height_mm = 335.0\n\
+                    tilt_deg = 20.0\n\
+                    offset_x_mm = 0.0\n\
+                    offset_y_mm = 40.0\n\
+                    offset_z_mm = -5.0\n";
+        let s = DisplaySetup::from_toml(text).expect("parse");
+        assert_eq!(s.width_mm, 800.0);
+        assert_eq!(s.offset_z_mm, -5.0);
+    }
+
+    #[test]
+    fn from_toml_missing_key_is_none() {
+        let text = "[display]\nwidth_mm = 800.0\n";
+        assert_eq!(DisplaySetup::from_toml(text), None);
     }
 }
