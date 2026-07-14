@@ -67,6 +67,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-config"
+version = "0.1.0"
+dependencies = [
+ "tobii-protocol",
+]
+
+[[package]]
 name = "tobii-protocol"
 version = "0.1.0"
 
