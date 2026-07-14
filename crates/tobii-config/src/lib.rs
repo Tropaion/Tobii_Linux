@@ -7,5 +7,7 @@
 //! params. No I/O beyond the config store (see `store`).
 
 mod setup;
+mod store;
 
 pub use setup::DisplaySetup;
+pub use store::{config_path, load, load_from, save, save_to};
