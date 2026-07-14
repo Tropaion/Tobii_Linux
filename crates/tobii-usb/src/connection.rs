@@ -3,7 +3,9 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use tobii_protocol::frame::{OP_GAZE_NOTIFY, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP};
+use tobii_protocol::frame::{
+    build_out_frame, OP_GAZE_NOTIFY, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+};
 use tobii_protocol::{Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
 use crate::transport::{Transport, UsbError};
@@ -12,6 +14,7 @@ const READ_BUF: usize = 16384;
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const GAZE_TIMEOUT: Duration = Duration::from_millis(1000);
 const HANDSHAKE_STEP_CAP: u32 = 400;
+const REQUEST_READ_CAP: u32 = 100;
 
 /// A live connection to the eye tracker. Generic over [`Transport`] so the
 /// driver logic is testable without hardware.
@@ -19,6 +22,8 @@ pub struct Connection<T: Transport> {
     transport: T,
     parser: Parser,
     gaze_queue: VecDeque<GazeSample>,
+    /// Next TTP sequence number for post-handshake requests.
+    seq: u32,
 }
 
 impl<T: Transport> Connection<T> {
@@ -29,6 +34,7 @@ impl<T: Transport> Connection<T> {
             transport,
             parser: Parser::new(),
             gaze_queue: VecDeque::new(),
+            seq: 1,
         };
         conn.run_handshake()?;
         Ok(conn)
@@ -37,6 +43,40 @@ impl<T: Transport> Connection<T> {
     /// Access the underlying transport (used in tests).
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    fn next_seq(&mut self) -> u32 {
+        let s = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        if self.seq == 0 {
+            self.seq = 1;
+        }
+        s
+    }
+
+    /// Send a request frame and return the payload of the first response frame
+    /// whose op matches. Gaze notifications arriving in the meantime are queued
+    /// for [`Connection::next_gaze`]. Returns `Ok(None)` if no matching response
+    /// arrives within the read window.
+    pub fn request(&mut self, op: u32, payload: &[u8]) -> Result<Option<Vec<u8>>, UsbError> {
+        let seq = self.next_seq();
+        self.transport.send(&build_out_frame(seq, op, payload))?;
+        let mut buf = [0u8; READ_BUF];
+        for _ in 0..REQUEST_READ_CAP {
+            let Some(n) = self.transport.recv(&mut buf, RECV_TIMEOUT) else {
+                continue;
+            };
+            let Ok(frames) = self.parser.feed(&buf[..n]) else {
+                continue;
+            };
+            for f in frames {
+                if f.magic == TTP_MAGIC_RSP && f.op == op {
+                    return Ok(Some(f.payload));
+                }
+                self.route(f, None);
+            }
+        }
+        Ok(None)
     }
 
     fn run_handshake(&mut self) -> Result<(), UsbError> {
@@ -51,7 +91,10 @@ impl<T: Transport> Connection<T> {
                 HandshakeAction::Recv => {
                     self.drain(&mut buf, Some(&mut hs));
                 }
-                HandshakeAction::Done => return Ok(()),
+                HandshakeAction::Done => {
+                    self.seq = hs.seq();
+                    return Ok(());
+                }
                 HandshakeAction::Failed => return Err(UsbError::Handshake),
             }
         }
@@ -216,5 +259,44 @@ mod tests {
         };
         let mut conn = Connection::connect(t).expect("handshake survives stray gaze");
         assert!(conn.next_gaze().is_some());
+    }
+
+    #[test]
+    fn request_returns_matching_response_and_queues_gaze() {
+        let mut to_recv = VecDeque::from(vec![
+            inbound(TTP_MAGIC_RSP, 1, 0x3e8, &[]),
+            inbound(TTP_MAGIC_RSP, 2, 0x640, &realm_type_zero()),
+            inbound(TTP_MAGIC_RSP, 3, 0x76c, &[0x00, 0x00]),
+        ]);
+        // After connect: a stray gaze frame, then the get-display-area response.
+        to_recv.push_back(inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload()));
+        to_recv.push_back(inbound(TTP_MAGIC_RSP, 5, 0x596, &[0xAA, 0xBB]));
+        let t = MockTransport {
+            sent: Vec::new(),
+            to_recv,
+        };
+        let mut conn = Connection::connect(t).expect("connect");
+        let resp = conn
+            .request(0x596, &[])
+            .expect("io ok")
+            .expect("a response");
+        assert_eq!(resp, vec![0xAA, 0xBB]);
+        // The gaze that arrived before the response was queued, not dropped.
+        assert!(conn.next_gaze().is_some());
+    }
+
+    #[test]
+    fn request_returns_none_when_no_matching_response() {
+        let t = MockTransport {
+            sent: Vec::new(),
+            to_recv: VecDeque::from(vec![
+                inbound(TTP_MAGIC_RSP, 1, 0x3e8, &[]),
+                inbound(TTP_MAGIC_RSP, 2, 0x640, &realm_type_zero()),
+                inbound(TTP_MAGIC_RSP, 3, 0x76c, &[0x00, 0x00]),
+            ]),
+        };
+        let mut conn = Connection::connect(t).expect("connect");
+        // Nothing left to receive → the request window drains to None.
+        assert!(conn.request(0x596, &[]).expect("io ok").is_none());
     }
 }
