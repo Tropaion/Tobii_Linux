@@ -215,8 +215,15 @@ correlation in the protocol core.
   before committing the `tobii-headpose` design.
 - **Spike S2 — opentrack UDP format.** Confirm exact packet layout, units, and
   axis signs from opentrack source before finalizing head-pose output.
-- **Spike S3 — display-setup math location.** Confirm the relevant function is in
-  the decompilable .NET assemblies (not a native DLL) and extract it.
+- **Spike S3 — display-setup math location. RESOLVED 2026-07-14** (see
+  `specs/2026-07-14-spike-s3-display-setup-math.md`). The forward math is **native**
+  (`TetConfig.dll`, x86-64), *not* in the decompilable managed assemblies — those
+  only collect inputs → registry and read the finished corners back. Decision: do not
+  native-RE it; `tobii-config` implements a validated planar-rectangle model (from the
+  `tobiifree` reference + first principles) that reproduces a real working display
+  area to < 0.1 mm, exposing the spec's intended inputs (monitor W/H mm, mounting &
+  vertical offset, screen tilt angle). This refines §3/§8's "match the original math
+  exactly" to "match the original *inputs*; equivalent validated math."
 - **R2 — Device prerequisite for streaming.** Verify the ET5 streams after just
   the handshake (realm auth + subscribe) with no prior user calibration. Confirm
   at live validation; if a minimal device-side step is required, it belongs in
