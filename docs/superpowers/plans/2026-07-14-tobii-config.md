@@ -248,6 +248,38 @@ In `crates/tobii-usb/src/connection.rs`, inside `mod tests`, add:
         // Nothing left to receive → the request window drains to None.
         assert!(conn.request(0x596, &[]).expect("io ok").is_none());
     }
+
+    #[test]
+    fn request_queues_gaze_that_trails_the_response_in_one_chunk() {
+        // One transport read delivers the matching RSP followed by a gaze NOTIFY;
+        // the trailing gaze must be queued, not dropped. The empty filler read is
+        // absorbed by the extra drain `run_handshake` does after the subscribe
+        // send, so the RSP+gaze chunk survives for `request` to read rather than
+        // being consumed during `connect`.
+        let mut to_recv = VecDeque::from(vec![
+            inbound(TTP_MAGIC_RSP, 1, 0x3e8, &[]),
+            inbound(TTP_MAGIC_RSP, 2, 0x640, &realm_type_zero()),
+            inbound(TTP_MAGIC_RSP, 3, 0x76c, &[0x00, 0x00]),
+            Vec::new(),
+        ]);
+        let mut chunk = inbound(TTP_MAGIC_RSP, 5, 0x596, &[0xAA, 0xBB]);
+        chunk.extend_from_slice(&inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload()));
+        to_recv.push_back(chunk);
+        let t = MockTransport {
+            sent: Vec::new(),
+            to_recv,
+        };
+        let mut conn = Connection::connect(t).expect("connect");
+        let resp = conn
+            .request(0x596, &[])
+            .expect("io ok")
+            .expect("a response");
+        assert_eq!(resp, vec![0xAA, 0xBB]);
+        assert!(
+            conn.next_gaze().is_some(),
+            "trailing gaze must be queued, not dropped"
+        );
+    }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -327,11 +359,20 @@ const REQUEST_READ_CAP: u32 = 100;
             let Ok(frames) = self.parser.feed(&buf[..n]) else {
                 continue;
             };
+            // Route EVERY frame in the batch (a single read can coalesce the
+            // response with trailing gaze notifications); capture the first
+            // matching RSP but only return after the batch is fully drained, so
+            // gaze that follows the response in the same chunk is never dropped.
+            let mut matched = None;
             for f in frames {
-                if f.magic == TTP_MAGIC_RSP && f.op == op {
-                    return Ok(Some(f.payload));
+                if matched.is_none() && f.magic == TTP_MAGIC_RSP && f.op == op {
+                    matched = Some(f.payload);
+                } else {
+                    self.route(f, None);
                 }
-                self.route(f, None);
+            }
+            if matched.is_some() {
+                return Ok(matched);
             }
         }
         Ok(None)
@@ -341,7 +382,7 @@ const REQUEST_READ_CAP: u32 = 100;
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p tobii-usb --lib connection::tests`
-Expected: PASS (the two new tests + the three existing ones).
+Expected: PASS (the three new tests + the three existing ones).
 
 - [ ] **Step 5: Clippy + commit**
 
