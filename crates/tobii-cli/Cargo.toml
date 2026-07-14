@@ -12,3 +12,4 @@ path = "src/main.rs"
 [dependencies]
 tobii-usb = { path = "../tobii-usb" }
 tobii-protocol = { path = "../tobii-protocol" }
+tobii-config = { path = "../tobii-config" }
