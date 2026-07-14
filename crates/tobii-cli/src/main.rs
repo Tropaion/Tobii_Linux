@@ -131,15 +131,22 @@ fn display_set() -> CmdResult {
 }
 
 fn prompt_f64(label: &str, default: f64) -> Result<f64, Box<dyn std::error::Error>> {
-    print!("{label} [{default}]: ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let t = line.trim();
-    if t.is_empty() {
-        Ok(default)
-    } else {
-        Ok(t.parse()?)
+    loop {
+        print!("{label} [{default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            // EOF (e.g. piped input exhausted) — accept the default.
+            return Ok(default);
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            return Ok(default);
+        }
+        match t.parse::<f64>() {
+            Ok(v) if v.is_finite() => return Ok(v),
+            _ => eprintln!("  please enter a finite number (or press Enter for {default})"),
+        }
     }
 }
 

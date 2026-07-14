@@ -14,6 +14,11 @@ const READ_BUF: usize = 16384;
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const GAZE_TIMEOUT: Duration = Duration::from_millis(1000);
 const HANDSHAKE_STEP_CAP: u32 = 400;
+/// Max transport reads `request` will consume waiting for a matching response.
+/// This is an iteration count, not a wall-clock timeout: because gaze chunks
+/// stream concurrently, each one consumes an iteration, so the effective wait
+/// shrinks under heavy gaze. A GET reply normally arrives within a few chunks;
+/// revisit (e.g. a wall-clock deadline) if live testing shows this is too tight.
 const REQUEST_READ_CAP: u32 = 100;
 
 /// A live connection to the eye tracker. Generic over [`Transport`] so the
