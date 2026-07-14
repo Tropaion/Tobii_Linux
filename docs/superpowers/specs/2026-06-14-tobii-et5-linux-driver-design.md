@@ -198,9 +198,9 @@ correlation in the protocol core.
 
 ## 9. Scope & Phasing
 
-- **v1 (this spec):** core driver (handshake, gaze stream, display-area config) +
-  `tobii-headpose` + opentrack output → playable in Star Citizen and any
-  head-tracking game.
+- **v1 (this spec):** core driver (handshake, gaze stream ✅, display-area config
+  ✅ via `tobii-config`/`tobii setup`) + `tobii-headpose` + opentrack output (next)
+  → playable in Star Citizen and any head-tracking game.
 - **Phase 2 (later):** per-user gaze calibration (stimulus points, add-point,
   compute/apply, save/load blob).
 - **Phase 3 (later):** Tobii Game Integration API emulation (Wine shim) for true
