@@ -83,6 +83,27 @@ fn print_setup(s: &DisplaySetup) {
     );
 }
 
+/// Apply corners to a connected device. Returns whether the device
+/// acknowledged the set (a response frame arrived) vs. was sent without ack.
+fn apply_to_device(
+    t: UsbTransport,
+    c: &DisplayCorners,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut conn = Connection::connect(t)?;
+    let payload = set_display_area_corners_payload(
+        c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
+    );
+    Ok(conn.request(OP_SET_DISPLAY_AREA, &payload)?.is_some())
+}
+
+fn report_applied(acked: bool) {
+    if acked {
+        println!("display area applied to device (acknowledged).");
+    } else {
+        println!("display area sent to device (no acknowledgement received).");
+    }
+}
+
 fn display_get() -> CmdResult {
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
@@ -103,14 +124,9 @@ fn display_get() -> CmdResult {
 fn display_set() -> CmdResult {
     let setup = tobii_config::load()?.ok_or("no saved config — run `tobii setup` first")?;
     let c = setup.to_corners();
-    let payload = set_display_area_corners_payload(
-        c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
-    );
-    let transport = UsbTransport::open()?;
-    let mut conn = Connection::connect(transport)?;
-    conn.request(OP_SET_DISPLAY_AREA, &payload)?;
-    println!("display area applied to device:");
+    let acked = apply_to_device(UsbTransport::open()?, &c)?;
     print_corners(&c);
+    report_applied(acked);
     Ok(())
 }
 
@@ -147,19 +163,15 @@ fn setup() -> CmdResult {
     println!("saved config to {}", path.display());
 
     match UsbTransport::open() {
-        Ok(t) => {
-            let mut conn = Connection::connect(t)?;
-            let payload = set_display_area_corners_payload(
-                c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
-            );
-            conn.request(OP_SET_DISPLAY_AREA, &payload)?;
-            println!("applied to the connected device.");
-        }
-        Err(e) => {
-            eprintln!(
-                "note: device not opened ({e}); config saved — run `tobii display set` when connected."
-            );
-        }
+        Ok(t) => match apply_to_device(t, &c) {
+            Ok(acked) => report_applied(acked),
+            Err(e) => eprintln!(
+                "note: config saved, but applying to the device failed ({e}); run `tobii display set` to retry."
+            ),
+        },
+        Err(e) => eprintln!(
+            "note: device not opened ({e}); config saved — run `tobii display set` when connected."
+        ),
     }
     Ok(())
 }
