@@ -69,11 +69,16 @@ impl<T: Transport> Connection<T> {
             let Ok(frames) = self.parser.feed(&buf[..n]) else {
                 continue;
             };
+            let mut matched = None;
             for f in frames {
-                if f.magic == TTP_MAGIC_RSP && f.op == op {
-                    return Ok(Some(f.payload));
+                if matched.is_none() && f.magic == TTP_MAGIC_RSP && f.op == op {
+                    matched = Some(f.payload);
+                } else {
+                    self.route(f, None);
                 }
-                self.route(f, None);
+            }
+            if matched.is_some() {
+                return Ok(matched);
             }
         }
         Ok(None)
@@ -283,6 +288,39 @@ mod tests {
         assert_eq!(resp, vec![0xAA, 0xBB]);
         // The gaze that arrived before the response was queued, not dropped.
         assert!(conn.next_gaze().is_some());
+    }
+
+    #[test]
+    fn request_queues_gaze_that_trails_the_response_in_one_chunk() {
+        // One transport read delivers the matching RSP followed by a gaze
+        // NOTIFY; the trailing gaze must be queued, not dropped.
+        let mut to_recv = VecDeque::from(vec![
+            inbound(TTP_MAGIC_RSP, 1, 0x3e8, &[]),
+            inbound(TTP_MAGIC_RSP, 2, 0x640, &realm_type_zero()),
+            inbound(TTP_MAGIC_RSP, 3, 0x76c, &[0x00, 0x00]),
+        ]);
+        // The no-auth handshake sends 4 frames (hello/query/open/subscribe) but
+        // only needs 3 responses; `run_handshake` still issues one opportunistic
+        // extra `recv` after the subscribe send. Absorb that with an empty read
+        // so the RSP+gaze chunk below survives untouched for `request` itself.
+        to_recv.push_back(Vec::new());
+        let mut chunk = inbound(TTP_MAGIC_RSP, 5, 0x596, &[0xAA, 0xBB]);
+        chunk.extend_from_slice(&inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload()));
+        to_recv.push_back(chunk);
+        let t = MockTransport {
+            sent: Vec::new(),
+            to_recv,
+        };
+        let mut conn = Connection::connect(t).expect("connect");
+        let resp = conn
+            .request(0x596, &[])
+            .expect("io ok")
+            .expect("a response");
+        assert_eq!(resp, vec![0xAA, 0xBB]);
+        assert!(
+            conn.next_gaze().is_some(),
+            "trailing gaze must be queued, not dropped"
+        );
     }
 
     #[test]
