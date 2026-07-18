@@ -3,8 +3,13 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use tobii_protocol::calibration::{
+    cal_add_point_payload, cal_apply_payload, cal_compute_payload, cal_retrieve_payload,
+    CalibrationBlob,
+};
 use tobii_protocol::frame::{
-    build_out_frame, OP_GAZE_NOTIFY, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
+    OP_GAZE_NOTIFY, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
 use tobii_protocol::{Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
@@ -87,6 +92,38 @@ impl<T: Transport> Connection<T> {
             }
         }
         Ok(None)
+    }
+
+    /// Send a request and require a matching response (calibration ops always
+    /// reply). Returns the response payload, or `NoResponse` on timeout.
+    fn expect_response(&mut self, op: u32, payload: &[u8]) -> Result<Vec<u8>, UsbError> {
+        self.request(op, payload)?
+            .ok_or(UsbError::NoResponse { op })
+    }
+
+    /// Sample one calibration stimulus point. `x`/`y` normalized `[0,1]`;
+    /// `eye` 0=both/1=L/2=R. Assumes calibration runs in the already-open realm.
+    pub fn add_calibration_point(&mut self, x: f64, y: f64, eye: u32) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_ADD_POINT, &cal_add_point_payload(x, y, eye))?;
+        Ok(())
+    }
+
+    /// Compute and apply the calibration from the collected points.
+    pub fn compute_and_apply_calibration(&mut self) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_COMPUTE, &cal_compute_payload())?;
+        Ok(())
+    }
+
+    /// Retrieve the opaque calibration blob (the verbatim response payload).
+    pub fn retrieve_calibration(&mut self) -> Result<CalibrationBlob, UsbError> {
+        let payload = self.expect_response(OP_CAL_RETRIEVE, &cal_retrieve_payload())?;
+        Ok(CalibrationBlob(payload))
+    }
+
+    /// Re-apply a previously saved calibration blob.
+    pub fn apply_calibration(&mut self, blob: &[u8]) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_APPLY, &cal_apply_payload(blob))?;
+        Ok(())
     }
 
     fn run_handshake(&mut self) -> Result<(), UsbError> {
@@ -341,5 +378,48 @@ mod tests {
         let mut conn = Connection::connect(t).expect("connect");
         // Nothing left to receive → the request window drains to None.
         assert!(conn.request(0x596, &[]).expect("io ok").is_none());
+    }
+
+    fn connected_with(post: Vec<Vec<u8>>) -> Connection<MockTransport> {
+        let mut to_recv = VecDeque::from(vec![
+            inbound(TTP_MAGIC_RSP, 1, 0x3e8, &[]),
+            inbound(TTP_MAGIC_RSP, 2, 0x640, &realm_type_zero()),
+            inbound(TTP_MAGIC_RSP, 3, 0x76c, &[0x00, 0x00]),
+            Vec::new(), // filler consumed by the post-subscribe drain
+        ]);
+        to_recv.extend(post);
+        Connection::connect(MockTransport {
+            sent: Vec::new(),
+            to_recv,
+        })
+        .expect("connect")
+    }
+
+    #[test]
+    fn add_calibration_point_gets_ack() {
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x408, &[])]);
+        assert!(conn.add_calibration_point(0.25, 0.75, 0).is_ok());
+    }
+
+    #[test]
+    fn retrieve_calibration_returns_blob_verbatim() {
+        let mut conn = connected_with(vec![inbound(
+            TTP_MAGIC_RSP,
+            5,
+            0x44c,
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+        )]);
+        let blob = conn.retrieve_calibration().expect("blob");
+        assert_eq!(blob.0, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn compute_without_response_errors() {
+        // No post-connect responses -> compute drains to NoResponse.
+        let mut conn = connected_with(vec![]);
+        assert!(matches!(
+            conn.compute_and_apply_calibration(),
+            Err(UsbError::NoResponse { op }) if op == 0x42f
+        ));
     }
 }
