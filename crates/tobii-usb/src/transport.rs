@@ -13,6 +13,8 @@ pub enum UsbError {
     ShortWrite { wrote: usize, expected: usize },
     /// The protocol handshake did not complete.
     Handshake,
+    /// A request was sent but no matching response arrived within the read window.
+    NoResponse { op: u32 },
 }
 
 impl std::fmt::Display for UsbError {
@@ -27,6 +29,7 @@ impl std::fmt::Display for UsbError {
                 write!(f, "short bulk write: {wrote}/{expected} bytes")
             }
             UsbError::Handshake => write!(f, "handshake failed"),
+            UsbError::NoResponse { op } => write!(f, "no device response for op {op:#x}"),
         }
     }
 }
