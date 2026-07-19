@@ -5,7 +5,6 @@
 use eframe::egui;
 
 use crate::device::{ConnStatus, DeviceState};
-use crate::eyeview::{EyeView, Guidance};
 
 /// A launcher the user activated in the hub this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,16 +43,7 @@ pub fn draw(ui: &mut egui::Ui, state: &DeviceState) -> Option<HubAction> {
     ui.add_space(12.0);
 
     ui.label("Eye position:");
-    let view = state
-        .latest_gaze
-        .as_ref()
-        .map(EyeView::from_gaze)
-        .unwrap_or(EyeView {
-            left: None,
-            right: None,
-            distance_mm: None,
-            guidance: Guidance::NoEyes,
-        });
+    let view = crate::widget::eye_view_for(state);
     crate::widget::draw_eye_view(ui, &view, egui::vec2(320.0, 200.0));
 
     let msg = crate::widget::guidance_message(&view);
