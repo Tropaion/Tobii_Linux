@@ -4,6 +4,9 @@
 //! The hub, guided flows, gaze overlay, and the ported device thread land in the
 //! GTK4 redesign plan.
 
+pub mod device;
+pub mod eyeview;
+
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow};
 
