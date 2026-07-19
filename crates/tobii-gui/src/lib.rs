@@ -7,8 +7,9 @@
 
 pub mod device;
 pub mod eyeview;
+pub mod hub;
 
-/// Run the app: open the window and start the egui event loop.
+/// Run the app: open the window, start the device thread, render the hub.
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -19,18 +20,29 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "tobii-gui",
         options,
-        Box::new(|_cc| Ok(Box::<TobiiApp>::default())),
+        Box::new(|_cc| Ok(Box::new(TobiiApp::new()))),
     )
 }
 
-#[derive(Default)]
-struct TobiiApp {}
+struct TobiiApp {
+    state: std::sync::Arc<std::sync::Mutex<device::DeviceState>>,
+    _cmd_tx: std::sync::mpsc::Sender<device::DeviceCommand>,
+}
+
+impl TobiiApp {
+    fn new() -> Self {
+        let (state, cmd_tx) = device::spawn();
+        Self {
+            state,
+            _cmd_tx: cmd_tx,
+        }
+    }
+}
 
 impl eframe::App for TobiiApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-        eframe::egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Tobii Configuration");
-            ui.label("(foundation — hub UI arrives in a later task)");
-        });
+        let snapshot = self.state.lock().unwrap().clone();
+        eframe::egui::CentralPanel::default().show(ctx, |ui| hub::draw(ui, &snapshot));
+        ctx.request_repaint_after(std::time::Duration::from_millis(33)); // ~30fps live view
     }
 }
