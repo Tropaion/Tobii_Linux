@@ -138,17 +138,18 @@ fn display_set() -> CmdResult {
 const CAL_POINTS: [(f64, f64); 5] = [(0.5, 0.5), (0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)];
 
 fn calibrate(apply_saved: bool) -> CmdResult {
-    let transport = UsbTransport::open()?;
-    let mut conn = Connection::connect(transport)?;
-
     if apply_saved {
         let blob = tobii_config::load_calibration()?
             .ok_or("no saved calibration — run `tobii calibrate` first")?;
+        let transport = UsbTransport::open()?;
+        let mut conn = Connection::connect(transport)?;
         conn.apply_calibration(&blob)?;
         println!("re-applied saved calibration ({} bytes).", blob.len());
         return Ok(());
     }
 
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
     eprintln!(
         "NOTE: headless calibration — no stimulus is drawn, so this validates the \
          protocol only, not gaze accuracy."
@@ -199,7 +200,8 @@ fn setup() -> CmdResult {
     let monitors = tobii_config::detect_monitors();
     if let Some(m) = monitors
         .iter()
-        .find(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
+        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
+        .max_by(|a, b| (a.width_mm * a.height_mm).total_cmp(&(b.width_mm * b.height_mm)))
     {
         println!(
             "detected monitor: {} ({:.0} x {:.0} mm)",
