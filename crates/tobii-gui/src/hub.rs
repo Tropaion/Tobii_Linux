@@ -6,7 +6,14 @@ use eframe::egui;
 use crate::device::{ConnStatus, DeviceState};
 use crate::eyeview::{EyeView, Guidance};
 
-pub fn draw(ui: &mut egui::Ui, state: &DeviceState) {
+/// A launcher the user activated in the hub this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubAction {
+    SetupDisplay,
+    PositionEyes,
+}
+
+pub fn draw(ui: &mut egui::Ui, state: &DeviceState) -> Option<HubAction> {
     ui.heading("Tobii Configuration");
     ui.add_space(6.0);
 
@@ -23,10 +30,14 @@ pub fn draw(ui: &mut egui::Ui, state: &DeviceState) {
     }
     ui.add_space(10.0);
 
+    let mut action = None;
     ui.horizontal(|ui| {
-        // Flows arrive in B2.2 — buttons are placeholders here.
-        let _ = ui.button("Set up display…");
-        let _ = ui.button("Position eyes…");
+        if ui.button("Set up display…").clicked() {
+            action = Some(HubAction::SetupDisplay);
+        }
+        if ui.button("Position eyes…").clicked() {
+            action = Some(HubAction::PositionEyes);
+        }
         ui.add_enabled(false, egui::Button::new("Calibrate… (B3)"));
     });
     ui.add_space(12.0);
@@ -46,4 +57,19 @@ pub fn draw(ui: &mut egui::Ui, state: &DeviceState) {
 
     let msg = crate::widget::guidance_message(&view);
     ui.label(msg);
+
+    action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_action_variants_exist() {
+        // Compile-level guarantee the launcher actions are modeled.
+        let a = HubAction::SetupDisplay;
+        let b = HubAction::PositionEyes;
+        assert_ne!(std::mem::discriminant(&a), std::mem::discriminant(&b));
+    }
 }
