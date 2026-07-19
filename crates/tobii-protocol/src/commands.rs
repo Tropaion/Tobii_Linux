@@ -53,10 +53,10 @@ pub fn build_set_display_area(
     )
 }
 
-/// Set display area from explicit corners (each tracker-relative, mm).
+/// The SET_DISPLAY_AREA payload for three explicit corners (each tracker-relative,
+/// mm). Order on the wire is TL, TR, BL; bottom-right is implied by the device.
 #[allow(clippy::too_many_arguments)]
-pub fn build_set_display_area_corners(
-    seq: u32,
+pub fn set_display_area_corners_payload(
     tl_x: f64,
     tl_y: f64,
     tl_z: f64,
@@ -75,7 +75,26 @@ pub fn build_set_display_area_corners(
     write_point(&mut pay, bl_x, bl_y, bl_z);
     write_tag(&mut pay, 0x10100);
     write_u32(&mut pay, 0x3039);
-    build_out_frame(seq, OP_SET_DISPLAY_AREA, &pay.into_vec())
+    pay.into_vec()
+}
+
+/// Set display area from explicit corners (each tracker-relative, mm).
+#[allow(clippy::too_many_arguments)]
+pub fn build_set_display_area_corners(
+    seq: u32,
+    tl_x: f64,
+    tl_y: f64,
+    tl_z: f64,
+    tr_x: f64,
+    tr_y: f64,
+    tr_z: f64,
+    bl_x: f64,
+    bl_y: f64,
+    bl_z: f64,
+) -> Vec<u8> {
+    let payload =
+        set_display_area_corners_payload(tl_x, tl_y, tl_z, tr_x, tr_y, tr_z, bl_x, bl_y, bl_z);
+    build_out_frame(seq, OP_SET_DISPLAY_AREA, &payload)
 }
 
 #[cfg(test)]
@@ -115,5 +134,20 @@ mod tests {
         let f = build_set_display_area(2, 400.0, 300.0, -200.0, 0.0, 0.0);
         assert_eq!(f.len(), 196); // payload 2 + 3*48 + 9 + 9 = 164 -> frame 196
         assert_eq!(&f[20..24], &[0, 0, 0x05, 0xa0]);
+    }
+
+    #[test]
+    fn set_display_area_corners_payload_is_164_bytes() {
+        let p = set_display_area_corners_payload(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        // 2 prefix + 3*point(48) + tag(9) + u32(9) = 164 (frame - envelope(8) - header(24)).
+        assert_eq!(p.len(), 164);
+    }
+
+    #[test]
+    fn frame_builder_payload_matches_standalone_payload() {
+        let f = build_set_display_area_corners(7, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
+        let p = set_display_area_corners_payload(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0);
+        // The frame's payload (after 8-byte envelope + 24-byte header) equals the builder.
+        assert_eq!(&f[32..], &p[..]);
     }
 }

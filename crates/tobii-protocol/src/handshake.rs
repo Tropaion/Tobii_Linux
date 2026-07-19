@@ -132,6 +132,12 @@ impl Handshake {
         s
     }
 
+    /// The next sequence number this handshake would use. After the handshake
+    /// reaches `Done`, callers continue post-handshake requests from here.
+    pub fn seq(&self) -> u32 {
+        self.seq
+    }
+
     /// Feed a response payload (the payload of a TTP response frame).
     pub fn on_response(&mut self, payload: &[u8]) {
         self.resp = Some(payload.to_vec());
@@ -410,5 +416,16 @@ mod handshake_tests {
         let responses = vec![prefixed(&[]), prefixed(&[u32_field(1)]), open_reply];
         let (_sent, term) = run(&mut hs, responses);
         assert!(matches!(term, HandshakeAction::Failed));
+    }
+
+    #[test]
+    fn seq_advances_past_the_handshake_frames() {
+        let mut hs = Handshake::new(0x500);
+        assert_eq!(hs.seq(), 1); // fresh: next seq is 1
+                                 // No-auth path sends 4 frames (hello, query, open, subscribe) → seq ends at 5.
+        let responses = vec![prefixed(&[]), prefixed(&[u32_field(0)]), prefixed(&[])];
+        let (_sent, term) = run(&mut hs, responses);
+        assert!(matches!(term, HandshakeAction::Done));
+        assert_eq!(hs.seq(), 5);
     }
 }
