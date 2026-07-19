@@ -78,23 +78,22 @@ impl eframe::App for TobiiApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 }
             }
-            Screen::DisplaySetup(flow) => match flow.update(ui, &snapshot) {
-                SetupOutcome::Apply(setup) => {
-                    let _ = tobii_config::save(&setup);
+            Screen::DisplaySetup(flow) => {
+                let out = flow.update(ui, &snapshot);
+                if let SetupOutcome::Apply(setup) = &out {
+                    let _ = tobii_config::save(setup);
                     let _ = self
                         .cmd_tx
                         .send(device::DeviceCommand::SetDisplayArea(setup.to_corners()));
                 }
-                SetupOutcome::Done | SetupOutcome::Cancel => {
+                if esc || matches!(out, SetupOutcome::Done | SetupOutcome::Cancel) {
                     self.screen = Screen::Hub;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 }
-                SetupOutcome::Continue => {}
-            },
+            }
         });
 
         // Esc while already in the hub does nothing; handled per-screen above.
-        let _ = esc;
         ctx.request_repaint_after(std::time::Duration::from_millis(33)); // ~30fps live view
     }
 }
