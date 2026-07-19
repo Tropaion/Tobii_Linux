@@ -7,6 +7,7 @@ is the protocol reference).
 ## Crates
 - `tobii-protocol` — pure protocol codec + handshake state machine (no I/O).
 - `tobii-usb` — libusb (rusb) transport + connection driver.
+- `tobii-config` — display-setup geometry + TOML config (no I/O beyond the config file).
 - `tobii-cli` — the `tobii` command-line tool.
 
 ## Setup (once)
@@ -23,8 +24,22 @@ Then plug in (or re-plug) the Eye Tracker 5.
     ./target/release/tobii stream          # human-readable gaze
     ./target/release/tobii stream --json   # one JSON object per sample
 
+### Display setup
+
+Tell the tracker where your screen is (needed for accurate on-screen gaze):
+
+    ./target/release/tobii setup           # interactive; writes config + applies
+    ./target/release/tobii display get      # read the device's current area
+    ./target/release/tobii display set      # re-apply the saved config
+
+Config is stored at `$XDG_CONFIG_HOME/tobii-linux/config.toml` (default
+`~/.config/tobii-linux/config.toml`). Inputs are your monitor's active-area
+width/height (mm), how far its bottom edge sits above the tracker, the screen's
+tilt angle, and any horizontal/depth offset — a planar model validated against a
+real working configuration (see `docs/superpowers/specs/`).
+
 ## Status
-v1 in progress: gaze streaming works; display-area config, calibration,
-head-pose, and opentrack output are upcoming. See `docs/superpowers/`.
+v1 in progress: gaze streaming and display-area setup work; head-pose and
+opentrack output are upcoming. See `docs/superpowers/`.
 
 License: GPL-3.0-only.

@@ -198,9 +198,9 @@ correlation in the protocol core.
 
 ## 9. Scope & Phasing
 
-- **v1 (this spec):** core driver (handshake, gaze stream, display-area config) +
-  `tobii-headpose` + opentrack output → playable in Star Citizen and any
-  head-tracking game.
+- **v1 (this spec):** core driver (handshake, gaze stream ✅, display-area config
+  ✅ via `tobii-config`/`tobii setup`) + `tobii-headpose` + opentrack output (next)
+  → playable in Star Citizen and any head-tracking game.
 - **Phase 2 (later):** per-user gaze calibration (stimulus points, add-point,
   compute/apply, save/load blob).
 - **Phase 3 (later):** Tobii Game Integration API emulation (Wine shim) for true
@@ -215,12 +215,27 @@ correlation in the protocol core.
   before committing the `tobii-headpose` design.
 - **Spike S2 — opentrack UDP format.** Confirm exact packet layout, units, and
   axis signs from opentrack source before finalizing head-pose output.
-- **Spike S3 — display-setup math location.** Confirm the relevant function is in
-  the decompilable .NET assemblies (not a native DLL) and extract it.
-- **R2 — Device prerequisite for streaming.** Verify the ET5 streams after just
-  the handshake (realm auth + subscribe) with no prior user calibration. Confirm
-  at live validation; if a minimal device-side step is required, it belongs in
-  the handshake, not Phase 2.
+- **Spike S3 — display-setup math location. RESOLVED 2026-07-14** (see
+  `specs/2026-07-14-spike-s3-display-setup-math.md`). The forward math is **native**
+  (`TetConfig.dll`, x86-64), *not* in the decompilable managed assemblies — those
+  only collect inputs → registry and read the finished corners back. Decision: do not
+  native-RE it; `tobii-config` implements a validated planar-rectangle model (from the
+  `tobiifree` reference + first principles) that reproduces a real working display
+  area to < 0.1 mm, exposing the spec's intended inputs (monitor W/H mm, mounting &
+  vertical offset, screen tilt angle). This refines §3/§8's "match the original math
+  exactly" to "match the original *inputs*; equivalent validated math."
+- **R2 — Device prerequisite for streaming. RESOLVED 2026-07-15 (live, on a
+  physical ET5 `2104:0313`).** Gaze streams immediately after the handshake
+  (hello → query/open realm → HMAC-MD5 realm auth → subscribe) with **no prior
+  user calibration** — the realm-auth path was exercised for real and the stream
+  began at ~33 Hz. When no eyes are in the trackbox the device reports its invalid
+  sentinel (`gaze=(-1,-1)`, `validity=4`), which is expected, not a decode error.
+  No extra device-side step was needed. Also confirmed live: the `get_display_area`
+  response echoes op `0x596`, `set_display_area` (op `0x5a0`) **is acknowledged**
+  with a response frame, and a `setup`→`display set`→`display get` round-trip is
+  byte-exact. The device shipped with an uninitialised 4×4 mm placeholder display
+  area (never configured by real Tobii software). Real captured gaze + display-area
+  frames are now golden decode vectors (`tobii-protocol` `gaze.rs`/`display.rs`).
 - **R3 — Firmware mode.** Device may appear in bootloader mode (`2104:0102`);
   reuse `tobiifree`'s DFU tooling/notes if a flash is ever required (not expected
   for v1).
