@@ -102,103 +102,142 @@ impl DisplaySetupFlow {
         if self.cancelled {
             return SetupOutcome::Cancel;
         }
-        let mut outcome = SetupOutcome::Continue;
-
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
             ui.heading("Set up your display");
-            ui.add_space(12.0);
+        });
+        ui.add_space(12.0);
 
-            match self.step {
-                Step::DetectMonitor => {
-                    ui.label(
+        // Center the body in a fixed-width column. `vertical_centered` centers
+        // single widgets (the heading) but does NOT center an `egui::Grid`, so
+        // the form otherwise pins to the left edge on a wide/fullscreen window.
+        let col_w = 460.0_f32.min(ui.available_width());
+        let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
+        egui::Frame::none()
+            .outer_margin(egui::Margin {
+                left: side,
+                right: side,
+                top: 0.0,
+                bottom: 0.0,
+            })
+            .show(ui, |ui| {
+                ui.set_width(col_w);
+                let mut outcome = SetupOutcome::Continue;
+
+                match self.step {
+                    Step::DetectMonitor => {
+                        ui.label(
                         "Select your monitor (detected via EDID), or continue with the saved size:",
                     );
-                    ui.add_space(8.0);
-                    // Snapshot to avoid borrowing self during the click handler.
-                    let mons: Vec<(String, f64, f64)> = self
-                        .monitors
-                        .iter()
-                        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
-                        .map(|m| {
-                            (
-                                format!("{} ({:.0}×{:.0} mm)", m.model, m.width_mm, m.height_mm),
-                                m.width_mm,
-                                m.height_mm,
-                            )
-                        })
-                        .collect();
-                    for (label, w, h) in mons {
-                        if ui.button(label).clicked() {
-                            self.select_monitor(w, h);
+                        ui.add_space(8.0);
+                        // Snapshot to avoid borrowing self during the click handler.
+                        let mons: Vec<(String, f64, f64)> = self
+                            .monitors
+                            .iter()
+                            .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
+                            .map(|m| {
+                                (
+                                    format!(
+                                        "{} ({:.0}×{:.0} mm)",
+                                        m.model, m.width_mm, m.height_mm
+                                    ),
+                                    m.width_mm,
+                                    m.height_mm,
+                                )
+                            })
+                            .collect();
+                        for (label, w, h) in mons {
+                            if ui.button(label).clicked() {
+                                self.select_monitor(w, h);
+                            }
+                        }
+                        if ui.button("Use saved size →").clicked() {
+                            self.step = Step::Geometry;
                         }
                     }
-                    if ui.button("Use saved size →").clicked() {
-                        self.step = Step::Geometry;
+                    Step::Geometry => {
+                        egui::Grid::new("geometry").num_columns(2).show(ui, |ui| {
+                            ui.label("Width (mm)");
+                            ui.add(
+                                egui::DragValue::new(&mut self.setup.width_mm).range(1.0..=5000.0),
+                            );
+                            ui.end_row();
+                            ui.label("Height (mm)");
+                            ui.add(
+                                egui::DragValue::new(&mut self.setup.height_mm).range(1.0..=5000.0),
+                            );
+                            ui.end_row();
+                            ui.label("Tilt back (deg)");
+                            ui.add(
+                                egui::DragValue::new(&mut self.setup.tilt_deg).range(-45.0..=45.0),
+                            );
+                            ui.end_row();
+                            ui.label("Bottom edge above tracker (mm)");
+                            ui.add(egui::DragValue::new(&mut self.setup.offset_y_mm));
+                            ui.end_row();
+                            ui.label("Depth from tracker (mm)");
+                            ui.add(egui::DragValue::new(&mut self.setup.offset_z_mm));
+                            ui.end_row();
+                            ui.label("Horizontal offset (mm)");
+                            ui.add(egui::DragValue::new(&mut self.setup.offset_x_mm));
+                            ui.end_row();
+                        });
+                        let c = self.setup.to_corners();
+                        ui.add_space(8.0);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new("Live preview").strong());
+                            ui.label(format!(
+                                "Screen {:.0} × {:.0} mm, tilted {:.0}° back",
+                                self.setup.width_mm, self.setup.height_mm, self.setup.tilt_deg
+                            ));
+                            ui.label("Corners in tracker space (mm):");
+                            ui.monospace(format!(
+                                "TL ({:>6.0}, {:>6.0}, {:>6.0})",
+                                c.tl[0], c.tl[1], c.tl[2]
+                            ));
+                            ui.monospace(format!(
+                                "TR ({:>6.0}, {:>6.0}, {:>6.0})",
+                                c.tr[0], c.tr[1], c.tr[2]
+                            ));
+                            ui.monospace(format!(
+                                "BL ({:>6.0}, {:>6.0}, {:>6.0})",
+                                c.bl[0], c.bl[1], c.bl[2]
+                            ));
+                        });
+                        ui.add_space(10.0);
+                        if ui.button("Apply & continue →").clicked() {
+                            outcome = SetupOutcome::Apply(self.confirm_geometry());
+                        }
+                    }
+                    Step::Confirm => {
+                        if let Some(w) = &self.apply_warning {
+                            ui.colored_label(egui::Color32::LIGHT_RED, w);
+                        } else {
+                            ui.label("Applied. Confirm the tracker can see you:");
+                        }
+                        if !matches!(state.status, crate::device::ConnStatus::Connected) {
+                            crate::widget::disconnect_status_line(ui, &state.status);
+                        }
+                        let view = crate::widget::eye_view_for(state);
+                        let side = ui.available_width().min(ui.available_height()) * 0.5;
+                        crate::widget::draw_eye_view(ui, &view, egui::vec2(side * 1.4, side));
+                        ui.label(crate::widget::guidance_message(&view));
+                        ui.add_space(12.0);
+                        if ui.button("Done").clicked() {
+                            outcome = SetupOutcome::Done;
+                        }
                     }
                 }
-                Step::Geometry => {
-                    egui::Grid::new("geometry").num_columns(2).show(ui, |ui| {
-                        ui.label("Width (mm)");
-                        ui.add(egui::DragValue::new(&mut self.setup.width_mm).range(1.0..=5000.0));
-                        ui.end_row();
-                        ui.label("Height (mm)");
-                        ui.add(
-                            egui::DragValue::new(&mut self.setup.height_mm).range(1.0..=5000.0),
-                        );
-                        ui.end_row();
-                        ui.label("Tilt back (deg)");
-                        ui.add(egui::DragValue::new(&mut self.setup.tilt_deg).range(-45.0..=45.0));
-                        ui.end_row();
-                        ui.label("Bottom edge above tracker (mm)");
-                        ui.add(egui::DragValue::new(&mut self.setup.offset_y_mm));
-                        ui.end_row();
-                        ui.label("Depth from tracker (mm)");
-                        ui.add(egui::DragValue::new(&mut self.setup.offset_z_mm));
-                        ui.end_row();
-                        ui.label("Horizontal offset (mm)");
-                        ui.add(egui::DragValue::new(&mut self.setup.offset_x_mm));
-                        ui.end_row();
-                    });
-                    let c = self.setup.to_corners();
-                    ui.add_space(6.0);
-                    ui.label(format!(
-                        "Corners (mm): TL({:.0},{:.0},{:.0}) TR({:.0},{:.0},{:.0}) BL({:.0},{:.0},{:.0})",
-                        c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2]
-                    ));
-                    ui.add_space(10.0);
-                    if ui.button("Apply & continue →").clicked() {
-                        outcome = SetupOutcome::Apply(self.confirm_geometry());
-                    }
-                }
-                Step::Confirm => {
-                    if let Some(w) = &self.apply_warning {
-                        ui.colored_label(egui::Color32::LIGHT_RED, w);
-                    } else {
-                        ui.label("Applied. Confirm the tracker can see you:");
-                    }
-                    if !matches!(state.status, crate::device::ConnStatus::Connected) {
-                        crate::widget::disconnect_status_line(ui, &state.status);
-                    }
-                    let view = crate::widget::eye_view_for(state);
-                    let side = ui.available_width().min(ui.available_height()) * 0.5;
-                    crate::widget::draw_eye_view(ui, &view, egui::vec2(side * 1.4, side));
-                    ui.label(crate::widget::guidance_message(&view));
-                    ui.add_space(12.0);
-                    if ui.button("Done").clicked() {
-                        outcome = SetupOutcome::Done;
-                    }
-                }
-            }
 
-            ui.add_space(16.0);
-            if ui.button("Cancel").clicked() {
-                self.cancel();
-                outcome = SetupOutcome::Cancel;
-            }
-        });
-
-        outcome
+                ui.add_space(16.0);
+                if ui.button("Cancel").clicked() {
+                    self.cancel();
+                    outcome = SetupOutcome::Cancel;
+                }
+                outcome
+            })
+            .inner
     }
 }
 
