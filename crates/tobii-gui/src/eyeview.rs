@@ -1,13 +1,22 @@
 //! Pure mapping from a decoded gaze sample to a renderable eye-position view.
 //! No egui — the widget (hub/flows) draws from this.
+//!
+//! Coordinate + distance conventions were confirmed against a live ET5:
+//! - trackbox columns (0x03/0x09) give eye x/y **normalized `[0,1]`** in the
+//!   tracker's camera frame, plus a normalized z (NOT millimetres);
+//! - the true operating **distance in mm** comes from the eye-origin columns
+//!   (0x02/0x08) z;
+//! - the camera frame is left-right mirrored vs. the user, so x is flipped so
+//!   the view reads like a mirror (you move left → your dot moves left).
 
 use tobii_protocol::gaze::present;
 use tobii_protocol::GazeSample;
 
-/// Comfortable operating-distance window (mm) and centre tolerance for guidance.
-const DIST_MIN_MM: f32 = 450.0;
-const DIST_MAX_MM: f32 = 750.0;
-const CENTRE_TOL: f32 = 0.18; // max |mid - 0.5| on each axis to count as centred
+/// Comfortable operating-distance window (mm). The ET5 tracks roughly 50–95 cm.
+const DIST_MIN_MM: f32 = 500.0;
+const DIST_MAX_MM: f32 = 900.0;
+/// How close to a trackbox edge (normalized) before we suggest re-centering.
+const EDGE_MARGIN: f32 = 0.08;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Guidance {
@@ -18,8 +27,9 @@ pub enum Guidance {
     OffCenter,
 }
 
-/// A renderable eye-position snapshot. `left`/`right` are normalized `[0,1]`
-/// trackbox coordinates (the widget scales them into its rectangle).
+/// A renderable eye-position snapshot. `left`/`right` are **mirror-view**
+/// normalized `[0,1]` coordinates (x already flipped) that the widget scales
+/// into its rectangle. `distance_mm` is the real operating distance (mm).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EyeView {
     pub left: Option<[f32; 2]>,
@@ -42,26 +52,36 @@ impl EyeView {
                 guidance: Guidance::NoEyes,
             };
         }
-        let left = [s.trackbox_eye_l[0] as f32, s.trackbox_eye_l[1] as f32];
-        let right = [s.trackbox_eye_r[0] as f32, s.trackbox_eye_r[1] as f32];
-        let distance = ((s.trackbox_eye_l[2] + s.trackbox_eye_r[2]) / 2.0) as f32;
-        let mid_x = (left[0] + right[0]) / 2.0;
-        let mid_y = (left[1] + right[1]) / 2.0;
 
-        let guidance = if distance < DIST_MIN_MM {
-            Guidance::MoveBack
-        } else if distance > DIST_MAX_MM {
-            Guidance::MoveCloser
-        } else if (mid_x - 0.5).abs() > CENTRE_TOL || (mid_y - 0.5).abs() > CENTRE_TOL {
-            Guidance::OffCenter
+        // Mirror x (camera frame → mirror view); y passes through.
+        let left = [1.0 - s.trackbox_eye_l[0] as f32, s.trackbox_eye_l[1] as f32];
+        let right = [1.0 - s.trackbox_eye_r[0] as f32, s.trackbox_eye_r[1] as f32];
+
+        // Real distance is the eye-origin z in mm (the trackbox z is normalized).
+        let distance_mm = if s.has(present::EYE_ORIGIN_L) && s.has(present::EYE_ORIGIN_R) {
+            Some(((s.eye_origin_l_mm[2] + s.eye_origin_r_mm[2]) / 2.0) as f32)
         } else {
-            Guidance::Centered
+            None
+        };
+
+        let near_edge = [left, right].iter().any(|p| {
+            p[0] < EDGE_MARGIN
+                || p[0] > 1.0 - EDGE_MARGIN
+                || p[1] < EDGE_MARGIN
+                || p[1] > 1.0 - EDGE_MARGIN
+        });
+
+        let guidance = match distance_mm {
+            Some(d) if d < DIST_MIN_MM => Guidance::MoveBack,
+            Some(d) if d > DIST_MAX_MM => Guidance::MoveCloser,
+            _ if near_edge => Guidance::OffCenter,
+            _ => Guidance::Centered,
         };
 
         EyeView {
             left: Some(left),
             right: Some(right),
-            distance_mm: Some(distance),
+            distance_mm,
             guidance,
         }
     }
@@ -73,13 +93,18 @@ mod tests {
     use tobii_protocol::gaze::present;
     use tobii_protocol::GazeSample;
 
-    fn sample_with_trackbox(l: [f64; 3], r: [f64; 3], valid: bool) -> GazeSample {
+    /// Build a sample with trackbox (normalized) + eye-origin (mm) + validity.
+    fn sample(tb_l: [f64; 3], tb_r: [f64; 3], origin_z_mm: f64, valid: bool) -> GazeSample {
         let v = if valid { 0 } else { 4 };
         GazeSample {
-            trackbox_eye_l: l,
-            trackbox_eye_r: r,
+            trackbox_eye_l: tb_l,
+            trackbox_eye_r: tb_r,
+            eye_origin_l_mm: [0.0, 0.0, origin_z_mm],
+            eye_origin_r_mm: [0.0, 0.0, origin_z_mm],
             present_mask: present::TRACKBOX_L
                 | present::TRACKBOX_R
+                | present::EYE_ORIGIN_L
+                | present::EYE_ORIGIN_R
                 | present::VALIDITY_L
                 | present::VALIDITY_R,
             validity_l: v,
@@ -96,52 +121,42 @@ mod tests {
     }
 
     #[test]
-    fn centered_eyes_map_to_box_and_report_centered() {
-        let v = EyeView::from_gaze(&sample_with_trackbox(
-            [0.45, 0.5, 550.0],
-            [0.55, 0.5, 550.0],
-            true,
-        ));
-        assert!(v.left.is_some() && v.right.is_some());
-        // x normalized [0,1] -> passed through as f32 for the widget to scale.
-        assert!((v.left.unwrap()[0] - 0.45).abs() < 1e-6);
-        assert!(matches!(v.guidance, Guidance::Centered));
-        assert!((v.distance_mm.unwrap() - 550.0).abs() < 1e-3);
+    fn invalid_validity_means_no_eyes() {
+        let v = EyeView::from_gaze(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, false));
+        assert!(matches!(v.guidance, Guidance::NoEyes));
     }
 
     #[test]
-    fn too_close_and_too_far_are_flagged() {
-        let close = EyeView::from_gaze(&sample_with_trackbox(
-            [0.5, 0.5, 300.0],
-            [0.5, 0.5, 300.0],
-            true,
-        ));
+    fn x_is_mirrored() {
+        // Trackbox left-eye at raw x=0.6 must render at 1-0.6=0.4 (mirror view).
+        let v = EyeView::from_gaze(&sample([0.6, 0.5, 0.5], [0.4, 0.5, 0.5], 680.0, true));
+        assert!((v.left.unwrap()[0] - 0.4).abs() < 1e-6);
+        assert!((v.right.unwrap()[0] - 0.6).abs() < 1e-6);
+        // y passes through unchanged.
+        assert!((v.left.unwrap()[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn distance_comes_from_eye_origin_mm_not_trackbox_z() {
+        // Trackbox z is a normalized 0.58; the reported distance must be the
+        // eye-origin 680 mm, and a mid-range distance reads as Centered.
+        let v = EyeView::from_gaze(&sample([0.55, 0.5, 0.58], [0.45, 0.5, 0.58], 680.0, true));
+        assert!((v.distance_mm.unwrap() - 680.0).abs() < 1e-3);
+        assert!(matches!(v.guidance, Guidance::Centered));
+    }
+
+    #[test]
+    fn too_close_and_too_far_use_mm_thresholds() {
+        let close = EyeView::from_gaze(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 400.0, true));
         assert!(matches!(close.guidance, Guidance::MoveBack));
-        let far = EyeView::from_gaze(&sample_with_trackbox(
-            [0.5, 0.5, 900.0],
-            [0.5, 0.5, 900.0],
-            true,
-        ));
+        let far = EyeView::from_gaze(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 1000.0, true));
         assert!(matches!(far.guidance, Guidance::MoveCloser));
     }
 
     #[test]
-    fn off_center_eyes_are_flagged() {
-        let v = EyeView::from_gaze(&sample_with_trackbox(
-            [0.1, 0.5, 550.0],
-            [0.2, 0.5, 550.0],
-            true,
-        ));
+    fn near_box_edge_is_off_center() {
+        // Raw x=0.95 → mirrored 0.05, within EDGE_MARGIN of the edge.
+        let v = EyeView::from_gaze(&sample([0.95, 0.5, 0.5], [0.9, 0.5, 0.5], 680.0, true));
         assert!(matches!(v.guidance, Guidance::OffCenter));
-    }
-
-    #[test]
-    fn invalid_validity_means_no_eyes() {
-        let v = EyeView::from_gaze(&sample_with_trackbox(
-            [0.5, 0.5, 550.0],
-            [0.5, 0.5, 550.0],
-            false,
-        ));
-        assert!(matches!(v.guidance, Guidance::NoEyes));
     }
 }
