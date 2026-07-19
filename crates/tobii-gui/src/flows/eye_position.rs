@@ -3,9 +3,8 @@
 
 use eframe::egui;
 
-use crate::device::DeviceState;
-use crate::eyeview::{EyeView, Guidance};
-use crate::widget::{draw_eye_view, guidance_message};
+use crate::device::{ConnStatus, DeviceState};
+use crate::widget::{disconnect_status_line, draw_eye_view, eye_view_for, guidance_message};
 
 #[derive(Default)]
 pub struct EyePositionFlow;
@@ -30,22 +29,17 @@ impl EyePositionFlow {
     }
 
     pub fn update(&mut self, ui: &mut egui::Ui, state: &DeviceState) -> EyeFlowOutcome {
-        let view = state
-            .latest_gaze
-            .as_ref()
-            .map(EyeView::from_gaze)
-            .unwrap_or(EyeView {
-                left: None,
-                right: None,
-                distance_mm: None,
-                guidance: Guidance::NoEyes,
-            });
+        let view = eye_view_for(state);
 
         let mut finish = false;
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
             ui.heading("Position your eyes");
             ui.add_space(16.0);
+            if !matches!(state.status, ConnStatus::Connected) {
+                disconnect_status_line(ui, &state.status);
+                ui.add_space(8.0);
+            }
             let side = ui.available_width().min(ui.available_height()) * 0.6;
             draw_eye_view(ui, &view, egui::vec2(side * 1.4, side));
             ui.add_space(16.0);

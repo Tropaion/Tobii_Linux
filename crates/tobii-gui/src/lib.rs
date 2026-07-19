@@ -81,10 +81,16 @@ impl eframe::App for TobiiApp {
             Screen::DisplaySetup(flow) => {
                 let out = flow.update(ui, &snapshot);
                 if let SetupOutcome::Apply(setup) = &out {
-                    let _ = tobii_config::save(setup);
-                    let _ = self
-                        .cmd_tx
-                        .send(device::DeviceCommand::SetDisplayArea(setup.to_corners()));
+                    match tobii_config::save(setup) {
+                        Ok(()) => {
+                            let _ = self
+                                .cmd_tx
+                                .send(device::DeviceCommand::SetDisplayArea(setup.to_corners()));
+                        }
+                        Err(e) => {
+                            flow.set_apply_warning(format!("Could not save configuration: {e}"));
+                        }
+                    }
                 }
                 if esc || matches!(out, SetupOutcome::Done | SetupOutcome::Cancel) {
                     self.screen = Screen::Hub;

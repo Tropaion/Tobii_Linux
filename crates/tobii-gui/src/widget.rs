@@ -20,6 +20,44 @@ pub fn guidance_message(view: &EyeView) -> String {
     }
 }
 
+/// The eye-position view to render for the current device state: `NoEyes`
+/// unless the device is actually connected AND a gaze sample has arrived.
+/// A disconnect (or a fresh connect with no sample yet) must never keep
+/// rendering a stale cached sample as if it were live.
+pub fn eye_view_for(state: &crate::device::DeviceState) -> EyeView {
+    let no_eyes = EyeView {
+        left: None,
+        right: None,
+        distance_mm: None,
+        guidance: Guidance::NoEyes,
+    };
+    if !matches!(state.status, crate::device::ConnStatus::Connected) {
+        return no_eyes;
+    }
+    state
+        .latest_gaze
+        .as_ref()
+        .map(EyeView::from_gaze)
+        .unwrap_or(no_eyes)
+}
+
+/// A colored status line for guided flows, shown only while the device isn't
+/// connected, so a mid-flow disconnect is visible instead of masked by a
+/// frozen eye view. Wording differs from `hub::draw`'s cold-start
+/// "Connecting…" on purpose: entering a flow implies the device was already
+/// connected, so this reads as a reconnect.
+pub fn disconnect_status_line(ui: &mut egui::Ui, status: &crate::device::ConnStatus) {
+    match status {
+        crate::device::ConnStatus::Connecting => {
+            ui.colored_label(egui::Color32::YELLOW, "Reconnecting to the eye tracker…");
+        }
+        crate::device::ConnStatus::Connected => {}
+        crate::device::ConnStatus::Error(e) => {
+            ui.colored_label(egui::Color32::LIGHT_RED, format!("Not connected: {e}"));
+        }
+    }
+}
+
 /// Draw the trackbox rectangle with the two eyes at their normalized positions,
 /// green when centered, yellow otherwise.
 pub fn draw_eye_view(ui: &mut egui::Ui, view: &EyeView, size: egui::Vec2) {
@@ -48,7 +86,9 @@ pub fn draw_eye_view(ui: &mut egui::Ui, view: &EyeView, size: egui::Vec2) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eyeview::{EyeView, Guidance};
+    use crate::device::{ConnStatus, DeviceState};
+    use tobii_protocol::gaze::present;
+    use tobii_protocol::GazeSample;
 
     fn view(g: Guidance, d: Option<f32>) -> EyeView {
         EyeView {
@@ -57,6 +97,54 @@ mod tests {
             distance_mm: d,
             guidance: g,
         }
+    }
+
+    /// A gaze sample with valid trackbox + eye-origin columns, built the same
+    /// way `eyeview.rs`'s tests do (trackbox cols present, validity 0,
+    /// eye-origin z set) so it decodes to a non-`NoEyes` `EyeView`.
+    fn valid_gaze_sample() -> GazeSample {
+        GazeSample {
+            trackbox_eye_l: [0.5, 0.5, 0.5],
+            trackbox_eye_r: [0.5, 0.5, 0.5],
+            eye_origin_l_mm: [0.0, 0.0, 680.0],
+            eye_origin_r_mm: [0.0, 0.0, 680.0],
+            present_mask: present::TRACKBOX_L
+                | present::TRACKBOX_R
+                | present::EYE_ORIGIN_L
+                | present::EYE_ORIGIN_R
+                | present::VALIDITY_L
+                | present::VALIDITY_R,
+            validity_l: 0,
+            validity_r: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn eye_view_for_disconnected_ignores_cached_gaze() {
+        let state = DeviceState {
+            status: ConnStatus::Error("x".to_string()),
+            latest_gaze: Some(valid_gaze_sample()),
+        };
+        assert_eq!(eye_view_for(&state).guidance, Guidance::NoEyes);
+    }
+
+    #[test]
+    fn eye_view_for_connected_with_no_sample_is_no_eyes() {
+        let state = DeviceState {
+            status: ConnStatus::Connected,
+            latest_gaze: None,
+        };
+        assert_eq!(eye_view_for(&state).guidance, Guidance::NoEyes);
+    }
+
+    #[test]
+    fn eye_view_for_connected_with_sample_maps_gaze() {
+        let state = DeviceState {
+            status: ConnStatus::Connected,
+            latest_gaze: Some(valid_gaze_sample()),
+        };
+        assert_ne!(eye_view_for(&state).guidance, Guidance::NoEyes);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! The fullscreen display-setup flow (the original's `-S`): forward-only
-//! DetectMonitor -> Geometry -> Confirm, then Done (return to hub). Cancel at
-//! any step returns to the hub without saving. Reuses Plan 4's `DisplaySetup`
-//! math + `tobii-config` EDID/TOML.
+//! DetectMonitor -> Geometry -> Confirm, then Done (return to hub). "Apply &
+//! continue" at Geometry saves + applies the setup before advancing to
+//! Confirm, so Cancel at Confirm does not undo it — Cancel only prevents a
+//! save/apply from happening at the earlier steps. Reuses Plan 4's
+//! `DisplaySetup` math + `tobii-config` EDID/TOML.
 
 use eframe::egui;
 
@@ -27,6 +29,7 @@ pub struct DisplaySetupFlow {
     setup: DisplaySetup,
     monitors: Vec<MonitorInfo>,
     cancelled: bool,
+    apply_warning: Option<String>,
 }
 
 /// Seed geometry: prefer the saved config, else defaults; dims are refined by
@@ -55,6 +58,7 @@ impl DisplaySetupFlow {
             setup: seed_setup(),
             monitors: detect_monitors(),
             cancelled: false,
+            apply_warning: None,
         }
     }
 
@@ -64,11 +68,17 @@ impl DisplaySetupFlow {
     pub fn setup(&self) -> &DisplaySetup {
         &self.setup
     }
-    pub fn monitors(&self) -> &[MonitorInfo] {
-        &self.monitors
-    }
     pub fn cancelled(&self) -> bool {
         self.cancelled
+    }
+    pub fn apply_warning(&self) -> Option<&str> {
+        self.apply_warning.as_deref()
+    }
+
+    /// Recorded when `tobii_config::save` fails for an applied setup, so the
+    /// Confirm step can be honest instead of claiming "Applied."
+    pub fn set_apply_warning(&mut self, msg: String) {
+        self.apply_warning = Some(msg);
     }
 
     pub fn select_monitor(&mut self, width_mm: f64, height_mm: f64) {
@@ -162,17 +172,15 @@ impl DisplaySetupFlow {
                     }
                 }
                 Step::Confirm => {
-                    ui.label("Applied. Confirm the tracker can see you:");
-                    let view = state
-                        .latest_gaze
-                        .as_ref()
-                        .map(crate::eyeview::EyeView::from_gaze)
-                        .unwrap_or(crate::eyeview::EyeView {
-                            left: None,
-                            right: None,
-                            distance_mm: None,
-                            guidance: crate::eyeview::Guidance::NoEyes,
-                        });
+                    if let Some(w) = &self.apply_warning {
+                        ui.colored_label(egui::Color32::LIGHT_RED, w);
+                    } else {
+                        ui.label("Applied. Confirm the tracker can see you:");
+                    }
+                    if !matches!(state.status, crate::device::ConnStatus::Connected) {
+                        crate::widget::disconnect_status_line(ui, &state.status);
+                    }
+                    let view = crate::widget::eye_view_for(state);
                     let side = ui.available_width().min(ui.available_height()) * 0.5;
                     crate::widget::draw_eye_view(ui, &view, egui::vec2(side * 1.4, side));
                     ui.label(crate::widget::guidance_message(&view));
@@ -237,5 +245,16 @@ mod tests {
         let s = f.confirm_geometry(); // same call the Apply button makes
         assert_eq!((s.width_mm, s.height_mm), (1193.0, 336.0));
         assert!(matches!(f.step(), Step::Confirm));
+    }
+
+    #[test]
+    fn apply_warning_round_trips() {
+        let mut f = DisplaySetupFlow::new();
+        assert_eq!(f.apply_warning(), None);
+        f.set_apply_warning("Could not save configuration: disk full".to_string());
+        assert_eq!(
+            f.apply_warning(),
+            Some("Could not save configuration: disk full")
+        );
     }
 }
