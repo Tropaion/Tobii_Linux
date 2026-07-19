@@ -1,4 +1,4 @@
-//! `tobii` CLI. Subcommands: `stream`, `setup`, `display get|set`.
+//! `tobii` CLI. Subcommands: `stream`, `setup`, `display get|set`, `calibrate`.
 
 use std::io::Write;
 use std::process::ExitCode;
