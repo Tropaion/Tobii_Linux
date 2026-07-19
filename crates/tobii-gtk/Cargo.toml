@@ -1,0 +1,20 @@
+[package]
+name = "tobii-gtk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "GTK4 configuration GUI for the Tobii ET5 Linux runtime."
+
+[lib]
+name = "tobii_gtk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tobii-gtk"
+path = "src/main.rs"
+
+[dependencies]
+tobii-protocol = { path = "../tobii-protocol" }
+tobii-usb = { path = "../tobii-usb" }
+tobii-config = { path = "../tobii-config" }
+gtk = { package = "gtk4", version = "0.11" }
