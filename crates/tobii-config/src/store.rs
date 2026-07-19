@@ -48,6 +48,38 @@ pub fn load() -> io::Result<Option<DisplaySetup>> {
     load_from(&config_path())
 }
 
+/// Path to the calibration blob, beside `config.toml`.
+pub fn calibration_path() -> PathBuf {
+    config_path().with_file_name("calibration.bin")
+}
+
+/// Write the opaque calibration blob to `path`, creating parent dirs as needed.
+pub fn save_calibration_to(path: &Path, blob: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, blob)
+}
+
+/// Read a calibration blob from `path`. `Ok(None)` if the file does not exist.
+pub fn load_calibration_from(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Save to the default [`calibration_path`].
+pub fn save_calibration(blob: &[u8]) -> io::Result<()> {
+    save_calibration_to(&calibration_path(), blob)
+}
+
+/// Load from the default [`calibration_path`].
+pub fn load_calibration() -> io::Result<Option<Vec<u8>>> {
+    load_calibration_from(&calibration_path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +120,35 @@ mod tests {
     fn config_path_ends_with_expected_suffix() {
         let p = config_path();
         assert!(p.ends_with("tobii-linux/config.toml"));
+    }
+
+    #[test]
+    fn calibration_blob_roundtrips() {
+        let dir = std::env::temp_dir().join("tobii-config-test-cal");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calibration.bin");
+        let blob = vec![0x01, 0x02, 0x03, 0xFE, 0xFF];
+        save_calibration_to(&path, &blob).expect("save");
+        assert_eq!(
+            load_calibration_from(&path)
+                .expect("load io")
+                .expect("some"),
+            blob
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_calibration_missing_is_none() {
+        let path = std::env::temp_dir()
+            .join("tobii-config-test-cal-missing")
+            .join("calibration.bin");
+        let _ = std::fs::remove_file(&path);
+        assert!(load_calibration_from(&path).expect("io ok").is_none());
+    }
+
+    #[test]
+    fn calibration_path_sits_beside_config() {
+        assert!(calibration_path().ends_with("tobii-linux/calibration.bin"));
     }
 }
