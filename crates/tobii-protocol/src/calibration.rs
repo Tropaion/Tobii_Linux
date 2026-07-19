@@ -80,4 +80,14 @@ mod tests {
         // eye is the trailing u32; byte at index 36 is its low byte.
         assert_eq!(*cal_add_point_payload(0.5, 0.5, 2).last().unwrap(), 2);
     }
+
+    #[test]
+    fn real_device_calibration_blob_is_sane() {
+        // Captured from a physical ET5 via `tobii calibrate` (live Task 7): the
+        // calibration ran on the handshake's already-open realm (no re-unlock),
+        // and the retrieved blob round-tripped through `cal_apply` unmodified.
+        let blob = include_bytes!("testdata/real-calibration.blob");
+        assert!(!blob.is_empty());
+        assert!(blob.len() <= 4096, "blob within device cap: {}", blob.len());
+    }
 }

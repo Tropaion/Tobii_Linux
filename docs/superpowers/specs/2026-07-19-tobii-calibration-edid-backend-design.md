@@ -203,24 +203,28 @@ pub fn load_calibration() -> std::io::Result<Option<Vec<u8>>>;
 A `[calibration] auto_apply = true` key (hand-rolled TOML, matching `DisplaySetup`)
 controls whether a saved blob is re-applied when a connection is opened.
 
-## 10. Risks & open questions (resolve at the live smoke test)
+## 10. Risks & open questions
 
-1. **Does calibration need its own realm unlock?** `tobiifree` re-unlocks the realm
-   for calibration, but our `Connection` already unlocks a realm during the handshake.
-   Try the calibration ops on the already-open connection first; if the device NAKs,
-   add an explicit re-unlock. Also confirm it's the same realm/key.
-2. **Blob prefix round-trip (highest risk).** `retrieve` stores the whole response
-   payload (incl. its own leading `00 00`) and `apply` prepends another `00 00` —
-   save→restore may double the prefix. Validate on hardware; if the device rejects it,
-   strip the leading 2 bytes before apply (make it a documented, tested transform).
-3. **Compute-done semantics.** First response is treated as "done" with no status
-   field. Confirm one response really means converged; use a generous read window
-   (budget seconds, not the display-area default).
-4. **Per-point ack cadence.** Confirm the device sends exactly one response per
-   `add_point`; decide whether to validate or just drain each ack.
-5. **Eye-position present-mask bits** (B2 concern): our crate marks raw eye-origin
-   presence at bits 12/13 while one extraction reported 19/20 — reconcile against the
-   live `present_mask` before the eye-position view relies on it.
+**All four backend questions RESOLVED 2026-07-19 (live, physical ET5 `2104:0313`,
+Samsung Odyssey G93SC).** `tobii calibrate` ran the full sequence and
+`tobii calibrate --apply` round-tripped the saved blob — no code change needed.
+
+1. **Does calibration need its own realm unlock? → NO.** The five `cal_add_point`
+   ops, `cal_compute`, and `cal_retrieve` all succeeded on the connection's
+   already-open (handshake) realm with **no re-unlock**. The backend's assumption
+   holds; no explicit enter/leave is required.
+2. **Blob prefix round-trip? → ROUND-TRIPS CLEANLY.** A 1480-byte blob was retrieved
+   verbatim and re-applied via `cal_apply` with the device acknowledging — the feared
+   doubled `00 00` prefix either does not occur or is tolerated. **No stripping
+   transform needed.** (Captured as a golden fixture: `tobii-protocol` `real-calibration.blob`.)
+3. **Compute-done semantics? → CONFIRMED.** `cal_compute` returned promptly with a
+   single response; treating the first response as "done" is correct.
+4. **Per-point ack cadence? → CONFIRMED.** Each of the five `cal_add_point` ops got
+   exactly one acknowledging response (no hang); `expect_response` per point is right.
+
+5. **Eye-position present-mask bits** (B2 concern, NOT tested here): our crate marks
+   raw eye-origin presence at bits 12/13 while one extraction reported 19/20 —
+   reconcile against the live `present_mask` before the eye-position view relies on it.
 
 ## 11. What comes next (after this backend lands)
 
