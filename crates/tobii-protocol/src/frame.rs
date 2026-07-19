@@ -26,6 +26,12 @@ pub const OP_OPEN_REALM: u32 = 0x76c;
 pub const OP_REALM_RESPONSE: u32 = 0x776;
 pub const OP_CLOSE_REALM: u32 = 0x77b;
 
+// Calibration ops (Phase 2). Enter/leave reuse the realm ops above.
+pub const OP_CAL_ADD_POINT: u32 = 0x408;
+pub const OP_CAL_COMPUTE: u32 = 0x42f; // compute AND apply
+pub const OP_CAL_RETRIEVE: u32 = 0x44c;
+pub const OP_CAL_APPLY: u32 = 0x456;
+
 /// The gaze notification stream id and its op code.
 pub const STREAM_GAZE: u16 = 0x500;
 pub const OP_GAZE_NOTIFY: u32 = 0x500;
