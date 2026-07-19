@@ -1,9 +1,18 @@
 # Tobii Config Backend — Calibration Protocol + EDID Auto-Detect (Design Spec)
 
 **Date:** 2026-07-19
-**Status:** Approved design (brainstormed 2026-07-19), pre-planning
+**Status:** Implemented + live-validated 2026-07-19 (branch `feat/tobii-calibration`)
 **Author:** Fabian Plaimauer (with Claude Code)
 **License:** GPL-3.0 (derives protocol knowledge from the GPL-3.0 `tobiifree` project)
+
+> **Shipped-API note (supersedes the design sketch below).** Two names in this
+> design differ from what shipped: (1) the CLI is **`tobii calibrate [--apply]`**
+> (the default run is the headless op sequence; `--apply` re-applies the saved
+> blob) — not `--smoke`; (2) the protocol layer ships **payload** builders
+> `cal_add_point_payload` / `cal_compute_payload` / `cal_retrieve_payload` /
+> `cal_apply_payload` (the op + seq are applied by `Connection::request`), not the
+> `build_cal_*(seq, …)` full-frame builders sketched in §5. The wire facts (§4) and
+> the resolved live findings (§10) are accurate as shipped.
 
 ## 1. Goal & context
 
