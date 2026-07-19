@@ -24,6 +24,8 @@ pub mod present {
     pub const EYE_ORIGIN_RAW_R: u32 = 1 << 13;
     pub const GAZE_3D_L: u32 = 1 << 14;
     pub const GAZE_3D_R: u32 = 1 << 15;
+    pub const TRACKBOX_L: u32 = 1 << 16;
+    pub const TRACKBOX_R: u32 = 1 << 17;
 }
 
 /// A decoded gaze frame. Fields are only meaningful when their `present` bit
@@ -47,6 +49,9 @@ pub struct GazeSample {
     pub eye_origin_raw_r_mm: [f64; 3],
     pub gaze_point_3d_l_mm: [f64; 3],
     pub gaze_point_3d_r_mm: [f64; 3],
+    /// Left/right eye position normalized in the trackbox ([0,1] x/y; z = distance mm).
+    pub trackbox_eye_l: [f64; 3],
+    pub trackbox_eye_r: [f64; 3],
 }
 
 /// TLV data kind for an unknown column, used to skip it by reading its width.
@@ -125,6 +130,26 @@ impl GazeSample {
                         &mut s.eye_origin_r_mm,
                         &mut s.present_mask,
                         present::EYE_ORIGIN_R,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x03 => {
+                    if !set3(
+                        &mut r,
+                        &mut s.trackbox_eye_l,
+                        &mut s.present_mask,
+                        present::TRACKBOX_L,
+                    ) {
+                        return Some(s);
+                    }
+                }
+                0x09 => {
+                    if !set3(
+                        &mut r,
+                        &mut s.trackbox_eye_r,
+                        &mut s.present_mask,
+                        present::TRACKBOX_R,
                     ) {
                         return Some(s);
                     }
@@ -524,5 +549,29 @@ mod tests {
             "gaze.y={}",
             s.gaze_point_2d[1]
         );
+    }
+
+    #[test]
+    fn decodes_trackbox_eye_positions() {
+        use crate::bytes::Writer;
+        use crate::tlv::{write_point, write_tag, write_u32, TAG_XDS_COLUMN};
+        let mut w = Writer::new();
+        w.push_u8(0x00);
+        w.push_u8(0x00);
+        write_tag(&mut w, (2u32 << 16) | 0x0bb8); // xds_row, 2 columns
+                                                  // col 0x03 = trackbox left (point3d)
+        write_tag(&mut w, TAG_XDS_COLUMN);
+        write_u32(&mut w, 0x03);
+        write_point(&mut w, 0.25, 0.75, 500.0);
+        // col 0x09 = trackbox right (point3d)
+        write_tag(&mut w, TAG_XDS_COLUMN);
+        write_u32(&mut w, 0x09);
+        write_point(&mut w, 0.30, 0.70, 510.0);
+
+        let s = GazeSample::decode(&w.into_vec()).expect("decode");
+        assert!(s.has(present::TRACKBOX_L) && s.has(present::TRACKBOX_R));
+        assert!((s.trackbox_eye_l[0] - 0.25).abs() < 1e-9);
+        assert!((s.trackbox_eye_l[2] - 500.0).abs() < 1e-6);
+        assert!((s.trackbox_eye_r[1] - 0.70).abs() < 1e-9);
     }
 }
