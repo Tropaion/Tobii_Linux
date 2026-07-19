@@ -6,8 +6,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tobii_protocol::commands::set_display_area_corners_payload;
-use tobii_protocol::frame::OP_SET_DISPLAY_AREA;
 use tobii_protocol::{DisplayCorners, GazeSample};
 use tobii_usb::{Connection, Transport, UsbError, UsbTransport};
 
@@ -41,10 +39,7 @@ pub fn device_tick<T: Transport>(
     // NOTE: single-variant `while let` drain. If DeviceCommand gains a second
     // variant, switch to a `match` so the drain can't silently drop it.
     while let Ok(DeviceCommand::SetDisplayArea(c)) = cmd_rx.try_recv() {
-        let payload = set_display_area_corners_payload(
-            c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
-        );
-        let _ = conn.request(OP_SET_DISPLAY_AREA, &payload);
+        let _ = conn.set_display_area(&c);
     }
     if let Some(g) = conn.next_gaze() {
         let mut s = state.lock().unwrap();
@@ -66,6 +61,13 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
         thread_state.lock().unwrap().status = ConnStatus::Connecting;
         match UsbTransport::open().and_then(Connection::connect) {
             Ok(mut conn) => {
+                // The ET5 resets its display area to a stub on every reboot (it
+                // reboots on each session close), and emits no eye-tracking data
+                // until a valid area is set. Re-apply the saved config in-session
+                // on every (re)connect — without this the device never detects.
+                if let Ok(Some(setup)) = tobii_config::load() {
+                    let _ = conn.set_display_area(&setup.to_corners());
+                }
                 thread_state.lock().unwrap().status = ConnStatus::Connected;
                 let mut idle_ticks = 0u32;
                 loop {

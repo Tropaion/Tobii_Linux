@@ -4,8 +4,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use tobii_config::DisplaySetup;
-use tobii_protocol::commands::set_display_area_corners_payload;
-use tobii_protocol::frame::{OP_GET_DISPLAY_AREA, OP_SET_DISPLAY_AREA};
+use tobii_protocol::frame::OP_GET_DISPLAY_AREA;
 use tobii_protocol::gaze::present;
 use tobii_protocol::DisplayCorners;
 use tobii_usb::{Connection, UsbTransport};
@@ -47,8 +46,26 @@ fn stream(json: bool) -> CmdResult {
     eprintln!("opening Tobii ET5...");
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
-    eprintln!("connected — streaming gaze (Ctrl-C to stop)");
 
+    // The ET5 resets its display area to a ~4mm stub on every reboot (it reboots
+    // on session close), and emits no eye-tracking data until a valid area is
+    // set — so re-apply the saved config in-session right after connecting.
+    match tobii_config::load() {
+        Ok(Some(setup)) => match conn.set_display_area(&setup.to_corners()) {
+            Ok(true) => eprintln!(
+                "display area applied ({:.0}x{:.0}mm)",
+                setup.width_mm, setup.height_mm
+            ),
+            Ok(false) => eprintln!("warning: display area sent but not acknowledged"),
+            Err(e) => eprintln!("warning: could not set display area ({e})"),
+        },
+        Ok(None) => {
+            eprintln!("note: no saved display config — run `tobii setup` first, or eyes won't be detected")
+        }
+        Err(e) => eprintln!("warning: could not load config ({e})"),
+    }
+
+    eprintln!("connected — streaming gaze (Ctrl-C to stop)");
     loop {
         let Some(s) = conn.next_gaze() else {
             continue; // read timeout — keep waiting
@@ -92,10 +109,7 @@ fn apply_to_device(
     c: &DisplayCorners,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(t)?;
-    let payload = set_display_area_corners_payload(
-        c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
-    );
-    Ok(conn.request(OP_SET_DISPLAY_AREA, &payload)?.is_some())
+    Ok(conn.set_display_area(c)?)
 }
 
 fn report_applied(acked: bool) {
