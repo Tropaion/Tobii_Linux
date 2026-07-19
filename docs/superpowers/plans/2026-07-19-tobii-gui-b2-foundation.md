@@ -24,8 +24,9 @@
 ## File Structure
 
 - `crates/tobii-protocol/src/gaze.rs` — add trackbox fields + present flags + decode arms (modify).
-- `crates/tobii-gui/Cargo.toml` — **new** (eframe dep).
-- `crates/tobii-gui/src/main.rs` — **new** (eframe entry).
+- `crates/tobii-gui/Cargo.toml` — **new** (eframe dep; lib + bin).
+- `crates/tobii-gui/src/lib.rs` — **new** (the app + module declarations; `pub fn run`).
+- `crates/tobii-gui/src/main.rs` — **new** (thin binary entry → `tobii_gui::run()`).
 - `crates/tobii-gui/src/eyeview.rs` — **new** (pure eye-position mapping).
 - `crates/tobii-gui/src/device.rs` — **new** (device thread + state/commands + testable tick).
 - `crates/tobii-gui/src/hub.rs` — **new** (the hub egui screen + trackbox widget).
@@ -165,6 +166,10 @@ edition.workspace = true
 license.workspace = true
 description = "Graphical config hub for the Tobii ET5 Linux runtime (egui/eframe)."
 
+[lib]
+name = "tobii_gui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tobii-gui"
 path = "src/main.rs"
@@ -176,15 +181,24 @@ tobii-config = { path = "../tobii-config" }
 eframe = "0.28"
 ```
 
-- [ ] **Step 3: Create a minimal `crates/tobii-gui/src/main.rs`**
+> **Why lib + bin:** the modules below (`eyeview`, `device`, `hub`) expose `pub`
+> items used by unit tests before the binary's own code uses them. In a bin-only
+> crate those read as `dead_code` and fail `clippy -D warnings`; in a **lib** they
+> are the crate's API and are never flagged. `main.rs` stays a thin entry that
+> calls `tobii_gui::run()`.
+
+- [ ] **Step 3: Create `crates/tobii-gui/src/lib.rs`** (the app; modules are added by later tasks)
 
 ```rust
 //! `tobii-gui` — graphical configuration hub for the Tobii ET5.
 //!
 //! A persistent hub window (status + live eye position + flow launchers) over a
 //! device thread that owns the blocking USB connection. (Flows are added in B2.2.)
+//! `main.rs` is a thin entry point; the app + modules live here so their `pub`
+//! items are library API rather than dead code in a binary.
 
-fn main() -> eframe::Result<()> {
+/// Run the app: open the window and start the egui event loop.
+pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([720.0, 480.0])
@@ -208,6 +222,16 @@ impl eframe::App for TobiiApp {
             ui.label("(foundation — hub UI arrives in a later task)");
         });
     }
+}
+```
+
+- [ ] **Step 3b: Create the thin `crates/tobii-gui/src/main.rs`**
+
+```rust
+//! Binary entry point — see the `tobii_gui` library crate for the app.
+
+fn main() -> eframe::Result<()> {
+    tobii_gui::run()
 }
 ```
 
@@ -308,11 +332,9 @@ mod tests {
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p tobii-gui --lib eyeview::tests`
-Expected: FAIL — `cannot find type EyeView` (and the crate has no lib target yet — see Step 3's note).
+Expected: FAIL — `cannot find type EyeView`.
 
 - [ ] **Step 3: Write the implementation**
-
-> Note: a `[[bin]]`-only crate still compiles `#[cfg(test)]` modules referenced from `main.rs`, so `mod eyeview;` in `main.rs` makes these tests run under `cargo test -p tobii-gui`.
 
 PREPEND to `crates/tobii-gui/src/eyeview.rs`:
 
@@ -377,7 +399,7 @@ impl EyeView {
 }
 ```
 
-Add `mod eyeview;` to `crates/tobii-gui/src/main.rs` (below the doc comment, above `fn main`).
+Add `pub mod eyeview;` to `crates/tobii-gui/src/lib.rs` (below the doc comment, above `pub fn run`).
 
 - [ ] **Step 4: Run tests + clippy**
 
@@ -388,7 +410,7 @@ Expected: 5 tests pass; clippy clean. (`EyeView`/`Guidance` are used by tests no
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"; cargo fmt
-git add crates/tobii-gui/src/eyeview.rs crates/tobii-gui/src/main.rs
+git add crates/tobii-gui/src/eyeview.rs crates/tobii-gui/src/lib.rs
 git commit -m "feat(gui): pure eye-position mapping (trackbox -> renderable + guidance)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -615,7 +637,7 @@ fn set_error(state: &Mutex<DeviceState>, e: &UsbError) {
 }
 ```
 
-Add `mod device;` to `crates/tobii-gui/src/main.rs`.
+Add `pub mod device;` to `crates/tobii-gui/src/lib.rs`.
 
 > **Note:** `device_tick` never terminates the inner `spawn` loop on its own (gaze polling has its own read timeout); a lost device surfaces only when a `request`/read errors. That is acceptable for the foundation; a future task can add explicit disconnect detection.
 
@@ -628,7 +650,7 @@ Expected: 2 tests pass; clippy clean.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"; cargo fmt
-git add crates/tobii-gui/src/device.rs crates/tobii-gui/src/main.rs
+git add crates/tobii-gui/src/device.rs crates/tobii-gui/src/lib.rs
 git commit -m "feat(gui): device thread + shared state/commands (tick mock-tested)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -724,16 +746,13 @@ fn draw_trackbox(ui: &mut egui::Ui, view: &EyeView, size: egui::Vec2) {
 }
 ```
 
-- [ ] **Step 2: Wire it in `main.rs`**
+- [ ] **Step 2: Wire the hub into `lib.rs`**
 
-Replace `crates/tobii-gui/src/main.rs`'s `TobiiApp` and `main` with (keeping the three `mod` lines):
+In `crates/tobii-gui/src/lib.rs`: add `pub mod hub;` alongside the existing `pub mod eyeview;` / `pub mod device;`, and replace the placeholder `run`/`TobiiApp` with the real wiring:
 
 ```rust
-mod device;
-mod eyeview;
-mod hub;
-
-fn main() -> eframe::Result<()> {
+/// Run the app: open the window, start the device thread, render the hub.
+pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([720.0, 480.0])
@@ -764,7 +783,7 @@ impl eframe::App for TobiiApp {
 }
 ```
 
-(Remove the old `//!` doc comment's obsolete line if it conflicts; keep one module doc comment at the top of the file above the `mod` lines.)
+`main.rs` stays the thin `fn main() -> eframe::Result<()> { tobii_gui::run() }` from Task 2 — no change. `hub.rs` refers to sibling modules via `crate::device` / `crate::eyeview` (they resolve because both are `pub mod` in the lib crate root).
 
 - [ ] **Step 3: Build + clippy**
 
@@ -775,7 +794,7 @@ Expected: builds cleanly; clippy clean. (Reconcile any egui 0.28.x painter/label
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"; cargo fmt
-git add crates/tobii-gui/src/hub.rs crates/tobii-gui/src/main.rs
+git add crates/tobii-gui/src/hub.rs crates/tobii-gui/src/lib.rs
 git commit -m "feat(gui): hub window — status, flow launchers, live trackbox mini-view
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
