@@ -6,8 +6,10 @@
 //! [`DisplaySetup::from_corners`] inverts a device-reported area back to editable
 //! params. No I/O beyond the config store (see `store`).
 
+mod edid;
 mod setup;
 mod store;
 
+pub use edid::{detect_monitors, MonitorInfo};
 pub use setup::DisplaySetup;
 pub use store::{config_path, load, load_from, save, save_to};
