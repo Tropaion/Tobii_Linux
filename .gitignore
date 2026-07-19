@@ -12,4 +12,3 @@ zig-out/
 
 # Rust
 target/
-Cargo.lock
