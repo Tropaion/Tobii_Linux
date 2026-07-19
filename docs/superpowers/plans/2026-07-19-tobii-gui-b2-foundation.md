@@ -150,7 +150,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Create: `crates/tobii-gui/src/main.rs`
 
 **Interfaces:**
-- Produces: a runnable `tobii-gui` binary that opens a window. Later tasks add `mod eyeview; mod device; mod hub;`.
+- Produces: a runnable `tobii-gui` binary (thin `main.rs`) over a `tobii_gui` library (`lib.rs`) exposing `run()`. Later tasks add `pub mod eyeview; pub mod device; pub mod hub;` to `lib.rs`.
 
 - [ ] **Step 1: Add to the workspace**
 
@@ -258,7 +258,7 @@ The pure logic the trackbox widget draws: a `GazeSample` → renderable eye posi
 
 **Files:**
 - Create: `crates/tobii-gui/src/eyeview.rs`
-- Modify: `crates/tobii-gui/src/main.rs` (add `mod eyeview;`)
+- Modify: `crates/tobii-gui/src/lib.rs` (add `pub mod eyeview;`)
 
 **Interfaces:**
 - Consumes: `tobii_protocol::{GazeSample, gaze::present}`.
@@ -424,7 +424,7 @@ Owns the blocking `Connection` on its own thread; publishes a `DeviceState` snap
 
 **Files:**
 - Create: `crates/tobii-gui/src/device.rs`
-- Modify: `crates/tobii-gui/src/main.rs` (add `mod device;`)
+- Modify: `crates/tobii-gui/src/lib.rs` (add `pub mod device;`)
 
 **Interfaces:**
 - Consumes: `tobii_usb::{Connection, UsbTransport, Transport}`, `tobii_protocol::{GazeSample, commands::set_display_area_corners_payload, frame::OP_SET_DISPLAY_AREA, DisplayCorners}`.
@@ -664,7 +664,7 @@ The persistent hub: connection status, launch buttons (flows are stubs for B2.2)
 
 **Files:**
 - Create: `crates/tobii-gui/src/hub.rs`
-- Modify: `crates/tobii-gui/src/main.rs` (wire the device thread + render the hub)
+- Modify: `crates/tobii-gui/src/lib.rs` (add `pub mod hub;`, wire the device thread + render the hub)
 
 **Interfaces:**
 - Consumes: `crate::device::{spawn, DeviceState, ConnStatus}`, `crate::eyeview::{EyeView, Guidance}`, `eframe::egui`.
