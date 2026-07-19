@@ -7,11 +7,12 @@ use tobii_protocol::calibration::{
     cal_add_point_payload, cal_apply_payload, cal_compute_payload, cal_retrieve_payload,
     CalibrationBlob,
 };
+use tobii_protocol::commands::set_display_area_corners_payload;
 use tobii_protocol::frame::{
     build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
-    OP_GAZE_NOTIFY, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    OP_GAZE_NOTIFY, OP_SET_DISPLAY_AREA, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
-use tobii_protocol::{Frame, GazeSample, Handshake, HandshakeAction, Parser};
+use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
 use crate::transport::{Transport, UsbError};
 
@@ -128,6 +129,22 @@ impl<T: Transport> Connection<T> {
     pub fn apply_calibration(&mut self, blob: &[u8]) -> Result<(), UsbError> {
         self.expect_response(OP_CAL_APPLY, &cal_apply_payload(blob))?;
         Ok(())
+    }
+
+    /// Apply a display-area configuration to the device, returning whether the
+    /// device acknowledged it.
+    ///
+    /// This MUST be called in-session on every connect for eye tracking to
+    /// work: the ET5 resets its stored display area to a ~4mm stub whenever it
+    /// reboots (which it does on every session close / USB re-enumeration), and
+    /// it produces NO eye-detection data (validity stays 4, all origins zero)
+    /// until a valid display area is set. The vendor stack re-applies the saved
+    /// configuration on every connect for exactly this reason.
+    pub fn set_display_area(&mut self, c: &DisplayCorners) -> Result<bool, UsbError> {
+        let payload = set_display_area_corners_payload(
+            c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
+        );
+        Ok(self.request(OP_SET_DISPLAY_AREA, &payload)?.is_some())
     }
 
     fn run_handshake(&mut self) -> Result<(), UsbError> {
@@ -456,5 +473,21 @@ mod tests {
         // Outbound payload (after envelope+header) must be exactly `00 00` + blob.
         let sent = conn.transport().sent.last().expect("a sent frame");
         assert_eq!(&sent[32..], &[0x00, 0x00, 0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn set_display_area_sends_op_and_reports_ack() {
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x5a0, &[])]);
+        let c = DisplayCorners {
+            tl: [-1.0, 1.0, 0.0],
+            tr: [1.0, 1.0, 0.0],
+            bl: [-1.0, -1.0, 0.0],
+        };
+        assert!(conn.set_display_area(&c).expect("io ok"));
+        // The last sent frame is a SET_DISPLAY_AREA request (op 0x5a0).
+        assert_eq!(
+            &conn.transport().sent.last().unwrap()[20..24],
+            &[0, 0, 0x05, 0xa0]
+        );
     }
 }
