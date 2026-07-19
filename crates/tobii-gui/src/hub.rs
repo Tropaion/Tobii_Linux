@@ -1,5 +1,6 @@
-//! The persistent hub screen: status, flow launchers (stubs in the foundation),
-//! and a live trackbox mini-view.
+//! The persistent hub screen: status, flow launchers, and a live trackbox
+//! mini-view. `draw` reports which launcher (if any) was clicked this frame;
+//! `lib.rs` owns the resulting screen transition.
 
 use eframe::egui;
 
