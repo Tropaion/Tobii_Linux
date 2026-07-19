@@ -73,20 +73,19 @@ mod tests {
     use tobii_protocol::gaze::present;
     use tobii_protocol::GazeSample;
 
-    // The GazeSample struct has many fields; building via `default()` + targeted
-    // field assignment (rather than a full struct literal) is the intended
-    // pattern here, so this test helper opts out of clippy's default lint.
-    #[allow(clippy::field_reassign_with_default)]
     fn sample_with_trackbox(l: [f64; 3], r: [f64; 3], valid: bool) -> GazeSample {
-        let mut s = GazeSample::default();
-        s.trackbox_eye_l = l;
-        s.trackbox_eye_r = r;
-        s.present_mask |= present::TRACKBOX_L | present::TRACKBOX_R;
-        s.present_mask |= present::VALIDITY_L | present::VALIDITY_R;
         let v = if valid { 0 } else { 4 };
-        s.validity_l = v;
-        s.validity_r = v;
-        s
+        GazeSample {
+            trackbox_eye_l: l,
+            trackbox_eye_r: r,
+            present_mask: present::TRACKBOX_L
+                | present::TRACKBOX_R
+                | present::VALIDITY_L
+                | present::VALIDITY_R,
+            validity_l: v,
+            validity_r: v,
+            ..Default::default()
+        }
     }
 
     #[test]
