@@ -64,8 +64,8 @@ fn draw_trackbox(ui: &mut egui::Ui, view: &EyeView, size: egui::Vec2) {
     painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.5, egui::Color32::GRAY));
     let plot = |p: [f32; 2]| {
         egui::pos2(
-            rect.left() + p[0] * rect.width(),
-            rect.top() + p[1] * rect.height(),
+            rect.left() + p[0].clamp(0.0, 1.0) * rect.width(),
+            rect.top() + p[1].clamp(0.0, 1.0) * rect.height(),
         )
     };
     let color = if matches!(view.guidance, Guidance::Centered) {

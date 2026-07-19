@@ -30,11 +30,16 @@ pub enum DeviceCommand {
 }
 
 /// One iteration: apply any queued commands, then poll one gaze sample.
+/// Returns `true` if a gaze sample was received this tick — the thread loop
+/// uses sustained `false` to detect a stalled/unplugged device (a healthy
+/// device streams gaze continuously).
 pub fn device_tick<T: Transport>(
     conn: &mut Connection<T>,
     state: &Mutex<DeviceState>,
     cmd_rx: &Receiver<DeviceCommand>,
-) {
+) -> bool {
+    // NOTE: single-variant `while let` drain. If DeviceCommand gains a second
+    // variant, switch to a `match` so the drain can't silently drop it.
     while let Ok(DeviceCommand::SetDisplayArea(c)) = cmd_rx.try_recv() {
         let payload = set_display_area_corners_payload(
             c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
@@ -45,6 +50,9 @@ pub fn device_tick<T: Transport>(
         let mut s = state.lock().unwrap();
         s.latest_gaze = Some(g);
         s.status = ConnStatus::Connected;
+        true
+    } else {
+        false
     }
 }
 
@@ -59,8 +67,17 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
         match UsbTransport::open().and_then(Connection::connect) {
             Ok(mut conn) => {
                 thread_state.lock().unwrap().status = ConnStatus::Connected;
+                let mut idle_ticks = 0u32;
                 loop {
-                    device_tick(&mut conn, &thread_state, &rx);
+                    if device_tick(&mut conn, &thread_state, &rx) {
+                        idle_ticks = 0;
+                    } else {
+                        idle_ticks += 1;
+                        std::thread::sleep(Duration::from_millis(100));
+                        if idle_ticks >= 20 {
+                            break; // ~2s without gaze -> assume disconnect; outer loop reconnects
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -158,7 +175,7 @@ mod tests {
         let mut conn = connected(vec![inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload())]);
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
-        device_tick(&mut conn, &state, &rx);
+        assert!(device_tick(&mut conn, &state, &rx));
         let g = state
             .lock()
             .unwrap()
@@ -166,6 +183,14 @@ mod tests {
             .clone()
             .expect("gaze published");
         assert_eq!(g.timestamp_us, 42);
+    }
+
+    #[test]
+    fn tick_returns_false_when_no_gaze() {
+        let mut conn = connected(vec![]);
+        let state = Mutex::new(DeviceState::default());
+        let (_tx, rx) = channel::<DeviceCommand>();
+        assert!(!device_tick(&mut conn, &state, &rx));
     }
 
     #[test]
