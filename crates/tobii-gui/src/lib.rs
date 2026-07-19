@@ -5,6 +5,7 @@
 //! `main.rs` is a thin entry point; the app + modules live here so their `pub`
 //! items are library API rather than dead code in a binary.
 
+pub mod device;
 pub mod eyeview;
 
 /// Run the app: open the window and start the egui event loop.
