@@ -65,9 +65,13 @@ impl<T: Transport> Connection<T> {
     }
 
     /// Send a request frame and return the payload of the first response frame
-    /// whose op matches. Gaze notifications arriving in the meantime are queued
-    /// for [`Connection::next_gaze`]. Returns `Ok(None)` if no matching response
-    /// arrives within the read window.
+    /// whose op AND seq match the request (the device echoes the request seq
+    /// back in its response, hardware-verified). Matching on seq as well as op
+    /// means a duplicated or stale-seq ack for a repeated op (e.g.
+    /// `cal_add_point`, fired once per calibration point) can never be
+    /// mismatched to the wrong request. Gaze notifications arriving in the
+    /// meantime are queued for [`Connection::next_gaze`]. Returns `Ok(None)`
+    /// if no matching response arrives within the read window.
     pub fn request(&mut self, op: u32, payload: &[u8]) -> Result<Option<Vec<u8>>, UsbError> {
         let seq = self.next_seq();
         self.transport.send(&build_out_frame(seq, op, payload))?;
@@ -81,7 +85,7 @@ impl<T: Transport> Connection<T> {
             };
             let mut matched = None;
             for f in frames {
-                if matched.is_none() && f.magic == TTP_MAGIC_RSP && f.op == op {
+                if matched.is_none() && f.magic == TTP_MAGIC_RSP && f.op == op && f.seq == seq {
                     matched = Some(f.payload);
                 } else {
                     self.route(f, None);
@@ -421,5 +425,36 @@ mod tests {
             conn.compute_and_apply_calibration(),
             Err(UsbError::NoResponse { op }) if op == 0x42f
         ));
+    }
+
+    #[test]
+    fn request_skips_wrong_seq_response() {
+        let mut to_recv = VecDeque::from(vec![
+            inbound(TTP_MAGIC_RSP, 1, 0x3e8, &[]),
+            inbound(TTP_MAGIC_RSP, 2, 0x640, &realm_type_zero()),
+            inbound(TTP_MAGIC_RSP, 3, 0x76c, &[0x00, 0x00]),
+            Vec::new(),
+        ]);
+        // Same op, WRONG seq (99) — must be ignored; then the correct seq (5).
+        to_recv.push_back(inbound(TTP_MAGIC_RSP, 99, 0x596, &[0xBA, 0xD0]));
+        to_recv.push_back(inbound(TTP_MAGIC_RSP, 5, 0x596, &[0xAA, 0xBB]));
+        let mut conn = Connection::connect(MockTransport {
+            sent: Vec::new(),
+            to_recv,
+        })
+        .expect("connect");
+        assert_eq!(
+            conn.request(0x596, &[]).expect("io").expect("resp"),
+            vec![0xAA, 0xBB]
+        );
+    }
+
+    #[test]
+    fn apply_calibration_sends_prefixed_blob_and_acks() {
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x456, &[])]);
+        assert!(conn.apply_calibration(&[0xDE, 0xAD]).is_ok());
+        // Outbound payload (after envelope+header) must be exactly `00 00` + blob.
+        let sent = conn.transport().sent.last().expect("a sent frame");
+        assert_eq!(&sent[32..], &[0x00, 0x00, 0xDE, 0xAD]);
     }
 }
