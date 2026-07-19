@@ -8,6 +8,7 @@
 pub mod device;
 pub mod eyeview;
 pub mod hub;
+pub mod widget;
 
 /// Run the app: open the window, start the device thread, render the hub.
 pub fn run() -> eframe::Result<()> {
