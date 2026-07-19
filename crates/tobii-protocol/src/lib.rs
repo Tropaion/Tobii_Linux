@@ -7,6 +7,7 @@
 //! Protocol decoded by the `tobiifree` project (GPL-3.0) from USB captures.
 
 pub mod bytes;
+pub mod calibration;
 pub mod commands;
 pub mod display;
 pub mod error;
@@ -18,6 +19,7 @@ pub mod parser;
 pub mod realm;
 pub mod tlv;
 
+pub use calibration::CalibrationBlob;
 pub use display::DisplayCorners;
 pub use error::ProtocolError;
 pub use gaze::GazeSample;

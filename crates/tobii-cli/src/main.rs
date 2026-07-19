@@ -1,4 +1,4 @@
-//! `tobii` CLI. Subcommands: `stream`, `setup`, `display get|set`.
+//! `tobii` CLI. Subcommands: `stream`, `setup`, `display get|set`, `calibrate`.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -21,13 +21,15 @@ fn main() -> ExitCode {
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
+        (Some("calibrate"), _) => calibrate(args.iter().any(|a| a == "--apply")),
         _ => {
             eprintln!(
                 "usage:\n  \
                  tobii stream [--json]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
-                 tobii display set"
+                 tobii display set\n  \
+                 tobii calibrate [--apply]"
             );
             return ExitCode::from(2);
         }
@@ -130,6 +132,46 @@ fn display_set() -> CmdResult {
     Ok(())
 }
 
+/// Host-chosen stimulus points (normalized). Center then four corners, inset
+/// from the edges. NOTE: headless — no dots are drawn, so this validates the
+/// protocol, not gaze accuracy (accuracy needs the stimulus UI, a later phase).
+const CAL_POINTS: [(f64, f64); 5] = [(0.5, 0.5), (0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)];
+
+fn calibrate(apply_saved: bool) -> CmdResult {
+    if apply_saved {
+        let blob = tobii_config::load_calibration()?
+            .ok_or("no saved calibration — run `tobii calibrate` first")?;
+        let transport = UsbTransport::open()?;
+        let mut conn = Connection::connect(transport)?;
+        conn.apply_calibration(&blob)?;
+        println!("re-applied saved calibration ({} bytes).", blob.len());
+        return Ok(());
+    }
+
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    eprintln!(
+        "NOTE: headless calibration — no stimulus is drawn, so this validates the \
+         protocol only, not gaze accuracy."
+    );
+    for (i, &(x, y)) in CAL_POINTS.iter().enumerate() {
+        conn.add_calibration_point(x, y, 0)?;
+        println!(
+            "  point {}/{} at ({x:.2}, {y:.2}) sampled",
+            i + 1,
+            CAL_POINTS.len()
+        );
+    }
+    conn.compute_and_apply_calibration()?;
+    let blob = conn.retrieve_calibration()?;
+    tobii_config::save_calibration(&blob.0)?;
+    println!(
+        "calibration computed + applied; saved {} bytes.",
+        blob.0.len()
+    );
+    Ok(())
+}
+
 fn prompt_f64(label: &str, default: f64) -> Result<f64, Box<dyn std::error::Error>> {
     loop {
         print!("{label} [{default}]: ");
@@ -153,9 +195,25 @@ fn prompt_f64(label: &str, default: f64) -> Result<f64, Box<dyn std::error::Erro
 fn setup() -> CmdResult {
     println!("Tobii display setup — enter your monitor geometry.");
     println!("(millimetres; tilt in degrees; press Enter to accept each default)\n");
+
+    let (mut w_def, mut h_def) = (600.0, 340.0);
+    let monitors = tobii_config::detect_monitors();
+    if let Some(m) = monitors
+        .iter()
+        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
+        .max_by(|a, b| (a.width_mm * a.height_mm).total_cmp(&(b.width_mm * b.height_mm)))
+    {
+        println!(
+            "detected monitor: {} ({:.0} x {:.0} mm)",
+            m.model, m.width_mm, m.height_mm
+        );
+        w_def = m.width_mm;
+        h_def = m.height_mm;
+    }
+
     let s = DisplaySetup {
-        width_mm: prompt_f64("Monitor active-area WIDTH (mm)", 600.0)?,
-        height_mm: prompt_f64("Monitor active-area HEIGHT (mm)", 340.0)?,
+        width_mm: prompt_f64("Monitor active-area WIDTH (mm)", w_def)?,
+        height_mm: prompt_f64("Monitor active-area HEIGHT (mm)", h_def)?,
         tilt_deg: prompt_f64("Screen tilt back from vertical (deg)", 20.0)?,
         offset_y_mm: prompt_f64("Height of screen BOTTOM edge above tracker (mm)", 10.0)?,
         offset_z_mm: prompt_f64("Depth of screen bottom from tracker (mm)", 0.0)?,

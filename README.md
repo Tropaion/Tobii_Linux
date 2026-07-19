@@ -32,6 +32,19 @@ Tell the tracker where your screen is (needed for accurate on-screen gaze):
     ./target/release/tobii display get      # read the device's current area
     ./target/release/tobii display set      # re-apply the saved config
 
+`tobii setup` auto-detects your monitor's size from its EDID (via
+`/sys/class/drm`), pre-filling the width/height — just confirm or override.
+
+### Gaze calibration (experimental)
+
+    ./target/release/tobii calibrate          # run + save a calibration
+    ./target/release/tobii calibrate --apply   # re-apply the saved calibration
+
+Calibration is stored at `$XDG_CONFIG_HOME/tobii-linux/calibration.bin`.
+The current `calibrate` is **headless** (no on-screen stimulus yet), so it
+exercises the device protocol but does not itself produce an accurate
+per-user calibration — the follow-the-dot stimulus UI is a later milestone.
+
 Config is stored at `$XDG_CONFIG_HOME/tobii-linux/config.toml` (default
 `~/.config/tobii-linux/config.toml`). Inputs are your monitor's active-area
 width/height (mm), how far its bottom edge sits above the tracker, the screen's
