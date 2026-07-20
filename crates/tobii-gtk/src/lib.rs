@@ -7,6 +7,7 @@
 pub mod align;
 pub mod device;
 pub mod eyeview;
+pub mod overlay;
 pub mod setup_flow;
 pub mod widget;
 
@@ -40,6 +41,7 @@ button:disabled { background-color: #2a2f36; color: #6b7178; }
 button:checked { background-color: #14696b; }
 button.spin-btn { min-width: 26px; padding: 2px 10px; }
 .spin-entry { padding: 2px 6px; }
+.overlay-window { background-color: transparent; }
 ";
 
 /// Run the GTK application.
@@ -97,6 +99,8 @@ fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
     // Latest view shared with the DrawingArea's draw callback (UI thread only).
     let view = Rc::new(RefCell::new(no_eyes_view()));
+    // The gaze-preview overlay window, while it is open.
+    let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
 
     // --- Header ---
     let title = Label::new(Some("Tobii Configuration"));
@@ -172,9 +176,24 @@ fn build_ui(app: &Application) {
     }
 
     let sw_preview = Switch::new();
-    sw_preview.set_sensitive(false);
     sw_preview.set_valign(Align::Center);
-    sw_preview.set_tooltip_text(Some("Coming soon"));
+    sw_preview.set_tooltip_text(Some("Show a dot on screen where you're looking"));
+    {
+        let app = app.clone();
+        let state = state.clone();
+        let overlay_win = overlay_win.clone();
+        sw_preview.connect_state_set(move |_sw, on| {
+            let mut ow = overlay_win.borrow_mut();
+            if on {
+                if ow.is_none() {
+                    *ow = Some(overlay::show(&app, state.clone()));
+                }
+            } else if let Some(w) = ow.take() {
+                w.close();
+            }
+            glib::Propagation::Proceed
+        });
+    }
 
     // Radio indicators with SEPARATE labels: a CheckButton's built-in label
     // clips its text on this theme, a standalone GtkLabel does not.

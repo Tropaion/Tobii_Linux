@@ -18,3 +18,4 @@ tobii-protocol = { path = "../tobii-protocol" }
 tobii-usb = { path = "../tobii-usb" }
 tobii-config = { path = "../tobii-config" }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+gtk4-layer-shell = "0.8"
