@@ -13,7 +13,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Overlay};
 
-use crate::device::{CalPhase, DeviceCommand, DeviceState};
+use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
 use tobii_protocol::EnabledEye;
 
 /// Calibration point sets (normalized, top-left origin, center-first — the
@@ -49,8 +49,19 @@ impl CalMode {
 
 // Tick cadence is 33 ms (~30 fps), matching the hub.
 const SETTLE_TICKS: u32 = 8; // ~260 ms saccade settle before sampling a point
-const START_TIMEOUT_TICKS: u32 = 150; // ~5 s waiting for the device to ack CalBegin
-const COLLECT_TIMEOUT_TICKS: u32 = 300; // ~10 s per point before giving up
+
+// Every UI deadline below must outlast the device-thread work it is waiting on.
+// If the UI gives up first the device thread keeps running the old command and
+// will not dequeue the abort for the remaining difference — the window in which
+// a queued CalBegin/CalFinish can still land on a session the UI has abandoned.
+//
+// `CalBegin` runs set_enabled_eye + start + clear, three requests each bounded
+// by `tobii-usb` DEFAULT_REQUEST_TIMEOUT (10 s).
+const START_TIMEOUT_TICKS: u32 = 1000; // ~33 s waiting for the device to ack CalBegin
+
+// One point is bounded by `tobii-usb` CAL_POINT_TIMEOUT (30 s) — keep this
+// above it, or a point the USB layer would still have acked is failed here.
+const COLLECT_TIMEOUT_TICKS: u32 = 1000; // ~33 s per point before giving up
 
 // Compute+retrieve are two separate device requests, each bounded by the USB
 // response deadline (`tobii-usb` DEFAULT_REQUEST_TIMEOUT, 10 s), and the device
@@ -62,13 +73,17 @@ const COMPUTE_TIMEOUT_TICKS: u32 = 1350; // ~45 s for compute+retrieve
 #[derive(Clone)]
 enum Phase {
     Chooser,
-    /// `CalBegin` sent; waiting for the device thread to publish a *fresh*
-    /// `CalPhase`. Without this gate the tick would compare point counters
-    /// against the previous session's leftovers (after Retry those can already
-    /// exceed the new index), walk every point without sampling any, and then
+    /// `CalBegin` sent; waiting for the device thread to publish a `CalPhase`
+    /// carrying *our* `token`. The token is what makes this an edge and not a
+    /// level: `active`, `collected`, `last_error` and `finished` all persist
+    /// from the previous session until the device thread dequeues a command,
+    /// and it can be blocked in a 30 s USB request while the UI ticks every
+    /// 33 ms. Testing those fields directly would let leftovers from the last
+    /// run satisfy the gate, walk every point without sampling any, and then
     /// compute + persist a calibration built from zero new points.
     Starting {
         mode: CalMode,
+        token: u64,
         ticks: u32,
     },
     Collecting {
@@ -246,8 +261,13 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
         let phase = phase.clone();
         let cmd_tx = cmd_tx.clone();
         Rc::new(move |mode: CalMode| {
-            let _ = cmd_tx.send(DeviceCommand::CalBegin { eye });
-            *phase.borrow_mut() = Phase::Starting { mode, ticks: 0 };
+            let token = next_cal_token();
+            let _ = cmd_tx.send(DeviceCommand::CalBegin { eye, token });
+            *phase.borrow_mut() = Phase::Starting {
+                mode,
+                token,
+                ticks: 0,
+            };
         })
     };
     {
@@ -316,15 +336,33 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
             Phase::Chooser => {
                 dot.borrow_mut().point = None;
             }
-            Phase::Starting { mode, ticks } => {
-                let (mode, ticks) = (*mode, *ticks);
+            Phase::Starting { mode, token, ticks } => {
+                let (mode, token, ticks) = (*mode, *token, *ticks);
                 dot.borrow_mut().point = None;
-                if let Some(Err(e)) = &cal.finished {
-                    // CalBegin's start/clear failed on the device thread.
-                    next = Some(Phase::Done(Err(e.clone())));
+                if cal.token != token {
+                    // Our CalBegin has not been dequeued yet. Everything in
+                    // `cal` still belongs to the previous session, so none of
+                    // it may be read — not `finished`, not `last_error`, not
+                    // `active`, not `collected`. Just wait.
+                    let t = ticks + 1;
+                    if t >= START_TIMEOUT_TICKS {
+                        // The abort is queued *behind* our CalBegin, so the
+                        // device thread still closes whatever CalBegin opened.
+                        let _ = tick_cmd.send(DeviceCommand::CalAbort);
+                        next = Some(Phase::Done(Err(
+                            "Could not start calibration. Check that the eye tracker is connected."
+                                .into(),
+                        )));
+                    } else {
+                        next = Some(Phase::Starting {
+                            mode,
+                            token,
+                            ticks: t,
+                        });
+                    }
                 } else if cal.active {
-                    // `active` is only ever set by CalBegin replacing the whole
-                    // CalPhase, so the counters below are now this session's.
+                    // This session's CalBegin succeeded: the counters below are
+                    // now definitively ours and start from zero.
                     next = Some(Phase::Collecting {
                         mode,
                         index: 0,
@@ -332,16 +370,15 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                         ticks: 0,
                     });
                 } else {
-                    let t = ticks + 1;
-                    if t >= START_TIMEOUT_TICKS {
-                        let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                        next = Some(Phase::Done(Err(
-                            "Could not start calibration. Check that the eye tracker is connected."
-                                .into(),
-                        )));
-                    } else {
-                        next = Some(Phase::Starting { mode, ticks: t });
-                    }
+                    // Our CalBegin ran and its start/clear failed. `start` may
+                    // still have succeeded (only `clear` failing), leaving the
+                    // device in an open session — so abort explicitly.
+                    let msg = match &cal.finished {
+                        Some(Err(e)) => e.clone(),
+                        _ => "Could not start calibration.".to_string(),
+                    };
+                    let _ = tick_cmd.send(DeviceCommand::CalAbort);
+                    next = Some(Phase::Done(Err(msg)));
                 }
             }
             Phase::Collecting {
@@ -352,9 +389,10 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
             } => {
                 let (mode, index, requested, ticks) = (*mode, *index, *requested, *ticks);
                 if let Some(Err(e)) = &cal.finished {
-                    // Reachable when CalBegin's start succeeded but clear
-                    // failed: the device is still in an open session, so it
-                    // needs an explicit stop.
+                    // Defensive: within a session nothing finishes it but our
+                    // own CalFinish (which leaves for `Computing`). If a finish
+                    // does surface here the session may still be open, so stop
+                    // it explicitly.
                     let _ = tick_cmd.send(DeviceCommand::CalAbort);
                     next = Some(Phase::Done(Err(e.clone())));
                 } else if let Some(e) = &cal.last_error {
