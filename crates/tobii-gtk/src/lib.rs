@@ -4,8 +4,10 @@
 //! ported device thread. Guided flows, the gaze overlay, and select-eyes land
 //! in later phases of the GTK4 redesign.
 
+pub mod align;
 pub mod device;
 pub mod eyeview;
+pub mod setup_flow;
 pub mod widget;
 
 use std::cell::RefCell;
@@ -61,7 +63,7 @@ fn no_eyes_view() -> EyeView {
 }
 
 fn build_ui(app: &Application) {
-    let (state, _cmd_tx) = device::spawn();
+    let (state, cmd_tx) = device::spawn();
     // Latest view shared with the DrawingArea's draw callback (UI thread only).
     let view = Rc::new(RefCell::new(no_eyes_view()));
 
@@ -89,6 +91,13 @@ fn build_ui(app: &Application) {
     b_cal.set_tooltip_text(Some("Calibration flow — coming in B3"));
     for b in [&b_setup, &b_eyes, &b_preview, &b_cal] {
         launchers.append(b);
+    }
+
+    // "Set up display…" launches the fullscreen line-alignment flow.
+    {
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        b_setup.connect_clicked(move |_| setup_flow::launch(&app, cmd_tx.clone()));
     }
 
     let area = DrawingArea::new();
