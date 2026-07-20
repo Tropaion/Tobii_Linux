@@ -7,10 +7,13 @@ use tobii_protocol::calibration::{
     cal_add_point_payload, cal_apply_payload, cal_compute_payload, cal_retrieve_payload,
     CalibrationBlob,
 };
-use tobii_protocol::commands::set_display_area_corners_payload;
+use tobii_protocol::commands::{
+    parse_enabled_eye, set_display_area_corners_payload, set_enabled_eye_payload, EnabledEye,
+};
 use tobii_protocol::frame::{
     build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
-    OP_GAZE_NOTIFY, OP_SET_DISPLAY_AREA, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    OP_GAZE_NOTIFY, OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA, OP_SET_ENABLED_EYE, STREAM_GAZE,
+    TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
 use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
@@ -145,6 +148,21 @@ impl<T: Transport> Connection<T> {
             c.tl[0], c.tl[1], c.tl[2], c.tr[0], c.tr[1], c.tr[2], c.bl[0], c.bl[1], c.bl[2],
         );
         Ok(self.request(OP_SET_DISPLAY_AREA, &payload)?.is_some())
+    }
+
+    /// Read which eye(s) the tracker is set to detect. `None` if the device did
+    /// not respond (e.g. firmware without the enabled_eye property).
+    pub fn get_enabled_eye(&mut self) -> Result<Option<EnabledEye>, UsbError> {
+        Ok(self
+            .request(OP_GET_ENABLED_EYE, &[])?
+            .and_then(|p| parse_enabled_eye(&p)))
+    }
+
+    /// Set which eye(s) the tracker detects; returns whether the device ack'd.
+    pub fn set_enabled_eye(&mut self, eye: EnabledEye) -> Result<bool, UsbError> {
+        Ok(self
+            .request(OP_SET_ENABLED_EYE, &set_enabled_eye_payload(eye))?
+            .is_some())
     }
 
     fn run_handshake(&mut self) -> Result<(), UsbError> {
@@ -488,6 +506,27 @@ mod tests {
         assert_eq!(
             &conn.transport().sent.last().unwrap()[20..24],
             &[0, 0, 0x05, 0xa0]
+        );
+    }
+
+    #[test]
+    fn get_enabled_eye_parses_device_response() {
+        // The hardware-captured BOTH response for op 0xc62.
+        let resp = [
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
+        ];
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0xc62, &resp)]);
+        assert_eq!(conn.get_enabled_eye().expect("io"), Some(EnabledEye::Both));
+    }
+
+    #[test]
+    fn set_enabled_eye_sends_op_and_reports_ack() {
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0xc58, &[])]);
+        assert!(conn.set_enabled_eye(EnabledEye::Left).expect("io"));
+        // The last sent frame is a SET_ENABLED_EYE request (op 0xc58).
+        assert_eq!(
+            &conn.transport().sent.last().unwrap()[20..24],
+            &[0, 0, 0x0c, 0x58]
         );
     }
 }

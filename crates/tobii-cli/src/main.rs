@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use tobii_config::DisplaySetup;
 use tobii_protocol::frame::OP_GET_DISPLAY_AREA;
 use tobii_protocol::gaze::present;
-use tobii_protocol::DisplayCorners;
+use tobii_protocol::{DisplayCorners, EnabledEye};
 use tobii_usb::{Connection, UsbTransport};
 
 type CmdResult = Result<(), Box<dyn std::error::Error>>;
@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
         (Some("calibrate"), _) => calibrate(args.iter().any(|a| a == "--apply")),
+        (Some("enabled-eye"), arg) => enabled_eye_cmd(arg),
         _ => {
             eprintln!(
                 "usage:\n  \
@@ -28,7 +29,8 @@ fn main() -> ExitCode {
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
-                 tobii calibrate [--apply]"
+                 tobii calibrate [--apply]\n  \
+                 tobii enabled-eye [both|left|right]"
             );
             return ExitCode::from(2);
         }
@@ -40,6 +42,28 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Get (and optionally set) which eye(s) the tracker detects (Spike S4).
+/// `which` = both|left|right sets it first; then reads it back.
+fn enabled_eye_cmd(which: Option<&str>) -> CmdResult {
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    if let Some(w) = which {
+        let eye = match w {
+            "both" => EnabledEye::Both,
+            "left" => EnabledEye::Left,
+            "right" => EnabledEye::Right,
+            _ => return Err("usage: tobii enabled-eye [both|left|right]".into()),
+        };
+        let acked = conn.set_enabled_eye(eye)?;
+        println!("set enabled_eye = {w} (acknowledged: {acked})");
+    }
+    match conn.get_enabled_eye()? {
+        Some(e) => println!("enabled_eye is now: {e:?}"),
+        None => println!("no enabled_eye response (unsupported firmware?)"),
+    }
+    Ok(())
 }
 
 fn stream(json: bool) -> CmdResult {

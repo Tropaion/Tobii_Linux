@@ -20,6 +20,7 @@ pub mod realm;
 pub mod tlv;
 
 pub use calibration::CalibrationBlob;
+pub use commands::EnabledEye;
 pub use display::DisplayCorners;
 pub use error::ProtocolError;
 pub use gaze::GazeSample;
