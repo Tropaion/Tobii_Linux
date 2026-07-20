@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
         (Some("calibrate"), _) => calibrate(args.iter().any(|a| a == "--apply")),
+        (Some("cal-probe"), _) => cal_probe(),
         (Some("enabled-eye"), arg) => enabled_eye_cmd(arg),
         _ => {
             eprintln!(
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
                  tobii display get\n  \
                  tobii display set\n  \
                  tobii calibrate [--apply]\n  \
+                 tobii cal-probe\n  \
                  tobii enabled-eye [both|left|right]"
             );
             return ExitCode::from(2);
@@ -62,6 +64,30 @@ fn enabled_eye_cmd(which: Option<&str>) -> CmdResult {
     match conn.get_enabled_eye()? {
         Some(e) => println!("enabled_eye is now: {e:?}"),
         None => println!("no enabled_eye response (unsupported firmware?)"),
+    }
+    Ok(())
+}
+
+/// B3 spike: probe the newly-mapped calibration session ops. Non-destructive —
+/// only `start` then `stop` (NOT `clear`, which would wipe the calibration, and
+/// no compute, so nothing is written). Confirms the device accepts these ops
+/// standalone before we build the follow-the-dot flow.
+fn cal_probe() -> CmdResult {
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    // The device wipes its display area on reboot; re-apply so it is in a
+    // normal working state before we exercise calibration.
+    if let Ok(Some(setup)) = tobii_config::load() {
+        let _ = conn.set_display_area(&setup.to_corners());
+    }
+    eprintln!("probing calibration session ops (start -> stop; non-destructive)...");
+    match conn.start_calibration() {
+        Ok(()) => println!("  calibration_start (0x3f2): ACK"),
+        Err(e) => println!("  calibration_start (0x3f2): FAILED ({e})"),
+    }
+    match conn.stop_calibration() {
+        Ok(()) => println!("  calibration_stop  (0x3fc): ACK"),
+        Err(e) => println!("  calibration_stop  (0x3fc): FAILED ({e})"),
     }
     Ok(())
 }

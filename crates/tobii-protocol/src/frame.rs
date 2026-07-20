@@ -32,7 +32,13 @@ pub const OP_CLOSE_REALM: u32 = 0x77b;
 pub const OP_GET_ENABLED_EYE: u32 = 0xc62;
 pub const OP_SET_ENABLED_EYE: u32 = 0xc58;
 
-// Calibration ops (Phase 2). Enter/leave reuse the realm ops above.
+// Calibration ops (Phase 2). Session control (start/stop/clear) op codes were
+// code-verified in the native lib (B3 research): each is a no-arg wrapper over
+// the common TTP frame builder. The device enters calibration mode on `start`
+// and leaves on `stop`; `clear` discards collected/active calibration data.
+pub const OP_CAL_START: u32 = 0x3f2;
+pub const OP_CAL_STOP: u32 = 0x3fc;
+pub const OP_CAL_CLEAR: u32 = 0x424;
 pub const OP_CAL_ADD_POINT: u32 = 0x408;
 pub const OP_CAL_COMPUTE: u32 = 0x42f; // compute AND apply
 pub const OP_CAL_RETRIEVE: u32 = 0x44c;

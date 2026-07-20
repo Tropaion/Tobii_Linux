@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use tobii_protocol::calibration::{
     cal_add_point_payload, cal_apply_payload, cal_compute_payload, cal_retrieve_payload,
-    CalibrationBlob,
+    cal_session_payload, CalibrationBlob,
 };
 use tobii_protocol::commands::{
     parse_enabled_eye, set_display_area_corners_payload, set_enabled_eye_payload, EnabledEye,
 };
 use tobii_protocol::frame::{
-    build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
-    OP_GAZE_NOTIFY, OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA, OP_SET_ENABLED_EYE, STREAM_GAZE,
-    TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_CLEAR, OP_CAL_COMPUTE,
+    OP_CAL_RETRIEVE, OP_CAL_START, OP_CAL_STOP, OP_GAZE_NOTIFY, OP_GET_ENABLED_EYE,
+    OP_SET_DISPLAY_AREA, OP_SET_ENABLED_EYE, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
 use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
@@ -107,6 +107,26 @@ impl<T: Transport> Connection<T> {
     fn expect_response(&mut self, op: u32, payload: &[u8]) -> Result<Vec<u8>, UsbError> {
         self.request(op, payload)?
             .ok_or(UsbError::NoResponse { op })
+    }
+
+    /// Enter calibration mode. Must precede point collection; the device stays
+    /// in calibration mode until `stop_calibration`.
+    pub fn start_calibration(&mut self) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_START, &cal_session_payload())?;
+        Ok(())
+    }
+
+    /// Leave calibration mode (call after `compute_and_apply_calibration`).
+    pub fn stop_calibration(&mut self) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_STOP, &cal_session_payload())?;
+        Ok(())
+    }
+
+    /// Discard collected/active calibration data (the original clears right
+    /// after `start`). Destructive: wipes the current calibration.
+    pub fn clear_calibration(&mut self) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_CLEAR, &cal_session_payload())?;
+        Ok(())
     }
 
     /// Sample one calibration stimulus point. `x`/`y` normalized `[0,1]`;
@@ -438,6 +458,19 @@ mod tests {
     fn add_calibration_point_gets_ack() {
         let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x408, &[])]);
         assert!(conn.add_calibration_point(0.25, 0.75, 0).is_ok());
+    }
+
+    #[test]
+    fn session_ops_send_correct_ops_and_ack() {
+        // start (0x3f2), clear (0x424), stop (0x3fc) in sequence; seqs 5,6,7.
+        let mut conn = connected_with(vec![
+            inbound(TTP_MAGIC_RSP, 5, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x424, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x3fc, &[]),
+        ]);
+        assert!(conn.start_calibration().is_ok());
+        assert!(conn.clear_calibration().is_ok());
+        assert!(conn.stop_calibration().is_ok());
     }
 
     #[test]
