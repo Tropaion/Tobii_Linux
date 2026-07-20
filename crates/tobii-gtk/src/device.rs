@@ -17,16 +17,70 @@ pub enum ConnStatus {
     Error(String),
 }
 
+/// Progress of an in-flight calibration, published to the UI.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CalPhase {
+    /// True between `CalBegin` and `CalFinish`/`CalAbort`.
+    pub active: bool,
+    /// Points successfully collected so far this session.
+    pub collected: usize,
+    /// Set when the last `CalCollect` failed (per-point error to surface).
+    pub last_error: Option<String>,
+    /// Set once the finish path resolves: `Ok` on success, `Err(msg)` on failure.
+    pub finished: Option<Result<(), String>>,
+}
+
+impl CalPhase {
+    /// A fresh in-progress phase (0 points collected).
+    pub fn begin() -> Self {
+        CalPhase {
+            active: true,
+            collected: 0,
+            last_error: None,
+            finished: None,
+        }
+    }
+    /// Record a point-collection result: increment on success, else store error.
+    pub fn on_collect(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.collected += 1;
+                self.last_error = None;
+            }
+            Err(e) => self.last_error = Some(e),
+        }
+    }
+    /// Record the compute/finish outcome and leave calibration mode.
+    pub fn on_finish(&mut self, result: Result<(), String>) {
+        self.active = false;
+        self.finished = Some(result);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DeviceState {
     pub status: ConnStatus,
     pub latest_gaze: Option<GazeSample>,
     pub enabled_eye: Option<EnabledEye>,
+    pub calibration: CalPhase,
 }
 
 pub enum DeviceCommand {
     SetDisplayArea(DisplayCorners),
     SetEnabledEye(EnabledEye),
+    /// Begin calibration: set the eye (experiment), then start + clear.
+    CalBegin {
+        eye: EnabledEye,
+    },
+    /// Sample one stimulus point (both eyes).
+    CalCollect {
+        x: f64,
+        y: f64,
+    },
+    /// Compute + apply + stop + retrieve + persist.
+    CalFinish,
+    /// Abort: stop (best-effort) and reset.
+    CalAbort,
 }
 
 /// One iteration: apply any queued commands, then poll one gaze sample.
@@ -47,6 +101,31 @@ pub fn device_tick<T: Transport>(
                 let _ = conn.set_enabled_eye(e);
                 let _ = tobii_config::save_enabled_eye(e);
                 state.lock().unwrap().enabled_eye = Some(e);
+            }
+            DeviceCommand::CalBegin { eye } => {
+                state.lock().unwrap().calibration = CalPhase::begin();
+                let _ = conn.set_enabled_eye(eye); // best-effort select-eyes experiment
+                let r = conn
+                    .start_calibration()
+                    .and_then(|()| conn.clear_calibration())
+                    .map_err(|e| e.to_string());
+                if let Err(e) = r {
+                    state.lock().unwrap().calibration.on_finish(Err(e));
+                }
+            }
+            DeviceCommand::CalCollect { x, y } => {
+                let r = conn
+                    .add_calibration_point(x, y, 0)
+                    .map_err(|e| e.to_string());
+                state.lock().unwrap().calibration.on_collect(r);
+            }
+            DeviceCommand::CalFinish => {
+                let r = finish_calibration(conn);
+                state.lock().unwrap().calibration.on_finish(r);
+            }
+            DeviceCommand::CalAbort => {
+                let _ = conn.stop_calibration();
+                state.lock().unwrap().calibration = CalPhase::default();
             }
         }
     }
@@ -82,6 +161,11 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 if let Ok(Some(eye)) = tobii_config::load_enabled_eye() {
                     let _ = conn.set_enabled_eye(eye);
                 }
+                // The ET5 wipes calibration on reboot like the display area;
+                // re-apply the saved blob so calibration persists across sessions.
+                if let Ok(Some(blob)) = tobii_config::load_calibration() {
+                    let _ = conn.apply_calibration(&blob);
+                }
                 let cur_eye = conn.get_enabled_eye().ok().flatten();
                 {
                     let mut s = thread_state.lock().unwrap();
@@ -90,7 +174,9 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 }
                 let mut idle_ticks = 0u32;
                 loop {
-                    if device_tick(&mut conn, &thread_state, &rx) {
+                    let got = device_tick(&mut conn, &thread_state, &rx);
+                    let calibrating = thread_state.lock().unwrap().calibration.active;
+                    if got || calibrating {
                         idle_ticks = 0;
                     } else {
                         idle_ticks += 1;
@@ -112,6 +198,19 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
 
 fn set_error(state: &Mutex<DeviceState>, e: &UsbError) {
     state.lock().unwrap().status = ConnStatus::Error(e.to_string());
+}
+
+/// Compute + stop + retrieve + persist. Always attempts `stop` so the device is
+/// not left in calibration mode even when compute fails.
+fn finish_calibration<T: Transport>(conn: &mut Connection<T>) -> Result<(), String> {
+    let compute = conn
+        .compute_and_apply_calibration()
+        .map_err(|e| e.to_string());
+    let _ = conn.stop_calibration();
+    compute?;
+    let blob = conn.retrieve_calibration().map_err(|e| e.to_string())?;
+    tobii_config::save_calibration(&blob.0).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -212,6 +311,48 @@ mod tests {
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
         assert!(!device_tick(&mut conn, &state, &rx));
+    }
+
+    #[test]
+    fn cal_phase_begin_is_active_and_empty() {
+        let p = CalPhase::begin();
+        assert!(p.active);
+        assert_eq!(p.collected, 0);
+        assert!(p.last_error.is_none());
+        assert!(p.finished.is_none());
+    }
+
+    #[test]
+    fn cal_phase_collect_increments_on_ok_and_records_error() {
+        let mut p = CalPhase::begin();
+        p.on_collect(Ok(()));
+        p.on_collect(Ok(()));
+        assert_eq!(p.collected, 2);
+        p.on_collect(Err("nope".into()));
+        assert_eq!(p.collected, 2);
+        assert_eq!(p.last_error.as_deref(), Some("nope"));
+        p.on_collect(Ok(()));
+        assert_eq!(p.collected, 3);
+        assert!(p.last_error.is_none());
+    }
+
+    #[test]
+    fn cal_phase_finish_sets_outcome_and_clears_active() {
+        let mut p = CalPhase::begin();
+        p.on_finish(Ok(()));
+        assert!(!p.active);
+        assert_eq!(p.finished, Some(Ok(())));
+    }
+
+    #[test]
+    fn tick_collects_a_calibration_point() {
+        let mut conn = connected(vec![inbound(TTP_MAGIC_RSP, 5, 0x408, &[])]);
+        let state = Mutex::new(DeviceState::default());
+        let (tx, rx) = channel::<DeviceCommand>();
+        tx.send(DeviceCommand::CalCollect { x: 0.5, y: 0.5 })
+            .unwrap();
+        device_tick(&mut conn, &state, &rx);
+        assert_eq!(state.lock().unwrap().calibration.collected, 1);
     }
 
     #[test]
