@@ -137,6 +137,7 @@ mod tests {
         let mut s = DeviceState {
             status: ConnStatus::Error("unplugged".into()),
             latest_gaze: Some(valid_sample()),
+            ..Default::default()
         };
         assert!(matches!(eye_view_for(&s).guidance, Guidance::NoEyes));
         // Connected + no sample is also "no eyes".

@@ -80,6 +80,30 @@ pub fn load_calibration() -> io::Result<Option<Vec<u8>>> {
     load_calibration_from(&calibration_path())
 }
 
+/// Path to the persisted "select eyes to detect" choice, beside `config.toml`.
+pub fn enabled_eye_path() -> PathBuf {
+    config_path().with_file_name("enabled_eye")
+}
+
+/// Persist which eye(s) the tracker should detect (stored as the wire value).
+pub fn save_enabled_eye(eye: tobii_protocol::EnabledEye) -> io::Result<()> {
+    let path = enabled_eye_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, [eye.to_wire() as u8])
+}
+
+/// Load the persisted eye choice. `Ok(None)` if unset or unparseable.
+pub fn load_enabled_eye() -> io::Result<Option<tobii_protocol::EnabledEye>> {
+    match std::fs::read(enabled_eye_path()) {
+        Ok(b) if !b.is_empty() => Ok(tobii_protocol::EnabledEye::from_wire(b[0] as u32)),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

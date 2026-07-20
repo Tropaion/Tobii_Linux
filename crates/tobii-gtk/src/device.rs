@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tobii_protocol::{DisplayCorners, GazeSample};
+use tobii_protocol::{DisplayCorners, EnabledEye, GazeSample};
 use tobii_usb::{Connection, Transport, UsbError, UsbTransport};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -21,10 +21,12 @@ pub enum ConnStatus {
 pub struct DeviceState {
     pub status: ConnStatus,
     pub latest_gaze: Option<GazeSample>,
+    pub enabled_eye: Option<EnabledEye>,
 }
 
 pub enum DeviceCommand {
     SetDisplayArea(DisplayCorners),
+    SetEnabledEye(EnabledEye),
 }
 
 /// One iteration: apply any queued commands, then poll one gaze sample.
@@ -36,10 +38,17 @@ pub fn device_tick<T: Transport>(
     state: &Mutex<DeviceState>,
     cmd_rx: &Receiver<DeviceCommand>,
 ) -> bool {
-    // NOTE: single-variant `while let` drain. If DeviceCommand gains a second
-    // variant, switch to a `match` so the drain can't silently drop it.
-    while let Ok(DeviceCommand::SetDisplayArea(c)) = cmd_rx.try_recv() {
-        let _ = conn.set_display_area(&c);
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            DeviceCommand::SetDisplayArea(c) => {
+                let _ = conn.set_display_area(&c);
+            }
+            DeviceCommand::SetEnabledEye(e) => {
+                let _ = conn.set_enabled_eye(e);
+                let _ = tobii_config::save_enabled_eye(e);
+                state.lock().unwrap().enabled_eye = Some(e);
+            }
+        }
     }
     if let Some(g) = conn.next_gaze() {
         let mut s = state.lock().unwrap();
@@ -68,7 +77,17 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 if let Ok(Some(setup)) = tobii_config::load() {
                     let _ = conn.set_display_area(&setup.to_corners());
                 }
-                thread_state.lock().unwrap().status = ConnStatus::Connected;
+                // Re-apply the saved eye selection (reboot-persistence is
+                // unverified), then read the device's current value to seed the UI.
+                if let Ok(Some(eye)) = tobii_config::load_enabled_eye() {
+                    let _ = conn.set_enabled_eye(eye);
+                }
+                let cur_eye = conn.get_enabled_eye().ok().flatten();
+                {
+                    let mut s = thread_state.lock().unwrap();
+                    s.enabled_eye = cur_eye;
+                    s.status = ConnStatus::Connected;
+                }
                 let mut idle_ticks = 0u32;
                 loop {
                     if device_tick(&mut conn, &thread_state, &rx) {
