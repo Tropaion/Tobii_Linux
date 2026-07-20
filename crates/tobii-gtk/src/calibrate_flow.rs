@@ -3,7 +3,7 @@
 //! `device::DeviceCommand::Cal*`). The point sets + `CalMode` are unit-tested;
 //! the GTK window + cairo dot (added next) are live-validated.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -49,13 +49,28 @@ impl CalMode {
 
 // Tick cadence is 33 ms (~30 fps), matching the hub.
 const SETTLE_TICKS: u32 = 8; // ~260 ms saccade settle before sampling a point
+const START_TIMEOUT_TICKS: u32 = 150; // ~5 s waiting for the device to ack CalBegin
 const COLLECT_TIMEOUT_TICKS: u32 = 300; // ~10 s per point before giving up
-const COMPUTE_TIMEOUT_TICKS: u32 = 450; // ~15 s for compute+retrieve
+
+// Compute+retrieve are two separate device requests, each bounded by the USB
+// response deadline (`tobii-usb` DEFAULT_REQUEST_TIMEOUT, 10 s), and the device
+// thread may still be finishing an earlier command before either runs. ~45 s
+// stays comfortably above that worst case — keep it in step with that deadline.
+const COMPUTE_TIMEOUT_TICKS: u32 = 1350; // ~45 s for compute+retrieve
 
 /// UI-side flow state (distinct from the device's `CalPhase`).
 #[derive(Clone)]
 enum Phase {
     Chooser,
+    /// `CalBegin` sent; waiting for the device thread to publish a *fresh*
+    /// `CalPhase`. Without this gate the tick would compare point counters
+    /// against the previous session's leftovers (after Retry those can already
+    /// exceed the new index), walk every point without sampling any, and then
+    /// compute + persist a calibration built from zero new points.
+    Starting {
+        mode: CalMode,
+        ticks: u32,
+    },
     Collecting {
         mode: CalMode,
         index: usize,
@@ -108,6 +123,7 @@ fn update_ui(
     instr: &Label,
     chooser: &gtk::Box,
     done_box: &gtk::Box,
+    retry: &Button,
     cancel: &Button,
 ) {
     match phase {
@@ -116,6 +132,12 @@ fn update_ui(
                 "Choose a calibration. Sit comfortably, about an arm's length from the screen.",
             );
             chooser.set_visible(true);
+            done_box.set_visible(false);
+            cancel.set_visible(true);
+        }
+        Phase::Starting { .. } => {
+            instr.set_text("Starting calibration…");
+            chooser.set_visible(false);
             done_box.set_visible(false);
             cancel.set_visible(true);
         }
@@ -142,6 +164,8 @@ fn update_ui(
             }
             chooser.set_visible(false);
             done_box.set_visible(true);
+            // Success offers only Done; Retry belongs to the failure screen.
+            retry.set_visible(res.is_err());
             cancel.set_visible(false);
         }
     }
@@ -215,18 +239,15 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
     overlay.add_overlay(&header);
     win.set_child(Some(&overlay));
 
-    // Chooser -> begin calibration for the chosen mode.
+    // Chooser -> begin calibration for the chosen mode. The flow waits in
+    // `Starting` until the device thread acknowledges the new session; it must
+    // not trust any counters until then (see `Phase::Starting`).
     let start_mode: Rc<dyn Fn(CalMode)> = {
         let phase = phase.clone();
         let cmd_tx = cmd_tx.clone();
         Rc::new(move |mode: CalMode| {
             let _ = cmd_tx.send(DeviceCommand::CalBegin { eye });
-            *phase.borrow_mut() = Phase::Collecting {
-                mode,
-                index: 0,
-                requested: false,
-                ticks: 0,
-            };
+            *phase.borrow_mut() = Phase::Starting { mode, ticks: 0 };
         })
     };
     {
@@ -241,31 +262,23 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
         let phase = phase.clone();
         retry_btn.connect_clicked(move |_| *phase.borrow_mut() = Phase::Chooser);
     }
+    // Every exit routes through `win.close()` so the single close handler below
+    // is the one place that aborts the session and stops the tick.
     {
         let win = win.clone();
-        let cmd_tx = cmd_tx.clone();
-        done_btn.connect_clicked(move |_| {
-            let _ = cmd_tx.send(DeviceCommand::CalAbort);
-            win.close();
-        });
+        done_btn.connect_clicked(move |_| win.close());
     }
     {
         let win = win.clone();
-        let cmd_tx = cmd_tx.clone();
-        cancel.connect_clicked(move |_| {
-            let _ = cmd_tx.send(DeviceCommand::CalAbort);
-            win.close();
-        });
+        cancel.connect_clicked(move |_| win.close());
     }
 
     // Esc cancels.
     let keys = gtk::EventControllerKey::new();
     {
         let win = win.clone();
-        let cmd_tx = cmd_tx.clone();
         keys.connect_key_pressed(move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {
-                let _ = cmd_tx.send(DeviceCommand::CalAbort);
                 win.close();
                 glib::Propagation::Stop
             } else {
@@ -275,15 +288,61 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
     }
     win.add_controller(keys);
 
+    // Closing the window — by button, Esc, or the compositor (Alt+F4) — aborts
+    // any open session and retires the tick. Without the flag the tick would
+    // keep firing forever against a dead window, and could still fire CalFinish
+    // and persist a calibration after the flow was gone.
+    let closed = Rc::new(Cell::new(false));
+    {
+        let closed = closed.clone();
+        let cmd_tx = cmd_tx.clone();
+        win.connect_close_request(move |_| {
+            closed.set(true);
+            let _ = cmd_tx.send(DeviceCommand::CalAbort);
+            glib::Propagation::Proceed
+        });
+    }
+
     // ~30 fps state machine: read the device's CalPhase, advance the UI phase.
     let tick_cmd = cmd_tx.clone();
     glib::timeout_add_local(Duration::from_millis(33), move || {
+        if closed.get() {
+            return glib::ControlFlow::Break;
+        }
         let cal: CalPhase = state.lock().unwrap().calibration.clone();
         let mut ph = phase.borrow_mut();
         let mut next: Option<Phase> = None;
         match &*ph {
             Phase::Chooser => {
                 dot.borrow_mut().point = None;
+            }
+            Phase::Starting { mode, ticks } => {
+                let (mode, ticks) = (*mode, *ticks);
+                dot.borrow_mut().point = None;
+                if let Some(Err(e)) = &cal.finished {
+                    // CalBegin's start/clear failed on the device thread.
+                    next = Some(Phase::Done(Err(e.clone())));
+                } else if cal.active {
+                    // `active` is only ever set by CalBegin replacing the whole
+                    // CalPhase, so the counters below are now this session's.
+                    next = Some(Phase::Collecting {
+                        mode,
+                        index: 0,
+                        requested: false,
+                        ticks: 0,
+                    });
+                } else {
+                    let t = ticks + 1;
+                    if t >= START_TIMEOUT_TICKS {
+                        let _ = tick_cmd.send(DeviceCommand::CalAbort);
+                        next = Some(Phase::Done(Err(
+                            "Could not start calibration. Check that the eye tracker is connected."
+                                .into(),
+                        )));
+                    } else {
+                        next = Some(Phase::Starting { mode, ticks: t });
+                    }
+                }
             }
             Phase::Collecting {
                 mode,
@@ -293,6 +352,10 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
             } => {
                 let (mode, index, requested, ticks) = (*mode, *index, *requested, *ticks);
                 if let Some(Err(e)) = &cal.finished {
+                    // Reachable when CalBegin's start succeeded but clear
+                    // failed: the device is still in an open session, so it
+                    // needs an explicit stop.
+                    let _ = tick_cmd.send(DeviceCommand::CalAbort);
                     next = Some(Phase::Done(Err(e.clone())));
                 } else if let Some(e) = &cal.last_error {
                     let _ = tick_cmd.send(DeviceCommand::CalAbort);
@@ -348,6 +411,7 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                 } else {
                     let t = ticks + 1;
                     if t >= COMPUTE_TIMEOUT_TICKS {
+                        let _ = tick_cmd.send(DeviceCommand::CalAbort);
                         next = Some(Phase::Done(
                             Err("Calibration computation timed out.".into()),
                         ));
@@ -361,7 +425,7 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
         if let Some(n) = next {
             *ph = n;
         }
-        update_ui(&ph, &instr, &chooser, &done_box, &cancel);
+        update_ui(&ph, &instr, &chooser, &done_box, &retry_btn, &cancel);
         area.queue_draw();
         glib::ControlFlow::Continue
     });
