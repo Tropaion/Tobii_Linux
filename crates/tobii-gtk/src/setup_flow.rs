@@ -49,11 +49,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     win.set_modal(true);
     win.fullscreen();
 
-    let root = gtk::Box::new(Orientation::Vertical, 12);
-    root.set_margin_top(24);
-    root.set_margin_bottom(24);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
+    let root = gtk::Box::new(Orientation::Vertical, 0);
 
     let instr = Label::new(Some(
         "Drag the two lines to the marks on the top corners of your eye tracker.",
@@ -80,10 +76,19 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     buttons.append(&apply);
     buttons.append(&cancel);
 
-    root.append(&instr);
-    root.append(&area);
-    root.append(&readout);
-    root.append(&buttons);
+    // Controls sit in a header ABOVE the alignment surface, so they never
+    // collide with the lines or the tracker illustration below.
+    let header = gtk::Box::new(Orientation::Vertical, 10);
+    header.set_margin_top(24);
+    header.set_margin_bottom(12);
+    header.set_margin_start(24);
+    header.set_margin_end(24);
+    header.append(&instr);
+    header.append(&readout);
+    header.append(&buttons);
+
+    root.append(&header);
+    root.append(&area); // fills the rest, full width, down to the screen's bottom edge
     win.set_child(Some(&root));
 
     // Drag the nearest line.
@@ -136,6 +141,29 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     }
     area.add_controller(drag);
 
+    // Hover near a line -> resize cursor, so the lines read as draggable.
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let lines = lines.clone();
+        let area = area.clone();
+        motion.connect_motion(move |_, x, _| {
+            let w = area.width().max(1) as f64;
+            let nx = x / w;
+            let (l, r) = *lines.borrow();
+            let near_px = (nx - l).abs().min((nx - r).abs()) * w;
+            area.set_cursor_from_name(Some(if near_px < 14.0 {
+                "col-resize"
+            } else {
+                "default"
+            }));
+        });
+    }
+    {
+        let area = area.clone();
+        motion.connect_leave(move |_| area.set_cursor_from_name(Some("default")));
+    }
+    area.add_controller(motion);
+
     // Esc cancels.
     let keys = gtk::EventControllerKey::new();
     {
@@ -183,21 +211,24 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
 fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
     let (w, h) = (w as f64, h as f64);
 
-    // Two full-height vertical lines with drag-handle arrows near the bottom.
+    // Tracker illustration: a bar near the bottom centre.
+    let bar_w = w * 0.55;
+    let bar_h = 26.0;
+    let bx = (w - bar_w) / 2.0;
+    let by = h - bar_h - 56.0;
+
+    // Vertical lines run from just above the tracker bar down to the screen's
+    // bottom edge — they mark the tracker's left/right ends.
+    let line_top = by - 22.0;
     cr.set_source_rgb(0.88, 0.92, 0.96);
     cr.set_line_width(2.0);
     for x_norm in [lines.0, lines.1] {
         let x = x_norm * w;
-        cr.move_to(x, 0.0);
+        cr.move_to(x, line_top);
         cr.line_to(x, h);
         let _ = cr.stroke();
     }
 
-    // Tracker illustration: a rounded bar near the bottom centre.
-    let bar_w = w * 0.55;
-    let bar_h = 26.0;
-    let bx = (w - bar_w) / 2.0;
-    let by = h - bar_h - 48.0;
     cr.set_source_rgb(0.30, 0.85, 0.85);
     cr.set_line_width(2.0);
     cr.rectangle(bx, by, bar_w, bar_h);
