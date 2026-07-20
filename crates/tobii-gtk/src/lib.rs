@@ -27,8 +27,10 @@ window { background-color: #15181c; color: #e6e8ea; }
 .app-title { font-size: 22px; font-weight: bold; }
 .status { font-size: 13px; color: #9aa4ad; }
 .guidance { font-size: 14px; }
+.section { margin-top: 10px; color: #c5ccd2; }
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
-         border: none; border-radius: 8px; padding: 8px 14px; }
+         border: none; border-radius: 8px; padding: 10px 18px; min-height: 24px; }
+button label { padding: 2px 0; }
 button:hover { background-color: #26b6b8; }
 button:disabled { background-color: #2a2f36; color: #6b7178; }
 ";
@@ -112,10 +114,15 @@ fn build_ui(app: &Application) {
     guidance.add_css_class("guidance");
     guidance.set_halign(Align::Start);
 
+    let section = Label::new(Some("Eye position:"));
+    section.add_css_class("section");
+    section.set_halign(Align::Start);
+    section.set_margin_top(6);
+
     root.append(&title);
     root.append(&status);
     root.append(&launchers);
-    root.append(&Label::new(Some("Eye position:")));
+    root.append(&section);
     root.append(&area);
     root.append(&guidance);
 
