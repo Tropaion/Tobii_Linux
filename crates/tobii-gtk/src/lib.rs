@@ -68,6 +68,23 @@ fn no_eyes_view() -> EyeView {
     }
 }
 
+/// Aspect ratio (w/h) of the primary monitor, so the eye-position box mirrors
+/// the screen's shape (e.g. 21:9). Falls back to 16:9.
+fn screen_aspect() -> f64 {
+    gtk::gdk::Display::default()
+        .and_then(|d| d.monitors().item(0))
+        .and_then(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
+        .map(|m| {
+            let g = m.geometry();
+            if g.height() > 0 {
+                g.width() as f64 / g.height() as f64
+            } else {
+                16.0 / 9.0
+            }
+        })
+        .unwrap_or(16.0 / 9.0)
+}
+
 fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
     // Latest view shared with the DrawingArea's draw callback (UI thread only).
@@ -86,9 +103,12 @@ fn build_ui(app: &Application) {
     eye_title.add_css_class("section-title");
     eye_title.set_halign(Align::Start);
 
+    // Eye-position box mirrors the monitor's aspect (e.g. 21:9).
     let area = DrawingArea::new();
-    area.set_content_width(360);
-    area.set_content_height(240);
+    let box_w = 380;
+    let box_h = ((box_w as f64) / screen_aspect()).round().max(80.0) as i32;
+    area.set_content_width(box_w);
+    area.set_content_height(box_h);
     {
         let view = view.clone();
         area.set_draw_func(move |_, cr, w, h| widget::draw_eye_view(cr, w, h, &view.borrow()));
@@ -181,7 +201,6 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("Tobii Configuration")
         .default_width(940)
-        .default_height(780)
         .build();
     window.set_child(Some(&root));
 
