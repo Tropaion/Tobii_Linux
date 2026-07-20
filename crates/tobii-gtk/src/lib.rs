@@ -23,6 +23,7 @@ use gtk::{
 };
 
 use crate::eyeview::{EyeView, Guidance};
+use tobii_protocol::EnabledEye;
 
 const APP_ID: &str = "com.tobiilinux.Configuration";
 
@@ -101,6 +102,10 @@ fn build_ui(app: &Application) {
     let view = Rc::new(RefCell::new(no_eyes_view()));
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    // "Select eyes to detect": guard against echoing our own seeding as a user
+    // change, and seed the radios from the device only once (on first connect).
+    let eye_seeding = Rc::new(Cell::new(false));
+    let eye_seeded = Rc::new(Cell::new(false));
 
     // --- Header ---
     let title = Label::new(Some("Tobii Configuration"));
@@ -203,7 +208,6 @@ fn build_ui(app: &Application) {
         if let Some(g) = group {
             cb.set_group(Some(g));
         }
-        cb.set_sensitive(false); // enabled once Spike S4 maps the enabled_eye op
         cb.set_valign(Align::Center);
         let lbl = Label::new(Some(text));
         lbl.set_valign(Align::Center);
@@ -216,11 +220,26 @@ fn build_ui(app: &Application) {
     };
     let (r_both, box_both) = radio("Both eyes", None);
     r_both.set_active(true);
-    let (_, box_left) = radio("Left eye only", Some(&r_both));
-    let (_, box_right) = radio("Right eye only", Some(&r_both));
+    let (r_left, box_left) = radio("Left eye only", Some(&r_both));
+    let (r_right, box_right) = radio("Right eye only", Some(&r_both));
     eyes_ctl.append(&box_both);
     eyes_ctl.append(&box_left);
     eyes_ctl.append(&box_right);
+
+    // Selecting a radio pushes the choice to the device (unless we're seeding).
+    for (cb, eye) in [
+        (&r_both, EnabledEye::Both),
+        (&r_left, EnabledEye::Left),
+        (&r_right, EnabledEye::Right),
+    ] {
+        let cmd_tx = cmd_tx.clone();
+        let seeding = eye_seeding.clone();
+        cb.connect_toggled(move |c| {
+            if c.is_active() && !seeding.get() {
+                let _ = cmd_tx.send(device::DeviceCommand::SetEnabledEye(eye));
+            }
+        });
+    }
 
     let b_cal = Button::with_label("Improve calibration");
     b_cal.set_sensitive(false);
@@ -284,6 +303,19 @@ fn build_ui(app: &Application) {
         connected.set(conn);
         status_label.set_text(if conn { "Connected" } else { "Disconnected" });
         status_dot.queue_draw();
+        // Seed the eye-selection radios once from the device's current value.
+        if conn && !eye_seeded.get() {
+            if let Some(e) = snap.enabled_eye {
+                eye_seeding.set(true);
+                match e {
+                    EnabledEye::Both => r_both.set_active(true),
+                    EnabledEye::Left => r_left.set_active(true),
+                    EnabledEye::Right => r_right.set_active(true),
+                }
+                eye_seeding.set(false);
+                eye_seeded.set(true);
+            }
+        }
         let ev = widget::eye_view_for(&snap);
         guidance.set_text(&widget::guidance_message(&ev));
         *tick_view.borrow_mut() = ev;
