@@ -1,8 +1,8 @@
 //! Fullscreen display-setup flow (the original's `-S`): drag two vertical lines
 //! to the physical ends of the eye tracker; the screen geometry (width + offset)
-//! is derived from their positions (`align`). An "Advanced" toggle reveals the
-//! editable numeric form (two-way synced with the drag). Apply persists +
-//! pushes to the device; Cancel/Esc returns to the hub without saving.
+//! is derived from their positions (`align`). A "Show advanced" toggle reveals
+//! the editable numeric form (compact −[value]+ spinners, two-way synced with
+//! the drag). Apply persists + pushes to the device; Cancel/Esc returns.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -11,8 +11,8 @@ use std::sync::mpsc::Sender;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    cairo, Align, Application, Button, DrawingArea, GestureDrag, Grid, Label, Orientation, Overlay,
-    SpinButton, ToggleButton,
+    cairo, Align, Application, Button, DrawingArea, Entry, GestureDrag, Grid, Label, Orientation,
+    Overlay, ToggleButton,
 };
 
 use crate::align;
@@ -36,22 +36,111 @@ fn default_setup() -> DisplaySetup {
     }
 }
 
-/// Wire a spin button so edits write `set(setup, value)` and refresh the view,
-/// unless we are the ones programmatically setting it (`syncing`).
-fn wire_spin(
-    sb: &SpinButton,
-    setup: Rc<RefCell<DisplaySetup>>,
-    syncing: Rc<Cell<bool>>,
-    refresh_view: Rc<dyn Fn()>,
-    set: impl Fn(&mut DisplaySetup, f64) + 'static,
-) {
-    sb.connect_value_changed(move |sb| {
-        if syncing.get() {
-            return;
-        }
-        set(&mut setup.borrow_mut(), sb.value());
-        refresh_view();
-    });
+/// Primary monitor height (px), to place the header a bit above the middle.
+fn screen_height() -> i32 {
+    gtk::gdk::Display::default()
+        .and_then(|d| d.monitors().item(0))
+        .and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok())
+        .map(|m| m.geometry().height())
+        .filter(|h| *h > 0)
+        .unwrap_or(1080)
+}
+
+fn fmt_val(v: f64) -> String {
+    format!("{v:.0}")
+}
+
+type Getter = Rc<dyn Fn(&DisplaySetup) -> f64>;
+type Setter = Rc<dyn Fn(&mut DisplaySetup, f64)>;
+
+/// One editable field: its entry + a getter for refreshing it from the setup.
+struct Field {
+    entry: Entry,
+    get: Getter,
+}
+
+/// Build + wire one compact `−[entry]+` spinner row into the grid.
+#[allow(clippy::too_many_arguments)]
+fn add_spinner(
+    grid: &Grid,
+    row: i32,
+    label: &str,
+    step: f64,
+    min: f64,
+    max: f64,
+    setup: &Rc<RefCell<DisplaySetup>>,
+    syncing: &Rc<Cell<bool>>,
+    refresh_view: &Rc<dyn Fn()>,
+    get: Getter,
+    set: Setter,
+) -> Field {
+    let lbl = Label::new(Some(label));
+    lbl.set_halign(Align::Start);
+    lbl.add_css_class("section-desc");
+
+    let minus = Button::with_label("−");
+    minus.add_css_class("spin-btn");
+    let entry = Entry::new();
+    entry.set_width_chars(5);
+    entry.set_max_width_chars(5);
+    entry.add_css_class("spin-entry");
+    let plus = Button::with_label("+");
+    plus.add_css_class("spin-btn");
+
+    let rowbox = gtk::Box::new(Orientation::Horizontal, 4);
+    rowbox.append(&minus);
+    rowbox.append(&entry);
+    rowbox.append(&plus);
+    grid.attach(&lbl, 0, row, 1, 1);
+    grid.attach(&rowbox, 1, row, 1, 1);
+
+    // Commit a value: clamp, store, reflect in the entry (guarded), refresh view.
+    let commit: Rc<dyn Fn(f64)> = {
+        let setup = setup.clone();
+        let syncing = syncing.clone();
+        let refresh_view = refresh_view.clone();
+        let entry = entry.clone();
+        let set = set.clone();
+        Rc::new(move |v: f64| {
+            let v = v.clamp(min, max);
+            set(&mut setup.borrow_mut(), v);
+            syncing.set(true);
+            entry.set_text(&fmt_val(v));
+            syncing.set(false);
+            refresh_view();
+        })
+    };
+
+    // Typing: parse + store + refresh (don't rewrite the entry mid-typing).
+    {
+        let setup = setup.clone();
+        let syncing = syncing.clone();
+        let refresh_view = refresh_view.clone();
+        let set = set.clone();
+        entry.connect_changed(move |e| {
+            if syncing.get() {
+                return;
+            }
+            if let Ok(v) = e.text().trim().parse::<f64>() {
+                set(&mut setup.borrow_mut(), v.clamp(min, max));
+                refresh_view();
+            }
+        });
+    }
+    {
+        let get = get.clone();
+        let setup = setup.clone();
+        let commit = commit.clone();
+        minus.connect_clicked(move |_| commit(get(&setup.borrow()) - step));
+    }
+    {
+        let get = get.clone();
+        let setup = setup.clone();
+        let commit = commit.clone();
+        plus.connect_clicked(move |_| commit(get(&setup.borrow()) + step));
+    }
+
+    Field { entry, get }
 }
 
 /// Open the fullscreen display-setup flow window.
@@ -79,7 +168,8 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
         });
     }
 
-    // Header widgets (overlaid, centred, nudged a bit above the middle).
+    // Header (instruction + readout + buttons) — anchored at a fixed spot a bit
+    // above the middle, so revealing the advanced box below doesn't move it.
     let instr = Label::new(Some(
         "Drag the two lines to the marks on the top corners of your eye tracker.",
     ));
@@ -101,55 +191,9 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     buttons.append(&advanced);
     buttons.append(&cancel);
 
-    // Advanced numeric form (hidden until the toggle is on).
-    let sb_w = SpinButton::with_range(1.0, 5000.0, 1.0);
-    let sb_h = SpinButton::with_range(1.0, 5000.0, 1.0);
-    let sb_tilt = SpinButton::with_range(-45.0, 45.0, 1.0);
-    let sb_ox = SpinButton::with_range(-2000.0, 2000.0, 1.0);
-    let sb_oy = SpinButton::with_range(-2000.0, 2000.0, 1.0);
-    let sb_oz = SpinButton::with_range(-2000.0, 2000.0, 1.0);
     let corners = Label::new(Some(""));
     corners.add_css_class("section-desc");
 
-    let grid = Grid::new();
-    grid.set_row_spacing(6);
-    grid.set_column_spacing(10);
-    grid.set_halign(Align::Center);
-    let rows: [(&str, &SpinButton); 6] = [
-        ("Width (mm)", &sb_w),
-        ("Height (mm)", &sb_h),
-        ("Tilt back (deg)", &sb_tilt),
-        ("Bottom edge above tracker (mm)", &sb_oy),
-        ("Depth from tracker (mm)", &sb_oz),
-        ("Horizontal offset (mm)", &sb_ox),
-    ];
-    for (i, (label, sb)) in rows.iter().enumerate() {
-        let l = Label::new(Some(label));
-        l.set_halign(Align::Start);
-        grid.attach(&l, 0, i as i32, 1, 1);
-        grid.attach(*sb, 1, i as i32, 1, 1);
-    }
-    let adv_panel = gtk::Box::new(Orientation::Vertical, 10);
-    adv_panel.set_halign(Align::Center);
-    adv_panel.append(&grid);
-    adv_panel.append(&corners);
-    adv_panel.set_visible(false);
-
-    let header = gtk::Box::new(Orientation::Vertical, 16);
-    header.set_halign(Align::Center);
-    header.set_valign(Align::Center);
-    header.set_margin_bottom(140); // bias the block a bit above the middle
-    header.append(&instr);
-    header.append(&readout);
-    header.append(&buttons);
-    header.append(&adv_panel);
-
-    let overlay = Overlay::new();
-    overlay.set_child(Some(&area));
-    overlay.add_overlay(&header);
-    win.set_child(Some(&overlay));
-
-    // --- shared refresh closures ---
     let syncing = Rc::new(Cell::new(false));
 
     let refresh_view: Rc<dyn Fn()> = {
@@ -172,78 +216,135 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
         })
     };
 
+    // Advanced numeric form: compact −[entry]+ spinners.
+    let grid = Grid::new();
+    grid.set_row_spacing(6);
+    grid.set_column_spacing(12);
+    grid.set_halign(Align::Center);
+    let fields = Rc::new(vec![
+        add_spinner(
+            &grid,
+            0,
+            "Width (mm)",
+            5.0,
+            1.0,
+            5000.0,
+            &setup,
+            &syncing,
+            &refresh_view,
+            Rc::new(|s| s.width_mm),
+            Rc::new(|s, v| s.width_mm = v),
+        ),
+        add_spinner(
+            &grid,
+            1,
+            "Height (mm)",
+            5.0,
+            1.0,
+            5000.0,
+            &setup,
+            &syncing,
+            &refresh_view,
+            Rc::new(|s| s.height_mm),
+            Rc::new(|s, v| s.height_mm = v),
+        ),
+        add_spinner(
+            &grid,
+            2,
+            "Tilt back (deg)",
+            1.0,
+            -45.0,
+            45.0,
+            &setup,
+            &syncing,
+            &refresh_view,
+            Rc::new(|s| s.tilt_deg),
+            Rc::new(|s, v| s.tilt_deg = v),
+        ),
+        add_spinner(
+            &grid,
+            3,
+            "Bottom edge above tracker (mm)",
+            5.0,
+            -2000.0,
+            2000.0,
+            &setup,
+            &syncing,
+            &refresh_view,
+            Rc::new(|s| s.offset_y_mm),
+            Rc::new(|s, v| s.offset_y_mm = v),
+        ),
+        add_spinner(
+            &grid,
+            4,
+            "Depth from tracker (mm)",
+            5.0,
+            -2000.0,
+            2000.0,
+            &setup,
+            &syncing,
+            &refresh_view,
+            Rc::new(|s| s.offset_z_mm),
+            Rc::new(|s, v| s.offset_z_mm = v),
+        ),
+        add_spinner(
+            &grid,
+            5,
+            "Horizontal offset (mm)",
+            5.0,
+            -2000.0,
+            2000.0,
+            &setup,
+            &syncing,
+            &refresh_view,
+            Rc::new(|s| s.offset_x_mm),
+            Rc::new(|s, v| s.offset_x_mm = v),
+        ),
+    ]);
+
+    let adv_panel = gtk::Box::new(Orientation::Vertical, 10);
+    adv_panel.set_halign(Align::Center);
+    adv_panel.set_margin_top(6);
+    adv_panel.append(&grid);
+    adv_panel.append(&corners);
+    adv_panel.set_visible(false);
+
     let refresh_form: Rc<dyn Fn()> = {
         let setup = setup.clone();
         let syncing = syncing.clone();
-        let (sb_w, sb_h, sb_tilt, sb_ox, sb_oy, sb_oz) = (
-            sb_w.clone(),
-            sb_h.clone(),
-            sb_tilt.clone(),
-            sb_ox.clone(),
-            sb_oy.clone(),
-            sb_oz.clone(),
-        );
+        let fields = fields.clone();
         Rc::new(move || {
             syncing.set(true);
             let s = *setup.borrow();
-            sb_w.set_value(s.width_mm);
-            sb_h.set_value(s.height_mm);
-            sb_tilt.set_value(s.tilt_deg);
-            sb_ox.set_value(s.offset_x_mm);
-            sb_oy.set_value(s.offset_y_mm);
-            sb_oz.set_value(s.offset_z_mm);
+            for f in fields.iter() {
+                f.entry.set_text(&fmt_val((f.get)(&s)));
+            }
             syncing.set(false);
         })
     };
 
-    // Advanced form edits -> setup.
-    wire_spin(
-        &sb_w,
-        setup.clone(),
-        syncing.clone(),
-        refresh_view.clone(),
-        |s, v| s.width_mm = v,
-    );
-    wire_spin(
-        &sb_h,
-        setup.clone(),
-        syncing.clone(),
-        refresh_view.clone(),
-        |s, v| s.height_mm = v,
-    );
-    wire_spin(
-        &sb_tilt,
-        setup.clone(),
-        syncing.clone(),
-        refresh_view.clone(),
-        |s, v| s.tilt_deg = v,
-    );
-    wire_spin(
-        &sb_ox,
-        setup.clone(),
-        syncing.clone(),
-        refresh_view.clone(),
-        |s, v| s.offset_x_mm = v,
-    );
-    wire_spin(
-        &sb_oy,
-        setup.clone(),
-        syncing.clone(),
-        refresh_view.clone(),
-        |s, v| s.offset_y_mm = v,
-    );
-    wire_spin(
-        &sb_oz,
-        setup.clone(),
-        syncing.clone(),
-        refresh_view.clone(),
-        |s, v| s.offset_z_mm = v,
-    );
+    let header = gtk::Box::new(Orientation::Vertical, 16);
+    header.set_halign(Align::Center);
+    header.set_valign(Align::Start);
+    header.set_margin_top((screen_height() as f64 * 0.34) as i32);
+    header.append(&instr);
+    header.append(&readout);
+    header.append(&buttons);
+    header.append(&adv_panel);
 
-    // Advanced toggle shows/hides the form.
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&area));
+    overlay.add_overlay(&header);
+    win.set_child(Some(&overlay));
+
+    // Advanced toggle: show/hide the form + reflect its state in the label.
     {
         let adv_panel = adv_panel.clone();
-        advanced.connect_toggled(move |t| adv_panel.set_visible(t.is_active()));
+        advanced.connect_toggled(move |t| {
+            let on = t.is_active();
+            adv_panel.set_visible(on);
+            t.set_label(if on { "Hide advanced" } else { "Show advanced" });
+        });
     }
 
     // Drag the nearest line -> update width/offset in the setup.
