@@ -38,14 +38,17 @@ button label { padding: 2px 0; }
 button:hover { background-color: #26b6b8; }
 button:disabled { background-color: #2a2f36; color: #6b7178; }
 button:checked { background-color: #14696b; }
-button.spin-btn { min-width: 22px; min-height: 22px; padding: 2px 8px; }
-.spin-entry { min-height: 22px; padding: 2px 6px; }
-checkbutton { min-height: 26px; }
-checkbutton label { padding: 3px 0; }
+button.spin-btn { min-width: 26px; padding: 2px 10px; }
+.spin-entry { padding: 2px 6px; }
 ";
 
 /// Run the GTK application.
 pub fn run() -> glib::ExitCode {
+    // GTK4's Vulkan renderer makes Mesa/radv print a noisy "not a conformant
+    // Vulkan implementation" warning; default to the GL renderer (overridable).
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        std::env::set_var("GSK_RENDERER", "gl");
+    }
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| load_css());
     app.connect_activate(build_ui);
@@ -173,18 +176,30 @@ fn build_ui(app: &Application) {
     sw_preview.set_valign(Align::Center);
     sw_preview.set_tooltip_text(Some("Coming soon"));
 
-    let eyes_ctl = gtk::Box::new(Orientation::Horizontal, 14);
-    let r_both = CheckButton::with_label("Both eyes");
+    // Radio indicators with SEPARATE labels: a CheckButton's built-in label
+    // clips its text on this theme, a standalone GtkLabel does not.
+    let eyes_ctl = gtk::Box::new(Orientation::Horizontal, 16);
+    let radio = |text: &str, group: Option<&CheckButton>| {
+        let cb = CheckButton::new();
+        if let Some(g) = group {
+            cb.set_group(Some(g));
+        }
+        cb.set_sensitive(false); // enabled once Spike S4 maps the enabled_eye op
+        cb.set_valign(Align::Center);
+        let lbl = Label::new(Some(text));
+        lbl.set_valign(Align::Center);
+        let row = gtk::Box::new(Orientation::Horizontal, 5);
+        row.append(&cb);
+        row.append(&lbl);
+        (cb, row)
+    };
+    let (r_both, box_both) = radio("Both eyes", None);
     r_both.set_active(true);
-    let r_left = CheckButton::with_label("Left eye only");
-    r_left.set_group(Some(&r_both));
-    let r_right = CheckButton::with_label("Right eye only");
-    r_right.set_group(Some(&r_both));
-    for r in [&r_both, &r_left, &r_right] {
-        r.set_sensitive(false); // enabled once Spike S4 maps the enabled_eye op
-        r.set_valign(Align::Center);
-        eyes_ctl.append(r);
-    }
+    let (_, box_left) = radio("Left eye only", Some(&r_both));
+    let (_, box_right) = radio("Right eye only", Some(&r_both));
+    eyes_ctl.append(&box_both);
+    eyes_ctl.append(&box_left);
+    eyes_ctl.append(&box_right);
 
     let b_cal = Button::with_label("Improve calibration");
     b_cal.set_sensitive(false);
