@@ -188,6 +188,8 @@ fn build_ui(app: &Application) {
         cb.set_valign(Align::Center);
         let lbl = Label::new(Some(text));
         lbl.set_valign(Align::Center);
+        lbl.set_margin_top(2);
+        lbl.set_margin_bottom(2);
         let row = gtk::Box::new(Orientation::Horizontal, 5);
         row.append(&cb);
         row.append(&lbl);
