@@ -18,7 +18,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
     Align, Application, ApplicationWindow, Button, CheckButton, DrawingArea, Label, Orientation,
-    PolicyType, ScrolledWindow, Switch,
+    Switch,
 };
 
 use crate::eyeview::{EyeView, Guidance};
@@ -114,12 +114,9 @@ fn build_ui(app: &Application) {
         b_setup.connect_clicked(move |_| setup_flow::launch(&app, cmd_tx.clone()));
     }
 
-    let b_eyes = Button::with_label("Position eyes");
-    b_eyes.set_sensitive(false);
-    b_eyes.set_tooltip_text(Some("Coming soon"));
-
     let sw_preview = Switch::new();
     sw_preview.set_sensitive(false);
+    sw_preview.set_valign(Align::Center);
     sw_preview.set_tooltip_text(Some("Coming soon"));
 
     let eyes_ctl = gtk::Box::new(Orientation::Horizontal, 14);
@@ -140,15 +137,12 @@ fn build_ui(app: &Application) {
 
     let right = gtk::Box::new(Orientation::Vertical, 18);
     right.set_hexpand(true);
+    right.set_valign(Align::Start);
     right.append(&section(
-        "Change screen",
-        "If you move the sensor to a different monitor, you'll need to set up the new display.",
-        &b_setup,
-    ));
-    right.append(&section(
-        "Position your eyes",
-        "Check that your eyes are centred in front of the tracker at a comfortable distance.",
-        &b_eyes,
+        "Improve my calibration",
+        "If the light conditions change or if you experience less tracker precision, you might \
+         benefit from improving your calibration.",
+        &b_cal,
     ));
     right.append(&section(
         "Preview my gaze",
@@ -162,24 +156,17 @@ fn build_ui(app: &Application) {
         &eyes_ctl,
     ));
     right.append(&section(
-        "Improve my calibration",
-        "If the light conditions change or if you experience less tracker precision, you might \
-         benefit from improving your calibration.",
-        &b_cal,
+        "Change screen",
+        "If you move the sensor to a different monitor, you'll need to set up the new display.",
+        &b_setup,
     ));
-
-    let scroll = ScrolledWindow::new();
-    scroll.set_hexpand(true);
-    scroll.set_vexpand(true);
-    scroll.set_hscrollbar_policy(PolicyType::Never);
-    scroll.set_child(Some(&right));
 
     // --- Two-column split ---
     let split = gtk::Box::new(Orientation::Horizontal, 30);
     split.set_hexpand(true);
     split.set_vexpand(true);
     split.append(&left);
-    split.append(&scroll);
+    split.append(&right);
 
     let root = gtk::Box::new(Orientation::Vertical, 12);
     root.set_margin_top(20);
@@ -194,7 +181,7 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("Tobii Configuration")
         .default_width(940)
-        .default_height(600)
+        .default_height(780)
         .build();
     window.set_child(Some(&root));
 
