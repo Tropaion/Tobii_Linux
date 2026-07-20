@@ -2,6 +2,7 @@
 //! snapshot for the UI, and applies `DeviceCommand`s. `device_tick` (one
 //! iteration) is generic over `Transport` so it is unit-tested without hardware.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,9 +18,27 @@ pub enum ConnStatus {
     Error(String),
 }
 
+/// Hands out process-unique calibration session tokens. The UI mints one per
+/// `CalBegin` and only trusts a `CalPhase` that carries it back (see
+/// [`CalPhase::token`]); starting at 1 keeps `CalPhase::default()`'s 0 a token
+/// that can never match a real session.
+static NEXT_CAL_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Mint a fresh calibration session token.
+pub fn next_cal_token() -> u64 {
+    NEXT_CAL_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Progress of an in-flight calibration, published to the UI.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CalPhase {
+    /// The session token this phase belongs to, echoed from `CalBegin`. Every
+    /// other field is meaningless to the UI until this matches the token it
+    /// minted: `active`/`collected`/`last_error`/`finished` all survive from
+    /// the previous session until the device thread dequeues a command, so
+    /// level-testing them races the queue. 0 = no session (see
+    /// [`next_cal_token`]).
+    pub token: u64,
     /// True between `CalBegin` and `CalFinish`/`CalAbort`.
     pub active: bool,
     /// Points successfully collected so far this session.
@@ -31,9 +50,10 @@ pub struct CalPhase {
 }
 
 impl CalPhase {
-    /// A fresh in-progress phase (0 points collected).
-    pub fn begin() -> Self {
+    /// A fresh in-progress phase (0 points collected) tagged with `token`.
+    pub fn begin(token: u64) -> Self {
         CalPhase {
+            token,
             active: true,
             collected: 0,
             last_error: None,
@@ -63,14 +83,23 @@ pub struct DeviceState {
     pub latest_gaze: Option<GazeSample>,
     pub enabled_eye: Option<EnabledEye>,
     pub calibration: CalPhase,
+    /// Whether the *device* is believed to be inside an open calibration realm:
+    /// set once `start_calibration` returns `Ok`, cleared only once a stop has
+    /// actually been issued. Deliberately separate from `calibration.active`,
+    /// which `on_finish` also clears on the start/clear failure path — where the
+    /// realm may well still be open and still needs an explicit stop.
+    pub cal_session_open: bool,
 }
 
 pub enum DeviceCommand {
     SetDisplayArea(DisplayCorners),
     SetEnabledEye(EnabledEye),
     /// Begin calibration: set the eye (experiment), then start + clear.
+    /// `token` identifies this session; it is echoed into `CalPhase::token` so
+    /// the UI can tell a fresh phase from the previous session's leftovers.
     CalBegin {
         eye: EnabledEye,
+        token: u64,
     },
     /// Sample one stimulus point (both eyes).
     CalCollect {
@@ -102,13 +131,20 @@ pub fn device_tick<T: Transport>(
                 let _ = tobii_config::save_enabled_eye(e);
                 state.lock().unwrap().enabled_eye = Some(e);
             }
-            DeviceCommand::CalBegin { eye } => {
-                state.lock().unwrap().calibration = CalPhase::begin();
+            DeviceCommand::CalBegin { eye, token } => {
+                state.lock().unwrap().calibration = CalPhase::begin(token);
                 let _ = conn.set_enabled_eye(eye); // best-effort select-eyes experiment
-                let r = conn
-                    .start_calibration()
-                    .and_then(|()| conn.clear_calibration())
-                    .map_err(|e| e.to_string());
+
+                // The realm is open the moment `start` acks, even if `clear`
+                // then fails — record that before clearing so the abort path
+                // below still knows it has to stop the session.
+                let r = match conn.start_calibration() {
+                    Ok(()) => {
+                        state.lock().unwrap().cal_session_open = true;
+                        conn.clear_calibration().map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
                 if let Err(e) = r {
                     state.lock().unwrap().calibration.on_finish(Err(e));
                 }
@@ -121,14 +157,21 @@ pub fn device_tick<T: Transport>(
             }
             DeviceCommand::CalFinish => {
                 let r = finish_calibration(conn);
-                state.lock().unwrap().calibration.on_finish(r);
+                // `finish_calibration` always issues a stop, success or not.
+                let mut s = state.lock().unwrap();
+                s.cal_session_open = false;
+                s.calibration.on_finish(r);
             }
             DeviceCommand::CalAbort => {
-                // Only stop a session that is actually open: after a successful
+                // Only stop a realm that is actually open: after a successful
                 // finish (which already stopped) a second stop may go
                 // unanswered and would burn a whole request deadline here.
-                if state.lock().unwrap().calibration.active {
+                // `cal_session_open` — not `calibration.active` — is the honest
+                // predicate: `active` is also false after CalBegin's start
+                // succeeded but clear failed, exactly when a stop is required.
+                if state.lock().unwrap().cal_session_open {
                     let _ = conn.stop_calibration();
+                    state.lock().unwrap().cal_session_open = false;
                 }
                 state.lock().unwrap().calibration = CalPhase::default();
             }
@@ -176,6 +219,9 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                     let mut s = thread_state.lock().unwrap();
                     s.enabled_eye = cur_eye;
                     s.status = ConnStatus::Connected;
+                    // A brand-new connection is never inside a calibration
+                    // realm, whatever the previous one was doing.
+                    s.cal_session_open = false;
                 }
                 let mut idle_ticks = 0u32;
                 loop {
@@ -325,16 +371,28 @@ mod tests {
 
     #[test]
     fn cal_phase_begin_is_active_and_empty() {
-        let p = CalPhase::begin();
+        let p = CalPhase::begin(7);
         assert!(p.active);
+        assert_eq!(p.token, 7);
         assert_eq!(p.collected, 0);
         assert!(p.last_error.is_none());
         assert!(p.finished.is_none());
     }
 
     #[test]
+    fn cal_tokens_are_unique_and_never_zero() {
+        let a = next_cal_token();
+        let b = next_cal_token();
+        assert_ne!(a, b);
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        // 0 is reserved for "no session", so a default phase matches nothing.
+        assert_eq!(CalPhase::default().token, 0);
+    }
+
+    #[test]
     fn cal_phase_collect_increments_on_ok_and_records_error() {
-        let mut p = CalPhase::begin();
+        let mut p = CalPhase::begin(1);
         p.on_collect(Ok(()));
         p.on_collect(Ok(()));
         assert_eq!(p.collected, 2);
@@ -348,7 +406,7 @@ mod tests {
 
     #[test]
     fn cal_phase_finish_sets_outcome_and_clears_active() {
-        let mut p = CalPhase::begin();
+        let mut p = CalPhase::begin(1);
         p.on_finish(Ok(()));
         assert!(!p.active);
         assert_eq!(p.finished, Some(Ok(())));
@@ -363,6 +421,85 @@ mod tests {
             .unwrap();
         device_tick(&mut conn, &state, &rx);
         assert_eq!(state.lock().unwrap().calibration.collected, 1);
+    }
+
+    /// Was a request frame for `op` ever sent? (op lives at bytes 20..24.)
+    fn sent_op(conn: &Connection<MockTransport>, op: u32) -> bool {
+        conn.transport()
+            .sent
+            .iter()
+            .any(|f| f.len() >= 24 && f[20..24] == op.to_be_bytes())
+    }
+
+    #[test]
+    fn cal_begin_echoes_the_token_and_marks_the_session_open() {
+        // Post-handshake seqs run 5, 6, 7: set_enabled_eye, start, clear.
+        let mut conn = connected(vec![
+            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x424, &[]),
+        ]);
+        let state = Mutex::new(DeviceState::default());
+        let (tx, rx) = channel::<DeviceCommand>();
+        tx.send(DeviceCommand::CalBegin {
+            eye: EnabledEye::Both,
+            token: 99,
+        })
+        .unwrap();
+        device_tick(&mut conn, &state, &rx);
+        let s = state.lock().unwrap();
+        assert_eq!(s.calibration.token, 99, "UI's token is echoed back");
+        assert!(s.calibration.active);
+        assert!(s.cal_session_open);
+    }
+
+    #[test]
+    fn cal_begin_marks_session_open_even_when_clear_fails() {
+        // start (seq 6) acks, clear (seq 7) gets no response: the realm IS open
+        // and a later abort must still stop it, even though `active` is false.
+        let mut conn = connected(vec![
+            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
+        ]);
+        conn.set_request_timeout(Duration::from_millis(10));
+        let state = Mutex::new(DeviceState::default());
+        let (tx, rx) = channel::<DeviceCommand>();
+        tx.send(DeviceCommand::CalBegin {
+            eye: EnabledEye::Both,
+            token: 5,
+        })
+        .unwrap();
+        device_tick(&mut conn, &state, &rx);
+        {
+            let s = state.lock().unwrap();
+            assert!(!s.calibration.active, "on_finish cleared active");
+            assert!(matches!(s.calibration.finished, Some(Err(_))));
+            assert!(s.cal_session_open, "realm is still open on the device");
+        }
+        // ...and the abort therefore actually stops it (the pre-fix `active`
+        // guard skipped exactly this case).
+        tx.send(DeviceCommand::CalAbort).unwrap();
+        device_tick(&mut conn, &state, &rx);
+        assert!(sent_op(&conn, 0x3fc), "CAL_STOP was sent");
+        assert!(!state.lock().unwrap().cal_session_open);
+    }
+
+    #[test]
+    fn cal_abort_skips_the_stop_when_no_session_is_open() {
+        let mut conn = connected(vec![]);
+        let state = Mutex::new(DeviceState::default());
+        let (tx, rx) = channel::<DeviceCommand>();
+        // A finished session: already stopped, so a second stop would just burn
+        // a request deadline.
+        {
+            let mut s = state.lock().unwrap();
+            s.calibration = CalPhase::begin(3);
+            s.cal_session_open = false;
+        }
+        tx.send(DeviceCommand::CalAbort).unwrap();
+        device_tick(&mut conn, &state, &rx);
+        assert!(!sent_op(&conn, 0x3fc), "no redundant CAL_STOP");
+        assert_eq!(state.lock().unwrap().calibration, CalPhase::default());
     }
 
     #[test]
