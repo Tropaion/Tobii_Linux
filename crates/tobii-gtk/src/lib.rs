@@ -243,8 +243,12 @@ fn build_ui(app: &Application) {
     }
 
     let b_cal = Button::with_label("Improve calibration");
-    b_cal.set_sensitive(false);
-    b_cal.set_tooltip_text(Some("Calibration — coming in B3"));
+    {
+        let app = app.clone();
+        let state = state.clone();
+        let cmd_tx = cmd_tx.clone();
+        b_cal.connect_clicked(move |_| calibrate_flow::launch(&app, state.clone(), cmd_tx.clone()));
+    }
 
     let right = gtk::Box::new(Orientation::Vertical, 18);
     right.set_hexpand(true);
