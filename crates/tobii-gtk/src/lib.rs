@@ -5,6 +5,7 @@
 //! in later phases of the GTK4 redesign.
 
 pub mod align;
+pub mod calibrate_flow;
 pub mod device;
 pub mod eyeview;
 pub mod overlay;
