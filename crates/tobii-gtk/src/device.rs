@@ -124,7 +124,12 @@ pub fn device_tick<T: Transport>(
                 state.lock().unwrap().calibration.on_finish(r);
             }
             DeviceCommand::CalAbort => {
-                let _ = conn.stop_calibration();
+                // Only stop a session that is actually open: after a successful
+                // finish (which already stopped) a second stop may go
+                // unanswered and would burn a whole request deadline here.
+                if state.lock().unwrap().calibration.active {
+                    let _ = conn.stop_calibration();
+                }
                 state.lock().unwrap().calibration = CalPhase::default();
             }
         }
@@ -209,6 +214,11 @@ fn finish_calibration<T: Transport>(conn: &mut Connection<T>) -> Result<(), Stri
     let _ = conn.stop_calibration();
     compute?;
     let blob = conn.retrieve_calibration().map_err(|e| e.to_string())?;
+    if blob.0.is_empty() {
+        // Persisting an empty blob would re-apply nothing on every connect and
+        // silently mask the fact that the calibration was never stored.
+        return Err("device returned an empty calibration".into());
+    }
     tobii_config::save_calibration(&blob.0).map_err(|e| e.to_string())?;
     Ok(())
 }
