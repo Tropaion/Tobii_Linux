@@ -131,13 +131,19 @@ fn add_spinner(
         let get = get.clone();
         let setup = setup.clone();
         let commit = commit.clone();
-        minus.connect_clicked(move |_| commit(get(&setup.borrow()) - step));
+        minus.connect_clicked(move |_| {
+            let v = get(&setup.borrow()) - step; // borrow released before commit()
+            commit(v);
+        });
     }
     {
         let get = get.clone();
         let setup = setup.clone();
         let commit = commit.clone();
-        plus.connect_clicked(move |_| commit(get(&setup.borrow()) + step));
+        plus.connect_clicked(move |_| {
+            let v = get(&setup.borrow()) + step; // borrow released before commit()
+            commit(v);
+        });
     }
 
     Field { entry, get }
