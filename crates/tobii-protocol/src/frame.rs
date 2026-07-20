@@ -26,6 +26,12 @@ pub const OP_OPEN_REALM: u32 = 0x76c;
 pub const OP_REALM_RESPONSE: u32 = 0x776;
 pub const OP_CLOSE_REALM: u32 = 0x77b;
 
+// "Select eyes to detect" — the enabled_eye platmod property (Spike S4,
+// op codes code-verified in the native lib). Wire enum is 1-based: 1=LEFT,
+// 2=RIGHT, 3=BOTH (= the C-API enum + 1). NOTE: SET is *lower* than GET.
+pub const OP_GET_ENABLED_EYE: u32 = 0xc62;
+pub const OP_SET_ENABLED_EYE: u32 = 0xc58;
+
 // Calibration ops (Phase 2). Enter/leave reuse the realm ops above.
 pub const OP_CAL_ADD_POINT: u32 = 0x408;
 pub const OP_CAL_COMPUTE: u32 = 0x42f; // compute AND apply

@@ -6,6 +6,59 @@ use crate::frame::{
 };
 use crate::tlv::{write_point, write_tag, write_u32};
 
+/// Which eye(s) the tracker should detect ("Select eyes to detect"). The wire
+/// encoding is 1-based (`LEFT=1, RIGHT=2, BOTH=3`) — the stream-engine
+/// `tobii_enabled_eye_t` enum + 1. Do NOT confuse with the calibration eye arg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnabledEye {
+    Both,
+    Left,
+    Right,
+}
+
+impl EnabledEye {
+    pub fn to_wire(self) -> u32 {
+        match self {
+            EnabledEye::Left => 1,
+            EnabledEye::Right => 2,
+            EnabledEye::Both => 3,
+        }
+    }
+    pub fn from_wire(v: u32) -> Option<Self> {
+        match v {
+            1 => Some(EnabledEye::Left),
+            2 => Some(EnabledEye::Right),
+            3 => Some(EnabledEye::Both),
+            _ => None,
+        }
+    }
+}
+
+/// `set_enabled_eye` payload: `00 00` + a scalar-u32 element (type `0x02`,
+/// length 4, value big-endian) — the exact structure the device's GET returns
+/// (hardware-verified: a BOTH value reads back `00 00 02 00 00 00 04 00 00 00 03`).
+pub fn set_enabled_eye_payload(eye: EnabledEye) -> Vec<u8> {
+    let mut p = vec![0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04];
+    p.extend_from_slice(&eye.to_wire().to_be_bytes());
+    p
+}
+
+/// Parse an `enabled_eye` GET response — the value is the trailing big-endian
+/// `u32` of the scalar element.
+pub fn parse_enabled_eye(payload: &[u8]) -> Option<EnabledEye> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let n = payload.len();
+    let v = u32::from_be_bytes([
+        payload[n - 4],
+        payload[n - 3],
+        payload[n - 2],
+        payload[n - 1],
+    ]);
+    EnabledEye::from_wire(v)
+}
+
 /// Captured 47-byte hello payload (op 0x3e8).
 const HELLO_PAYLOAD: [u8; 47] = [
     0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -100,6 +153,28 @@ pub fn build_set_display_area_corners(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_eye_wire_round_trips() {
+        for e in [EnabledEye::Both, EnabledEye::Left, EnabledEye::Right] {
+            assert_eq!(EnabledEye::from_wire(e.to_wire()), Some(e));
+        }
+        assert_eq!(EnabledEye::from_wire(0), None);
+    }
+
+    #[test]
+    fn enabled_eye_payload_and_parse_match_device() {
+        // The device's BOTH response, hardware-captured.
+        let both = [
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
+        ];
+        assert_eq!(parse_enabled_eye(&both), Some(EnabledEye::Both));
+        assert_eq!(set_enabled_eye_payload(EnabledEye::Both), both);
+        assert_eq!(
+            parse_enabled_eye(&set_enabled_eye_payload(EnabledEye::Left)),
+            Some(EnabledEye::Left)
+        );
+    }
 
     #[test]
     fn hello_frame_is_79_bytes() {
