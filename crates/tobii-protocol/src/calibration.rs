@@ -24,6 +24,13 @@ pub fn cal_add_point_payload(x: f64, y: f64, eye: u32) -> Vec<u8> {
     p.into_vec()
 }
 
+/// `cal_start` / `cal_stop` / `cal_clear` payload: the `00 00` prefix only.
+/// These session-control ops carry no arguments on the ET5 (the native
+/// `tobii_calibration_start` even drops its `enabled_eye` argument on the wire).
+pub fn cal_session_payload() -> Vec<u8> {
+    vec![0x00, 0x00]
+}
+
 /// `cal_compute` (compute AND apply) payload: the `00 00` prefix only.
 pub fn cal_compute_payload() -> Vec<u8> {
     vec![0x00, 0x00]
@@ -67,6 +74,11 @@ mod tests {
     fn compute_and_retrieve_payloads_are_prefix_only() {
         assert_eq!(cal_compute_payload(), vec![0x00, 0x00]);
         assert_eq!(cal_retrieve_payload(), vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn session_payload_is_prefix_only() {
+        assert_eq!(cal_session_payload(), vec![0x00, 0x00]);
     }
 
     #[test]

@@ -1,19 +1,19 @@
 //! Connection driver: runs the handshake, then yields decoded gaze samples.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tobii_protocol::calibration::{
     cal_add_point_payload, cal_apply_payload, cal_compute_payload, cal_retrieve_payload,
-    CalibrationBlob,
+    cal_session_payload, CalibrationBlob,
 };
 use tobii_protocol::commands::{
     parse_enabled_eye, set_display_area_corners_payload, set_enabled_eye_payload, EnabledEye,
 };
 use tobii_protocol::frame::{
-    build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
-    OP_GAZE_NOTIFY, OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA, OP_SET_ENABLED_EYE, STREAM_GAZE,
-    TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_CLEAR, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
+    OP_CAL_START, OP_CAL_STOP, OP_GAZE_NOTIFY, OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA,
+    OP_SET_ENABLED_EYE, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
 use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
@@ -23,12 +23,14 @@ const READ_BUF: usize = 16384;
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const GAZE_TIMEOUT: Duration = Duration::from_millis(1000);
 const HANDSHAKE_STEP_CAP: u32 = 400;
-/// Max transport reads `request` will consume waiting for a matching response.
-/// This is an iteration count, not a wall-clock timeout: because gaze chunks
-/// stream concurrently, each one consumes an iteration, so the effective wait
-/// shrinks under heavy gaze. A GET reply normally arrives within a few chunks;
-/// revisit (e.g. a wall-clock deadline) if live testing shows this is too tight.
-const REQUEST_READ_CAP: u32 = 100;
+/// Wall-clock window `request` waits for a matching response. A deadline (not
+/// an iteration count) is essential: gaze notifications stream concurrently and
+/// are routed to the queue from inside the same read loop, so an iteration cap
+/// would shrink the effective wait to nothing under normal gaze traffic.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// `add_calibration_point` needs a much longer window: the device blocks there
+/// while it gathers samples for the stimulus point before acking.
+const CAL_POINT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A live connection to the eye tracker. Generic over [`Transport`] so the
 /// driver logic is testable without hardware.
@@ -38,6 +40,8 @@ pub struct Connection<T: Transport> {
     gaze_queue: VecDeque<GazeSample>,
     /// Next TTP sequence number for post-handshake requests.
     seq: u32,
+    /// How long [`Connection::request`] waits for a matching response.
+    request_timeout: Duration,
 }
 
 impl<T: Transport> Connection<T> {
@@ -49,6 +53,7 @@ impl<T: Transport> Connection<T> {
             parser: Parser::new(),
             gaze_queue: VecDeque::new(),
             seq: 1,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         };
         conn.run_handshake()?;
         Ok(conn)
@@ -57,6 +62,11 @@ impl<T: Transport> Connection<T> {
     /// Access the underlying transport (used in tests).
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    /// Override how long [`Connection::request`] waits for a response.
+    pub fn set_request_timeout(&mut self, t: Duration) {
+        self.request_timeout = t;
     }
 
     fn next_seq(&mut self) -> u32 {
@@ -75,12 +85,23 @@ impl<T: Transport> Connection<T> {
     /// `cal_add_point`, fired once per calibration point) can never be
     /// mismatched to the wrong request. Gaze notifications arriving in the
     /// meantime are queued for [`Connection::next_gaze`]. Returns `Ok(None)`
-    /// if no matching response arrives within the read window.
+    /// if no matching response arrives within `self.request_timeout`.
     pub fn request(&mut self, op: u32, payload: &[u8]) -> Result<Option<Vec<u8>>, UsbError> {
+        self.request_until(op, payload, self.request_timeout)
+    }
+
+    /// [`Connection::request`] with an explicit wall-clock response window.
+    fn request_until(
+        &mut self,
+        op: u32,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, UsbError> {
         let seq = self.next_seq();
         self.transport.send(&build_out_frame(seq, op, payload))?;
+        let deadline = Instant::now() + timeout;
         let mut buf = [0u8; READ_BUF];
-        for _ in 0..REQUEST_READ_CAP {
+        while Instant::now() < deadline {
             let Some(n) = self.transport.recv(&mut buf, RECV_TIMEOUT) else {
                 continue;
             };
@@ -109,10 +130,37 @@ impl<T: Transport> Connection<T> {
             .ok_or(UsbError::NoResponse { op })
     }
 
+    /// Enter calibration mode. Must precede point collection; the device stays
+    /// in calibration mode until `stop_calibration`.
+    pub fn start_calibration(&mut self) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_START, &cal_session_payload())?;
+        Ok(())
+    }
+
+    /// Leave calibration mode (call after `compute_and_apply_calibration`).
+    pub fn stop_calibration(&mut self) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_STOP, &cal_session_payload())?;
+        Ok(())
+    }
+
+    /// Discard collected/active calibration data (the original clears right
+    /// after `start`). Destructive: wipes the current calibration.
+    pub fn clear_calibration(&mut self) -> Result<(), UsbError> {
+        self.expect_response(OP_CAL_CLEAR, &cal_session_payload())?;
+        Ok(())
+    }
+
     /// Sample one calibration stimulus point. `x`/`y` normalized `[0,1]`;
     /// `eye` 0=both/1=L/2=R. Assumes calibration runs in the already-open realm.
     pub fn add_calibration_point(&mut self, x: f64, y: f64, eye: u32) -> Result<(), UsbError> {
-        self.expect_response(OP_CAL_ADD_POINT, &cal_add_point_payload(x, y, eye))?;
+        self.request_until(
+            OP_CAL_ADD_POINT,
+            &cal_add_point_payload(x, y, eye),
+            CAL_POINT_TIMEOUT,
+        )?
+        .ok_or(UsbError::NoResponse {
+            op: OP_CAL_ADD_POINT,
+        })?;
         Ok(())
     }
 
@@ -415,6 +463,9 @@ mod tests {
             ]),
         };
         let mut conn = Connection::connect(t).expect("connect");
+        // The mock's `recv` returns instantly, so shorten the deadline to keep
+        // the test fast while still exercising the timeout path.
+        conn.set_request_timeout(Duration::from_millis(150));
         // Nothing left to receive → the request window drains to None.
         assert!(conn.request(0x596, &[]).expect("io ok").is_none());
     }
@@ -441,6 +492,19 @@ mod tests {
     }
 
     #[test]
+    fn session_ops_send_correct_ops_and_ack() {
+        // start (0x3f2), clear (0x424), stop (0x3fc) in sequence; seqs 5,6,7.
+        let mut conn = connected_with(vec![
+            inbound(TTP_MAGIC_RSP, 5, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x424, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x3fc, &[]),
+        ]);
+        assert!(conn.start_calibration().is_ok());
+        assert!(conn.clear_calibration().is_ok());
+        assert!(conn.stop_calibration().is_ok());
+    }
+
+    #[test]
     fn retrieve_calibration_returns_blob_verbatim() {
         let mut conn = connected_with(vec![inbound(
             TTP_MAGIC_RSP,
@@ -456,6 +520,7 @@ mod tests {
     fn compute_without_response_errors() {
         // No post-connect responses -> compute drains to NoResponse.
         let mut conn = connected_with(vec![]);
+        conn.set_request_timeout(Duration::from_millis(150));
         assert!(matches!(
             conn.compute_and_apply_calibration(),
             Err(UsbError::NoResponse { op }) if op == 0x42f

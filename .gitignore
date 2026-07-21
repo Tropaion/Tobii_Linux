@@ -12,3 +12,6 @@ zig-out/
 
 # Rust
 target/
+
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json

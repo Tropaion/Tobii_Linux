@@ -1,10 +1,11 @@
 //! `tobii-gtk` — GTK4 configuration GUI for the Tobii ET5 Linux runtime.
 //!
-//! Foundation: a styled hub window (status + live eye-position view) over the
-//! ported device thread. Guided flows, the gaze overlay, and select-eyes land
-//! in later phases of the GTK4 redesign.
+//! A styled hub window (status + live eye-position view) over the device
+//! thread, from which the guided display-setup and calibration flows, the
+//! gaze-preview overlay, and the select-eyes control are driven.
 
 pub mod align;
+pub mod calibrate_flow;
 pub mod device;
 pub mod eyeview;
 pub mod overlay;
@@ -22,7 +23,7 @@ use gtk::{
     Switch,
 };
 
-use crate::eyeview::{EyeView, Guidance};
+use crate::eyeview::EyeView;
 use tobii_protocol::EnabledEye;
 
 const APP_ID: &str = "com.tobiilinux.Configuration";
@@ -34,6 +35,7 @@ window { background-color: #15181c; color: #e6e8ea; }
 .guidance { font-size: 14px; }
 .section-title { font-size: 15px; font-weight: bold; }
 .section-desc { font-size: 12px; color: #9aa4ad; }
+.section-warn { color: #f2b134; font-weight: bold; }
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
          border: none; border-radius: 8px; padding: 10px 18px; min-height: 24px; }
 button label { padding: 2px 0; }
@@ -41,6 +43,9 @@ button:hover { background-color: #26b6b8; }
 button:disabled { background-color: #2a2f36; color: #6b7178; }
 button:checked { background-color: #14696b; }
 button.spin-btn { min-width: 26px; padding: 2px 10px; }
+button.help-btn { min-width: 22px; padding: 0 8px; background-color: #2a2f36;
+                  color: #9aa4ad; font-size: 12px; }
+button.help-btn:hover { background-color: #3a424b; color: #e6e8ea; }
 .spin-entry { padding: 2px 6px; }
 .overlay-window { background-color: transparent; }
 ";
@@ -70,21 +75,17 @@ fn load_css() {
     }
 }
 
-fn no_eyes_view() -> EyeView {
-    EyeView {
-        left: None,
-        right: None,
-        distance_mm: None,
-        guidance: Guidance::NoEyes,
-    }
+/// The primary monitor, if one can be resolved.
+fn primary_monitor() -> Option<gtk::gdk::Monitor> {
+    gtk::gdk::Display::default()
+        .and_then(|d| d.monitors().item(0))
+        .and_then(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
 }
 
 /// Aspect ratio (w/h) of the primary monitor, so the eye-position box mirrors
 /// the screen's shape (e.g. 21:9). Falls back to 16:9.
 fn screen_aspect() -> f64 {
-    gtk::gdk::Display::default()
-        .and_then(|d| d.monitors().item(0))
-        .and_then(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
+    primary_monitor()
         .map(|m| {
             let g = m.geometry();
             if g.height() > 0 {
@@ -96,10 +97,36 @@ fn screen_aspect() -> f64 {
         .unwrap_or(16.0 / 9.0)
 }
 
+/// Primary monitor height (px), used by the fullscreen flows to place their
+/// header a bit above the middle. Falls back to 1080.
+pub(crate) fn screen_height() -> i32 {
+    primary_monitor()
+        .map(|m| m.geometry().height())
+        .filter(|h| *h > 0)
+        .unwrap_or(1080)
+}
+
+/// Make Esc close `win`. Closing is the flows' single exit route, so each flow's
+/// own `close_request` handler still runs (that is where calibration aborts its
+/// session) — this only triggers it.
+pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
+    let keys = gtk::EventControllerKey::new();
+    let win_for_key = win.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            win_for_key.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    win.add_controller(keys);
+}
+
 fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
     // Latest view shared with the DrawingArea's draw callback (UI thread only).
-    let view = Rc::new(RefCell::new(no_eyes_view()));
+    let view = Rc::new(RefCell::new(EyeView::none()));
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
     // "Select eyes to detect": guard against echoing our own seeding as a user
@@ -242,8 +269,30 @@ fn build_ui(app: &Application) {
     }
 
     let b_cal = Button::with_label("Improve calibration");
-    b_cal.set_sensitive(false);
-    b_cal.set_tooltip_text(Some("Calibration — coming in B3"));
+    {
+        let app = app.clone();
+        let state = state.clone();
+        let cmd_tx = cmd_tx.clone();
+        let sw_preview = sw_preview.clone();
+        b_cal.connect_clicked(move |btn| {
+            // The gaze preview is a layer-shell surface on the Overlay layer,
+            // which composites ABOVE a fullscreen window — the user would end
+            // up chasing their own gaze dot instead of the stimulus dot, which
+            // poisons every sample while still reporting success. Switching the
+            // toggle off closes it through the switch's own handler, so the
+            // switch and the overlay window cannot end up disagreeing.
+            sw_preview.set_active(false);
+            // One flow at a time: a second window would drive the same device
+            // session and corrupt the first's point accounting.
+            btn.set_sensitive(false);
+            let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone());
+            let btn = btn.clone();
+            win.connect_close_request(move |_| {
+                btn.set_sensitive(true);
+                glib::Propagation::Proceed
+            });
+        });
+    }
 
     let right = gtk::Box::new(Orientation::Vertical, 18);
     right.set_hexpand(true);
