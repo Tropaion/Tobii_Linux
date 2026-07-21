@@ -8,6 +8,7 @@ pub mod align;
 pub mod calibrate_flow;
 pub mod device;
 pub mod eyeview;
+pub mod fine_tune;
 pub mod overlay;
 pub mod setup_flow;
 pub mod widget;
@@ -294,6 +295,30 @@ fn build_ui(app: &Application) {
         });
     }
 
+    let b_fine = Button::with_label("Fine-tune alignment");
+    {
+        let app = app.clone();
+        let state = state.clone();
+        let cmd_tx = cmd_tx.clone();
+        let sw_preview = sw_preview.clone();
+        b_fine.connect_clicked(move |btn| {
+            // Same reasoning as the calibration flow: the gaze preview is a
+            // layer-shell surface that composites ABOVE a fullscreen window, so
+            // leaving it on would put a second, unrelated dot on the target
+            // cross and the user would align the wrong one.
+            sw_preview.set_active(false);
+            // One flow at a time — two windows would both write the display
+            // geometry and the last one to Apply would silently win.
+            btn.set_sensitive(false);
+            let win = fine_tune::launch(&app, state.clone(), cmd_tx.clone());
+            let btn = btn.clone();
+            win.connect_close_request(move |_| {
+                btn.set_sensitive(true);
+                glib::Propagation::Proceed
+            });
+        });
+    }
+
     let right = gtk::Box::new(Orientation::Vertical, 18);
     right.set_hexpand(true);
     right.set_valign(Align::Start);
@@ -302,6 +327,13 @@ fn build_ui(app: &Application) {
         "If the light conditions change or if you experience less tracker precision, you might \
          benefit from improving your calibration.",
         &b_cal,
+    ));
+    right.append(&section(
+        "Fine-tune gaze alignment",
+        "If the gaze dot is always the same distance off — a few centimetres too high, say — the \
+         screen's measured position is out rather than your calibration. Look at a cross, then \
+         drag the tracker's answer onto it, and the offset is corrected without a ruler.",
+        &b_fine,
     ));
     right.append(&section(
         "Preview my gaze",
