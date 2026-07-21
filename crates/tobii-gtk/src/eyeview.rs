@@ -39,18 +39,25 @@ pub struct EyeView {
 }
 
 impl EyeView {
+    /// The "nothing to show" view: no eyes, no distance. Used both for a sample
+    /// that carries no usable eyes and, by the widget, when the device is not
+    /// connected at all.
+    pub fn none() -> EyeView {
+        EyeView {
+            left: None,
+            right: None,
+            distance_mm: None,
+            guidance: Guidance::NoEyes,
+        }
+    }
+
     pub fn from_gaze(s: &GazeSample) -> EyeView {
         let eyes_valid = s.has(present::TRACKBOX_L)
             && s.has(present::TRACKBOX_R)
             && s.validity_l == 0
             && s.validity_r == 0;
         if !eyes_valid {
-            return EyeView {
-                left: None,
-                right: None,
-                distance_mm: None,
-                guidance: Guidance::NoEyes,
-            };
+            return EyeView::none();
         }
 
         // Mirror x (camera frame → mirror view); y passes through.

@@ -408,21 +408,13 @@ fn add_spinner(
             }
         });
     }
-    {
+    // −/+ differ only in the sign of the step they apply.
+    for (button, delta) in [(&minus, -step), (&plus, step)] {
         let get = get.clone();
         let setup = setup.clone();
         let commit = commit.clone();
-        minus.connect_clicked(move |_| {
-            let v = get(&setup.borrow()) - step; // borrow released before commit()
-            commit(v);
-        });
-    }
-    {
-        let get = get.clone();
-        let setup = setup.clone();
-        let commit = commit.clone();
-        plus.connect_clicked(move |_| {
-            let v = get(&setup.borrow()) + step; // borrow released before commit()
+        button.connect_clicked(move |_| {
+            let v = get(&setup.borrow()) + delta; // borrow released before commit()
             commit(v);
         });
     }
