@@ -801,10 +801,22 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     {
         let setup = setup.clone();
         let win = win.clone();
+        let status = status.clone();
         apply.connect_clicked(move |_| {
             let s = *setup.borrow();
-            let _ = tobii_config::save(&s);
+            let saved = tobii_config::save(&s);
             let _ = cmd_tx.send(DeviceCommand::SetDisplayArea(s.to_corners()));
+            // A failed save is not fatal — the geometry is still pushed to the
+            // device — but it will not survive a restart, so say so and keep the
+            // window open instead of silently closing.
+            if let Err(e) = saved {
+                status.add_css_class("section-warn");
+                status.set_text(&format!(
+                    "Applied to the tracker, but saving the configuration failed: {e}. \
+                     The settings will be lost when the tracker reconnects."
+                ));
+                return;
+            }
             win.close();
         });
     }

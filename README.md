@@ -107,7 +107,6 @@ A Cargo workspace of focused crates:
 | `tobii-config`   | Display-setup geometry + EDID detection + TOML/blob persistence. |
 | `tobii-cli`      | The `tobii` command-line tool. |
 | `tobii-gtk`      | The GTK4 configuration GUI + gaze overlay. |
-| `tobii-gui`      | An earlier egui prototype (superseded by `tobii-gtk`). |
 
 ## Status
 
