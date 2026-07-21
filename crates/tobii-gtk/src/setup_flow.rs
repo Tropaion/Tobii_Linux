@@ -939,12 +939,13 @@ fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
         cr.line_to(x, h);
         let _ = cr.stroke();
 
-        // A small upward arrow near the bottom, so it's obvious the lines are
-        // the draggable elements. Same normalized x, so it tracks the drag.
+        // A small arrow pointing DOWN, its tip exactly on the bottom edge of
+        // the display, so it reads as "this line ends here" and makes the
+        // draggable elements obvious. Same normalized x, so it tracks the drag.
         cr.set_source_rgba(0.30, 0.85, 0.85, 0.75);
-        cr.move_to(x, h - 34.0);
-        cr.line_to(x - 7.0, h - 20.0);
-        cr.line_to(x + 7.0, h - 20.0);
+        cr.move_to(x, h); // tip, on the bottom border
+        cr.line_to(x - 7.0, h - 14.0);
+        cr.line_to(x + 7.0, h - 14.0);
         cr.close_path();
         let _ = cr.fill();
     }
