@@ -36,7 +36,7 @@ fn aspect(area: &DrawingArea) -> f64 {
     w / h
 }
 
-fn default_setup() -> DisplaySetup {
+pub(crate) fn default_setup() -> DisplaySetup {
     DisplaySetup {
         width_mm: 600.0,
         height_mm: 340.0,
@@ -480,13 +480,11 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     instr.set_wrap(true);
     instr.set_justify(gtk::Justification::Center);
 
-    let readout = Label::new(Some(""));
-    readout.add_css_class("guidance");
-    readout.set_halign(Align::Center);
-
-    // Detection status: reassurance when EDID worked, a call to action when not.
+    // ONE status line carrying both halves of "where do we stand": where the
+    // geometry came from (EDID or not) and what it currently is. They used to be
+    // two labels stacked on top of each other saying overlapping things.
     let status = Label::new(None);
-    status.add_css_class("section-desc");
+    status.add_css_class("guidance");
     status.set_halign(Align::Center);
     status.set_wrap(true);
     status.set_justify(gtk::Justification::Center);
@@ -502,29 +500,36 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
         Rc::new(move || {
             let s = *setup.borrow(); // Copy; borrow released here
             let mut warn = false;
+            // Always lead with the current geometry — it is what Apply will
+            // save — then explain where it came from.
+            let geometry = format!(
+                "Screen ≈ {:.0} × {:.0} mm   ·   horizontal offset {:.0} mm",
+                s.width_mm, s.height_mm, s.offset_x_mm
+            );
             let mut text = match &detected {
                 Some(m) => {
                     let chord = tobii_config::chord_from_arc(m.width_mm, s.curvature_radius_mm);
                     if (chord - m.width_mm).abs() >= 0.5 {
                         format!(
-                            "Detected {} — {:.0} × {:.0} mm. That width follows the curve; \
-                             straightened for a {:.0}R screen it is {:.0} mm. Drag the lines \
-                             only if this looks wrong.",
+                            "{geometry}\nDetected {} — {:.0} × {:.0} mm. That width follows the \
+                             curve; straightened for a {:.0}R screen it is {:.0} mm. Drag the \
+                             lines only if this looks wrong.",
                             m.model, m.width_mm, m.height_mm, s.curvature_radius_mm, chord
                         )
                     } else {
                         format!(
-                            "Detected {} — {:.0} × {:.0} mm. Drag the lines only if this \
-                             looks wrong.",
+                            "{geometry}\nDetected {} — {:.0} × {:.0} mm. Drag the lines only if \
+                             this looks wrong.",
                             m.model, m.width_mm, m.height_mm
                         )
                     }
                 }
                 None => {
                     warn = true;
-                    "Could not detect your monitor. Measure the screen glass (not the bezel) \
-                     and set the size under Show advanced."
-                        .to_string()
+                    format!(
+                        "{geometry}\nCould not detect your monitor. Measure the screen glass \
+                         (not the bezel) and set the size under Show advanced."
+                    )
                 }
             };
             // No circle of this radius passes through both side edges, so the
@@ -567,17 +572,12 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     let refresh_view: Rc<dyn Fn()> = {
         let setup = setup.clone();
         let area = area.clone();
-        let readout = readout.clone();
         let corners = corners.clone();
         let refresh_status = refresh_status.clone();
         Rc::new(move || {
             let s = *setup.borrow(); // Copy; borrow released here
             area.queue_draw();
             refresh_status();
-            readout.set_text(&format!(
-                "Screen ≈ {:.0} × {:.0} mm   ·   horizontal offset {:.0} mm",
-                s.width_mm, s.height_mm, s.offset_x_mm
-            ));
             let c = s.to_corners();
             corners.set_text(&format!(
                 "Corners (mm):  TL({:.0}, {:.0}, {:.0})   TR({:.0}, {:.0}, {:.0})   BL({:.0}, {:.0}, {:.0})",
@@ -594,6 +594,17 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     grid.set_row_spacing(6);
     grid.set_column_spacing(12);
     grid.set_halign(Align::Center);
+
+    // Curvature lives on the MAIN screen, not behind "Show advanced". Every
+    // other field here can be detected or dragged; the curve radius cannot —
+    // it is in no EDID field (verified against the user's 384-byte EDID, whose
+    // DisplayID extension carries only a Type II Timing block), so it can only
+    // ever come from the user. Hiding the one value we can never fill in
+    // ourselves behind a disclosure toggle is exactly backwards.
+    let curve_grid = Grid::new();
+    curve_grid.set_column_spacing(12);
+    curve_grid.set_halign(Align::Center);
+
     let fields = Rc::new(vec![
         add_spinner(
             &grid,
@@ -714,8 +725,8 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             None,
         ),
         add_spinner(
-            &grid,
-            6,
+            &curve_grid,
+            0,
             "Screen curve radius (mm)",
             (
                 diagram_curvature,
@@ -786,8 +797,8 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     header.set_valign(Align::Start);
     header.set_margin_top((screen_height() as f64 * 0.34) as i32);
     header.append(&instr);
-    header.append(&readout);
     header.append(&status);
+    header.append(&curve_grid);
     header.append(&buttons);
     header.append(&adv_panel);
 
@@ -931,12 +942,16 @@ fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
 
     // Vertical lines run from just above the tracker bar to the screen's bottom.
     let line_top = by - 22.0;
+    // Height of the arrow head at the foot of each line. The line stops at the
+    // arrow's flat base instead of running to `h`: drawn through, the stroke
+    // showed as a spike splitting the head in two.
+    let arrow_h = 14.0;
     for x_norm in [lines.0, lines.1] {
         let x = x_norm * w;
         cr.set_source_rgb(0.88, 0.92, 0.96);
         cr.set_line_width(2.0);
         cr.move_to(x, line_top);
-        cr.line_to(x, h);
+        cr.line_to(x, h - arrow_h);
         let _ = cr.stroke();
 
         // A small arrow pointing DOWN, its tip exactly on the bottom edge of
@@ -944,8 +959,8 @@ fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
         // draggable elements obvious. Same normalized x, so it tracks the drag.
         cr.set_source_rgba(0.30, 0.85, 0.85, 0.75);
         cr.move_to(x, h); // tip, on the bottom border
-        cr.line_to(x - 7.0, h - 14.0);
-        cr.line_to(x + 7.0, h - 14.0);
+        cr.line_to(x - 7.0, h - arrow_h);
+        cr.line_to(x + 7.0, h - arrow_h);
         cr.close_path();
         let _ = cr.fill();
     }
