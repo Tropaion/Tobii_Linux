@@ -87,12 +87,16 @@ enum Phase {
         ticks: u32,
     },
     Collecting {
+        /// The session token this phase belongs to (see `Starting`).
+        token: u64,
         mode: CalMode,
         index: usize,
         requested: bool,
         ticks: u32,
     },
     Computing {
+        /// The session token this phase belongs to (see `Starting`).
+        token: u64,
         ticks: u32,
     },
     Done(Result<(), String>),
@@ -156,12 +160,21 @@ fn update_ui(
             done_box.set_visible(false);
             cancel.set_visible(true);
         }
-        Phase::Collecting { index, mode, .. } => {
-            instr.set_text(&format!(
-                "Follow the dot with your eyes  ·  point {} of {}",
-                index + 1,
-                mode.points().len()
-            ));
+        Phase::Collecting {
+            index,
+            mode,
+            requested,
+            ..
+        } => {
+            let progress = format!("point {} of {}", index + 1, mode.points().len());
+            // While `requested` the device is actually sampling this point.
+            // Users saccade away once a target stops moving, which degrades the
+            // sample invisibly — so say explicitly when fixation matters.
+            instr.set_text(&if *requested {
+                format!("Hold still — keep looking at the dot  ·  {progress}")
+            } else {
+                format!("Follow the dot with your eyes  ·  {progress}")
+            });
             chooser.set_visible(false);
             done_box.set_visible(false);
             cancel.set_visible(true);
@@ -186,8 +199,13 @@ fn update_ui(
     }
 }
 
-/// Open the fullscreen follow-the-dot calibration flow.
-pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<DeviceCommand>) {
+/// Open the fullscreen follow-the-dot calibration flow, returning the window so
+/// the caller can react to it closing (the hub re-enables its button).
+pub fn launch(
+    app: &Application,
+    state: Arc<Mutex<DeviceState>>,
+    cmd_tx: Sender<DeviceCommand>,
+) -> gtk::ApplicationWindow {
     // Eye to calibrate: the device's current selection, defaulting to Both.
     let eye = state
         .lock()
@@ -261,6 +279,14 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
         let phase = phase.clone();
         let cmd_tx = cmd_tx.clone();
         Rc::new(move |mode: CalMode| {
+            // The chooser buttons stay clickable until the next tick hides
+            // them, so a double-click would otherwise send a second CalBegin
+            // and issue `start` on an already-open realm. Bind the check to
+            // drop the shared borrow before the borrow_mut below.
+            let in_chooser = matches!(&*phase.borrow(), Phase::Chooser);
+            if !in_chooser {
+                return;
+            }
             let token = next_cal_token();
             let _ = cmd_tx.send(DeviceCommand::CalBegin { eye, token });
             *phase.borrow_mut() = Phase::Starting {
@@ -339,11 +365,15 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
             Phase::Starting { mode, token, ticks } => {
                 let (mode, token, ticks) = (*mode, *token, *ticks);
                 dot.borrow_mut().point = None;
-                if cal.token != token {
-                    // Our CalBegin has not been dequeued yet. Everything in
-                    // `cal` still belongs to the previous session, so none of
-                    // it may be read — not `finished`, not `last_error`, not
-                    // `active`, not `collected`. Just wait.
+                // Keep waiting while EITHER our CalBegin has not been dequeued
+                // (token mismatch — nothing in `cal` is ours, so not `finished`,
+                // not `last_error`, not `active`, not `collected` may be read)
+                // OR it has been dequeued but `start`/`clear` are still in
+                // flight. `started` — not `active` — is the "session is really
+                // open" signal: `active` is set before any USB traffic, so
+                // gating on it would enter Collecting against an unopened realm
+                // and queue a stray point request behind a start that may fail.
+                if cal.token != token || (!cal.started && cal.finished.is_none()) {
                     let t = ticks + 1;
                     if t >= START_TIMEOUT_TICKS {
                         // The abort is queued *behind* our CalBegin, so the
@@ -360,10 +390,11 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                             ticks: t,
                         });
                     }
-                } else if cal.active {
-                    // This session's CalBegin succeeded: the counters below are
-                    // now definitively ours and start from zero.
+                } else if cal.started {
+                    // start + clear are both acked: the session is really open
+                    // and the counters below are ours, starting from zero.
                     next = Some(Phase::Collecting {
+                        token,
                         mode,
                         index: 0,
                         requested: false,
@@ -382,13 +413,20 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                 }
             }
             Phase::Collecting {
+                token,
                 mode,
                 index,
                 requested,
                 ticks,
             } => {
-                let (mode, index, requested, ticks) = (*mode, *index, *requested, *ticks);
-                if let Some(Err(e)) = &cal.finished {
+                let (token, mode, index, requested, ticks) =
+                    (*token, *mode, *index, *requested, *ticks);
+                if cal.token != token {
+                    // Another session replaced ours — only reachable if a second
+                    // flow window ever opened. Never act on counters that are not
+                    // ours; that is precisely what the token exists to prevent.
+                    next = Some(Phase::Done(Err("Calibration was interrupted.".into())));
+                } else if let Some(Err(e)) = &cal.finished {
                     // Defensive: within a session nothing finishes it but our
                     // own CalFinish (which leaves for `Computing`). If a finish
                     // does surface here the session may still be open, so stop
@@ -404,9 +442,10 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                     let pts = mode.points();
                     if index + 1 >= pts.len() {
                         let _ = tick_cmd.send(DeviceCommand::CalFinish);
-                        next = Some(Phase::Computing { ticks: 0 });
+                        next = Some(Phase::Computing { token, ticks: 0 });
                     } else {
                         next = Some(Phase::Collecting {
+                            token,
                             mode,
                             index: index + 1,
                             requested: false,
@@ -424,6 +463,7 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                     if !requested && t >= SETTLE_TICKS {
                         let _ = tick_cmd.send(DeviceCommand::CalCollect { x: px, y: py });
                         next = Some(Phase::Collecting {
+                            token,
                             mode,
                             index,
                             requested: true,
@@ -434,6 +474,7 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                         next = Some(Phase::Done(Err("Timed out reading a point.".into())));
                     } else {
                         next = Some(Phase::Collecting {
+                            token,
                             mode,
                             index,
                             requested,
@@ -442,9 +483,14 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                     }
                 }
             }
-            Phase::Computing { ticks } => {
+            Phase::Computing { token, ticks } => {
+                let token = *token;
                 dot.borrow_mut().point = None;
-                if let Some(res) = &cal.finished {
+                if cal.token != token {
+                    // Another session replaced ours; `finished` below would be
+                    // someone else's outcome, so never report it as our own.
+                    next = Some(Phase::Done(Err("Calibration was interrupted.".into())));
+                } else if let Some(res) = &cal.finished {
                     next = Some(Phase::Done(res.clone()));
                 } else {
                     let t = ticks + 1;
@@ -454,7 +500,7 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
                             Err("Calibration computation timed out.".into()),
                         ));
                     } else {
-                        next = Some(Phase::Computing { ticks: t });
+                        next = Some(Phase::Computing { token, ticks: t });
                     }
                 }
             }
@@ -469,6 +515,7 @@ pub fn launch(app: &Application, state: Arc<Mutex<DeviceState>>, cmd_tx: Sender<
     });
 
     win.present();
+    win
 }
 
 #[cfg(test)]
