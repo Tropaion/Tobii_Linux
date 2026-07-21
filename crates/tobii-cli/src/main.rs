@@ -21,6 +21,7 @@ fn main() -> ExitCode {
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
         (Some("calibrate"), _) => calibrate(args.iter().any(|a| a == "--apply")),
+        (Some("cal-probe"), _) => cal_probe(),
         (Some("enabled-eye"), arg) => enabled_eye_cmd(arg),
         _ => {
             eprintln!(
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
                  tobii display get\n  \
                  tobii display set\n  \
                  tobii calibrate [--apply]\n  \
+                 tobii cal-probe\n  \
                  tobii enabled-eye [both|left|right]"
             );
             return ExitCode::from(2);
@@ -62,6 +64,30 @@ fn enabled_eye_cmd(which: Option<&str>) -> CmdResult {
     match conn.get_enabled_eye()? {
         Some(e) => println!("enabled_eye is now: {e:?}"),
         None => println!("no enabled_eye response (unsupported firmware?)"),
+    }
+    Ok(())
+}
+
+/// Diagnostic: probe the calibration session ops. Non-destructive — only
+/// `start` then `stop` (NOT `clear`, which would wipe the calibration, and no
+/// compute, so nothing is written). Useful for checking that a device still
+/// accepts these ops standalone, independently of the GUI's calibration flow.
+fn cal_probe() -> CmdResult {
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    // The device wipes its display area on reboot; re-apply so it is in a
+    // normal working state before we exercise calibration.
+    if let Ok(Some(setup)) = tobii_config::load() {
+        let _ = conn.set_display_area(&setup.to_corners());
+    }
+    eprintln!("probing calibration session ops (start -> stop; non-destructive)...");
+    match conn.start_calibration() {
+        Ok(()) => println!("  calibration_start (0x3f2): ACK"),
+        Err(e) => println!("  calibration_start (0x3f2): FAILED ({e})"),
+    }
+    match conn.stop_calibration() {
+        Ok(()) => println!("  calibration_stop  (0x3fc): ACK"),
+        Err(e) => println!("  calibration_stop  (0x3fc): FAILED ({e})"),
     }
     Ok(())
 }
@@ -124,6 +150,15 @@ fn print_setup(s: &DisplaySetup) {
         "  width={:.1}mm height={:.1}mm tilt={:.1}° offset=({:.1}, {:.1}, {:.1})mm",
         s.width_mm, s.height_mm, s.tilt_deg, s.offset_x_mm, s.offset_y_mm, s.offset_z_mm
     );
+    // A plane carries no curvature, so `display get` (which derives the setup
+    // from the device's three corners) always reports flat — only the saved
+    // config knows the real radius.
+    if s.curvature_radius_mm > 0.0 {
+        println!(
+            "  curve radius={:.0}mm (width above is the flat chord)",
+            s.curvature_radius_mm
+        );
+    }
 }
 
 /// Apply corners to a connected device. Returns whether the device
@@ -172,7 +207,8 @@ fn display_set() -> CmdResult {
 
 /// Host-chosen stimulus points (normalized). Center then four corners, inset
 /// from the edges. NOTE: headless — no dots are drawn, so this validates the
-/// protocol, not gaze accuracy (accuracy needs the stimulus UI, a later phase).
+/// protocol, not gaze accuracy. For an accurate calibration use the GUI's
+/// follow-the-dot flow (`tobii-gtk`), which shows the stimulus.
 const CAL_POINTS: [(f64, f64); 5] = [(0.5, 0.5), (0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)];
 
 fn calibrate(apply_saved: bool) -> CmdResult {
@@ -236,11 +272,7 @@ fn setup() -> CmdResult {
 
     let (mut w_def, mut h_def) = (600.0, 340.0);
     let monitors = tobii_config::detect_monitors();
-    if let Some(m) = monitors
-        .iter()
-        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
-        .max_by(|a, b| (a.width_mm * a.height_mm).total_cmp(&(b.width_mm * b.height_mm)))
-    {
+    if let Some(m) = tobii_config::pick_monitor(&monitors) {
         println!(
             "detected monitor: {} ({:.0} x {:.0} mm)",
             m.model, m.width_mm, m.height_mm
@@ -256,6 +288,7 @@ fn setup() -> CmdResult {
         offset_y_mm: prompt_f64("Height of screen BOTTOM edge above tracker (mm)", 10.0)?,
         offset_z_mm: prompt_f64("Depth of screen bottom from tracker (mm)", 0.0)?,
         offset_x_mm: prompt_f64("Horizontal offset of screen centre from tracker (mm)", 0.0)?,
+        curvature_radius_mm: prompt_f64("Screen curve radius (mm; 1800 for 1800R, 0 = flat)", 0.0)?,
     };
     let c = s.to_corners();
     println!("\ncomputed display-area corners (tracker-space mm):");

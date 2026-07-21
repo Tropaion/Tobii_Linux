@@ -63,6 +63,16 @@ pub fn parse_edid(edid: &[u8]) -> Option<MonitorInfo> {
     })
 }
 
+/// Pick the monitor to seed display geometry from: the largest by area among
+/// the entries that reported a usable physical size. Shared by `tobii setup`
+/// and the GUI's display-setup flow so both seed from the same monitor.
+pub fn pick_monitor(monitors: &[MonitorInfo]) -> Option<&MonitorInfo> {
+    monitors
+        .iter()
+        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
+        .max_by(|a, b| (a.width_mm * a.height_mm).total_cmp(&(b.width_mm * b.height_mm)))
+}
+
 /// Read every `/sys/class/drm/*/edid` and parse the ones that are valid.
 pub fn detect_monitors() -> Vec<MonitorInfo> {
     let mut out = Vec::new();
@@ -101,5 +111,39 @@ mod tests {
     fn rejects_bad_header_and_short_input() {
         assert!(parse_edid(&[0u8; 128]).is_none()); // header all zero
         assert!(parse_edid(&[0xff; 10]).is_none()); // too short
+    }
+
+    fn mon(model: &str, w: f64, h: f64) -> MonitorInfo {
+        MonitorInfo {
+            model: model.into(),
+            width_mm: w,
+            height_mm: h,
+        }
+    }
+
+    #[test]
+    fn picks_largest_by_area() {
+        let ms = vec![
+            mon("small", 300.0, 200.0),
+            mon("big", 1193.0, 336.0),
+            mon("mid", 600.0, 340.0),
+        ];
+        assert_eq!(pick_monitor(&ms).unwrap().model, "big");
+    }
+
+    #[test]
+    fn skips_zero_and_negative_entries() {
+        let ms = vec![
+            mon("bogus-zero", 0.0, 0.0),
+            mon("bogus-neg", -1000.0, -1000.0),
+            mon("real", 300.0, 200.0),
+        ];
+        assert_eq!(pick_monitor(&ms).unwrap().model, "real");
+    }
+
+    #[test]
+    fn none_when_nothing_usable() {
+        assert!(pick_monitor(&[]).is_none());
+        assert!(pick_monitor(&[mon("zero", 0.0, 340.0)]).is_none());
     }
 }
