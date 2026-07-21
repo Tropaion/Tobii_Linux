@@ -110,12 +110,28 @@ A Cargo workspace of focused crates:
 
 ## Status
 
-Working: gaze streaming, display setup (CLI + guided GUI flow), live
-eye-position view, and the gaze overlay. **Calibration** (follow-the-dot) is in
-progress — "Select eyes to detect" is stored/persisted but only takes effect
-once calibration lands (the tracker applies the eye selection when it
-(re)calibrates). Head-pose output (for opentrack / Star Citizen) is a later
-milestone. See `docs/superpowers/` for design specs and plans.
+**Working and validated on hardware:** gaze streaming, display setup (CLI +
+guided GUI flow, now seeded from the monitor's EDID), live eye-position view,
+and the gaze overlay.
+
+**Implemented, pending live validation:** the follow-the-dot **calibration**
+flow (Quick 5-point / Full 9-point) and **curved-monitor support** (curvature
+radius, arc→chord width, and a gaze correction that re-intersects the gaze ray
+with the real cylindrical screen — the device itself can only be told about a
+flat plane).
+
+**Known issue:** `EYE_TRACKER_WIDTH_MM` in `tobii-gtk/src/align.rs` is
+unverified and believed wrong by roughly a factor of two (it exceeds the ET5's
+published 285 mm length). Since the screen width is now seeded from EDID this
+only affects the manual line-drag adjustment. It needs a measured value — see
+the comment on the constant.
+
+**Not yet started:** head-pose output (for opentrack / Star Citizen).
+"Select eyes to detect" is stored and persisted, but the device only applies it
+when it (re)calibrates, and whether a standard calibration is enough has not
+been confirmed on hardware.
+
+See `docs/superpowers/` for design specs and plans.
 
 ## Credits & license
 
