@@ -26,8 +26,9 @@ const MIN_EYE_DISTANCE_MM: f64 = 1.0;
 /// A top-down 2D point `(x, z)` in tracker space.
 type P2 = (f64, f64);
 
-/// The screen arc in the top-down plane: centre of curvature, radius, the chord
-/// end directions, and the half-angle the screen subtends.
+/// The screen arc in the top-down plane: centre of curvature and radius, the
+/// chord it is struck across (direction, midpoint, half-length), and the
+/// half-angle the screen subtends at the centre.
 struct Arc {
     centre: P2,
     radius: f64,
@@ -35,6 +36,10 @@ struct Arc {
     along: P2,
     /// Unit vector from the centre of curvature toward the screen.
     toward: P2,
+    /// Midpoint of the chord (the flat plane the device reports against).
+    mid: P2,
+    /// Half the chord length, i.e. `radius * sin(half_angle)`.
+    half_w: f64,
     /// Half the angle the screen subtends at the centre of curvature.
     half_angle: f64,
 }
@@ -99,6 +104,8 @@ fn screen_arc(setup: &DisplaySetup, eye: P2) -> Option<Arc> {
         radius: r,
         along,
         toward,
+        mid,
+        half_w,
         half_angle: (half_w / r).asin(),
     })
 }
@@ -133,9 +140,7 @@ fn ray_circle_t(origin: P2, dir: P2, centre: P2, radius: f64, toward: P2) -> Opt
             let hit = (origin.0 + dir.0 * t, origin.1 + dir.1 * t);
             dot(sub(hit, centre), toward) > 0.0
         })
-        .fold(None, |acc: Option<f64>, t| {
-            Some(acc.map_or(t, |m| m.min(t)))
-        })
+        .reduce(f64::min)
 }
 
 /// Correct a device-reported horizontal gaze coordinate for screen curvature.
@@ -163,7 +168,7 @@ pub fn correct_gaze_x(gaze_x: f64, eye_origin_mm: [f64; 3], setup: &DisplaySetup
     // test: the device reports an all-zero eye origin when it sees no eyes, and
     // for a tilted or offset screen that value is nowhere near the chord
     // midpoint, so the distance check below would happily accept it.
-    let from_tracker = eye_origin_mm.iter().fold(0.0, |acc, v| acc + v * v).sqrt();
+    let from_tracker = eye_origin_mm.iter().map(|v| v * v).sum::<f64>().sqrt();
     if from_tracker < MIN_EYE_DISTANCE_MM {
         return gaze_x;
     }
@@ -173,16 +178,11 @@ pub fn correct_gaze_x(gaze_x: f64, eye_origin_mm: [f64; 3], setup: &DisplaySetup
     };
 
     // The reported gaze identifies a point P on the chord: walk `gaze_x` of the
-    // way along it from the left end. (Left end = centre + half-angle rotated
-    // back; recover it from the arc frame rather than re-deriving corners.)
-    let half_w = arc.radius * arc.half_angle.sin();
-    let sag_depth = (arc.radius * arc.radius - half_w * half_w).sqrt();
-    let mid = (
-        arc.centre.0 + arc.toward.0 * sag_depth,
-        arc.centre.1 + arc.toward.1 * sag_depth,
-    );
-    let off = (gaze_x - 0.5) * 2.0 * half_w;
-    let p = (mid.0 + arc.along.0 * off, mid.1 + arc.along.1 * off);
+    // way along it from the left end. The chord's midpoint and half-length come
+    // straight off the arc, which built them from `to_corners` — so this can
+    // never drift from the plane the device was actually given.
+    let off = (gaze_x - 0.5) * 2.0 * arc.half_w;
+    let p = (arc.mid.0 + arc.along.0 * off, arc.mid.1 + arc.along.1 * off);
 
     let dir = sub(p, eye);
     let Some(t) = ray_circle_t(eye, dir, arc.centre, arc.radius, arc.toward) else {

@@ -23,7 +23,7 @@ use gtk::{
     Switch,
 };
 
-use crate::eyeview::{EyeView, Guidance};
+use crate::eyeview::EyeView;
 use tobii_protocol::EnabledEye;
 
 const APP_ID: &str = "com.tobiilinux.Configuration";
@@ -72,15 +72,6 @@ fn load_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
-    }
-}
-
-fn no_eyes_view() -> EyeView {
-    EyeView {
-        left: None,
-        right: None,
-        distance_mm: None,
-        guidance: Guidance::NoEyes,
     }
 }
 
@@ -135,7 +126,7 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
 fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
     // Latest view shared with the DrawingArea's draw callback (UI thread only).
-    let view = Rc::new(RefCell::new(no_eyes_view()));
+    let view = Rc::new(RefCell::new(EyeView::none()));
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
     // "Select eyes to detect": guard against echoing our own seeding as a user

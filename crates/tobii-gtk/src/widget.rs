@@ -10,21 +10,14 @@ use crate::eyeview::{EyeView, Guidance};
 /// The `EyeView` to render for a device snapshot: never show stale gaze — force
 /// "no eyes" unless the device is connected AND a sample is present.
 pub fn eye_view_for(state: &DeviceState) -> EyeView {
-    let no_eyes = EyeView {
-        left: None,
-        right: None,
-        distance_mm: None,
-        guidance: Guidance::NoEyes,
-    };
-    if matches!(state.status, ConnStatus::Connected) {
-        state
-            .latest_gaze
-            .as_ref()
-            .map(EyeView::from_gaze)
-            .unwrap_or(no_eyes)
-    } else {
-        no_eyes
+    if !matches!(state.status, ConnStatus::Connected) {
+        return EyeView::none();
     }
+    state
+        .latest_gaze
+        .as_ref()
+        .map(EyeView::from_gaze)
+        .unwrap_or_else(EyeView::none)
 }
 
 /// Human-readable eye-position guidance line.
