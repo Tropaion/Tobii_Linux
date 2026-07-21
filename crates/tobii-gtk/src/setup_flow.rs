@@ -44,6 +44,7 @@ fn default_setup() -> DisplaySetup {
         offset_x_mm: 0.0,
         offset_y_mm: 10.0,
         offset_z_mm: 0.0,
+        curvature_radius_mm: 0.0,
     }
 }
 
@@ -247,6 +248,50 @@ fn diagram_offset_x(cr: &cairo::Context) {
     caption(cr, (tcx + scx) / 2.0, 98.0, "offset");
 }
 
+/// Top-down view of a curved screen: the arc, the straight chord across its
+/// ends, the sagitta between them, and the radius struck from the viewer side.
+fn diagram_curvature(cr: &cairo::Context) {
+    diagram_bg(cr);
+    // Centre of curvature sits on the viewer's side (below, in this top-down
+    // view), so the screen bows away from the viewer.
+    let (ccx, ccy) = (110.0, 240.0);
+    let r = 190.0;
+    let half = 0.55f64; // half-angle the drawn screen subtends
+    let up = -std::f64::consts::FRAC_PI_2;
+
+    // The screen arc.
+    rgb(cr, GREY);
+    cr.set_line_width(2.0);
+    cr.arc(ccx, ccy, r, up - half, up + half);
+    let _ = cr.stroke();
+
+    // Its two ends, and the straight chord between them.
+    let end = |s: f64| (ccx + r * (up + s).cos(), ccy + r * (up + s).sin());
+    let (lx, ly) = end(-half);
+    let (rx, ry) = end(half);
+    cr.set_line_width(1.4);
+    cr.set_dash(&[4.0, 3.0], 0.0);
+    cr.move_to(lx, ly);
+    cr.line_to(rx, ry);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+
+    // Radius, struck from the centre of curvature out to the screen.
+    rgb(cr, GREY);
+    cr.set_line_width(0.8);
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.move_to(ccx, ccy);
+    cr.line_to(ccx, ccy - r);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    caption(cr, ccx + 26.0, ccy - 34.0, "radius");
+
+    // Sagitta: chord midpoint to the deepest point of the arc.
+    double_arrow(cr, ccx, (ly + ry) / 2.0, ccx, ccy - r);
+    caption(cr, ccx - 44.0, ccy - r + 16.0, "sagitta");
+    caption(cr, rx - 22.0, ry + 16.0, "chord");
+}
+
 /// A "?" button whose tooltip is `diagram` over `text`.
 fn help_button(diagram: fn(&cairo::Context), text: &'static str) -> Button {
     let btn = Button::with_label("?");
@@ -376,8 +421,16 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
         .ok()
         .flatten()
         .unwrap_or_else(default_setup);
+    // On a curved panel EDID reports the *arc* width (the panel is a flat sheet
+    // bent into an arc), but `width_mm` is the straight chord the flat display
+    // area is built from — so convert whenever a curve radius is configured.
+    let mut curved_seed: Option<f64> = None;
     if let Some(m) = &detected {
-        initial.width_mm = m.width_mm;
+        let chord = tobii_config::chord_from_arc(m.width_mm, initial.curvature_radius_mm);
+        if chord != m.width_mm {
+            curved_seed = Some(chord);
+        }
+        initial.width_mm = chord;
         initial.height_mm = m.height_mm;
     }
     let setup = Rc::new(RefCell::new(initial));
@@ -424,10 +477,18 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     status.set_justify(gtk::Justification::Center);
     status.set_max_width_chars(70);
     match &detected {
-        Some(m) => status.set_text(&format!(
-            "Detected {} — {:.0} × {:.0} mm. Drag the lines only if this looks wrong.",
-            m.model, m.width_mm, m.height_mm
-        )),
+        Some(m) => status.set_text(&match curved_seed {
+            Some(chord) => format!(
+                "Detected {} — {:.0} × {:.0} mm. That width follows the curve; \
+                 straightened for a {:.0}R screen it is {:.0} mm. Drag the lines \
+                 only if this looks wrong.",
+                m.model, m.width_mm, m.height_mm, initial.curvature_radius_mm, chord
+            ),
+            None => format!(
+                "Detected {} — {:.0} × {:.0} mm. Drag the lines only if this looks wrong.",
+                m.model, m.width_mm, m.height_mm
+            ),
+        }),
         None => {
             status.add_css_class("section-warn");
             status.set_text(
@@ -588,6 +649,27 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.offset_x_mm),
             Rc::new(|s, v| s.offset_x_mm = v),
+        ),
+        add_spinner(
+            &grid,
+            6,
+            "Screen curve radius (mm)",
+            (
+                diagram_curvature,
+                "The curve radius from your monitor's spec sheet — \"1800R\" \
+                 means 1800. 0 means a flat screen. It matters because the \
+                 tracker can only be told about a flat plane, so on a curved \
+                 screen the gaze point drifts by a few centimetres through the \
+                 middle region of the screen.",
+            ),
+            100.0,
+            0.0,
+            5000.0,
+            &setup,
+            &syncing,
+            &refresh_view,
+            Rc::new(|s| s.curvature_radius_mm),
+            Rc::new(|s, v| s.curvature_radius_mm = v),
         ),
     ]);
 

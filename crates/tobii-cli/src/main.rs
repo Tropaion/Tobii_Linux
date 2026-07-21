@@ -279,6 +279,7 @@ fn setup() -> CmdResult {
         offset_y_mm: prompt_f64("Height of screen BOTTOM edge above tracker (mm)", 10.0)?,
         offset_z_mm: prompt_f64("Depth of screen bottom from tracker (mm)", 0.0)?,
         offset_x_mm: prompt_f64("Horizontal offset of screen centre from tracker (mm)", 0.0)?,
+        curvature_radius_mm: prompt_f64("Screen curve radius (mm; 1800 for 1800R, 0 = flat)", 0.0)?,
     };
     let c = s.to_corners();
     println!("\ncomputed display-area corners (tracker-space mm):");
