@@ -150,6 +150,15 @@ fn print_setup(s: &DisplaySetup) {
         "  width={:.1}mm height={:.1}mm tilt={:.1}° offset=({:.1}, {:.1}, {:.1})mm",
         s.width_mm, s.height_mm, s.tilt_deg, s.offset_x_mm, s.offset_y_mm, s.offset_z_mm
     );
+    // A plane carries no curvature, so `display get` (which derives the setup
+    // from the device's three corners) always reports flat — only the saved
+    // config knows the real radius.
+    if s.curvature_radius_mm > 0.0 {
+        println!(
+            "  curve radius={:.0}mm (width above is the flat chord)",
+            s.curvature_radius_mm
+        );
+    }
 }
 
 /// Apply corners to a connected device. Returns whether the device
