@@ -35,6 +35,7 @@ window { background-color: #15181c; color: #e6e8ea; }
 .guidance { font-size: 14px; }
 .section-title { font-size: 15px; font-weight: bold; }
 .section-desc { font-size: 12px; color: #9aa4ad; }
+.section-warn { color: #f2b134; font-weight: bold; }
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
          border: none; border-radius: 8px; padding: 10px 18px; min-height: 24px; }
 button label { padding: 2px 0; }
@@ -42,6 +43,9 @@ button:hover { background-color: #26b6b8; }
 button:disabled { background-color: #2a2f36; color: #6b7178; }
 button:checked { background-color: #14696b; }
 button.spin-btn { min-width: 26px; padding: 2px 10px; }
+button.help-btn { min-width: 22px; padding: 0 8px; background-color: #2a2f36;
+                  color: #9aa4ad; font-size: 12px; }
+button.help-btn:hover { background-color: #3a424b; color: #e6e8ea; }
 .spin-entry { padding: 2px 6px; }
 .overlay-window { background-color: transparent; }
 ";
