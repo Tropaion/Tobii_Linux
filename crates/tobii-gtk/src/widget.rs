@@ -1,5 +1,5 @@
 //! GTK/cairo rendering + pure presentation helpers over the `eyeview` data.
-//! The pure helpers (`eye_view_for`, `status_text`, `guidance_message`) are
+//! The pure helpers (`eye_view_for`, `guidance_message`) are
 //! unit-tested; `draw_eye_view` is the cairo drawing (live-validated).
 
 use gtk::cairo;
@@ -24,15 +24,6 @@ pub fn eye_view_for(state: &DeviceState) -> EyeView {
             .unwrap_or(no_eyes)
     } else {
         no_eyes
-    }
-}
-
-/// Human-readable connection status line.
-pub fn status_text(status: &ConnStatus) -> String {
-    match status {
-        ConnStatus::Connecting => "Connecting to the eye tracker…".to_string(),
-        ConnStatus::Connected => "Eye tracker connected".to_string(),
-        ConnStatus::Error(e) => format!("Not connected: {e}"),
     }
 }
 
@@ -110,13 +101,6 @@ mod tests {
             validity_r: 0,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn status_text_covers_each_state() {
-        assert!(status_text(&ConnStatus::Connecting).contains("Connecting"));
-        assert!(status_text(&ConnStatus::Connected).contains("connected"));
-        assert!(status_text(&ConnStatus::Error("x".into())).contains("Not connected: x"));
     }
 
     #[test]

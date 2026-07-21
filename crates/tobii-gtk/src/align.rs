@@ -3,10 +3,27 @@
 //! The two on-screen vertical lines are dragged to the physical left/right ends
 //! of the eye tracker (whose real width is known). From their normalized x
 //! positions we derive the screen's physical width and the tracker's horizontal
-//! offset — the same algorithm the original Tobii software uses (verified
-//! against the decompiled `MovingLinesScreenPlaneSetup`).
+//! offset — the same shape of algorithm the original Tobii software uses.
 
-/// ET5 physical width in mm — the span the two alignment lines bracket.
+/// Span in mm that the two alignment lines are meant to bracket (the distance
+/// between the tracker's reference marks).
+///
+/// **UNVERIFIED — believed wrong by roughly a factor of two. Replace with a
+/// measured value.**
+///
+/// Evidence that 376.3 is wrong:
+/// - The number appears nowhere in the decompiled Tobii sources (grepped).
+/// - The published physical length of an ET5 is 285 mm, so 376.3 mm is longer
+///   than the entire device and cannot be a span between two marks on it.
+/// - A user who dragged the lines accurately onto the tracker's reference marks
+///   got width 2431.7 mm for a monitor whose real width is 1193 mm — a factor
+///   of 2.04. Working backwards, their line gap implies the marks are about
+///   185 mm apart (181 mm against the chord), i.e. roughly 2.03x smaller than
+///   this constant.
+///
+/// Impact is limited: the screen width is now seeded from EDID, so this
+/// constant only affects the manual drag adjustment (and the line positions
+/// seeded back from a known width).
 pub const EYE_TRACKER_WIDTH_MM: f64 = 376.3;
 /// Line clamps (normalized screen x) + minimum gap between the two lines.
 pub const MIN_LINE: f64 = 0.02;
