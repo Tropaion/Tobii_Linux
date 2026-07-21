@@ -68,10 +68,10 @@ fn enabled_eye_cmd(which: Option<&str>) -> CmdResult {
     Ok(())
 }
 
-/// B3 spike: probe the newly-mapped calibration session ops. Non-destructive —
-/// only `start` then `stop` (NOT `clear`, which would wipe the calibration, and
-/// no compute, so nothing is written). Confirms the device accepts these ops
-/// standalone before we build the follow-the-dot flow.
+/// Diagnostic: probe the calibration session ops. Non-destructive — only
+/// `start` then `stop` (NOT `clear`, which would wipe the calibration, and no
+/// compute, so nothing is written). Useful for checking that a device still
+/// accepts these ops standalone, independently of the GUI's calibration flow.
 fn cal_probe() -> CmdResult {
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
@@ -198,7 +198,8 @@ fn display_set() -> CmdResult {
 
 /// Host-chosen stimulus points (normalized). Center then four corners, inset
 /// from the edges. NOTE: headless — no dots are drawn, so this validates the
-/// protocol, not gaze accuracy (accuracy needs the stimulus UI, a later phase).
+/// protocol, not gaze accuracy. For an accurate calibration use the GUI's
+/// follow-the-dot flow (`tobii-gtk`), which shows the stimulus.
 const CAL_POINTS: [(f64, f64); 5] = [(0.5, 0.5), (0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)];
 
 fn calibrate(apply_saved: bool) -> CmdResult {
@@ -262,11 +263,7 @@ fn setup() -> CmdResult {
 
     let (mut w_def, mut h_def) = (600.0, 340.0);
     let monitors = tobii_config::detect_monitors();
-    if let Some(m) = monitors
-        .iter()
-        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
-        .max_by(|a, b| (a.width_mm * a.height_mm).total_cmp(&(b.width_mm * b.height_mm)))
-    {
+    if let Some(m) = tobii_config::pick_monitor(&monitors) {
         println!(
             "detected monitor: {} ({:.0} x {:.0} mm)",
             m.model, m.width_mm, m.height_mm

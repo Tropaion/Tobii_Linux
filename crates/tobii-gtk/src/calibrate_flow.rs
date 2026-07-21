@@ -1,7 +1,7 @@
 //! Fullscreen follow-the-dot calibration flow. The user picks Quick/Full, then
 //! follows a pulsing dot; each point is sampled by the device thread (see
 //! `device::DeviceCommand::Cal*`). The point sets + `CalMode` are unit-tested;
-//! the GTK window + cairo dot (added next) are live-validated.
+//! the GTK window + cairo dot are live-validated.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -14,6 +14,7 @@ use gtk::prelude::*;
 use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Overlay};
 
 use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
+use crate::{add_escape_to_close, screen_height};
 use tobii_protocol::EnabledEye;
 
 /// Calibration point sets (normalized, top-left origin, center-first — the
@@ -116,16 +117,6 @@ struct DotView {
     /// 0 = the dot just arrived, 1 = sampling now. Drives the converging ring,
     /// which is the user's only cue for *when* fixation actually matters.
     progress: f64,
-}
-
-/// Primary monitor height (px), to place the header a bit above the middle.
-fn screen_height() -> i32 {
-    gtk::gdk::Display::default()
-        .and_then(|d| d.monitors().item(0))
-        .and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok())
-        .map(|m| m.geometry().height())
-        .filter(|h| *h > 0)
-        .unwrap_or(1080)
 }
 
 /// Dark background + the pulsing fixation dot (a ring converging on a dot).
@@ -332,19 +323,7 @@ pub fn launch(
     }
 
     // Esc cancels.
-    let keys = gtk::EventControllerKey::new();
-    {
-        let win = win.clone();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk::gdk::Key::Escape {
-                win.close();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
-    }
-    win.add_controller(keys);
+    add_escape_to_close(&win);
 
     // Closing the window — by button, Esc, or the compositor (Alt+F4) — aborts
     // any open session and retires the tick. Without the flag the tick would
