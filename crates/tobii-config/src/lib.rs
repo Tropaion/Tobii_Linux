@@ -10,7 +10,7 @@ mod edid;
 mod setup;
 mod store;
 
-pub use edid::{detect_monitors, MonitorInfo};
+pub use edid::{detect_monitors, pick_monitor, MonitorInfo};
 pub use setup::DisplaySetup;
 pub use store::{
     calibration_path, config_path, enabled_eye_path, load, load_calibration, load_calibration_from,

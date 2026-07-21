@@ -19,7 +19,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
-use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
     cairo, Align, Application, Button, DrawingArea, Entry, GestureDrag, Grid, Label, Orientation,
@@ -28,16 +27,8 @@ use gtk::{
 
 use crate::align;
 use crate::device::DeviceCommand;
-use tobii_config::{DisplaySetup, MonitorInfo};
-
-/// Pick the monitor to seed the geometry from: the largest by area among the
-/// entries that reported a usable physical size. Same rule as `tobii setup`.
-pub fn pick_monitor(monitors: &[MonitorInfo]) -> Option<&MonitorInfo> {
-    monitors
-        .iter()
-        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
-        .max_by(|a, b| (a.width_mm * a.height_mm).total_cmp(&(b.width_mm * b.height_mm)))
-}
+use crate::{add_escape_to_close, screen_height};
+use tobii_config::{pick_monitor, DisplaySetup};
 
 fn aspect(area: &DrawingArea) -> f64 {
     let w = area.width().max(1) as f64;
@@ -54,16 +45,6 @@ fn default_setup() -> DisplaySetup {
         offset_y_mm: 10.0,
         offset_z_mm: 0.0,
     }
-}
-
-/// Primary monitor height (px), to place the header a bit above the middle.
-fn screen_height() -> i32 {
-    gtk::gdk::Display::default()
-        .and_then(|d| d.monitors().item(0))
-        .and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok())
-        .map(|m| m.geometry().height())
-        .filter(|h| *h > 0)
-        .unwrap_or(1080)
 }
 
 fn fmt_val(v: f64) -> String {
@@ -732,19 +713,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     area.add_controller(motion);
 
     // Esc cancels.
-    let keys = gtk::EventControllerKey::new();
-    {
-        let win = win.clone();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk::gdk::Key::Escape {
-                win.close();
-                glib::Propagation::Stop
-            } else {
-                glib::Propagation::Proceed
-            }
-        });
-    }
-    win.add_controller(keys);
+    add_escape_to_close(&win);
 
     // Apply: persist + push to device, return to hub.
     {
@@ -805,43 +774,4 @@ fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
     let _ = cr.stroke();
     cr.arc(w / 2.0, by + bar_h / 2.0, 5.0, 0.0, std::f64::consts::TAU);
     let _ = cr.fill();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mon(model: &str, w: f64, h: f64) -> MonitorInfo {
-        MonitorInfo {
-            model: model.into(),
-            width_mm: w,
-            height_mm: h,
-        }
-    }
-
-    #[test]
-    fn picks_largest_by_area() {
-        let ms = vec![
-            mon("small", 300.0, 200.0),
-            mon("big", 1193.0, 336.0),
-            mon("mid", 600.0, 340.0),
-        ];
-        assert_eq!(pick_monitor(&ms).unwrap().model, "big");
-    }
-
-    #[test]
-    fn skips_zero_and_negative_entries() {
-        let ms = vec![
-            mon("bogus-zero", 0.0, 0.0),
-            mon("bogus-neg", -1000.0, -1000.0),
-            mon("real", 300.0, 200.0),
-        ];
-        assert_eq!(pick_monitor(&ms).unwrap().model, "real");
-    }
-
-    #[test]
-    fn none_when_nothing_usable() {
-        assert!(pick_monitor(&[]).is_none());
-        assert!(pick_monitor(&[mon("zero", 0.0, 340.0)]).is_none());
-    }
 }

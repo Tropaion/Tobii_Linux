@@ -1,8 +1,8 @@
 //! `tobii-gtk` — GTK4 configuration GUI for the Tobii ET5 Linux runtime.
 //!
-//! Foundation: a styled hub window (status + live eye-position view) over the
-//! ported device thread. Guided flows, the gaze overlay, and select-eyes land
-//! in later phases of the GTK4 redesign.
+//! A styled hub window (status + live eye-position view) over the device
+//! thread, from which the guided display-setup and calibration flows, the
+//! gaze-preview overlay, and the select-eyes control are driven.
 
 pub mod align;
 pub mod calibrate_flow;
@@ -84,12 +84,17 @@ fn no_eyes_view() -> EyeView {
     }
 }
 
-/// Aspect ratio (w/h) of the primary monitor, so the eye-position box mirrors
-/// the screen's shape (e.g. 21:9). Falls back to 16:9.
-fn screen_aspect() -> f64 {
+/// The primary monitor, if one can be resolved.
+fn primary_monitor() -> Option<gtk::gdk::Monitor> {
     gtk::gdk::Display::default()
         .and_then(|d| d.monitors().item(0))
         .and_then(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
+}
+
+/// Aspect ratio (w/h) of the primary monitor, so the eye-position box mirrors
+/// the screen's shape (e.g. 21:9). Falls back to 16:9.
+fn screen_aspect() -> f64 {
+    primary_monitor()
         .map(|m| {
             let g = m.geometry();
             if g.height() > 0 {
@@ -99,6 +104,32 @@ fn screen_aspect() -> f64 {
             }
         })
         .unwrap_or(16.0 / 9.0)
+}
+
+/// Primary monitor height (px), used by the fullscreen flows to place their
+/// header a bit above the middle. Falls back to 1080.
+pub(crate) fn screen_height() -> i32 {
+    primary_monitor()
+        .map(|m| m.geometry().height())
+        .filter(|h| *h > 0)
+        .unwrap_or(1080)
+}
+
+/// Make Esc close `win`. Closing is the flows' single exit route, so each flow's
+/// own `close_request` handler still runs (that is where calibration aborts its
+/// session) — this only triggers it.
+pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
+    let keys = gtk::EventControllerKey::new();
+    let win_for_key = win.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            win_for_key.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    win.add_controller(keys);
 }
 
 fn build_ui(app: &Application) {
