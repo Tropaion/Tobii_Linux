@@ -1,8 +1,19 @@
-//! Fullscreen display-setup flow (the original's `-S`): drag two vertical lines
-//! to the physical ends of the eye tracker; the screen geometry (width + offset)
-//! is derived from their positions (`align`). A "Show advanced" toggle reveals
-//! the editable numeric form (compact −[value]+ spinners, two-way synced with
-//! the drag). Apply persists + pushes to the device; Cancel/Esc returns.
+//! Fullscreen display-setup flow (the original's `-S`).
+//!
+//! The screen geometry is **seeded from the monitor's EDID** (`detect_monitors`)
+//! whenever one can be detected: deriving the size purely from dragged lines is
+//! error-prone, because width is *inversely* proportional to the line gap — a
+//! user who dragged the lines to half the tracker's real width ended up with a
+//! 2431 mm "screen" (real monitor: 1193 x 336 mm), which threw gaze mapping off
+//! by centimetres. EDID makes that class of error nearly impossible.
+//!
+//! The two vertical lines are still draggable and keep their meaning (width +
+//! horizontal offset via `align`), so absent or wrong EDID can be corrected by
+//! eye. They are *rendered* from the current width/offset, so seeding the width
+//! places them correctly for free. A "Show advanced" toggle reveals the editable
+//! numeric form (compact −[value]+ spinners, two-way synced with the drag), each
+//! row carrying a "?" button whose tooltip explains + diagrams the field.
+//! Apply persists + pushes to the device; Cancel/Esc returns.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -17,7 +28,16 @@ use gtk::{
 
 use crate::align;
 use crate::device::DeviceCommand;
-use tobii_config::DisplaySetup;
+use tobii_config::{DisplaySetup, MonitorInfo};
+
+/// Pick the monitor to seed the geometry from: the largest by area among the
+/// entries that reported a usable physical size. Same rule as `tobii setup`.
+pub fn pick_monitor(monitors: &[MonitorInfo]) -> Option<&MonitorInfo> {
+    monitors
+        .iter()
+        .filter(|m| m.width_mm > 0.0 && m.height_mm > 0.0)
+        .max_by(|a, b| (a.width_mm * a.height_mm).total_cmp(&(b.width_mm * b.height_mm)))
+}
 
 fn aspect(area: &DrawingArea) -> f64 {
     let w = area.width().max(1) as f64;
@@ -59,12 +79,226 @@ struct Field {
     get: Getter,
 }
 
+// ---------------------------------------------------------------------------
+// Field help: a "?" button per row whose tooltip is a cairo diagram + a sentence.
+// Line art only — this project ships no binary assets and must stay self-contained.
+// ---------------------------------------------------------------------------
+
+/// Highlighted dimension.
+const TEAL: (f64, f64, f64) = (0.30, 0.85, 0.85);
+/// Context geometry (the monitor/tracker outlines the dimension is measured on).
+const GREY: (f64, f64, f64) = (0.55, 0.60, 0.66);
+
+fn rgb(cr: &cairo::Context, c: (f64, f64, f64)) {
+    cr.set_source_rgb(c.0, c.1, c.2);
+}
+
+/// Dark backdrop so the line art reads inside the tooltip.
+fn diagram_bg(cr: &cairo::Context) {
+    cr.set_source_rgb(0.08, 0.10, 0.12);
+    let _ = cr.paint();
+}
+
+/// A filled arrow head at `(x, y)` pointing along the unit vector `(dx, dy)`.
+fn arrow_head(cr: &cairo::Context, x: f64, y: f64, dx: f64, dy: f64) {
+    let (s, t) = (7.0, 3.5); // length, half-width
+    let (px, py) = (-dy, dx); // perpendicular
+    cr.move_to(x, y);
+    cr.line_to(x - dx * s + px * t, y - dy * s + py * t);
+    cr.line_to(x - dx * s - px * t, y - dy * s - py * t);
+    cr.close_path();
+    let _ = cr.fill();
+}
+
+/// A teal double-headed arrow from `(x1, y1)` to `(x2, y2)`.
+fn double_arrow(cr: &cairo::Context, x1: f64, y1: f64, x2: f64, y2: f64) {
+    rgb(cr, TEAL);
+    cr.set_line_width(1.6);
+    cr.move_to(x1, y1);
+    cr.line_to(x2, y2);
+    let _ = cr.stroke();
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+    let (ux, uy) = (dx / len, dy / len);
+    arrow_head(cr, x2, y2, ux, uy);
+    arrow_head(cr, x1, y1, -ux, -uy);
+}
+
+/// Small teal caption centred on `x`.
+fn caption(cr: &cairo::Context, x: f64, y: f64, text: &str) {
+    rgb(cr, TEAL);
+    cr.set_font_size(11.0);
+    let w = cr.text_extents(text).map(|e| e.width()).unwrap_or(0.0);
+    cr.move_to(x - w / 2.0, y);
+    let _ = cr.show_text(text);
+}
+
+/// Grey monitor front view: bezel + inset glass. Returns the glass rectangle.
+fn front_monitor(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
+    rgb(cr, GREY);
+    cr.set_line_width(1.4);
+    cr.rectangle(x, y, w, h);
+    let _ = cr.stroke();
+    let g = (x + 8.0, y + 8.0, w - 16.0, h - 16.0);
+    cr.set_line_width(1.0);
+    cr.rectangle(g.0, g.1, g.2, g.3);
+    let _ = cr.stroke();
+    g
+}
+
+/// Grey tracker bar (front view: wide; side view: short) centred on `x`.
+fn tracker_bar(cr: &cairo::Context, cx: f64, cy: f64, w: f64) {
+    rgb(cr, GREY);
+    cr.set_line_width(1.4);
+    cr.rectangle(cx - w / 2.0, cy - 3.0, w, 6.0);
+    let _ = cr.stroke();
+}
+
+/// Grey side view of a screen leaning back from its bottom edge at `(sx, sy)`.
+fn side_screen(cr: &cairo::Context, sx: f64, sy: f64) {
+    rgb(cr, GREY);
+    cr.set_line_width(2.0);
+    cr.move_to(sx, sy);
+    cr.line_to(sx + 26.0, sy - 72.0);
+    let _ = cr.stroke();
+    // A stubby foot so the "bottom of the glass" end is unmistakable.
+    cr.set_line_width(1.2);
+    cr.move_to(sx - 10.0, sy + 8.0);
+    cr.line_to(sx + 14.0, sy + 8.0);
+    let _ = cr.stroke();
+    cr.move_to(sx, sy);
+    cr.line_to(sx + 4.0, sy + 8.0);
+    let _ = cr.stroke();
+}
+
+fn diagram_width(cr: &cairo::Context) {
+    diagram_bg(cr);
+    let g = front_monitor(cr, 30.0, 24.0, 160.0, 82.0);
+    double_arrow(cr, g.0, g.1 + g.3 / 2.0, g.0 + g.2, g.1 + g.3 / 2.0);
+    caption(cr, 110.0, g.1 + g.3 / 2.0 - 8.0, "width");
+}
+
+fn diagram_height(cr: &cairo::Context) {
+    diagram_bg(cr);
+    let g = front_monitor(cr, 30.0, 24.0, 160.0, 82.0);
+    double_arrow(cr, g.0 + g.2 / 2.0, g.1, g.0 + g.2 / 2.0, g.1 + g.3);
+    caption(cr, 140.0, g.1 + g.3 / 2.0 + 4.0, "height");
+}
+
+fn diagram_tilt(cr: &cairo::Context) {
+    diagram_bg(cr);
+    let (sx, sy) = (85.0, 112.0);
+    side_screen(cr, sx, sy);
+    // Vertical dashed reference the tilt is measured against.
+    rgb(cr, GREY);
+    cr.set_line_width(1.0);
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.move_to(sx, sy);
+    cr.line_to(sx, sy - 78.0);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    // Arc from vertical to the screen line.
+    rgb(cr, TEAL);
+    cr.set_line_width(1.6);
+    let r = 46.0;
+    let lean = (26.0f64).atan2(72.0); // screen's lean from vertical
+    let up = -std::f64::consts::FRAC_PI_2;
+    cr.arc(sx, sy, r, up, up + lean);
+    let _ = cr.stroke();
+    caption(cr, sx + 40.0, sy - 46.0, "tilt");
+}
+
+fn diagram_offset_y(cr: &cairo::Context) {
+    diagram_bg(cr);
+    let (sx, sy) = (100.0, 84.0);
+    side_screen(cr, sx, sy);
+    let ty = 122.0;
+    tracker_bar(cr, 60.0, ty, 34.0);
+    // Where the screen bottom sits, carried across to the arrow.
+    rgb(cr, GREY);
+    cr.set_line_width(0.8);
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.move_to(60.0, sy);
+    cr.line_to(sx, sy);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    double_arrow(cr, 60.0, ty - 4.0, 60.0, sy);
+    caption(cr, 60.0, sy - 8.0, "height");
+}
+
+fn diagram_offset_z(cr: &cairo::Context) {
+    diagram_bg(cr);
+    let (sx, sy) = (128.0, 96.0);
+    side_screen(cr, sx, sy);
+    let (tx, ty) = (56.0, 118.0);
+    tracker_bar(cr, tx, ty, 34.0);
+    // Drop the screen bottom down to the tracker's level to compare depth.
+    rgb(cr, GREY);
+    cr.set_line_width(0.8);
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.move_to(sx, sy);
+    cr.line_to(sx, ty + 14.0);
+    cr.move_to(tx, ty + 4.0);
+    cr.line_to(tx, ty + 14.0);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    double_arrow(cr, tx, ty + 14.0, sx, ty + 14.0);
+    caption(cr, (tx + sx) / 2.0, ty + 30.0, "depth");
+}
+
+fn diagram_offset_x(cr: &cairo::Context) {
+    diagram_bg(cr);
+    // Monitor deliberately off-centre from the tracker below it.
+    let g = front_monitor(cr, 52.0, 20.0, 140.0, 74.0);
+    let scx = g.0 + g.2 / 2.0;
+    let tcx = 88.0;
+    tracker_bar(cr, tcx, 116.0, 60.0);
+    rgb(cr, GREY);
+    cr.set_line_width(0.8);
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.move_to(scx, g.1 + g.3);
+    cr.line_to(scx, 106.0);
+    cr.move_to(tcx, 112.0);
+    cr.line_to(tcx, 106.0);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    double_arrow(cr, tcx, 104.0, scx, 104.0);
+    caption(cr, (tcx + scx) / 2.0, 98.0, "offset");
+}
+
+/// A "?" button whose tooltip is `diagram` over `text`.
+fn help_button(diagram: fn(&cairo::Context), text: &'static str) -> Button {
+    let btn = Button::with_label("?");
+    btn.add_css_class("help-btn");
+    btn.set_valign(Align::Center);
+    btn.set_has_tooltip(true);
+    btn.connect_query_tooltip(move |_, _, _, _, tooltip| {
+        let area = DrawingArea::new();
+        area.set_content_width(220);
+        area.set_content_height(140);
+        area.set_draw_func(move |_, cr, _, _| diagram(cr));
+
+        let label = Label::new(Some(text));
+        label.set_wrap(true);
+        label.set_max_width_chars(38);
+        label.set_xalign(0.0);
+
+        let bx = gtk::Box::new(Orientation::Vertical, 8);
+        bx.append(&area);
+        bx.append(&label);
+        tooltip.set_custom(Some(&bx));
+        true
+    });
+    btn
+}
+
 /// Build + wire one compact `−[entry]+` spinner row into the grid.
 #[allow(clippy::too_many_arguments)]
 fn add_spinner(
     grid: &Grid,
     row: i32,
     label: &str,
+    help: (fn(&cairo::Context), &'static str),
     step: f64,
     min: f64,
     max: f64,
@@ -93,6 +327,7 @@ fn add_spinner(
     rowbox.append(&plus);
     grid.attach(&lbl, 0, row, 1, 1);
     grid.attach(&rowbox, 1, row, 1, 1);
+    grid.attach(&help_button(help.0, help.1), 2, row, 1, 1);
 
     // Commit a value: clamp, store, reflect in the entry (guarded), refresh view.
     let commit: Rc<dyn Fn(f64)> = {
@@ -151,8 +386,20 @@ fn add_spinner(
 
 /// Open the fullscreen display-setup flow window.
 pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
-    let saved = tobii_config::load().ok().flatten();
-    let setup = Rc::new(RefCell::new(saved.unwrap_or_else(default_setup)));
+    // Seed from EDID when we can: the saved/default config supplies the pose
+    // (tilt + offsets), the detected monitor overrides the physical size, which
+    // is the part users get catastrophically wrong when dragging the lines.
+    let monitors = tobii_config::detect_monitors();
+    let detected = pick_monitor(&monitors).cloned();
+    let mut initial = tobii_config::load()
+        .ok()
+        .flatten()
+        .unwrap_or_else(default_setup);
+    if let Some(m) = &detected {
+        initial.width_mm = m.width_mm;
+        initial.height_mm = m.height_mm;
+    }
+    let setup = Rc::new(RefCell::new(initial));
 
     let win = gtk::ApplicationWindow::builder()
         .application(app)
@@ -187,6 +434,27 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     let readout = Label::new(Some(""));
     readout.add_css_class("guidance");
     readout.set_halign(Align::Center);
+
+    // Detection status: reassurance when EDID worked, a call to action when not.
+    let status = Label::new(None);
+    status.add_css_class("section-desc");
+    status.set_halign(Align::Center);
+    status.set_wrap(true);
+    status.set_justify(gtk::Justification::Center);
+    status.set_max_width_chars(70);
+    match &detected {
+        Some(m) => status.set_text(&format!(
+            "Detected {} — {:.0} × {:.0} mm. Drag the lines only if this looks wrong.",
+            m.model, m.width_mm, m.height_mm
+        )),
+        None => {
+            status.add_css_class("section-warn");
+            status.set_text(
+                "Could not detect your monitor. Measure the screen glass (not the bezel) \
+                 and set the size under Show advanced.",
+            );
+        }
+    }
 
     let apply = Button::with_label("Apply & save");
     let advanced = ToggleButton::with_label("Show advanced");
@@ -232,6 +500,11 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &grid,
             0,
             "Width (mm)",
+            (
+                diagram_width,
+                "Measure the visible glass horizontally, from picture edge to \
+                 picture edge — do not include the bezel or the case.",
+            ),
             5.0,
             1.0,
             5000.0,
@@ -245,6 +518,11 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &grid,
             1,
             "Height (mm)",
+            (
+                diagram_height,
+                "Measure the visible glass vertically, from picture edge to \
+                 picture edge — do not include the bezel or the case.",
+            ),
             5.0,
             1.0,
             5000.0,
@@ -258,6 +536,11 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &grid,
             2,
             "Tilt back (deg)",
+            (
+                diagram_tilt,
+                "How far the screen leans back from vertical. 0 is perfectly \
+                 upright; most desk monitors sit around 10–20.",
+            ),
             1.0,
             -45.0,
             45.0,
@@ -271,6 +554,12 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &grid,
             3,
             "Bottom edge above tracker (mm)",
+            (
+                diagram_offset_y,
+                "Vertical distance from the tracker up to the bottom of the \
+                 visible glass. This one matters a lot: an error here shifts \
+                 every gaze point vertically.",
+            ),
             5.0,
             -2000.0,
             2000.0,
@@ -284,6 +573,13 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &grid,
             4,
             "Depth from tracker (mm)",
+            (
+                diagram_offset_z,
+                "How far the bottom of the screen sits behind the tracker — 0 \
+                 if they are flush. It mostly affects accuracy near the screen \
+                 edges and when you move your head, so it is low-leverage and \
+                 can usually stay at its default.",
+            ),
             5.0,
             -2000.0,
             2000.0,
@@ -297,6 +593,12 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &grid,
             5,
             "Horizontal offset (mm)",
+            (
+                diagram_offset_x,
+                "How far the centre of the screen sits left or right of the \
+                 tracker's centre. 0 if the tracker is centred; negative means \
+                 the screen sits to the left.",
+            ),
             5.0,
             -2000.0,
             2000.0,
@@ -335,6 +637,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     header.set_margin_top((screen_height() as f64 * 0.34) as i32);
     header.append(&instr);
     header.append(&readout);
+    header.append(&status);
     header.append(&buttons);
     header.append(&adv_panel);
 
@@ -478,13 +781,22 @@ fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
 
     // Vertical lines run from just above the tracker bar to the screen's bottom.
     let line_top = by - 22.0;
-    cr.set_source_rgb(0.88, 0.92, 0.96);
-    cr.set_line_width(2.0);
     for x_norm in [lines.0, lines.1] {
         let x = x_norm * w;
+        cr.set_source_rgb(0.88, 0.92, 0.96);
+        cr.set_line_width(2.0);
         cr.move_to(x, line_top);
         cr.line_to(x, h);
         let _ = cr.stroke();
+
+        // A small upward arrow near the bottom, so it's obvious the lines are
+        // the draggable elements. Same normalized x, so it tracks the drag.
+        cr.set_source_rgba(0.30, 0.85, 0.85, 0.75);
+        cr.move_to(x, h - 34.0);
+        cr.line_to(x - 7.0, h - 20.0);
+        cr.line_to(x + 7.0, h - 20.0);
+        cr.close_path();
+        let _ = cr.fill();
     }
 
     cr.set_source_rgb(0.30, 0.85, 0.85);
@@ -493,4 +805,43 @@ fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
     let _ = cr.stroke();
     cr.arc(w / 2.0, by + bar_h / 2.0, 5.0, 0.0, std::f64::consts::TAU);
     let _ = cr.fill();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mon(model: &str, w: f64, h: f64) -> MonitorInfo {
+        MonitorInfo {
+            model: model.into(),
+            width_mm: w,
+            height_mm: h,
+        }
+    }
+
+    #[test]
+    fn picks_largest_by_area() {
+        let ms = vec![
+            mon("small", 300.0, 200.0),
+            mon("big", 1193.0, 336.0),
+            mon("mid", 600.0, 340.0),
+        ];
+        assert_eq!(pick_monitor(&ms).unwrap().model, "big");
+    }
+
+    #[test]
+    fn skips_zero_and_negative_entries() {
+        let ms = vec![
+            mon("bogus-zero", 0.0, 0.0),
+            mon("bogus-neg", -1000.0, -1000.0),
+            mon("real", 300.0, 200.0),
+        ];
+        assert_eq!(pick_monitor(&ms).unwrap().model, "real");
+    }
+
+    #[test]
+    fn none_when_nothing_usable() {
+        assert!(pick_monitor(&[]).is_none());
+        assert!(pick_monitor(&[mon("zero", 0.0, 340.0)]).is_none());
+    }
 }
