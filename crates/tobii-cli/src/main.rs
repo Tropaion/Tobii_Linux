@@ -1,9 +1,13 @@
-//! `tobii` CLI. Subcommands: `stream`, `setup`, `display get|set`, `calibrate`.
+//! `tobii` CLI. Subcommands: `stream`, `headpose`, `setup`, `display get|set`,
+//! `calibrate`.
 
 use std::io::Write;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use tobii_config::DisplaySetup;
+use tobii_headpose::{opentrack, pose_from_sample, PoseFilter};
 use tobii_protocol::frame::OP_GET_DISPLAY_AREA;
 use tobii_protocol::gaze::present;
 use tobii_protocol::{DisplayCorners, EnabledEye};
@@ -20,6 +24,7 @@ fn main() -> ExitCode {
             args.iter().any(|a| a == "--json"),
             args.iter().any(|a| a == "--eyes"),
         ),
+        (Some("headpose"), _) => headpose(&args),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
@@ -30,6 +35,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage:\n  \
                  tobii stream [--json] [--eyes]\n  \
+                 tobii headpose [--udp ADDR] [--rate HZ]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -95,14 +101,15 @@ fn cal_probe() -> CmdResult {
     Ok(())
 }
 
-fn stream(json: bool, eyes: bool) -> CmdResult {
-    eprintln!("opening Tobii ET5...");
-    let transport = UsbTransport::open()?;
-    let mut conn = Connection::connect(transport)?;
-
-    // The ET5 resets its display area to a ~4mm stub on every reboot (it reboots
-    // on session close), and emits no eye-tracking data until a valid area is
-    // set — so re-apply the saved config in-session right after connecting.
+/// Re-apply the saved display area to a freshly connected device.
+///
+/// The ET5 resets its display area to a ~4mm stub on every reboot (it reboots
+/// on session close), and emits no eye-tracking data at all until a valid area
+/// is set — so every command that wants gaze data must do this in-session right
+/// after connecting, or the user sees a device that reports no eyes forever.
+/// Failures are reported but not fatal: the device may already have a usable
+/// area from another session.
+fn reapply_display_area(conn: &mut Connection<UsbTransport>) {
     match tobii_config::load() {
         Ok(Some(setup)) => match conn.set_display_area(&setup.to_corners()) {
             Ok(true) => eprintln!(
@@ -117,6 +124,13 @@ fn stream(json: bool, eyes: bool) -> CmdResult {
         }
         Err(e) => eprintln!("warning: could not load config ({e})"),
     }
+}
+
+fn stream(json: bool, eyes: bool) -> CmdResult {
+    eprintln!("opening Tobii ET5...");
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
 
     eprintln!("connected — streaming gaze (Ctrl-C to stop)");
     loop {
@@ -158,6 +172,127 @@ fn stream(json: bool, eyes: bool) -> CmdResult {
             }
         } else {
             println!("t={:>12}  (no 2D gaze this frame)", s.timestamp_us);
+        }
+    }
+}
+
+/// opentrack's default "UDP over network" endpoint.
+const DEFAULT_UDP_ADDR: &str = "127.0.0.1:4242";
+/// Datagrams per second when `--rate` is not given.
+const DEFAULT_RATE_HZ: f64 = 60.0;
+/// How often the human-readable status line is printed to stderr.
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// How long tracking must stay lost before the smoothing filter is reset. A
+/// blink drops a handful of frames and should not cause a visible snap when the
+/// eyes come back; a genuine absence should not drag a stale pose back in.
+const TRACKING_LOSS_RESET: Duration = Duration::from_millis(1000);
+
+/// Value of a `--flag VALUE` style option, if present.
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).map(String::as_str)
+}
+
+/// Resolve the `--udp` argument to a single socket address.
+fn parse_udp_addr(raw: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    raw.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| format!("`{raw}` did not resolve to any address").into())
+}
+
+/// Parse the `--rate` argument into a positive, finite frequency in Hz.
+fn parse_rate(raw: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    match raw.parse::<f64>() {
+        Ok(hz) if hz.is_finite() && hz > 0.0 => Ok(hz),
+        _ => Err(format!("--rate needs a positive number of Hz, got `{raw}`").into()),
+    }
+}
+
+/// Stream a derived head pose to opentrack over UDP.
+///
+/// Pitch is always zero — it cannot be recovered from two eye positions. See
+/// the `tobii-headpose` crate docs for the geometry and the (still unvalidated)
+/// sign conventions.
+fn headpose(args: &[String]) -> CmdResult {
+    let addr = parse_udp_addr(flag_value(args, "--udp").unwrap_or(DEFAULT_UDP_ADDR))?;
+    let rate_hz = match flag_value(args, "--rate") {
+        Some(raw) => parse_rate(raw)?,
+        None => DEFAULT_RATE_HZ,
+    };
+    let send_interval = Duration::from_secs_f64(1.0 / rate_hz);
+
+    // Bind an ephemeral local port; opentrack only ever receives from us.
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+
+    eprintln!("opening Tobii ET5...");
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+
+    eprintln!("sending head pose to {addr} at {rate_hz:.0} Hz (Ctrl-C to stop)");
+    eprintln!(
+        "note: pitch is always 0 — it is not derivable from two eye positions, \
+         and the device's own head-pose stream is not mapped yet."
+    );
+
+    let mut filter = PoseFilter::default();
+    let now = Instant::now();
+    let (mut last_send, mut last_status) = (now, now);
+    let mut last_tracked: Option<Instant> = None;
+    let mut samples_since_status = 0u32;
+    let mut sends_since_status = 0u32;
+
+    loop {
+        // Drain every sample the device offers and feed them all to the filter;
+        // `--rate` throttles what goes on the wire, not what we smooth over.
+        if let Some(sample) = conn.next_gaze() {
+            samples_since_status += 1;
+            match pose_from_sample(&sample) {
+                Some(raw) => {
+                    last_tracked = Some(Instant::now());
+                    let pose = filter.update(raw);
+                    if last_send.elapsed() >= send_interval {
+                        socket.send_to(&opentrack::to_opentrack_datagram(&pose), addr)?;
+                        last_send = Instant::now();
+                        sends_since_status += 1;
+                    }
+                }
+                None => {
+                    // Tracking lost. Stop sending rather than emitting a
+                    // synthetic pose: opentrack simply holds its last value,
+                    // which is far less jarring in game than a snap to zero.
+                    let lost_for = last_tracked.map(|t| t.elapsed());
+                    if lost_for.is_none_or(|d| d >= TRACKING_LOSS_RESET) {
+                        filter.reset();
+                        last_tracked = None;
+                    }
+                }
+            }
+        }
+
+        if last_status.elapsed() >= STATUS_INTERVAL {
+            let elapsed = last_status.elapsed().as_secs_f64();
+            match (last_tracked.is_some(), filter.current()) {
+                (true, Some(p)) => eprintln!(
+                    "pos=({:>7.1}, {:>7.1}, {:>7.1})mm  yaw={:>6.1}°  roll={:>6.1}°  \
+                     pitch=n/a   {:.0} samples/s, {:.0} sent/s",
+                    p.x_mm,
+                    p.y_mm,
+                    p.z_mm,
+                    p.yaw_deg,
+                    p.roll_deg,
+                    f64::from(samples_since_status) / elapsed,
+                    f64::from(sends_since_status) / elapsed,
+                ),
+                _ => eprintln!(
+                    "NO HEAD DETECTED — both eyes must be in the trackbox  \
+                     ({:.0} samples/s, not sending)",
+                    f64::from(samples_since_status) / elapsed
+                ),
+            }
+            last_status = Instant::now();
+            samples_since_status = 0;
+            sends_since_status = 0;
         }
     }
 }
@@ -333,4 +468,70 @@ fn setup() -> CmdResult {
         ),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_value_reads_the_argument_after_the_flag() {
+        let a = args(&[
+            "tobii",
+            "headpose",
+            "--udp",
+            "10.0.0.5:9999",
+            "--rate",
+            "30",
+        ]);
+        assert_eq!(flag_value(&a, "--udp"), Some("10.0.0.5:9999"));
+        assert_eq!(flag_value(&a, "--rate"), Some("30"));
+        assert_eq!(flag_value(&a, "--missing"), None);
+    }
+
+    #[test]
+    fn flag_value_is_none_when_the_flag_is_last() {
+        assert_eq!(
+            flag_value(&args(&["tobii", "headpose", "--udp"]), "--udp"),
+            None
+        );
+    }
+
+    #[test]
+    fn default_udp_address_is_opentracks_usual_port() {
+        let addr = parse_udp_addr(DEFAULT_UDP_ADDR).expect("default address parses");
+        assert_eq!(addr.port(), opentrack::DEFAULT_PORT);
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn udp_addresses_parse_and_bad_ones_are_rejected() {
+        assert_eq!(
+            parse_udp_addr("192.168.1.7:4242")
+                .expect("host:port")
+                .port(),
+            4242
+        );
+        assert!(parse_udp_addr("192.168.1.7").is_err(), "missing port");
+        assert!(parse_udp_addr("not an address").is_err());
+    }
+
+    #[test]
+    fn rate_accepts_positive_frequencies_only() {
+        assert_eq!(parse_rate("120").expect("integral Hz"), 120.0);
+        assert_eq!(parse_rate("33.5").expect("fractional Hz"), 33.5);
+        for bad in ["0", "-30", "nan", "inf", "", "fast"] {
+            assert!(parse_rate(bad).is_err(), "`{bad}` must be rejected");
+        }
+    }
+
+    #[test]
+    fn default_rate_yields_a_sane_send_interval() {
+        let interval = Duration::from_secs_f64(1.0 / DEFAULT_RATE_HZ);
+        assert!(interval > Duration::ZERO && interval < STATUS_INTERVAL);
+    }
 }

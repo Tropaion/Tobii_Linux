@@ -13,3 +13,4 @@ path = "src/main.rs"
 tobii-usb = { path = "../tobii-usb" }
 tobii-protocol = { path = "../tobii-protocol" }
 tobii-config = { path = "../tobii-config" }
+tobii-headpose = { path = "../tobii-headpose" }

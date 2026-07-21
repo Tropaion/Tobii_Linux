@@ -682,6 +682,7 @@ name = "tobii-cli"
 version = "0.1.0"
 dependencies = [
  "tobii-config",
+ "tobii-headpose",
  "tobii-protocol",
  "tobii-usb",
 ]
@@ -702,6 +703,13 @@ dependencies = [
  "tobii-config",
  "tobii-protocol",
  "tobii-usb",
+]
+
+[[package]]
+name = "tobii-headpose"
+version = "0.1.0"
+dependencies = [
+ "tobii-protocol",
 ]
 
 [[package]]
