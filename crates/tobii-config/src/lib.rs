@@ -6,17 +6,17 @@
 //! [`DisplaySetup::from_corners`] inverts a device-reported area back to editable
 //! params. No I/O beyond the config store (see `store`).
 //!
-//! The device only ever accepts a plane, so curved panels get two extra pieces:
+//! The device only ever accepts a plane. Curved panels therefore need the
+//! arc->chord width conversion below, but deliberately NO runtime gaze
+//! correction: a per-user calibration already absorbs curvature (see
+//! `tobii-gtk/src/overlay.rs`).
 //! [`chord_from_arc`] / [`arc_from_chord`] convert between the arc width EDID
-//! reports and the chord width [`DisplaySetup`] stores, and [`correct_gaze_x`]
-//! (see `curve`) maps a device-reported gaze x back onto the physical arc.
+//! reports and the chord width [`DisplaySetup`] stores.
 
-mod curve;
 mod edid;
 mod setup;
 mod store;
 
-pub use curve::correct_gaze_x;
 pub use edid::{detect_monitors, pick_monitor, MonitorInfo};
 pub use setup::{arc_from_chord, chord_from_arc, DisplaySetup};
 pub use store::{
