@@ -16,7 +16,10 @@ fn main() -> ExitCode {
     let sub = args.get(1).map(String::as_str);
     let arg2 = args.get(2).map(String::as_str);
     let result = match (sub, arg2) {
-        (Some("stream"), _) => stream(args.iter().any(|a| a == "--json")),
+        (Some("stream"), _) => stream(
+            args.iter().any(|a| a == "--json"),
+            args.iter().any(|a| a == "--eyes"),
+        ),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
@@ -26,7 +29,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage:\n  \
-                 tobii stream [--json]\n  \
+                 tobii stream [--json] [--eyes]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -92,7 +95,7 @@ fn cal_probe() -> CmdResult {
     Ok(())
 }
 
-fn stream(json: bool) -> CmdResult {
+fn stream(json: bool, eyes: bool) -> CmdResult {
     eprintln!("opening Tobii ET5...");
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
@@ -133,6 +136,26 @@ fn stream(json: bool) -> CmdResult {
                 "t={:>12}  gaze=({:.4}, {:.4})  valL={} valR={}",
                 s.timestamp_us, s.gaze_point_2d[0], s.gaze_point_2d[1], s.validity_l, s.validity_r
             );
+            // Diagnostic view of the raw eye geometry the GUI's eye-position
+            // box is drawn from: trackbox is the device's own normalized
+            // capture volume (independent of any display config), origin is
+            // the eye position in tracker-space mm.
+            if eyes {
+                println!(
+                    "                trackbox L=({:.3}, {:.3})  R=({:.3}, {:.3})   \
+                     origin L=({:.0}, {:.0}, {:.0})mm  R=({:.0}, {:.0}, {:.0})mm",
+                    s.trackbox_eye_l[0],
+                    s.trackbox_eye_l[1],
+                    s.trackbox_eye_r[0],
+                    s.trackbox_eye_r[1],
+                    s.eye_origin_l_mm[0],
+                    s.eye_origin_l_mm[1],
+                    s.eye_origin_l_mm[2],
+                    s.eye_origin_r_mm[0],
+                    s.eye_origin_r_mm[1],
+                    s.eye_origin_r_mm[2],
+                );
+            }
         } else {
             println!("t={:>12}  (no 2D gaze this frame)", s.timestamp_us);
         }
