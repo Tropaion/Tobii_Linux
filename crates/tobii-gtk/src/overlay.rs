@@ -11,7 +11,23 @@ use gtk::{Application, ApplicationWindow, DrawingArea};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::device::{ConnStatus, DeviceState};
-use tobii_protocol::gaze::present;
+use tobii_config::{correct_gaze_x, DisplaySetup};
+use tobii_protocol::gaze::{present, GazeSample};
+
+/// Midpoint of whichever eye origins the sample carries, if any.
+fn eye_origin(s: &GazeSample) -> Option<[f64; 3]> {
+    let l = s.has(present::EYE_ORIGIN_L).then_some(s.eye_origin_l_mm);
+    let r = s.has(present::EYE_ORIGIN_R).then_some(s.eye_origin_r_mm);
+    match (l, r) {
+        (Some(l), Some(r)) => Some([
+            (l[0] + r[0]) / 2.0,
+            (l[1] + r[1]) / 2.0,
+            (l[2] + r[2]) / 2.0,
+        ]),
+        (Some(e), None) | (None, Some(e)) => Some(e),
+        (None, None) => None,
+    }
+}
 
 /// Create + present the gaze overlay. Returns the window so the caller can close
 /// it later. The per-frame refresh auto-stops when the window is destroyed.
@@ -29,6 +45,15 @@ pub fn show(app: &Application, state: Arc<Mutex<DeviceState>>) -> ApplicationWin
 
     // Latest gaze point (normalized), shared with the draw callback.
     let gaze: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+
+    // Saved geometry, for the curved-screen correction below. The device only
+    // knows about a flat plane, so on a curved panel its reported x is off by
+    // centimetres through the middle of the screen; `correct_gaze_x` maps it
+    // back onto the physical arc. A no-op at curvature 0 (every flat setup).
+    let setup: Option<DisplaySetup> = tobii_config::load()
+        .ok()
+        .flatten()
+        .filter(|s| s.curvature_radius_mm > 0.0);
 
     let area = DrawingArea::new();
     area.set_hexpand(true);
@@ -67,7 +92,13 @@ pub fn show(app: &Application, state: Arc<Mutex<DeviceState>>) -> ApplicationWin
             let g = if matches!(snap.status, ConnStatus::Connected) {
                 snap.latest_gaze.as_ref().and_then(|s| {
                     if s.has(present::GAZE_2D) && s.validity_l == 0 {
-                        Some((s.gaze_point_2d[0], s.gaze_point_2d[1]))
+                        let mut x = s.gaze_point_2d[0];
+                        // Curvature is cylindrical about a vertical axis, so
+                        // only x needs correcting; y passes through untouched.
+                        if let (Some(cfg), Some(eye)) = (setup.as_ref(), eye_origin(s)) {
+                            x = correct_gaze_x(x, eye, cfg);
+                        }
+                        Some((x, s.gaze_point_2d[1]))
                     } else {
                         None
                     }

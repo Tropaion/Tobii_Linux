@@ -130,6 +130,7 @@ mod tests {
             offset_x_mm: 0.0,
             offset_y_mm: 40.0,
             offset_z_mm: -5.0,
+            curvature_radius_mm: 1800.0,
         }
     }
 

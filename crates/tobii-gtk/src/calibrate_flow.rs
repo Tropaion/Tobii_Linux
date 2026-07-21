@@ -19,6 +19,13 @@ use tobii_protocol::EnabledEye;
 
 /// Calibration point sets (normalized, top-left origin, center-first — the
 /// original's Guest (5) and recalibration (9) sets, verbatim).
+///
+/// These are deliberately **not** run through `tobii_config::correct_gaze_x`,
+/// even on a curved screen: during calibration the device's flat-plane model is
+/// the reference frame both sides agree on, and pre-distorting the stimulus
+/// would bake an unvalidated correction into the calibration itself. The
+/// curvature correction belongs downstream, where we consume gaze (see
+/// `overlay.rs`).
 pub const QUICK_5: [(f64, f64); 5] = [(0.5, 0.5), (0.1, 0.9), (0.5, 0.1), (0.9, 0.9), (0.5, 0.5)];
 pub const FULL_9: [(f64, f64); 9] = [
     (0.5, 0.5),

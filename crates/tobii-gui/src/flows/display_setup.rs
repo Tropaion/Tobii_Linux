@@ -42,6 +42,7 @@ fn seed_setup() -> DisplaySetup {
         offset_x_mm: 0.0,
         offset_y_mm: 10.0,
         offset_z_mm: 0.0,
+        curvature_radius_mm: 0.0,
     })
 }
 
