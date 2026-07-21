@@ -538,6 +538,12 @@ mod tests {
         assert!(s.has(present::VALIDITY_L) && s.has(present::VALIDITY_R));
         assert_eq!(s.validity_l, 4);
         assert_eq!(s.validity_r, 4);
+        // The eye-origin columns are *present but zeroed* in a no-eyes frame:
+        // the present bit alone never means "this eye is tracked". Consumers
+        // must gate on validity too (see `tobii-gtk`'s overlay + eyeview).
+        assert!(s.has(present::EYE_ORIGIN_L) && s.has(present::EYE_ORIGIN_R));
+        assert_eq!(s.eye_origin_l_mm, [0.0; 3]);
+        assert_eq!(s.eye_origin_r_mm, [0.0; 3]);
         assert!(s.has(present::GAZE_2D));
         assert!(
             (s.gaze_point_2d[0] - (-1.0)).abs() < 1e-9,

@@ -55,6 +55,22 @@ fn fmt_val(v: f64) -> String {
 type Getter = Rc<dyn Fn(&DisplaySetup) -> f64>;
 type Setter = Rc<dyn Fn(&mut DisplaySetup, f64)>;
 
+/// A late-bound "this field changed" hook. The curvature spinner needs to write
+/// back into *another* field's entry, which does not exist until every spinner
+/// has been built — so the spinner holds the cell and the closure is dropped in
+/// afterwards.
+type Hook = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// Run `hook`'s closure, if one has been installed. Clones it out of the
+/// `RefCell` first: the closure re-enters the setup state, and this file has
+/// shipped a double-borrow panic before (c8db2c7).
+fn fire(hook: &Option<Hook>) {
+    let f = hook.as_ref().and_then(|c| c.borrow().clone());
+    if let Some(f) = f {
+        f();
+    }
+}
+
 /// One editable field: its entry + a getter for refreshing it from the setup.
 struct Field {
     entry: Entry,
@@ -333,6 +349,7 @@ fn add_spinner(
     refresh_view: &Rc<dyn Fn()>,
     get: Getter,
     set: Setter,
+    hook: Option<Hook>,
 ) -> Field {
     let lbl = Label::new(Some(label));
     lbl.set_halign(Align::Start);
@@ -362,12 +379,14 @@ fn add_spinner(
         let refresh_view = refresh_view.clone();
         let entry = entry.clone();
         let set = set.clone();
+        let hook = hook.clone();
         Rc::new(move |v: f64| {
             let v = v.clamp(min, max);
-            set(&mut setup.borrow_mut(), v);
+            set(&mut setup.borrow_mut(), v); // borrow released before fire()
             syncing.set(true);
             entry.set_text(&fmt_val(v));
             syncing.set(false);
+            fire(&hook);
             refresh_view();
         })
     };
@@ -383,7 +402,8 @@ fn add_spinner(
                 return;
             }
             if let Ok(v) = e.text().trim().parse::<f64>() {
-                set(&mut setup.borrow_mut(), v.clamp(min, max));
+                set(&mut setup.borrow_mut(), v.clamp(min, max)); // borrow released
+                fire(&hook);
                 refresh_view();
             }
         });
@@ -424,13 +444,16 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     // On a curved panel EDID reports the *arc* width (the panel is a flat sheet
     // bent into an arc), but `width_mm` is the straight chord the flat display
     // area is built from — so convert whenever a curve radius is configured.
-    let mut curved_seed: Option<f64> = None;
+    //
+    // The radius here comes from the *saved* config, which a first-time user of
+    // a curved monitor does not have: it is 0, the conversion is the identity,
+    // and the arc gets seeded as if it were the chord. So keep the arc for the
+    // lifetime of the flow and re-derive the width whenever the radius changes
+    // (see `on_curve` below) — otherwise typing "1800" into the curvature
+    // spinner would leave a 22 mm-too-wide screen on disk and on the device.
+    let edid_arc_mm: Option<f64> = detected.as_ref().map(|m| m.width_mm);
     if let Some(m) = &detected {
-        let chord = tobii_config::chord_from_arc(m.width_mm, initial.curvature_radius_mm);
-        if chord != m.width_mm {
-            curved_seed = Some(chord);
-        }
-        initial.width_mm = chord;
+        initial.width_mm = tobii_config::chord_from_arc(m.width_mm, initial.curvature_radius_mm);
         initial.height_mm = m.height_mm;
     }
     let setup = Rc::new(RefCell::new(initial));
@@ -476,27 +499,64 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     status.set_wrap(true);
     status.set_justify(gtk::Justification::Center);
     status.set_max_width_chars(70);
-    match &detected {
-        Some(m) => status.set_text(&match curved_seed {
-            Some(chord) => format!(
-                "Detected {} — {:.0} × {:.0} mm. That width follows the curve; \
-                 straightened for a {:.0}R screen it is {:.0} mm. Drag the lines \
-                 only if this looks wrong.",
-                m.model, m.width_mm, m.height_mm, initial.curvature_radius_mm, chord
-            ),
-            None => format!(
-                "Detected {} — {:.0} × {:.0} mm. Drag the lines only if this looks wrong.",
-                m.model, m.width_mm, m.height_mm
-            ),
-        }),
-        None => {
-            status.add_css_class("section-warn");
-            status.set_text(
-                "Could not detect your monitor. Measure the screen glass (not the bezel) \
-                 and set the size under Show advanced.",
-            );
-        }
-    }
+
+    // Rebuilt from the current setup on every change, so the arc→chord
+    // straightening becomes visible the moment a curve radius is entered, and a
+    // physically impossible radius says so instead of silently doing nothing.
+    let refresh_status: Rc<dyn Fn()> = {
+        let setup = setup.clone();
+        let status = status.clone();
+        let detected = detected.clone();
+        Rc::new(move || {
+            let s = *setup.borrow(); // Copy; borrow released here
+            let mut warn = false;
+            let mut text = match &detected {
+                Some(m) => {
+                    let chord = tobii_config::chord_from_arc(m.width_mm, s.curvature_radius_mm);
+                    if (chord - m.width_mm).abs() >= 0.5 {
+                        format!(
+                            "Detected {} — {:.0} × {:.0} mm. That width follows the curve; \
+                             straightened for a {:.0}R screen it is {:.0} mm. Drag the lines \
+                             only if this looks wrong.",
+                            m.model, m.width_mm, m.height_mm, s.curvature_radius_mm, chord
+                        )
+                    } else {
+                        format!(
+                            "Detected {} — {:.0} × {:.0} mm. Drag the lines only if this \
+                             looks wrong.",
+                            m.model, m.width_mm, m.height_mm
+                        )
+                    }
+                }
+                None => {
+                    warn = true;
+                    "Could not detect your monitor. Measure the screen glass (not the bezel) \
+                     and set the size under Show advanced."
+                        .to_string()
+                }
+            };
+            // No circle of this radius passes through both side edges, so the
+            // curvature correction cannot run at all. Silently behaving like a
+            // flat screen would be indistinguishable from typing 0.
+            if s.curvature_radius_mm > 0.0 && s.curvature_radius_mm <= s.width_mm / 2.0 {
+                warn = true;
+                text.push_str(&format!(
+                    "\nA {:.0} mm curve radius is impossible on a {:.0} mm wide screen — it \
+                     has to be more than half the width ({:.0} mm), so the curve correction \
+                     is switched off. Use the figure from the spec sheet: \"1800R\" is 1800.",
+                    s.curvature_radius_mm,
+                    s.width_mm,
+                    s.width_mm / 2.0
+                ));
+            }
+            if warn {
+                status.add_css_class("section-warn");
+            } else {
+                status.remove_css_class("section-warn");
+            }
+            status.set_text(&text);
+        })
+    };
 
     let apply = Button::with_label("Apply & save");
     let advanced = ToggleButton::with_label("Show advanced");
@@ -517,9 +577,11 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
         let area = area.clone();
         let readout = readout.clone();
         let corners = corners.clone();
+        let refresh_status = refresh_status.clone();
         Rc::new(move || {
-            let s = *setup.borrow();
+            let s = *setup.borrow(); // Copy; borrow released here
             area.queue_draw();
+            refresh_status();
             readout.set_text(&format!(
                 "Screen ≈ {:.0} × {:.0} mm   ·   horizontal offset {:.0} mm",
                 s.width_mm, s.height_mm, s.offset_x_mm
@@ -531,6 +593,9 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             ));
         })
     };
+
+    // Filled in once the fields exist; see the wiring below the form.
+    let on_curve: Hook = Rc::new(RefCell::new(None));
 
     // Advanced numeric form: compact −[entry]+ spinners.
     let grid = Grid::new();
@@ -555,6 +620,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.width_mm),
             Rc::new(|s, v| s.width_mm = v),
+            None,
         ),
         add_spinner(
             &grid,
@@ -573,6 +639,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.height_mm),
             Rc::new(|s, v| s.height_mm = v),
+            None,
         ),
         add_spinner(
             &grid,
@@ -591,6 +658,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.tilt_deg),
             Rc::new(|s, v| s.tilt_deg = v),
+            None,
         ),
         add_spinner(
             &grid,
@@ -610,6 +678,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.offset_y_mm),
             Rc::new(|s, v| s.offset_y_mm = v),
+            None,
         ),
         add_spinner(
             &grid,
@@ -630,6 +699,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.offset_z_mm),
             Rc::new(|s, v| s.offset_z_mm = v),
+            None,
         ),
         add_spinner(
             &grid,
@@ -649,6 +719,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.offset_x_mm),
             Rc::new(|s, v| s.offset_x_mm = v),
+            None,
         ),
         add_spinner(
             &grid,
@@ -670,8 +741,32 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             &refresh_view,
             Rc::new(|s| s.curvature_radius_mm),
             Rc::new(|s, v| s.curvature_radius_mm = v),
+            Some(on_curve.clone()),
         ),
     ]);
+
+    // Curvature changed → re-derive the width from the remembered EDID arc.
+    // Without this a first-time user of a curved monitor saves the arc width as
+    // if it were the chord (22 mm too wide on a 49" 1800R), corrupting both the
+    // plane sent to the device and the arc geometry the gaze correction derives
+    // from it. Deliberately a no-op when EDID told us nothing: then the width in
+    // the form is hand-measured, i.e. already a chord, and must not be rewritten.
+    {
+        let setup = setup.clone();
+        let syncing = syncing.clone();
+        let width_entry = fields[0].entry.clone(); // row 0 is "Width (mm)"
+        *on_curve.borrow_mut() = Some(Rc::new(move || {
+            let Some(arc) = edid_arc_mm else {
+                return;
+            };
+            let r = setup.borrow().curvature_radius_mm; // borrow released here
+            let chord = tobii_config::chord_from_arc(arc, r);
+            setup.borrow_mut().width_mm = chord;
+            syncing.set(true);
+            width_entry.set_text(&fmt_val(chord));
+            syncing.set(false);
+        }));
+    }
 
     let adv_panel = gtk::Box::new(Orientation::Vertical, 10);
     adv_panel.set_halign(Align::Center);

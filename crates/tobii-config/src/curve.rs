@@ -18,7 +18,9 @@
 
 use crate::DisplaySetup;
 
-/// Below this the eye origin is treated as unusable (all-zero / on the screen).
+/// Below this the eye origin is treated as unusable: either it is the tracker's
+/// own origin (the all-zero value the device fills in when it sees no eyes) or
+/// it sits on the screen plane, where the ray cast has no depth to work with.
 const MIN_EYE_DISTANCE_MM: f64 = 1.0;
 
 /// A top-down 2D point `(x, z)` in tracker space.
@@ -101,8 +103,16 @@ fn screen_arc(setup: &DisplaySetup, eye: P2) -> Option<Arc> {
     })
 }
 
-/// Smallest strictly-positive `t` with `|origin + t·dir − centre| == radius`.
-fn ray_circle_t(origin: P2, dir: P2, centre: P2, radius: f64) -> Option<f64> {
+/// Nearest strictly-positive `t` with `|origin + t·dir − centre| == radius`
+/// **whose hit lies on the screen half of the circle**, i.e. on the `toward`
+/// side of the centre of curvature.
+///
+/// The side test is what makes this correct for a far-away eye. While the eye
+/// is inside the circle (nearer than `radius + sagitta`) exactly one root is
+/// positive and it is the screen; beyond that both roots are positive and the
+/// nearer one lands on the *front* of the circle — the half that is not the
+/// screen — which would send `theta` to ±π and clamp the result to an edge.
+fn ray_circle_t(origin: P2, dir: P2, centre: P2, radius: f64, toward: P2) -> Option<f64> {
     let f = sub(origin, centre);
     let a = dot(dir, dir);
     if a < 1e-18 {
@@ -116,11 +126,13 @@ fn ray_circle_t(origin: P2, dir: P2, centre: P2, radius: f64) -> Option<f64> {
     }
     let sq = disc.sqrt();
     let (t1, t2) = ((-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a));
-    // The eye is normally *inside* the circle (the centre of curvature is
-    // behind it), so t1 < 0 < t2 and the far root is the screen.
     [t1, t2]
         .into_iter()
         .filter(|t| *t > 1e-9 && t.is_finite())
+        .filter(|t| {
+            let hit = (origin.0 + dir.0 * t, origin.1 + dir.1 * t);
+            dot(sub(hit, centre), toward) > 0.0
+        })
         .fold(None, |acc: Option<f64>, t| {
             Some(acc.map_or(t, |m| m.min(t)))
         })
@@ -135,15 +147,24 @@ fn ray_circle_t(origin: P2, dir: P2, centre: P2, radius: f64) -> Option<f64> {
 /// the true gaze point measured **by arc length along the physical screen**, so
 /// `0.0` and `1.0` stay the physical screen edges.
 ///
-/// Returns `gaze_x` unchanged — never `NaN`, never panicking — when the screen
-/// is flat (`curvature_radius_mm <= 0`), the geometry is degenerate, the eye
-/// origin is unusable, or the ray misses the screen arc.
+/// Returns `gaze_x` **clamped to `[0, 1]` but otherwise uncorrected** — never
+/// `NaN`, never panicking — when the screen is flat (`curvature_radius_mm <=
+/// 0`), the geometry is degenerate, the eye origin is unusable, or the ray
+/// misses the screen arc. A non-finite `gaze_x` is passed straight back.
 pub fn correct_gaze_x(gaze_x: f64, eye_origin_mm: [f64; 3], setup: &DisplaySetup) -> f64 {
     if !gaze_x.is_finite() {
         return gaze_x;
     }
     let gaze_x = gaze_x.clamp(0.0, 1.0);
     if !eye_origin_mm.iter().all(|v| v.is_finite()) {
+        return gaze_x;
+    }
+    // The origin must be usable *in its own right*, before any screen-relative
+    // test: the device reports an all-zero eye origin when it sees no eyes, and
+    // for a tilted or offset screen that value is nowhere near the chord
+    // midpoint, so the distance check below would happily accept it.
+    let from_tracker = eye_origin_mm.iter().fold(0.0, |acc, v| acc + v * v).sqrt();
+    if from_tracker < MIN_EYE_DISTANCE_MM {
         return gaze_x;
     }
     let eye: P2 = (eye_origin_mm[0], eye_origin_mm[2]);
@@ -164,7 +185,7 @@ pub fn correct_gaze_x(gaze_x: f64, eye_origin_mm: [f64; 3], setup: &DisplaySetup
     let p = (mid.0 + arc.along.0 * off, mid.1 + arc.along.1 * off);
 
     let dir = sub(p, eye);
-    let Some(t) = ray_circle_t(eye, dir, arc.centre, arc.radius) else {
+    let Some(t) = ray_circle_t(eye, dir, arc.centre, arc.radius, arc.toward) else {
         return gaze_x;
     };
     let hit = (eye.0 + dir.0 * t, eye.1 + dir.1 * t);
@@ -289,10 +310,22 @@ mod tests {
         assert!(left < 0.25, "left={left}");
         assert!(right > 0.75, "right={right}");
         // Magnitude in mm of screen: a couple of centimetres, matching what the
-        // user observes. Sanity-bracket it rather than pinning the exact value.
+        // user observes.
         let mm = (0.25 - left) * 1193.0;
         assert!((10.0..45.0).contains(&mm), "shift={mm} mm");
         assert!(((0.25 - left) - (right - 0.75)).abs() < 1e-9);
+
+        // The exact value, pinned. This single number is the only assertion in
+        // the file that constrains the *normalisation*: every other test (edges,
+        // centre, symmetry, bounds) is satisfied identically by arc-length and
+        // by chord normalisation, because the two agree at 0, 0.5 and 1. Pinning
+        // 0.25 pins normalisation, magnitude and sign at once — a chord-
+        // normalised implementation lands on 0.225390 and fails here. Verified
+        // by an independent re-derivation of the ray/circle intersection.
+        assert!(
+            (left - 0.228924).abs() < 1e-6,
+            "left={left} (arc-length normalisation is what this pins)"
+        );
     }
 
     #[test]
@@ -303,6 +336,12 @@ mod tests {
             [-500.0, 300.0, -400.0],
             [600.0, 900.0, -1500.0],
             [0.0, 0.0, -60.0],
+            // Far enough that the eye is *outside* the circle of curvature
+            // (beyond radius + sagitta ≈ 1898 mm from the screen): both ray
+            // roots are then positive and the nearer one is on the wrong half
+            // of the circle. Well outside the ET5's range, but it must not
+            // silently pin the gaze to a screen edge.
+            [0.0, 400.0, -4000.0],
         ] {
             for i in -5..=25 {
                 let x = i as f64 / 20.0;
@@ -383,6 +422,40 @@ mod tests {
         assert!(correct_gaze_x(0.0, EYE, &s).abs() < 1e-9);
         assert!((correct_gaze_x(1.0, EYE, &s) - 1.0).abs() < 1e-9);
         assert!((correct_gaze_x(0.5, EYE, &s) - 0.5).abs() < 1e-9);
+    }
+
+    /// An eye beyond `radius + sagitta` sits *outside* the circle of curvature,
+    /// so both ray/circle roots are positive. Taking the nearer one hits the
+    /// front of the circle instead of the screen arc, which sends the answer to
+    /// an edge; the screen-side root keeps the geometry meaningful.
+    #[test]
+    fn eye_outside_the_circle_of_curvature_still_hits_the_screen_arc() {
+        let s = odyssey();
+        let far = [0.0, 400.0, -4000.0];
+        // Centre must still be the centre (the near root gives 1.0 here).
+        assert!((correct_gaze_x(0.5, far, &s) - 0.5).abs() < 1e-9);
+        // And 0.25 must still be a small outward nudge, not a clamp to 0.0.
+        let left = correct_gaze_x(0.25, far, &s);
+        assert!((0.24..0.25).contains(&left), "left={left}");
+    }
+
+    /// The "all-zero origin is unusable" guard must not depend on the screen
+    /// happening to sit at the tracker origin. With tilt and depth offset the
+    /// chord midpoint is metres away from `[0, 0, 0]`, so a distance-from-the-
+    /// screen test alone would accept the device's no-eyes sentinel and return
+    /// a wildly displaced point.
+    #[test]
+    fn all_zero_origin_is_rejected_even_for_a_tilted_offset_screen() {
+        let s = DisplaySetup {
+            tilt_deg: 20.0,
+            offset_z_mm: -30.0,
+            ..odyssey()
+        };
+        assert_eq!(correct_gaze_x(0.25, [0.0; 3], &s), 0.25);
+        assert_eq!(correct_gaze_x(0.75, [0.0; 3], &s), 0.75);
+        // A real eye with the same setup is still corrected outward.
+        let left = correct_gaze_x(0.25, EYE, &s);
+        assert!(left.is_finite() && left < 0.25 && left > 0.2, "left={left}");
     }
 
     /// An off-centre viewer sees an asymmetric correction — the near half of
