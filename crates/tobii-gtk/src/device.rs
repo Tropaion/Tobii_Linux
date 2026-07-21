@@ -39,8 +39,17 @@ pub struct CalPhase {
     /// level-testing them races the queue. 0 = no session (see
     /// [`next_cal_token`]).
     pub token: u64,
-    /// True between `CalBegin` and `CalFinish`/`CalAbort`.
+    /// True between `CalBegin` being *dequeued* and `CalFinish`/`CalAbort`.
+    /// Deliberately set before any USB traffic: the device thread's idle
+    /// watchdog uses it to suppress disconnect detection for the whole session,
+    /// including the seconds `start`/`clear` may take. It is NOT evidence that
+    /// the session opened — see [`CalPhase::started`].
     pub active: bool,
+    /// True once `start` AND `clear` have both been acked, i.e. the device is
+    /// really in a calibration session and point collection may begin. The UI
+    /// waits on this rather than `active`, which would only prove the command
+    /// left the queue.
+    pub started: bool,
     /// Points successfully collected so far this session.
     pub collected: usize,
     /// Set when the last `CalCollect` failed (per-point error to surface).
@@ -55,10 +64,15 @@ impl CalPhase {
         CalPhase {
             token,
             active: true,
+            started: false,
             collected: 0,
             last_error: None,
             finished: None,
         }
+    }
+    /// Record that `start` + `clear` both acked: the session is really open.
+    pub fn on_started(&mut self) {
+        self.started = true;
     }
     /// Record a point-collection result: increment on success, else store error.
     pub fn on_collect(&mut self, result: Result<(), String>) {
@@ -83,11 +97,13 @@ pub struct DeviceState {
     pub latest_gaze: Option<GazeSample>,
     pub enabled_eye: Option<EnabledEye>,
     pub calibration: CalPhase,
-    /// Whether the *device* is believed to be inside an open calibration realm:
-    /// set once `start_calibration` returns `Ok`, cleared only once a stop has
-    /// actually been issued. Deliberately separate from `calibration.active`,
-    /// which `on_finish` also clears on the start/clear failure path — where the
-    /// realm may well still be open and still needs an explicit stop.
+    /// Whether the device *may* be inside an open calibration realm. Set
+    /// pessimistically before `start_calibration` is issued (a deadline error
+    /// is not proof the device ignored the request) and cleared only once a
+    /// stop is actually **acked**. Erring towards `true` costs at most one
+    /// redundant stop; erring towards `false` strands the device in calibration
+    /// mode. Deliberately separate from `calibration.active`, which `on_finish`
+    /// clears on the start/clear failure path — exactly when a stop is needed.
     pub cal_session_open: bool,
 }
 
@@ -135,18 +151,21 @@ pub fn device_tick<T: Transport>(
                 state.lock().unwrap().calibration = CalPhase::begin(token);
                 let _ = conn.set_enabled_eye(eye); // best-effort select-eyes experiment
 
-                // The realm is open the moment `start` acks, even if `clear`
-                // then fails — record that before clearing so the abort path
-                // below still knows it has to stop the session.
-                let r = match conn.start_calibration() {
-                    Ok(()) => {
-                        state.lock().unwrap().cal_session_open = true;
-                        conn.clear_calibration().map_err(|e| e.to_string())
-                    }
-                    Err(e) => Err(e.to_string()),
-                };
-                if let Err(e) = r {
-                    state.lock().unwrap().calibration.on_finish(Err(e));
+                // Pessimistic: a request fails on a wall-clock deadline, which
+                // is NOT proof the device ignored it — it may have entered the
+                // realm while the ack was lost or late. Record "possibly open"
+                // *before* issuing `start`, so the abort path always tries to
+                // close it. A stale `true` costs one redundant stop; a `false`
+                // with an open realm strands the device in calibration mode.
+                state.lock().unwrap().cal_session_open = true;
+                let r = conn
+                    .start_calibration()
+                    .and_then(|()| conn.clear_calibration())
+                    .map_err(|e| e.to_string());
+                match r {
+                    // Only now is the session really open for point collection.
+                    Ok(()) => state.lock().unwrap().calibration.on_started(),
+                    Err(e) => state.lock().unwrap().calibration.on_finish(Err(e)),
                 }
             }
             DeviceCommand::CalCollect { x, y } => {
@@ -156,10 +175,14 @@ pub fn device_tick<T: Transport>(
                 state.lock().unwrap().calibration.on_collect(r);
             }
             DeviceCommand::CalFinish => {
-                let r = finish_calibration(conn);
-                // `finish_calibration` always issues a stop, success or not.
+                let (r, stop_acked) = finish_calibration(conn);
                 let mut s = state.lock().unwrap();
-                s.cal_session_open = false;
+                // Issuing a stop is not the same as the realm closing: only an
+                // acked stop proves that. If the ack was lost, leave the flag
+                // set so a later abort retries the stop.
+                if stop_acked {
+                    s.cal_session_open = false;
+                }
                 s.calibration.on_finish(r);
             }
             DeviceCommand::CalAbort => {
@@ -170,8 +193,24 @@ pub fn device_tick<T: Transport>(
                 // predicate: `active` is also false after CalBegin's start
                 // succeeded but clear failed, exactly when a stop is required.
                 if state.lock().unwrap().cal_session_open {
-                    let _ = conn.stop_calibration();
-                    state.lock().unwrap().cal_session_open = false;
+                    // Clear the flag only on an acked stop (see `CalFinish`).
+                    if conn.stop_calibration().is_ok() {
+                        state.lock().unwrap().cal_session_open = false;
+                    }
+                    // `CalBegin` issues a destructive `clear`, and nothing else
+                    // puts the calibration back — without this an aborted or
+                    // failed session would leave the tracker uncalibrated for
+                    // the rest of the USB session. Having no saved blob is
+                    // normal (first ever run), not an error.
+                    match tobii_config::load_calibration() {
+                        Ok(Some(blob)) => {
+                            if let Err(e) = conn.apply_calibration(&blob) {
+                                eprintln!("warning: could not restore calibration ({e})");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("warning: could not load saved calibration ({e})"),
+                    }
                 }
                 state.lock().unwrap().calibration = CalPhase::default();
             }
@@ -212,7 +251,11 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 // The ET5 wipes calibration on reboot like the display area;
                 // re-apply the saved blob so calibration persists across sessions.
                 if let Ok(Some(blob)) = tobii_config::load_calibration() {
-                    let _ = conn.apply_calibration(&blob);
+                    // OP_CAL_APPLY is disasm-derived and runs on every connect;
+                    // don't let a rejection pass silently as bad tracking.
+                    if let Err(e) = conn.apply_calibration(&blob) {
+                        eprintln!("warning: could not apply saved calibration ({e})");
+                    }
                 }
                 let cur_eye = conn.get_enabled_eye().ok().flatten();
                 {
@@ -253,20 +296,25 @@ fn set_error(state: &Mutex<DeviceState>, e: &UsbError) {
 
 /// Compute + stop + retrieve + persist. Always attempts `stop` so the device is
 /// not left in calibration mode even when compute fails.
-fn finish_calibration<T: Transport>(conn: &mut Connection<T>) -> Result<(), String> {
+/// Returns the outcome alongside whether the stop was *acked* — only an acked
+/// stop proves the realm closed, so the caller must not clear
+/// `cal_session_open` without it.
+fn finish_calibration<T: Transport>(conn: &mut Connection<T>) -> (Result<(), String>, bool) {
     let compute = conn
         .compute_and_apply_calibration()
         .map_err(|e| e.to_string());
-    let _ = conn.stop_calibration();
-    compute?;
-    let blob = conn.retrieve_calibration().map_err(|e| e.to_string())?;
-    if blob.0.is_empty() {
-        // Persisting an empty blob would re-apply nothing on every connect and
-        // silently mask the fact that the calibration was never stored.
-        return Err("device returned an empty calibration".into());
-    }
-    tobii_config::save_calibration(&blob.0).map_err(|e| e.to_string())?;
-    Ok(())
+    // Stop unconditionally, even when compute failed.
+    let stop_acked = conn.stop_calibration().is_ok();
+    let outcome = compute.and_then(|()| {
+        let blob = conn.retrieve_calibration().map_err(|e| e.to_string())?;
+        if blob.0.is_empty() {
+            // Persisting an empty blob would re-apply nothing on every connect
+            // and silently mask that the calibration was never stored.
+            return Err("device returned an empty calibration".into());
+        }
+        tobii_config::save_calibration(&blob.0).map_err(|e| e.to_string())
+    });
+    (outcome, stop_acked)
 }
 
 #[cfg(test)]
@@ -481,7 +529,28 @@ mod tests {
         tx.send(DeviceCommand::CalAbort).unwrap();
         device_tick(&mut conn, &state, &rx);
         assert!(sent_op(&conn, 0x3fc), "CAL_STOP was sent");
-        assert!(!state.lock().unwrap().cal_session_open);
+        // The mock never acks that stop, so the realm may well still be open:
+        // the flag must STAY set so a later abort retries it. Clearing on a
+        // merely-issued stop is how a device gets stranded in calibration mode.
+        assert!(
+            state.lock().unwrap().cal_session_open,
+            "an unacked stop must not be taken as proof the realm closed"
+        );
+    }
+
+    #[test]
+    fn cal_phase_started_is_separate_from_active() {
+        // `active` is set the moment CalBegin is dequeued (the idle watchdog
+        // depends on that covering the whole start/clear window); `started`
+        // only once the session is really open, which is what the UI waits on.
+        let mut p = CalPhase::begin(9);
+        assert!(p.active, "in flight as soon as the command is dequeued");
+        assert!(
+            !p.started,
+            "but the session is not open until start+clear ack"
+        );
+        p.on_started();
+        assert!(p.started);
     }
 
     #[test]

@@ -247,7 +247,25 @@ fn build_ui(app: &Application) {
         let app = app.clone();
         let state = state.clone();
         let cmd_tx = cmd_tx.clone();
-        b_cal.connect_clicked(move |_| calibrate_flow::launch(&app, state.clone(), cmd_tx.clone()));
+        let sw_preview = sw_preview.clone();
+        b_cal.connect_clicked(move |btn| {
+            // The gaze preview is a layer-shell surface on the Overlay layer,
+            // which composites ABOVE a fullscreen window — the user would end
+            // up chasing their own gaze dot instead of the stimulus dot, which
+            // poisons every sample while still reporting success. Switching the
+            // toggle off closes it through the switch's own handler, so the
+            // switch and the overlay window cannot end up disagreeing.
+            sw_preview.set_active(false);
+            // One flow at a time: a second window would drive the same device
+            // session and corrupt the first's point accounting.
+            btn.set_sensitive(false);
+            let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone());
+            let btn = btn.clone();
+            win.connect_close_request(move |_| {
+                btn.set_sensitive(true);
+                glib::Propagation::Proceed
+            });
+        });
     }
 
     let right = gtk::Box::new(Orientation::Vertical, 18);

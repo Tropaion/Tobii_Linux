@@ -54,11 +54,25 @@ pub fn calibration_path() -> PathBuf {
 }
 
 /// Write the opaque calibration blob to `path`, creating parent dirs as needed.
+///
+/// Written atomically (temp file in the same directory, then rename): a plain
+/// write truncates first, so a crash or unplug mid-write would leave a
+/// truncated blob that [`load_calibration_from`] cannot tell from a good one —
+/// and it is re-applied to the device on every connect.
 pub fn save_calibration_to(path: &Path, blob: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, blob)
+    let tmp = path.with_extension("bin.tmp");
+    std::fs::write(&tmp, blob)?;
+    // Same directory, so rename is atomic (never crosses a filesystem).
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // don't leave debris behind
+            Err(e)
+        }
+    }
 }
 
 /// Read a calibration blob from `path`. `Ok(None)` if the file does not exist.
@@ -144,6 +158,36 @@ mod tests {
     fn config_path_ends_with_expected_suffix() {
         let p = config_path();
         assert!(p.ends_with("tobii-linux/config.toml"));
+    }
+
+    #[test]
+    fn saving_a_calibration_overwrites_atomically_and_leaves_no_temp_file() {
+        // The blob is re-applied to the device on every connect, so a truncated
+        // file left by an interrupted write would be indistinguishable from a
+        // good one. Overwriting must also not strand a .tmp beside it.
+        let dir = std::env::temp_dir().join("tobii-config-test-cal-atomic");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("calibration.bin");
+        save_calibration_to(&path, &[0xAA; 64]).expect("first save");
+        save_calibration_to(&path, &[0xBB; 8]).expect("overwrite");
+        assert_eq!(
+            load_calibration_from(&path)
+                .expect("load io")
+                .expect("some"),
+            vec![0xBB; 8],
+            "overwrite fully replaces the previous blob"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
