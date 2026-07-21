@@ -5,26 +5,25 @@
 //! positions we derive the screen's physical width and the tracker's horizontal
 //! offset — the same shape of algorithm the original Tobii software uses.
 
-/// Span in mm that the two alignment lines are meant to bracket (the distance
-/// between the tracker's reference marks).
+/// Span in mm that the two alignment lines are meant to bracket: the distance
+/// between the reference marks on the eye tracker.
 ///
-/// **UNVERIFIED — believed wrong by roughly a factor of two. Replace with a
-/// measured value.**
+/// **MEASURED on a physical ET5 (2026-07-21): 184 mm.**
 ///
-/// Evidence that 376.3 is wrong:
-/// - The number appears nowhere in the decompiled Tobii sources (grepped).
-/// - The published physical length of an ET5 is 285 mm, so 376.3 mm is longer
-///   than the entire device and cannot be a span between two marks on it.
-/// - A user who dragged the lines accurately onto the tracker's reference marks
-///   got width 2431.7 mm for a monitor whose real width is 1193 mm — a factor
-///   of 2.04. Working backwards, their line gap implies the marks are about
-///   185 mm apart (181 mm against the chord), i.e. roughly 2.03x smaller than
-///   this constant.
+/// This replaced a long-standing 376.3, which was wrong by a factor of 2.04 and
+/// documented as "verified" when it never had been. Two independent lines of
+/// evidence agree on 184:
+/// - Direct measurement of the marks on the device.
+/// - Back-calculation: a user dragging the lines accurately onto those marks
+///   produced a gap of 0.15475 of screen width on a monitor EDID reports as
+///   1193 mm, implying 184.6 mm — 0.3% from the measured figure. With 376.3
+///   that same drag derived a 2431.7 mm "screen", which threw gaze mapping off
+///   by centimetres.
 ///
-/// Impact is limited: the screen width is now seeded from EDID, so this
-/// constant only affects the manual drag adjustment (and the line positions
-/// seeded back from a known width).
-pub const EYE_TRACKER_WIDTH_MM: f64 = 376.3;
+/// Note this is the span between the *marks*, not the device's overall length
+/// (a published ET5 is 285 mm long) — which is why the old value being longer
+/// than the whole tracker should have been caught immediately.
+pub const EYE_TRACKER_WIDTH_MM: f64 = 184.0;
 /// Line clamps (normalized screen x) + minimum gap between the two lines.
 pub const MIN_LINE: f64 = 0.02;
 pub const MAX_LINE: f64 = 0.98;
@@ -86,6 +85,24 @@ pub fn lines_from_width_offset(width_mm: f64, offset_x_mm: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_world_drag_derives_the_measured_screen_width() {
+        // Ground truth from a physical setup (2026-07-21): the ET5's reference
+        // marks measure 184 mm apart, and a user dragging the lines onto them
+        // on a Samsung Odyssey G93SC produced a gap of 0.15475 of screen width.
+        // EDID reports that panel as 1193 mm wide, so the derivation must land
+        // close to it. This is the case that exposed the old 376.3 constant,
+        // which turned the very same drag into a 2431.7 mm "screen".
+        let gap = 0.154_747_f64;
+        let (l, r) = (0.5 - gap / 2.0, 0.5 + gap / 2.0);
+        let a = alignment_from_lines(l, r, 3.55);
+        assert!(
+            (a.width_mm - 1193.0).abs() < 30.0,
+            "derived {:.0} mm from a correct drag, expected ~1193 mm (EDID)",
+            a.width_mm
+        );
+    }
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
