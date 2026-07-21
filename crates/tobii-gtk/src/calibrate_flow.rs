@@ -48,7 +48,15 @@ impl CalMode {
 }
 
 // Tick cadence is 33 ms (~30 fps), matching the hub.
-const SETTLE_TICKS: u32 = 8; // ~260 ms saccade settle before sampling a point
+const SETTLE_TICKS: u32 = 10; // ~330 ms for the saccade to the new dot to land
+
+// HARDWARE-OBSERVED (2026-07-21): the ET5 acks add_calibration_point almost
+// immediately — it does NOT block while gathering samples, contrary to what the
+// original's managed layer implied. So the fixation dwell is entirely ours to
+// enforce: without it the whole 5-point set flew past in ~1.5 s and every
+// sample was taken mid-saccade, before the user could even look at the dot.
+const DWELL_TICKS: u32 = 36; // ~1.2 s holding the target before we sample it
+const SAMPLE_AT_TICKS: u32 = SETTLE_TICKS + DWELL_TICKS;
 
 // Every UI deadline below must outlast the device-thread work it is waiting on.
 // If the UI gives up first the device thread keeps running the old command and
@@ -105,7 +113,9 @@ enum Phase {
 /// What the cairo surface draws this frame.
 struct DotView {
     point: Option<(f64, f64)>,
-    pulse: f64,
+    /// 0 = the dot just arrived, 1 = sampling now. Drives the converging ring,
+    /// which is the user's only cue for *when* fixation actually matters.
+    progress: f64,
 }
 
 /// Primary monitor height (px), to place the header a bit above the middle.
@@ -125,8 +135,12 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView) {
     let _ = cr.paint();
     if let Some((nx, ny)) = dot.point {
         let (cx, cy) = (nx * w, ny * h);
-        let ring = 26.0 + (1.0 - dot.pulse) * 22.0;
-        cr.set_source_rgba(0.30, 0.85, 0.85, 0.6 * dot.pulse.max(0.15));
+        // The ring shrinks onto the dot as the sample approaches: an
+        // unambiguous "hold here, now" countdown. The device samples the
+        // instant we ask, so the eye must already be still when it lands.
+        let p = dot.progress.clamp(0.0, 1.0);
+        let ring = 9.0 + (1.0 - p) * 42.0;
+        cr.set_source_rgba(0.30, 0.85, 0.85, 0.35 + 0.45 * p);
         cr.set_line_width(3.0);
         cr.arc(cx, cy, ring, 0.0, std::f64::consts::TAU);
         let _ = cr.stroke();
@@ -161,16 +175,14 @@ fn update_ui(
             cancel.set_visible(true);
         }
         Phase::Collecting {
-            index,
-            mode,
-            requested,
-            ..
+            index, mode, ticks, ..
         } => {
             let progress = format!("point {} of {}", index + 1, mode.points().len());
-            // While `requested` the device is actually sampling this point.
-            // Users saccade away once a target stops moving, which degrades the
-            // sample invisibly — so say explicitly when fixation matters.
-            instr.set_text(&if *requested {
+            // Once the saccade has landed the ring is counting down to the
+            // sample, so fixation matters from here on. (`requested` is true
+            // only for a blink — the device acks instantly — so it is the dwell,
+            // not the request, that the hint must track.)
+            instr.set_text(&if *ticks >= SETTLE_TICKS {
                 format!("Hold still — keep looking at the dot  ·  {progress}")
             } else {
                 format!("Follow the dot with your eyes  ·  {progress}")
@@ -223,7 +235,7 @@ pub fn launch(
     let phase = Rc::new(RefCell::new(Phase::Chooser));
     let dot = Rc::new(RefCell::new(DotView {
         point: None,
-        pulse: 0.0,
+        progress: 0.0,
     }));
 
     let area = DrawingArea::new();
@@ -454,13 +466,17 @@ pub fn launch(
                     }
                 } else {
                     let (px, py) = mode.points()[index];
+                    let t = ticks + 1;
                     {
                         let mut d = dot.borrow_mut();
                         d.point = Some((px, py));
-                        d.pulse = (d.pulse + 0.06) % 1.0;
+                        d.progress = if requested {
+                            1.0
+                        } else {
+                            (t.saturating_sub(SETTLE_TICKS) as f64) / (DWELL_TICKS as f64)
+                        };
                     }
-                    let t = ticks + 1;
-                    if !requested && t >= SETTLE_TICKS {
+                    if !requested && t >= SAMPLE_AT_TICKS {
                         let _ = tick_cmd.send(DeviceCommand::CalCollect { x: px, y: py });
                         next = Some(Phase::Collecting {
                             token,
