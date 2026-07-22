@@ -467,14 +467,16 @@ mod tests {
         assert!(!inv.is_empty(), "a real frame must carry columns");
     }
 
-    /// The device streams far more columns than [`GazeSample::decode`] models,
-    /// so an unmapped stream (head pose) is already on the wire, discarded. This
-    /// pins the exact candidate set to check against a Windows-VM capture taken
-    /// *with a head present*: the head-pose columns are the ones that go
-    /// non-zero there while these read zero in this no-eyes frame. The four
-    /// unmapped point3d columns are the strongest position-vector candidates.
+    /// The decoder models fewer columns than the device streams. This pins the
+    /// unmapped point3d set so a decode change that shifts it fails loudly.
+    ///
+    /// These were *investigated* as head-pose candidates and RULED OUT: a live
+    /// six-axis capture (2026-07-22) showed `0x22`/`0x24` are just another eye
+    /// position-pair (~45mm above the eye origins) and `0x25`/`0x27` stay near
+    /// zero — no head orientation is anywhere in the 0x500 gaze frame. See the
+    /// `et5-headpose-not-in-gaze-stream` note and the VM handoff doc.
     #[test]
-    fn unmapped_point3d_columns_are_the_head_pose_candidates() {
+    fn unmapped_point3d_columns_are_eye_positions_not_head_pose() {
         let inv = column_inventory(real_frame_payload());
         let modeled = [0x02, 0x03, 0x04, 0x08, 0x09, 0x0a, 0x17, 0x18];
         let unmapped_pt3d: Vec<u32> = inv
@@ -482,13 +484,8 @@ mod tests {
             .filter(|(c, v)| matches!(v, ColumnValue::Point3d(_)) && !modeled.contains(c))
             .map(|(c, _)| *c)
             .collect();
-        assert_eq!(
-            unmapped_pt3d,
-            vec![0x22, 0x24, 0x25, 0x27],
-            "head-pose candidate columns changed — re-check against a live capture"
-        );
-        // All zero here because no eyes were present; a head-present capture is
-        // what tells us which of these carry the pose.
+        assert_eq!(unmapped_pt3d, vec![0x22, 0x24, 0x25, 0x27]);
+        // Zero here (no eyes present); the live capture is what identified them.
         for c in &unmapped_pt3d {
             let v = inv.iter().find(|(col, _)| col == c).map(|(_, v)| *v);
             assert_eq!(v, Some(ColumnValue::Point3d([0.0; 3])));
