@@ -25,6 +25,7 @@ fn main() -> ExitCode {
             args.iter().any(|a| a == "--eyes"),
         ),
         (Some("headpose"), _) => headpose(&args),
+        (Some("columns"), _) => columns(),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  tobii stream [--json] [--eyes]\n  \
                  tobii headpose [--udp ADDR] [--rate HZ]\n  \
+                 tobii columns\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -99,6 +101,55 @@ fn cal_probe() -> CmdResult {
         Err(e) => println!("  calibration_stop  (0x3fc): FAILED ({e})"),
     }
     Ok(())
+}
+
+/// Diagnostic: stream the FULL column inventory of each gaze frame, including
+/// the columns `stream`/`headpose` discard. This is how the head-pose stream
+/// gets mapped — move your head one axis at a time (translate, then yaw/pitch/
+/// roll) and watch which unmapped point3d columns (0x22/0x24/0x25/0x27 are the
+/// prime candidates) go non-zero and track the motion. Redirect to a file to
+/// keep a record. Needs a valid display area, or the device reports no eyes.
+fn columns() -> CmdResult {
+    use tobii_protocol::gaze::{column_inventory, ColumnValue};
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+    eprintln!(
+        "streaming column inventory (~2/s) — move your head ONE axis at a time; \
+         watch which columns change (Ctrl-C to stop)"
+    );
+    let mut last = std::time::Instant::now();
+    loop {
+        let Some(payload) = conn.next_gaze_payload() else {
+            continue;
+        };
+        // Throttle to ~2 Hz so the output is readable and loggable.
+        if last.elapsed().as_millis() < 500 {
+            continue;
+        }
+        last = std::time::Instant::now();
+        let inv = column_inventory(&payload);
+        // Only the geometry-bearing columns matter for head pose; flag the
+        // unmapped point3d candidates so they stand out.
+        println!("--- {} columns ---", inv.len());
+        for (col, v) in &inv {
+            let candidate = matches!(v, ColumnValue::Point3d(_))
+                && !matches!(col, 0x02 | 0x03 | 0x04 | 0x08 | 0x09 | 0x0a | 0x17 | 0x18);
+            let mark = if candidate { "  <-- unmapped pt3d" } else { "" };
+            match v {
+                ColumnValue::Point3d(p) if *p != [0.0; 3] => {
+                    println!(
+                        "  0x{col:02x} = ({:.1}, {:.1}, {:.1}){mark}",
+                        p[0], p[1], p[2]
+                    )
+                }
+                ColumnValue::Point2d(p) if *p != [-1.0, -1.0] && *p != [0.0, 0.0] => {
+                    println!("  0x{col:02x} = ({:.4}, {:.4})", p[0], p[1])
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Re-apply the saved display area to a freshly connected device.

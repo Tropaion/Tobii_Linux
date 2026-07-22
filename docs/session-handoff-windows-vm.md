@@ -79,8 +79,24 @@ curvature_radius_mm = 1800
    per-point bias.
 3. **Select-eyes** — toggle Left / Right / Both and capture what it sends.
    This resolves a genuinely open question (see protocol facts below).
-4. **Head-pose stream** — completely unmapped, and it is the endgame
-   (head tracking → opentrack → Star Citizen).
+4. **Head-pose stream** — the endgame (head tracking → opentrack → Star
+   Citizen). NOT completely unmapped anymore: the gaze notification (op `0x500`)
+   already carries **39 columns**, of which the decoder models ~18. A diagnostic
+   (`column_inventory` in `tobii-protocol/src/gaze.rs`) dumps them all. In a
+   captured **no-eyes** frame the four unmapped **point3d** columns
+   **`0x22`, `0x24`, `0x25`, `0x27`** all read `[0,0,0]` — these are the
+   strongest head-pose (position/rotation vector) candidates. Also unmapped:
+   point2d `0x19`/`0x1a`/`0x20` and scalars `0x29`/`0x2b` (fixed) plus many u32
+   flags. **This does NOT need the VM or the original software — the data is
+   already on our own wire.** Run `tobii columns` (a diagnostic subcommand that
+   streams the full inventory ~2/s and flags unmapped point3d columns) with a
+   head present and MOVING ONE AXIS AT A TIME (translate left/right, up/down,
+   forward/back, then yaw, pitch, roll). The columns that go non-zero and track
+   each motion are the pose; redirect to a file per axis for a record.
+
+   `crates/tobii-headpose` already derives a 5-DOF pose (position + yaw + roll,
+   pitch stubbed at 0) from the two eye origins as a fallback; the real 6DOF
+   stream replaces the derivation once these columns are identified.
 
 Also worth dumping: `HKCU\Software\Tobii\...\EyeXConfig\UserProfiles\` — the
 original stores `TrackedEyes` and geometry host-side in the registry.

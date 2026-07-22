@@ -281,6 +281,56 @@ impl GazeSample {
     }
 }
 
+/// One column's raw decoded value, for [`column_inventory`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColumnValue {
+    S64(i64),
+    U32(u32),
+    Fixed(f64),
+    Point2d([f64; 2]),
+    Point3d([f64; 3]),
+}
+
+/// Every column present in a gaze payload, with its raw value.
+///
+/// Diagnostic counterpart to [`GazeSample::decode`], which silently discards
+/// columns it does not model — which is exactly how an unmapped stream (head
+/// pose, for instance) goes unnoticed. Stops at the first truncated or unknown
+/// column, like the decoder, returning what it gathered.
+pub fn column_inventory(payload: &[u8]) -> Vec<(u32, ColumnValue)> {
+    let mut out = Vec::new();
+    if payload.len() < 2 {
+        return out;
+    }
+    let mut r = Reader::new(payload);
+    r.skip(2);
+    let Ok(n_cols) = r.read_xds_row() else {
+        return out;
+    };
+    let mut i = 0;
+    while i < n_cols && r.remaining() > 0 {
+        i += 1;
+        let Ok(col) = r.read_xds_column() else {
+            return out;
+        };
+        let Some(kind) = column_kind(col) else {
+            return out;
+        };
+        let value = match kind {
+            Kind::S64 => r.read_s64().map(ColumnValue::S64).ok(),
+            Kind::U32 => r.read_u32().map(ColumnValue::U32).ok(),
+            Kind::Fixed16x16 => r.read_fixed16x16().map(ColumnValue::Fixed).ok(),
+            Kind::Point2d => r.read_point2d().map(ColumnValue::Point2d).ok(),
+            Kind::Point3d => r.read_point3d().map(ColumnValue::Point3d).ok(),
+        };
+        match value {
+            Some(v) => out.push((col, v)),
+            None => return out,
+        }
+    }
+    out
+}
+
 /// Read and discard a known-but-unmodeled column of the given kind, advancing
 /// the reader past it. Returns `false` if the column was truncated.
 fn skip_column(r: &mut Reader, kind: Kind) -> bool {
@@ -403,13 +453,55 @@ mod tests {
         assert!(!s.has(present::EYE_ORIGIN_L)); // truncated column not populated
     }
 
+    /// Prints every column a REAL device frame carries, including the ones the
+    /// decoder discards. Run with:
+    ///   cargo test -p tobii-protocol dump_real_frame_columns -- --nocapture
     #[test]
-    fn decodes_real_device_gaze_frame_2026_07_15() {
-        // Captured from a physical Tobii ET5 via `tobii stream` during the Plan 4
-        // live test. No eyes were in the trackbox, so gaze reads the device's
-        // invalid sentinel (-1,-1) with validity 4 — still a genuine wire-format
-        // regression vector exercising the full frame/TLV/XDS-column decode (1692 B).
-        let payload: &[u8] = &[
+    fn dump_real_frame_columns() {
+        let payload = real_frame_payload();
+        let inv = column_inventory(payload);
+        println!("--- {} columns in the captured frame ---", inv.len());
+        for (col, v) in &inv {
+            println!("  col 0x{col:02x} = {v:?}");
+        }
+        assert!(!inv.is_empty(), "a real frame must carry columns");
+    }
+
+    /// The device streams far more columns than [`GazeSample::decode`] models,
+    /// so an unmapped stream (head pose) is already on the wire, discarded. This
+    /// pins the exact candidate set to check against a Windows-VM capture taken
+    /// *with a head present*: the head-pose columns are the ones that go
+    /// non-zero there while these read zero in this no-eyes frame. The four
+    /// unmapped point3d columns are the strongest position-vector candidates.
+    #[test]
+    fn unmapped_point3d_columns_are_the_head_pose_candidates() {
+        let inv = column_inventory(real_frame_payload());
+        let modeled = [0x02, 0x03, 0x04, 0x08, 0x09, 0x0a, 0x17, 0x18];
+        let unmapped_pt3d: Vec<u32> = inv
+            .iter()
+            .filter(|(c, v)| matches!(v, ColumnValue::Point3d(_)) && !modeled.contains(c))
+            .map(|(c, _)| *c)
+            .collect();
+        assert_eq!(
+            unmapped_pt3d,
+            vec![0x22, 0x24, 0x25, 0x27],
+            "head-pose candidate columns changed — re-check against a live capture"
+        );
+        // All zero here because no eyes were present; a head-present capture is
+        // what tells us which of these carry the pose.
+        for c in &unmapped_pt3d {
+            let v = inv.iter().find(|(col, _)| col == c).map(|(_, v)| *v);
+            assert_eq!(v, Some(ColumnValue::Point3d([0.0; 3])));
+        }
+    }
+
+    /// A real 1692-byte gaze frame captured from a physical Tobii ET5 via
+    /// `tobii stream` (Plan 4 live test). No eyes were in the trackbox, so gaze
+    /// reads the device's invalid sentinel (-1,-1) with validity 4 — still a
+    /// genuine wire-format regression vector exercising the full
+    /// frame/TLV/XDS-column decode. Shared by the decode + inventory tests.
+    fn real_frame_payload() -> &'static [u8] {
+        &[
             0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x27, 0x0b, 0xb8, 0x05, 0x00, 0x00,
             0x00, 0x04, 0x00, 0x02, 0x0b, 0xb9, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
             0x01, 0x06, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x45, 0xe1, 0x3a, 0x79,
@@ -531,7 +623,12 @@ mod tests {
             0x00, 0x00, 0x00, 0x2b, 0x03, 0x00, 0x00, 0x00, 0x04, 0xff, 0xff, 0x00, 0x00, 0x05,
             0x00, 0x00, 0x00, 0x04, 0x00, 0x02, 0x0b, 0xb9, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00,
             0x00, 0x00, 0x2c, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
-        ];
+        ]
+    }
+
+    #[test]
+    fn decodes_real_device_gaze_frame_2026_07_15() {
+        let payload = real_frame_payload();
         let s = GazeSample::decode(payload).expect("real gaze frame decodes");
         assert!(s.has(present::TIMESTAMP));
         assert!(s.timestamp_us > 0, "timestamp_us={}", s.timestamp_us);
