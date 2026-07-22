@@ -104,11 +104,14 @@ fn cal_probe() -> CmdResult {
 }
 
 /// Diagnostic: stream the FULL column inventory of each gaze frame, including
-/// the columns `stream`/`headpose` discard. This is how the head-pose stream
-/// gets mapped — move your head one axis at a time (translate, then yaw/pitch/
-/// roll) and watch which unmapped point3d columns (0x22/0x24/0x25/0x27 are the
-/// prime candidates) go non-zero and track the motion. Redirect to a file to
-/// keep a record. Needs a valid display area, or the device reports no eyes.
+/// the columns `stream`/`headpose` discard. Used to map the head-pose data:
+/// move your head one axis at a time (translate, then yaw/pitch/roll) and watch
+/// which columns track the motion. A first pass showed the point3d columns are
+/// all eye positions (0x02/0x08/0x17/0x18/0x22/0x24) and per-eye gaze
+/// directions (0x04/0x0a) — no clean 6DOF pose — so this now also prints the
+/// fixed16x16 and integer columns, where explicit head-orientation angles would
+/// live. Redirect to a file. Needs a valid display area or the device reports
+/// no eyes.
 fn columns() -> CmdResult {
     use tobii_protocol::gaze::{column_inventory, ColumnValue};
     let transport = UsbTransport::open()?;
@@ -129,25 +132,35 @@ fn columns() -> CmdResult {
         }
         last = std::time::Instant::now();
         let inv = column_inventory(&payload);
-        // Only the geometry-bearing columns matter for head pose; flag the
-        // unmapped point3d candidates so they stand out.
+        // Print EVERY column that carries a value that could plausibly move
+        // with the head: point3d/point2d (positions/directions) AND the
+        // fixed16x16 and s64/u32 columns, which is where an explicit head
+        // orientation (Euler angles or a quaternion) would live. Only truly
+        // constant sentinels are suppressed. Unmapped columns are flagged.
+        let mapped3 = [0x02, 0x03, 0x04, 0x08, 0x09, 0x0a, 0x17, 0x18];
+        let mapped_other = [0x01, 0x06, 0x0c, 0x07, 0x0d, 0x14, 0x1c];
         println!("--- {} columns ---", inv.len());
         for (col, v) in &inv {
-            let candidate = matches!(v, ColumnValue::Point3d(_))
-                && !matches!(col, 0x02 | 0x03 | 0x04 | 0x08 | 0x09 | 0x0a | 0x17 | 0x18);
-            let mark = if candidate { "  <-- unmapped pt3d" } else { "" };
-            match v {
-                ColumnValue::Point3d(p) if *p != [0.0; 3] => {
-                    println!(
-                        "  0x{col:02x} = ({:.1}, {:.1}, {:.1}){mark}",
-                        p[0], p[1], p[2]
-                    )
+            let (line, unmapped) = match v {
+                ColumnValue::Point3d(p) if *p != [0.0; 3] => (
+                    format!("({:.1}, {:.1}, {:.1})", p[0], p[1], p[2]),
+                    !mapped3.contains(col),
+                ),
+                ColumnValue::Point2d(p) if *p != [-1.0, -1.0] && *p != [0.0, 0.0] => (
+                    format!("({:.4}, {:.4})", p[0], p[1]),
+                    !mapped_other.contains(col),
+                ),
+                ColumnValue::Fixed(f) if *f != -1.0 && *f != 0.0 => {
+                    (format!("{f:.4}"), !mapped_other.contains(col))
                 }
-                ColumnValue::Point2d(p) if *p != [-1.0, -1.0] && *p != [0.0, 0.0] => {
-                    println!("  0x{col:02x} = ({:.4}, {:.4})", p[0], p[1])
+                ColumnValue::U32(u) if *u != 0 && *u != 4 => {
+                    (format!("{u}"), !mapped_other.contains(col))
                 }
-                _ => {}
-            }
+                ColumnValue::S64(s) if *s != 0 => (format!("{s}"), !mapped_other.contains(col)),
+                _ => continue,
+            };
+            let mark = if unmapped { "   <-- unmapped" } else { "" };
+            println!("  0x{col:02x} = {line}{mark}");
         }
     }
 }
