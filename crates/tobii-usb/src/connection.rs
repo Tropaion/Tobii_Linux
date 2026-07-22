@@ -8,12 +8,13 @@ use tobii_protocol::calibration::{
     cal_session_payload, CalibrationBlob,
 };
 use tobii_protocol::commands::{
-    parse_enabled_eye, set_display_area_corners_payload, set_enabled_eye_payload, EnabledEye,
+    parse_enabled_eye, set_display_area_corners_payload, set_enabled_eye_payload,
+    subscribe_payload, EnabledEye,
 };
 use tobii_protocol::frame::{
     build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_CLEAR, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
     OP_CAL_START, OP_CAL_STOP, OP_GAZE_NOTIFY, OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA,
-    OP_SET_ENABLED_EYE, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    OP_SET_ENABLED_EYE, OP_SUBSCRIBE, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
 use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
@@ -298,6 +299,35 @@ impl<T: Transport> Connection<T> {
         }
         found
     }
+
+    /// Subscribe to an additional TTP stream beyond the handshake's gaze stream.
+    /// Returns whether the device acked (a matching response arrived within the
+    /// request window — set a short [`Connection::set_request_timeout`] first
+    /// when probing many unknown ids, so silent ones fail fast). Diagnostic:
+    /// used to hunt for undiscovered streams (e.g. head pose).
+    pub fn subscribe_stream(&mut self, stream_id: u16) -> Result<bool, UsbError> {
+        Ok(self
+            .request(OP_SUBSCRIBE, &subscribe_payload(stream_id))?
+            .is_some())
+    }
+
+    /// Read the next NOTIFICATION frame of ANY op — the general form of
+    /// [`Connection::next_gaze_payload`], which only returns `0x500`. Returns
+    /// `(op, payload)`. Diagnostic: for observing streams other than gaze.
+    pub fn next_notification(&mut self) -> Option<(u32, Vec<u8>)> {
+        let mut buf = [0u8; READ_BUF];
+        let n = self.transport.recv(&mut buf, GAZE_TIMEOUT)?;
+        let frames = self.parser.feed(&buf[..n]).ok()?;
+        let mut found = None;
+        for f in frames {
+            if found.is_none() && f.magic == TTP_MAGIC_NOTIFY {
+                found = Some((f.op, f.payload));
+            } else {
+                self.route(f, None);
+            }
+        }
+        found
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +552,25 @@ mod tests {
         assert!(conn.start_calibration().is_ok());
         assert!(conn.clear_calibration().is_ok());
         assert!(conn.stop_calibration().is_ok());
+    }
+
+    #[test]
+    fn subscribe_stream_sends_op_and_reports_ack() {
+        // First post-handshake request is seq 5; subscribe op is 0x4c4.
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x4c4, &[])]);
+        assert!(conn.subscribe_stream(0x501).expect("acked"));
+        // The sent frame carries the subscribe op and the stream id (BE @ payload 9..10).
+        let sent = conn.transport().sent.last().unwrap();
+        assert_eq!(&sent[20..24], &[0, 0, 0x04, 0xc4]); // op 0x4c4
+    }
+
+    #[test]
+    fn next_notification_returns_any_notify_op() {
+        // A notify frame with a non-gaze op (0x501) must still surface.
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_NOTIFY, 0, 0x501, &[0xAB, 0xCD])]);
+        let (op, payload) = conn.next_notification().expect("a notification");
+        assert_eq!(op, 0x501);
+        assert_eq!(payload, vec![0xAB, 0xCD]);
     }
 
     #[test]
