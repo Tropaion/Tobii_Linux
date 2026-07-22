@@ -65,29 +65,48 @@ offset_z_mm         = 0                   # UNMEASURED
 curvature_radius_mm = 1800
 ```
 
-## Do this FIRST, on Linux, no VM needed
+## SETTLED on Linux: head pose is NOT in the gaze stream
 
-**Map the head-pose stream with our own tools.** The device's 6DOF head pose is
-almost certainly already on our wire: the gaze notification (op `0x500`) carries
-**39 columns**, of which the decoder models ~18 and silently discards the rest.
-`column_inventory` (`tobii-protocol/src/gaze.rs`) dumps them all; in a captured
-**no-eyes** frame the four unmapped **point3d** columns **`0x22`, `0x24`,
-`0x25`, `0x27`** read `[0,0,0]` and are the strongest position/rotation-vector
-candidates (also unmapped: point2d `0x19`/`0x1a`/`0x20`, fixed `0x29`/`0x2b`,
-plus many u32 flags).
+The head-pose columns are not in the gaze notification — this was checked
+exhaustively, not assumed. `tobii columns` (a diagnostic that dumps the full
+per-frame inventory of all 39 columns, every data kind) was captured across all
+six head axes (translate x/y/z, yaw, pitch, roll). Result:
 
-Run `tobii columns` (streams the inventory ~2/s, flags unmapped point3d
-columns) with a head present and MOVING ONE AXIS AT A TIME — translate
-left/right, up/down, forward/back, then yaw, pitch, roll. The columns that go
-non-zero and track each motion are the pose; redirect to a file per axis
-(`tobii columns > yaw.log`) for a record. No VM, no original software.
+- **point3d columns are all eye geometry:** `0x02`/`0x08`/`0x17`/`0x18` and the
+  related higher point-pair `0x22`/`0x24` are eye/head **positions** (they give
+  clean position + yaw + roll); `0x04`/`0x0a` are per-eye **gaze directions**
+  (x tracks yaw, y tracks pitch — where you *look*, not head facing).
+- **scalar columns carry no orientation:** every unmapped integer column
+  (`0x15`,`0x16`,`0x1b`,`0x1d`–`0x1f`,`0x21`,`0x23`,`0x26`,`0x28`) has range 0
+  across both rotations — constant flags. The fixed columns are pupil diameters.
+- **No Euler angles, no quaternion, no head pose anywhere in the frame.** Pitch
+  is not recoverable from the point geometry (the `0x22`→eye vector tilted more
+  on translation than on a nod).
 
-`crates/tobii-headpose` already derives a 5-DOF fallback (position + yaw + roll,
-pitch stubbed at 0) from the two eye origins; the real 6DOF stream replaces that
-derivation once these columns are identified — and gives us the pitch two eye
-points can't.
+**tobiifree agrees:** it only ever subscribes to `0x500`
+(`scripts/compare_origins.mjs:136`, `sdk/src/protocol.ts:4`), and its own
+head-pose hypothesis (`scripts/identify_direction_columns.mjs:412`, "H8: does
+direction correlate with eye_origin (tracks head pose)?") was an attempt to
+*derive* pose from eye origins, not read a pose stream. Neither project ever
+found a dedicated head-pose stream.
 
-## What the VM is actually for — observing the ORIGINAL software
+### So the VM capture is now the decisive tool for head pose
+
+The ET5's 6DOF head tracking is a real product feature, so the original software
+gets it *somehow*. Two possibilities, and the capture distinguishes them:
+1. **A separate stream/subscription** we never discovered. `build_subscribe`
+   already takes any `stream_id` (we only send `0x500`); the capture will show
+   the original subscribing to a different id and the head-pose notification op
+   + payload. **This is the thing to look for.**
+2. **Host-side derivation** from the eye/gaze data — in which case the original
+   sends nothing extra, and our `tobii-headpose` 5-DOF derivation is already the
+   right approach (only clean pitch is missing).
+
+`crates/tobii-headpose` derives a 5-DOF pose (position + yaw + roll, pitch = 0)
+from the two eye origins and streams it to opentrack now — shippable regardless
+of which possibility holds.
+
+## What else the VM is for — observing the ORIGINAL software
 
 The VM only earns its keep where we need to see what *Tobii's own software*
 sends or computes, which we cannot derive from our side. In priority order:
