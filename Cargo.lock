@@ -717,6 +717,13 @@ name = "tobii-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "tobii-recap"
+version = "0.1.0"
+dependencies = [
+ "tobii-protocol",
+]
+
+[[package]]
 name = "tobii-usb"
 version = "0.1.0"
 dependencies = [
