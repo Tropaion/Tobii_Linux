@@ -278,6 +278,26 @@ impl<T: Transport> Connection<T> {
         }
         self.gaze_queue.pop_front()
     }
+
+    /// Diagnostic: the raw, **undecoded** payload of the next gaze notification.
+    /// `next_gaze` throws away every column the decoder does not model, so this
+    /// is the only way to inspect unmapped columns (e.g. head pose) live. The
+    /// first gaze frame in the chunk is returned; any other frames are routed
+    /// normally so nothing is dropped. Returns `None` on read timeout.
+    pub fn next_gaze_payload(&mut self) -> Option<Vec<u8>> {
+        let mut buf = [0u8; READ_BUF];
+        let n = self.transport.recv(&mut buf, GAZE_TIMEOUT)?;
+        let frames = self.parser.feed(&buf[..n]).ok()?;
+        let mut found = None;
+        for f in frames {
+            if found.is_none() && f.magic == TTP_MAGIC_NOTIFY && f.op == OP_GAZE_NOTIFY {
+                found = Some(f.payload);
+            } else {
+                self.route(f, None);
+            }
+        }
+        found
+    }
 }
 
 #[cfg(test)]
