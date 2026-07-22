@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         (Some("headpose"), _) => headpose(&args),
         (Some("columns"), _) => columns(),
         (Some("probe-streams"), _) => probe_streams(&args),
+        (Some("probe-stream"), _) => probe_stream(&args),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
                  tobii headpose [--udp ADDR] [--rate HZ]\n  \
                  tobii columns\n  \
                  tobii probe-streams [START] [END]\n  \
+                 tobii probe-stream <ID> [SECS]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -106,6 +108,7 @@ fn cal_probe() -> CmdResult {
 }
 
 /// Collect notification ops seen over `dur`: op -> (count, last payload len).
+/// Uses `read_notifications` so co-occurring streams are not undercounted.
 fn collect_notif_ops(
     conn: &mut Connection<UsbTransport>,
     dur: Duration,
@@ -114,13 +117,80 @@ fn collect_notif_ops(
     let mut seen: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
-        if let Some((op, payload)) = conn.next_notification() {
+        for (op, payload) in conn.read_notifications() {
             let e = seen.entry(op).or_insert((0, 0));
             e.0 += 1;
             e.1 = payload.len();
         }
     }
     seen
+}
+
+/// Diagnostic deep-dive on ONE stream: subscribe to it on a fresh connection,
+/// read for `secs`, and report its rate, payload size range, whether the payload
+/// CHANGES frame-to-frame (live data vs static config), and a hex preview. Move
+/// your head while this runs to see whether a small live stream is head pose.
+/// `tobii probe-stream <id-hex> [secs]`.
+fn probe_stream(args: &[String]) -> CmdResult {
+    let id = args
+        .get(2)
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or("usage: tobii probe-stream <stream-id-hex> [secs]")?;
+    let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(5);
+
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+    conn.set_request_timeout(Duration::from_millis(300));
+    let acked = conn.subscribe_stream(id)?;
+    eprintln!(
+        "stream 0x{id:03x}: subscribe {}",
+        if acked { "ACK" } else { "no ack" }
+    );
+    eprintln!("reading {secs}s — MOVE YOUR HEAD if hunting head pose (Ctrl-C to stop)...");
+
+    let mut count = 0u32;
+    let (mut min_sz, mut max_sz) = (usize::MAX, 0usize);
+    let mut first: Option<Vec<u8>> = None;
+    let mut changed = false;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        for (op, payload) in conn.read_notifications() {
+            if op != id as u32 {
+                continue; // ignore the always-on gaze stream (0x500)
+            }
+            count += 1;
+            min_sz = min_sz.min(payload.len());
+            max_sz = max_sz.max(payload.len());
+            match &first {
+                None => {
+                    let n = payload.len().min(64);
+                    let hex: String = payload[..n].iter().map(|b| format!("{b:02x} ")).collect();
+                    println!("first frame ({} bytes), first {n}:\n  {hex}", payload.len());
+                    first = Some(payload);
+                }
+                Some(f) => {
+                    if *f != payload {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "\nstream 0x{id:03x}: {count} notifs in {secs}s (~{:.0} Hz), payload {}..{} bytes, payload {}",
+        count as f64 / secs as f64,
+        if min_sz == usize::MAX { 0 } else { min_sz },
+        max_sz,
+        if changed {
+            "CHANGES frame-to-frame (LIVE DATA)"
+        } else if count > 1 {
+            "is CONSTANT (static config, not live)"
+        } else {
+            "seen too rarely to judge"
+        }
+    );
+    Ok(())
 }
 
 /// Diagnostic: hunt for undiscovered TTP streams (chiefly the head-pose stream).

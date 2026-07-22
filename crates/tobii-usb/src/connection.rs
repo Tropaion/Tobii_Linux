@@ -314,6 +314,10 @@ impl<T: Transport> Connection<T> {
     /// Read the next NOTIFICATION frame of ANY op — the general form of
     /// [`Connection::next_gaze_payload`], which only returns `0x500`. Returns
     /// `(op, payload)`. Diagnostic: for observing streams other than gaze.
+    ///
+    /// NOTE: returns only the FIRST notify in the transport chunk and drops the
+    /// rest — so co-occurring streams are undercounted. Use
+    /// [`Connection::read_notifications`] to characterize concurrent streams.
     pub fn next_notification(&mut self) -> Option<(u32, Vec<u8>)> {
         let mut buf = [0u8; READ_BUF];
         let n = self.transport.recv(&mut buf, GAZE_TIMEOUT)?;
@@ -327,6 +331,30 @@ impl<T: Transport> Connection<T> {
             }
         }
         found
+    }
+
+    /// Read one transport chunk and return EVERY notification frame in it as
+    /// `(op, payload)` — unlike [`Connection::next_notification`], notifies that
+    /// share a chunk are all kept. Essential for accurately characterizing
+    /// multiple concurrent streams (a small stream co-occurring with gaze in the
+    /// same chunk would otherwise be dropped). Non-notify frames are routed.
+    pub fn read_notifications(&mut self) -> Vec<(u32, Vec<u8>)> {
+        let mut buf = [0u8; READ_BUF];
+        let Some(n) = self.transport.recv(&mut buf, GAZE_TIMEOUT) else {
+            return Vec::new();
+        };
+        let Ok(frames) = self.parser.feed(&buf[..n]) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for f in frames {
+            if f.magic == TTP_MAGIC_NOTIFY {
+                out.push((f.op, f.payload));
+            } else {
+                self.route(f, None);
+            }
+        }
+        out
     }
 }
 
@@ -562,6 +590,23 @@ mod tests {
         // The sent frame carries the subscribe op and the stream id (BE @ payload 9..10).
         let sent = conn.transport().sent.last().unwrap();
         assert_eq!(&sent[20..24], &[0, 0, 0x04, 0xc4]); // op 0x4c4
+    }
+
+    #[test]
+    fn read_notifications_keeps_co_occurring_notifies() {
+        // Two notifies (gaze 0x500 + a small 0x504) delivered in ONE chunk must
+        // both be returned — next_notification would drop the second.
+        let g = inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &[0x11]);
+        let s = inbound(TTP_MAGIC_NOTIFY, 0, 0x504, &[0x22, 0x33]);
+        let mut chunk = g.clone();
+        chunk.extend_from_slice(&s);
+        let mut conn = connected_with(vec![chunk]);
+        let got = conn.read_notifications();
+        let ops: Vec<u32> = got.iter().map(|(op, _)| *op).collect();
+        assert!(
+            ops.contains(&0x500) && ops.contains(&0x504),
+            "got ops {ops:?}"
+        );
     }
 
     #[test]
