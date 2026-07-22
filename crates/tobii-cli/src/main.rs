@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         ),
         (Some("headpose"), _) => headpose(&args),
         (Some("columns"), _) => columns(),
+        (Some("probe-streams"), _) => probe_streams(&args),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
                  tobii stream [--json] [--eyes]\n  \
                  tobii headpose [--udp ADDR] [--rate HZ]\n  \
                  tobii columns\n  \
+                 tobii probe-streams [START] [END]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -99,6 +101,81 @@ fn cal_probe() -> CmdResult {
     match conn.stop_calibration() {
         Ok(()) => println!("  calibration_stop  (0x3fc): ACK"),
         Err(e) => println!("  calibration_stop  (0x3fc): FAILED ({e})"),
+    }
+    Ok(())
+}
+
+/// Collect notification ops seen over `dur`: op -> (count, last payload len).
+fn collect_notif_ops(
+    conn: &mut Connection<UsbTransport>,
+    dur: Duration,
+) -> std::collections::BTreeMap<u32, (u32, usize)> {
+    use std::collections::BTreeMap;
+    let mut seen: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        if let Some((op, payload)) = conn.next_notification() {
+            let e = seen.entry(op).or_insert((0, 0));
+            e.0 += 1;
+            e.1 = payload.len();
+        }
+    }
+    seen
+}
+
+/// Diagnostic: hunt for undiscovered TTP streams (chiefly the head-pose stream).
+/// We only ever subscribe to gaze (0x500); this baselines the gaze-only notify
+/// ops, subscribes to a range of candidate stream ids, then watches which notify
+/// ops newly appear. A newly-appearing op is a stream the device started sending
+/// because we asked — a real find. Non-destructive (subscribe only, no writes).
+/// Default range 0x501..=0x520 (adjacent to gaze); override with START END (hex).
+fn probe_streams(args: &[String]) -> CmdResult {
+    let parse_hex = |s: &String| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok();
+    let start = args.get(2).and_then(parse_hex).unwrap_or(0x501);
+    let end = args.get(3).and_then(parse_hex).unwrap_or(0x520);
+
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+
+    eprintln!("baseline (gaze only), 1.5s...");
+    let base = collect_notif_ops(&mut conn, Duration::from_millis(1500));
+    eprintln!(
+        "  baseline notify ops: {}",
+        base.keys()
+            .map(|o| format!("0x{o:03x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Short window so silent (unsupported) stream ids fail fast instead of
+    // burning the full 10s request deadline each.
+    conn.set_request_timeout(Duration::from_millis(300));
+    eprintln!("subscribing to stream ids 0x{start:03x}..=0x{end:03x}...");
+    for id in start..=end {
+        match conn.subscribe_stream(id) {
+            Ok(true) => eprintln!("  0x{id:03x}: ACK"),
+            Ok(false) => {}
+            Err(e) => eprintln!("  0x{id:03x}: err {e}"),
+        }
+    }
+
+    eprintln!("reading notifications for 5s...");
+    let after = collect_notif_ops(&mut conn, Duration::from_secs(5));
+    println!("=== notify ops after subscribing ===");
+    for (op, (count, sz)) in &after {
+        let novel = if base.contains_key(op) {
+            ""
+        } else {
+            "   <== NEW STREAM (appeared only after subscribing)"
+        };
+        println!("  op 0x{op:03x}: {count} notifs, ~{sz} bytes{novel}");
+    }
+    if after.keys().all(|o| base.contains_key(o)) {
+        println!(
+            "\nNo new streams in 0x{start:03x}..=0x{end:03x}. Try a wider range, \
+             e.g. `tobii probe-streams 0x400 0x600`, or the head pose is host-derived."
+        );
     }
     Ok(())
 }

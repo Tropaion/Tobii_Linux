@@ -70,15 +70,22 @@ pub fn build_hello(seq: u32) -> Vec<u8> {
     build_out_frame(seq, OP_HELLO, &HELLO_PAYLOAD)
 }
 
-/// Subscribe to a TTP stream (stream_id at payload bytes 9..10, BE).
-pub fn build_subscribe(seq: u32, stream_id: u16) -> Vec<u8> {
-    let mut pay: [u8; 20] = [
+/// The `subscribe` request payload (stream_id at bytes 9..10, BE), without the
+/// frame wrapper — for sending via [`crate::frame::build_out_frame`] or a
+/// transport's generic request path.
+pub fn subscribe_payload(stream_id: u16) -> Vec<u8> {
+    let mut pay: Vec<u8> = vec![
         0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x00,
         0x04, 0x00, 0x00, 0x00, 0x00,
     ];
     pay[9] = (stream_id >> 8) as u8;
     pay[10] = stream_id as u8;
-    build_out_frame(seq, OP_SUBSCRIBE, &pay)
+    pay
+}
+
+/// Subscribe to a TTP stream (stream_id at payload bytes 9..10, BE).
+pub fn build_subscribe(seq: u32, stream_id: u16) -> Vec<u8> {
+    build_out_frame(seq, OP_SUBSCRIBE, &subscribe_payload(stream_id))
 }
 
 pub fn build_get_display_area(seq: u32) -> Vec<u8> {
