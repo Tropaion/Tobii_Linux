@@ -34,19 +34,36 @@ decode shift fails loudly. **tobiifree concurs** — it only ever subscribes to
 `0x500`; its own "does direction correlate with eye_origin (head pose)?" probe
 was an attempt to *derive* pose, not read a pose stream. **[CONFIRMED]**.
 
-## Two remaining hypotheses
+## How Tobii actually does it — host-side neural inference [CONFIRMED]
 
-The 6-DOF feature is real, so Tobii's software gets pose *somehow*. Exactly one
-of these holds, and only a capture of the original software distinguishes them:
+Resolved 2026-07-23 from the Tobii MSI (`platformservice.exe` strings). Head
+pose is **computed on the PC, not sent by the device**:
 
-1. **A separate stream/subscription we never found.** `build_subscribe` already
-   accepts any stream id; we only ever send `0x500`. Probing `0x501..=0x520`
-   found only eye-image (`0x501`/`0x50e`) and event (`0x504`) streams, no pose.
-   The head-pose stream, if it exists, is outside that range or uses a subscribe
-   variant we have not seen. **[HYPOTHESIS]**
-2. **Host-side derivation** from the eye/gaze data. If so, Tobii sends nothing
-   extra and our derivation approach is already correct (only clean pitch is
-   missing). **[HYPOTHESIS]**
+- The device streams **eye-camera images** (`0x501`/`0x50e`, ~78 KB @ 33 Hz —
+  see [[Streams]]).
+- `platformservice` runs an **OpenVINO** neural model on them —
+  `bdtsdata/NN/model.vino.xml` + `model.vino.bin`, loaded via `ReadNetwork` /
+  `LoadNetwork` (Intel `InferenceEngine`/`MKLDNNPlugin` DLLs ship alongside).
+- The result is exposed as a **client-side** stream:
+  `PRP_STREAM_ENUM_HEADPOSE` → `headpose.position` + `headpose.rotation` (also
+  `PRP_STREAM_ENUM_LOW_FREQUENCY_HEAD_POSITION`/`_ROTATION`).
+
+This is exactly why USB device-stream probing (`0x400`–`0x520`) never found a
+pose stream: **there is none on the wire** — the pose is inferred host-side from
+the camera images. Our earlier "host-derived" hypothesis was correct; the
+mechanism is a neural net, not a geometric derivation.
+
+### Replicating it
+
+Feasible: subscribe to `0x501`/`0x50e` → run a head-pose model (Rust
+`openvino` / `ort` / `tract`) → 6 DOF. Open questions being worked:
+- **Camera-image format** — decode `0x501`/`0x50e` (`tobii dump-stream 0x501`).
+  Face image vs eye crops decides which models can consume it.
+- **Model source** — Tobii's `model.vino.*` is proprietary and **cannot be
+  shipped in this GPL repo**; code would load a user-supplied model extracted
+  from their own install (`bdtsdata/NN/`). Clean alternative: opentrack's free
+  `head-pose-0.4-big-int8.onnx`, if the NIR images are face-like enough (a
+  grayscale/NIR domain gap may need fine-tuning).
 
 ## What we ship: a 5-DOF eye-origin fallback
 
@@ -72,10 +89,5 @@ device sends zeroed origins with `validity == 4` when no eye is detected; see
 out mirrored, negate the offending angle in `pose_from_eyes` — the only place
 each sign is decided.
 
-## What capture would resolve it
-
-A **Windows-VM USB capture** of Tobii's own software while the head moves. Watch
-for: a `subscribe` (`0x4c4`) to a stream id other than `0x500`, and a subsequent
-notify op whose payload changes with head orientation (Euler angles or a
-quaternion). If none appears, pose is host-derived and hypothesis (2) holds. See
-[[Reverse-Engineering-Methodology]] and `docs/session-handoff-windows-vm.md`.
+The 5-DOF eye-origin fallback remains useful as a no-model, always-available
+baseline (position + yaw + roll); the neural path adds the pitch it cannot give.
