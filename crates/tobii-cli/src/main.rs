@@ -263,12 +263,21 @@ fn dump_stream(args: &[String]) -> CmdResult {
         .ok_or("usage: tobii dump-stream <stream-id-hex> [count]")?;
     let count: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
 
+    // Write into a FRESH PRIVATE directory, not fixed /tmp paths. A predictable
+    // world-writable path (`/tmp/stream-….bin`) lets a local attacker pre-plant a
+    // symlink there so our write lands on one of the user's files instead; the
+    // per-run 0700 dir + O_EXCL opens below refuse to follow a planted symlink.
+    let dir = private_dump_dir()?;
+
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
     reapply_display_area(&mut conn);
     conn.set_request_timeout(Duration::from_millis(300));
     conn.subscribe_stream(id)?;
-    eprintln!("capturing {count} frame(s) of stream 0x{id:03x} to /tmp (sit in view)...");
+    eprintln!(
+        "capturing {count} frame(s) of stream 0x{id:03x} to {} (sit in view)...",
+        dir.display()
+    );
 
     let mut saved = 0u32;
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -277,9 +286,14 @@ fn dump_stream(args: &[String]) -> CmdResult {
             if op != id as u32 {
                 continue;
             }
-            let path = format!("/tmp/stream-{id:03x}-{saved}.bin");
-            std::fs::write(&path, &payload)?;
-            println!("wrote {path} ({} bytes)", payload.len());
+            let path = dir.join(format!("stream-{id:03x}-{saved}.bin"));
+            // create_new = O_CREAT|O_EXCL: fails rather than following a symlink.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            f.write_all(&payload)?;
+            println!("wrote {} ({} bytes)", path.display(), payload.len());
             saved += 1;
             if saved >= count {
                 break;
@@ -290,6 +304,25 @@ fn dump_stream(args: &[String]) -> CmdResult {
         println!("no frames captured for 0x{id:03x} (does it stream? try `probe-stream`)");
     }
     Ok(())
+}
+
+/// A fresh, private (0700) per-run directory under the system temp dir for
+/// diagnostic captures. `create_dir` fails if the path already exists — including
+/// a pre-planted symlink — so an attacker cannot redirect our writes.
+fn private_dump_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let uniq = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("tobii-dump-{}-{uniq}", std::process::id()));
+    std::fs::create_dir(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
 }
 
 /// Diagnostic: stream the FULL column inventory of each gaze frame, including
