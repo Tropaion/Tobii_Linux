@@ -8,6 +8,7 @@
 
 pub mod bytes;
 pub mod calibration;
+pub mod camera;
 pub mod commands;
 pub mod display;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod realm;
 pub mod tlv;
 
 pub use calibration::CalibrationBlob;
+pub use camera::CameraFrame;
 pub use commands::EnabledEye;
 pub use display::DisplayCorners;
 pub use error::ProtocolError;

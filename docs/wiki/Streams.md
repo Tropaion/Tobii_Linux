@@ -19,16 +19,20 @@ nothing. **[CONFIRMED]** — live probe 2026-07-22/23.
 | Stream | Payload size | Rate | What it is | Confidence |
 |--------|-------------|------|------------|-----------|
 | `0x500` | ~1692 B | ~33 Hz | **gaze** — 39 XDS columns (eye positions, gaze directions, pupils, validity, timestamps, flags). See [[Gaze-Stream]] | **[CONFIRMED]** |
-| `0x501` | ~78 KB | ~33 Hz | eye-camera image stream (one eye) — size ≈ a small grayscale eye image; payload structure not decoded | **[HYPOTHESIS]** |
-| `0x50e` | ~78 KB | ~33 Hz | second eye-camera image stream (other eye) | **[HYPOTHESIS]** |
+| `0x501` | 78550 B | ~33 Hz | **NIR camera image** — 280×280, 8-bit grayscale, full-face wide-angle (one of a stereo pair) | **[CONFIRMED]** |
+| `0x50e` | 78577 B | ~33 Hz | **NIR camera image** — the second (stereo) camera, same format | **[CONFIRMED]** |
 | `0x504` | 69 B (2 cols) | once | state-change **event** — fires exactly once on subscribe, not again; XDS row with a timestamp + one small value. Likely user-presence / tracking-state change | one-shot **[CONFIRMED]**; meaning **[HYPOTHESIS]** |
 | `0x502`, `0x503`, `0x505`–`0x50d`, `0x50f`–`0x520` | — | — | ACK the subscribe but produced no data in a 5 s window | ACK **[CONFIRMED]**; purpose unknown |
 
-The two ~78 KB streams are almost certainly the raw eye-camera images the
-tracker uses internally; `78_000 ≈ 320×240` at one byte per pixel, consistent
-with a small IR eye image, but the exact header/format is **[HYPOTHESIS]** — not
-yet decoded. The `0x504` one-shot-on-subscribe behavior is what marks it as an
-event notification rather than a periodic sample. **[CONFIRMED]** one-shot.
+The two ~78 KB streams are the ET5's **two near-infrared cameras** — a stereo
+pair imaging the whole face wide-angle (the tracker sits below the monitor, so
+the face appears low in frame). Decoded live 2026-07-23: same XDS/TLV framing as
+gaze, with columns `[timestamp(s64), bit_depth=8, width=280, height=280,
+image-blob]`; the `0x05` blob is a 4-byte prefix (`00 01 ..`) followed by
+`280×280 = 78400` 8-bit pixels. See `tobii-protocol/src/camera.rs`
+(`decode_camera_frame`). These images are the **input to the host-side head-pose
+model** (see [[Head-Pose]]). The `0x504` one-shot-on-subscribe behavior marks it
+as an event notification, not a periodic sample. **[CONFIRMED]**.
 
 ## Head pose is NOT a known stream
 
