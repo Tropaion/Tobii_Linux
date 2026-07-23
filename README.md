@@ -96,6 +96,15 @@ real working configuration — see `docs/superpowers/specs/`.
 > on every session close), so the driver **re-applies your saved configuration
 > on every connect** — without this the tracker reports no eyes.
 
+## Protocol documentation
+
+The reverse-engineered ET5 USB protocol is documented in [`docs/wiki/`](docs/wiki/)
+(mirrored to the GitHub project wiki): TTP framing, the handshake, the full op
+catalog, the gaze-stream column layout, display-area/calibration/select-eyes,
+the stream map (gaze, eye-camera images, events), the head-pose investigation,
+and the reverse-engineering methodology. Each claim is tagged CONFIRMED /
+CODE-VERIFIED / HYPOTHESIS.
+
 ## Architecture
 
 A Cargo workspace of focused crates:
