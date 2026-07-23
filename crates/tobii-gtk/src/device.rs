@@ -7,8 +7,13 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tobii_protocol::{DisplayCorners, EnabledEye, GazeSample};
+use tobii_protocol::camera::decode_camera_frame;
+use tobii_protocol::frame::OP_GAZE_NOTIFY;
+use tobii_protocol::{CameraFrame, DisplayCorners, EnabledEye, GazeSample};
 use tobii_usb::{Connection, Transport, UsbError, UsbTransport};
+
+/// The eye-camera stream mirrored into the hub preview (one of the stereo pair).
+const CAMERA_STREAM: u16 = 0x501;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ConnStatus {
@@ -95,6 +100,9 @@ impl CalPhase {
 pub struct DeviceState {
     pub status: ConnStatus,
     pub latest_gaze: Option<GazeSample>,
+    /// Most recent decoded eye-camera frame ([`CAMERA_STREAM`]), for the hub
+    /// preview. `None` until the camera stream is subscribed and a frame arrives.
+    pub latest_camera: Option<CameraFrame>,
     pub enabled_eye: Option<EnabledEye>,
     pub calibration: CalPhase,
     /// Whether the device *may* be inside an open calibration realm. Set
@@ -216,14 +224,30 @@ pub fn device_tick<T: Transport>(
             }
         }
     }
-    if let Some(g) = conn.next_gaze() {
-        let mut s = state.lock().unwrap();
-        s.latest_gaze = Some(g);
-        s.status = ConnStatus::Connected;
-        true
-    } else {
-        false
+    // Read one transport chunk and publish every gaze + camera frame in it (the
+    // camera stream co-occurs with gaze, so read them together rather than via
+    // the gaze-only queue). Returns whether any frame arrived, for the watchdog.
+    let mut got = false;
+    for (op, payload) in conn.read_notifications() {
+        match op {
+            OP_GAZE_NOTIFY => {
+                if let Some(g) = GazeSample::decode(&payload) {
+                    let mut s = state.lock().unwrap();
+                    s.latest_gaze = Some(g);
+                    s.status = ConnStatus::Connected;
+                }
+                got = true;
+            }
+            op if op == CAMERA_STREAM as u32 => {
+                if let Some(f) = decode_camera_frame(&payload) {
+                    state.lock().unwrap().latest_camera = Some(f);
+                }
+                got = true;
+            }
+            _ => {}
+        }
     }
+    got
 }
 
 /// Spawn the device thread. It handshakes, then loops `device_tick`; on any
@@ -257,6 +281,9 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                         eprintln!("warning: could not apply saved calibration ({e})");
                     }
                 }
+                // Subscribe to one eye-camera for the hub preview (best-effort:
+                // the preview is optional, gaze/calibration work without it).
+                let _ = conn.subscribe_stream(CAMERA_STREAM);
                 let cur_eye = conn.get_enabled_eye().ok().flatten();
                 {
                     let mut s = thread_state.lock().unwrap();
