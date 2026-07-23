@@ -11,10 +11,17 @@
 //! * **+z** — away from the tracker, towards the user. An eye origin with
 //!   `z ≈ 680` means the user's head is ~680 mm in front of the tracker.
 //!
-//! # What is derivable, and what is not
+//! # Two paths: neural (6-DOF) and geometric fallback (5-DOF)
 //!
-//! The device's own 6DOF head-pose stream has not been mapped yet, so this
-//! module reconstructs what two points can support:
+//! Tobii computes head pose **host-side**, with an OpenVINO neural model run on
+//! the two NIR camera images (there is no head-pose stream on the wire — see the
+//! `Head-Pose` wiki page). The full pipeline mirrors that: camera frames →
+//! [`model::PoseModel`] → 6-DOF. Backends for Tobii's model and the open ONNX
+//! models plug in behind that trait; [`preprocess`] holds the shared face-crop
+//! and tensor conversion.
+//!
+//! This function is the **geometric fallback** used when no model is configured:
+//! it reconstructs what the two eye origins alone can support —
 //!
 //! * **position** — the midpoint of the two eye origins.
 //! * **yaw** — the interocular vector's angle in the horizontal (x–z) plane.
@@ -43,9 +50,12 @@
 //! [`opentrack::TRANSLATION_SCALE`] for the matching unit caveat on position.
 
 pub mod filter;
+pub mod model;
 pub mod opentrack;
+pub mod preprocess;
 
 pub use filter::PoseFilter;
+pub use model::{ModelConfig, ModelKind, PoseModel};
 pub use opentrack::to_opentrack_datagram;
 
 use tobii_protocol::gaze::{present, GazeSample};
