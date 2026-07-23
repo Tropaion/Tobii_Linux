@@ -194,11 +194,35 @@ fn build_ui(app: &Application) {
     guidance.set_wrap(true);
     guidance.set_xalign(0.0);
 
+    // Live NIR camera preview below the eye-position box (square, matches the
+    // 280×280 stream). Shared frame drawn by the tick.
+    let cam_title = Label::new(Some("Camera"));
+    cam_title.add_css_class("section-title");
+    cam_title.set_halign(Align::Start);
+    let cam_frame: Rc<RefCell<Option<tobii_protocol::CameraFrame>>> = Rc::new(RefCell::new(None));
+    let cam_area = DrawingArea::new();
+    cam_area.set_content_width(220);
+    cam_area.set_content_height(220);
+    cam_area.set_halign(Align::Start);
+    {
+        let cam_frame = cam_frame.clone();
+        cam_area.set_draw_func(move |_, cr, w, h| {
+            if let Some(f) = cam_frame.borrow().as_ref() {
+                widget::draw_camera_view(cr, w, h, f);
+            } else {
+                cr.set_source_rgb(0.05, 0.05, 0.06);
+                let _ = cr.paint();
+            }
+        });
+    }
+
     let left = gtk::Box::new(Orientation::Vertical, 10);
     left.set_width_request(380);
     left.append(&eye_title);
     left.append(&area);
     left.append(&guidance);
+    left.append(&cam_title);
+    left.append(&cam_area);
 
     // --- Right column: settings sections (original wording) ---
     let b_setup = Button::with_label("Set up display");
@@ -372,7 +396,7 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("Tobii Configuration")
         .default_width(940)
-        .default_height(560)
+        .default_height(760)
         .build();
     window.set_child(Some(&root));
 
@@ -401,6 +425,10 @@ fn build_ui(app: &Application) {
         guidance.set_text(&widget::guidance_message(&ev));
         *tick_view.borrow_mut() = ev;
         area.queue_draw();
+        // Camera preview: publish the latest frame (only when connected, so a
+        // stale frame doesn't linger after unplug) and redraw.
+        *cam_frame.borrow_mut() = if conn { snap.latest_camera } else { None };
+        cam_area.queue_draw();
         glib::ControlFlow::Continue
     });
 

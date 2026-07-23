@@ -63,6 +63,57 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     }
 }
 
+/// Draw the latest NIR camera frame into a cairo context of size `w`×`h`,
+/// contrast-stretched (the raw frames are very dark) and letterboxed to preserve
+/// the square aspect. Mirrored horizontally so it reads like a mirror.
+pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_protocol::CameraFrame) {
+    cr.set_source_rgb(0.05, 0.05, 0.06);
+    let _ = cr.paint();
+    let (iw, ih) = (frame.width as i32, frame.height as i32);
+    if iw <= 0 || ih <= 0 || frame.pixels.len() < (iw * ih) as usize {
+        return;
+    }
+    // Contrast stretch (min→0, max→255) so the dark IR face is visible.
+    let (mut mn, mut mx) = (255u8, 0u8);
+    for &p in &frame.pixels {
+        mn = mn.min(p);
+        mx = mx.max(p);
+    }
+    let range = (mx.saturating_sub(mn)).max(1) as f32;
+
+    let Ok(stride) = cairo::Format::Rgb24.stride_for_width(iw as u32) else {
+        return;
+    };
+    let mut buf = vec![0u8; (stride * ih) as usize];
+    for y in 0..ih {
+        for x in 0..iw {
+            let p = frame.pixels[(y * iw + x) as usize];
+            let v = (((p.saturating_sub(mn)) as f32 / range) * 255.0) as u8;
+            let off = (y * stride + x * 4) as usize;
+            // Rgb24 is 0x00RRGGBB in a native-endian u32; grayscale ⇒ B=G=R=v.
+            buf[off] = v;
+            buf[off + 1] = v;
+            buf[off + 2] = v;
+        }
+    }
+    let Ok(surface) =
+        cairo::ImageSurface::create_for_data(buf, cairo::Format::Rgb24, iw, ih, stride)
+    else {
+        return;
+    };
+
+    let scale = (w as f64 / iw as f64).min(h as f64 / ih as f64);
+    let (dw, dh) = (iw as f64 * scale, ih as f64 * scale);
+    cr.save().ok();
+    // Centre, then mirror horizontally (flip x about the image centre).
+    cr.translate((w as f64 - dw) / 2.0, (h as f64 - dh) / 2.0);
+    cr.translate(dw, 0.0);
+    cr.scale(-scale, scale);
+    let _ = cr.set_source_surface(&surface, 0.0, 0.0);
+    let _ = cr.paint();
+    cr.restore().ok();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
