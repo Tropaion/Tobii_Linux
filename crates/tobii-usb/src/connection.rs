@@ -21,6 +21,12 @@ use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeActi
 use crate::transport::{Transport, UsbError};
 
 const READ_BUF: usize = 16384;
+/// Larger buffer for the streaming read path ([`Connection::read_notifications`]).
+/// The eye-camera stream is ~2.6 MB/s (78 KB @ 33 Hz); with synchronous bulk
+/// reads, throughput is round-trip-limited, so each transfer must move a lot to
+/// keep up — a 16 KB buffer backs the pipe up and the preview lags. Heap-held and
+/// reused (too big for the stack, and re-zeroing it every read would be waste).
+const STREAM_READ_BUF: usize = 262144;
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const GAZE_TIMEOUT: Duration = Duration::from_millis(1000);
 const HANDSHAKE_STEP_CAP: u32 = 400;
@@ -45,6 +51,8 @@ pub struct Connection<T: Transport> {
     seq: u32,
     /// How long [`Connection::request`] waits for a matching response.
     request_timeout: Duration,
+    /// Reused large read buffer for the streaming path (see [`STREAM_READ_BUF`]).
+    read_buf: Vec<u8>,
 }
 
 impl<T: Transport> Connection<T> {
@@ -57,6 +65,7 @@ impl<T: Transport> Connection<T> {
             gaze_queue: VecDeque::new(),
             seq: 1,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            read_buf: vec![0u8; STREAM_READ_BUF],
         };
         conn.run_handshake()?;
         Ok(conn)
@@ -341,11 +350,12 @@ impl<T: Transport> Connection<T> {
     /// multiple concurrent streams (a small stream co-occurring with gaze in the
     /// same chunk would otherwise be dropped). Non-notify frames are routed.
     pub fn read_notifications(&mut self) -> Vec<(u32, Vec<u8>)> {
-        let mut buf = [0u8; READ_BUF];
-        let Some(n) = self.transport.recv(&mut buf, GAZE_TIMEOUT) else {
+        // Reuse the large heap buffer (disjoint field borrows: transport,
+        // read_buf, parser are separate fields).
+        let Some(n) = self.transport.recv(&mut self.read_buf, GAZE_TIMEOUT) else {
             return Vec::new();
         };
-        let Ok(frames) = self.parser.feed(&buf[..n]) else {
+        let Ok(frames) = self.parser.feed(&self.read_buf[..n]) else {
             return Vec::new();
         };
         let mut out = Vec::new();
