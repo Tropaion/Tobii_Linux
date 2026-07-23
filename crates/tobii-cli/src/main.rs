@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         (Some("columns"), _) => columns(),
         (Some("probe-streams"), _) => probe_streams(&args),
         (Some("probe-stream"), _) => probe_stream(&args),
+        (Some("dump-stream"), _) => dump_stream(&args),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
                  tobii columns\n  \
                  tobii probe-streams [START] [END]\n  \
                  tobii probe-stream <ID> [SECS]\n  \
+                 tobii dump-stream <ID> [COUNT]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -246,6 +248,46 @@ fn probe_streams(args: &[String]) -> CmdResult {
             "\nNo new streams in 0x{start:03x}..=0x{end:03x}. Try a wider range, \
              e.g. `tobii probe-streams 0x400 0x600`, or the head pose is host-derived."
         );
+    }
+    Ok(())
+}
+
+/// Diagnostic: capture raw frames of ONE stream to /tmp for offline analysis.
+/// Used to decode the eye-camera image streams (0x501/0x50e) — their pixel
+/// format determines whether an off-the-shelf head-pose model can consume them.
+/// `tobii dump-stream <id-hex> [count]` writes /tmp/stream-<id>-<n>.bin.
+fn dump_stream(args: &[String]) -> CmdResult {
+    let id = args
+        .get(2)
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .ok_or("usage: tobii dump-stream <stream-id-hex> [count]")?;
+    let count: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+    conn.set_request_timeout(Duration::from_millis(300));
+    conn.subscribe_stream(id)?;
+    eprintln!("capturing {count} frame(s) of stream 0x{id:03x} to /tmp (sit in view)...");
+
+    let mut saved = 0u32;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while saved < count && Instant::now() < deadline {
+        for (op, payload) in conn.read_notifications() {
+            if op != id as u32 {
+                continue;
+            }
+            let path = format!("/tmp/stream-{id:03x}-{saved}.bin");
+            std::fs::write(&path, &payload)?;
+            println!("wrote {path} ({} bytes)", payload.len());
+            saved += 1;
+            if saved >= count {
+                break;
+            }
+        }
+    }
+    if saved == 0 {
+        println!("no frames captured for 0x{id:03x} (does it stream? try `probe-stream`)");
     }
     Ok(())
 }
