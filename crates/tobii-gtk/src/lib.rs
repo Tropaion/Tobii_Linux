@@ -203,7 +203,7 @@ fn build_ui(app: &Application) {
     let cam_area = DrawingArea::new();
     cam_area.set_content_width(220);
     cam_area.set_content_height(220);
-    cam_area.set_halign(Align::Start);
+    cam_area.set_halign(Align::Center);
     {
         let cam_frame = cam_frame.clone();
         cam_area.set_draw_func(move |_, cr, w, h| {
@@ -403,7 +403,13 @@ fn build_ui(app: &Application) {
     // ~30 fps tick: read the device snapshot, refresh status + eye view.
     let tick_view = view.clone();
     glib::timeout_add_local(Duration::from_millis(33), move || {
-        let snap = state.lock().unwrap().clone();
+        // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
+        // under one lock. `new_cam` is None on the ticks between device frames.
+        let (snap, new_cam) = {
+            let mut s = state.lock().unwrap();
+            let cam = s.latest_camera.take();
+            (s.clone(), cam)
+        };
         let conn = matches!(snap.status, device::ConnStatus::Connected);
         connected.set(conn);
         status_label.set_text(if conn { "Connected" } else { "Disconnected" });
@@ -425,9 +431,13 @@ fn build_ui(app: &Application) {
         guidance.set_text(&widget::guidance_message(&ev));
         *tick_view.borrow_mut() = ev;
         area.queue_draw();
-        // Camera preview: publish the latest frame (only when connected, so a
-        // stale frame doesn't linger after unplug) and redraw.
-        *cam_frame.borrow_mut() = if conn { snap.latest_camera } else { None };
+        // Camera preview: keep the last frame between device frames; update on a
+        // new one; clear on disconnect so nothing stale lingers.
+        if !conn {
+            *cam_frame.borrow_mut() = None;
+        } else if new_cam.is_some() {
+            *cam_frame.borrow_mut() = new_cam;
+        }
         cam_area.queue_draw();
         glib::ControlFlow::Continue
     });
