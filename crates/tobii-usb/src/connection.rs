@@ -29,8 +29,10 @@ const HANDSHAKE_STEP_CAP: u32 = 400;
 /// are routed to the queue from inside the same read loop, so an iteration cap
 /// would shrink the effective wait to nothing under normal gaze traffic.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// `add_calibration_point` needs a much longer window: the device blocks there
-/// while it gathers samples for the stimulus point before acking.
+/// Defensive upper bound for `add_calibration_point`. NOTE: the device actually
+/// acks a point almost immediately (verified live 2026-07-21 — it does NOT block
+/// while sampling; the fixation dwell is enforced host-side), so this ceiling is
+/// never reached in practice; it only guards a pathological stall.
 const CAL_POINT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A live connection to the eye tracker. Generic over [`Transport`] so the
