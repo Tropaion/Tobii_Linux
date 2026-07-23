@@ -29,6 +29,7 @@ fn main() -> ExitCode {
         (Some("probe-streams"), _) => probe_streams(&args),
         (Some("probe-stream"), _) => probe_stream(&args),
         (Some("dump-stream"), _) => dump_stream(&args),
+        (Some("camera"), _) => camera(&args),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
         (Some("display"), Some("set")) => display_set(),
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
                  tobii probe-streams [START] [END]\n  \
                  tobii probe-stream <ID> [SECS]\n  \
                  tobii dump-stream <ID> [COUNT]\n  \
+                 tobii camera [ID] [COUNT]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -248,6 +250,69 @@ fn probe_streams(args: &[String]) -> CmdResult {
             "\nNo new streams in 0x{start:03x}..=0x{end:03x}. Try a wider range, \
              e.g. `tobii probe-streams 0x400 0x600`, or the head pose is host-derived."
         );
+    }
+    Ok(())
+}
+
+/// Capture DECODED camera frames (0x501/0x50e) and save them as viewable PGM
+/// images. Confirms the camera pipeline end-to-end and lets you eyeball the NIR
+/// image the head-pose model will consume. `tobii camera [id-hex] [count]`
+/// (default 0x501, 3 frames). PGM is dependency-free; open with any image viewer.
+fn camera(args: &[String]) -> CmdResult {
+    use tobii_protocol::camera::decode_camera_frame;
+    let id = args
+        .get(2)
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x501);
+    let count: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+
+    let dir = private_dump_dir()?;
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+    conn.set_request_timeout(Duration::from_millis(300));
+    conn.subscribe_stream(id)?;
+    eprintln!(
+        "capturing {count} camera frame(s) from 0x{id:03x} to {} (sit in view)...",
+        dir.display()
+    );
+
+    let mut saved = 0u32;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while saved < count && Instant::now() < deadline {
+        for (op, payload) in conn.read_notifications() {
+            if op != id as u32 {
+                continue;
+            }
+            let Some(f) = decode_camera_frame(&payload) else {
+                continue;
+            };
+            let mean =
+                f.pixels.iter().map(|&b| b as u64).sum::<u64>() / f.pixels.len().max(1) as u64;
+            let path = dir.join(format!("cam-{id:03x}-{saved}.pgm"));
+            // PGM (P5) grayscale: header + raw bytes. No image-crate dependency.
+            let mut out = format!("P5\n{} {}\n255\n", f.width, f.height).into_bytes();
+            out.extend_from_slice(&f.pixels);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(&out)?;
+            println!(
+                "{}  ({}x{}, {}-bit, mean brightness {mean})",
+                path.display(),
+                f.width,
+                f.height,
+                f.bit_depth
+            );
+            saved += 1;
+            if saved >= count {
+                break;
+            }
+        }
+    }
+    if saved == 0 {
+        println!("no camera frames from 0x{id:03x} (is it a camera stream? try 0x501 or 0x50e)");
     }
     Ok(())
 }
