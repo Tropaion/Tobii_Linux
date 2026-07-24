@@ -7,6 +7,7 @@
 pub mod align;
 pub mod calibrate_flow;
 pub mod device;
+pub mod eye_preview;
 pub mod eyeview;
 pub mod fine_tune;
 pub mod overlay;
