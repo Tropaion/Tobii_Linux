@@ -138,6 +138,15 @@ fn build_ui(app: &Application) {
     // calibration). Unlike `eye_seeded`, this must reset on disconnect so a
     // later reconnect — e.g. moved to a different monitor — is re-evaluated.
     let cal_evaluated = Rc::new(Cell::new(false));
+    // True while a forced flow (setup or calibration) is open. Prevents a
+    // disconnect/reconnect glitch mid-flow from stacking a second forced
+    // window on top of the first (the disconnect branch resets
+    // `cal_evaluated`, so without this the very next `Connected` tick would
+    // re-enter `decide()` while the first window is still up). Cleared when
+    // the flow closes, at which point `cal_evaluated` is also reset so
+    // `decide()` re-runs immediately — this is what chains ForceSetup ->
+    // ForceCalibration within one session instead of waiting for a reconnect.
+    let forced_flow_open = Rc::new(Cell::new(false));
 
     // --- Header ---
     let title = Label::new(Some("Tobii Configuration"));
@@ -472,7 +481,7 @@ fn build_ui(app: &Application) {
         // `tobii_config::decide`; this only computes its inputs and maps its
         // output to a UI action.
         if conn {
-            if !cal_evaluated.get() {
+            if !cal_evaluated.get() && !forced_flow_open.get() {
                 cal_evaluated.set(true);
                 let display_configured = tobii_config::load().ok().flatten().is_some();
                 let fp = tobii_config::load()
@@ -487,19 +496,27 @@ fn build_ui(app: &Application) {
                 let active = device::active_monitor_id();
                 match tobii_config::decide(display_configured, cal.as_ref(), active.as_deref(), fp)
                 {
-                    tobii_config::CalAction::ForceSetup => {
-                        launch_forced(&tick_app, &tick_window, {
+                    tobii_config::CalAction::ForceSetup => launch_forced(
+                        &tick_app,
+                        &tick_window,
+                        &forced_flow_open,
+                        &cal_evaluated,
+                        {
                             let cmd_tx = tick_cmd_tx.clone();
                             move |app| setup_flow::launch(app, cmd_tx.clone())
-                        })
-                    }
-                    tobii_config::CalAction::ForceCalibration => {
-                        launch_forced(&tick_app, &tick_window, {
+                        },
+                    ),
+                    tobii_config::CalAction::ForceCalibration => launch_forced(
+                        &tick_app,
+                        &tick_window,
+                        &forced_flow_open,
+                        &cal_evaluated,
+                        {
                             let state = state.clone();
                             let cmd_tx = tick_cmd_tx.clone();
                             move |app| calibrate_flow::launch(app, state.clone(), cmd_tx.clone())
-                        })
-                    }
+                        },
+                    ),
                     tobii_config::CalAction::RecommendCalibration(reason) => {
                         show_recommend_banner(&tick_banner_label, &tick_banner, reason);
                     }
@@ -545,16 +562,32 @@ fn build_ui(app: &Application) {
 /// existing `b_cal`/`b_fine` single-flow-at-a-time pattern, but disables the
 /// whole hub window rather than a single button, since a forced flow has no
 /// button of its own to anchor to.
+///
+/// `forced_flow_open` is set for the lifetime of the window, so the tick's
+/// `decide()` evaluation does not re-enter while a forced flow is already up
+/// (e.g. a disconnect/reconnect glitch mid-setup). On close, `cal_evaluated`
+/// is also reset so `decide()` re-runs on the very next tick while still
+/// connected — this is what chains ForceSetup -> ForceCalibration within one
+/// session (a fresh install has neither display config nor a calibration, and
+/// completing setup must not wait for a reconnect before calibration is
+/// forced too).
 fn launch_forced(
     app: &Application,
     window: &ApplicationWindow,
+    forced_flow_open: &Rc<Cell<bool>>,
+    cal_evaluated: &Rc<Cell<bool>>,
     open: impl FnOnce(&Application) -> ApplicationWindow,
 ) {
     window.set_sensitive(false);
+    forced_flow_open.set(true);
     let win = open(app);
     let hub = window.clone();
+    let forced_flow_open = forced_flow_open.clone();
+    let cal_evaluated = cal_evaluated.clone();
     win.connect_close_request(move |_| {
         hub.set_sensitive(true);
+        forced_flow_open.set(false);
+        cal_evaluated.set(false);
         glib::Propagation::Proceed
     });
 }
