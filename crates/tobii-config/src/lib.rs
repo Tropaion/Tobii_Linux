@@ -13,11 +13,13 @@
 //! [`chord_from_arc`] / [`arc_from_chord`] remain as general arc/chord helper
 //! math; the plane sent to the device no longer goes through them.
 
+mod calibration_state;
 mod edid;
 mod setpm;
 mod setup;
 mod store;
 
+pub use calibration_state::{decide, CalAction, RecommendReason};
 pub use edid::{detect_monitors, pick_monitor, MonitorInfo};
 pub use setpm::parse_setpm_corners;
 pub use setup::{arc_from_chord, chord_from_arc, plane_width_from_edid, DisplaySetup};
