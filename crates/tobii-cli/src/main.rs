@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tobii_config::DisplaySetup;
 use tobii_headpose::{opentrack, pose_from_sample, PoseFilter};
@@ -722,7 +722,7 @@ const CAL_POINTS: [(f64, f64); 5] = [(0.5, 0.5), (0.1, 0.1), (0.9, 0.1), (0.1, 0
 
 fn calibrate(apply_saved: bool) -> CmdResult {
     if apply_saved {
-        let blob = tobii_config::load_calibration()?
+        let (blob, _meta) = tobii_config::load_calibration()?
             .ok_or("no saved calibration — run `tobii calibrate` first")?;
         let transport = UsbTransport::open()?;
         let mut conn = Connection::connect(transport)?;
@@ -747,7 +747,14 @@ fn calibrate(apply_saved: bool) -> CmdResult {
     }
     conn.compute_and_apply_calibration()?;
     let blob = conn.retrieve_calibration()?;
-    tobii_config::save_calibration(&blob.0)?;
+    let meta = tobii_config::CalMeta {
+        monitor_id: tobii_config::pick_monitor(&tobii_config::detect_monitors())
+            .and_then(|m| m.id.clone()),
+        created_utc: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
+        mode: "cli".to_string(),
+        display_fingerprint: tobii_config::load()?.map(|s| s.fingerprint()).unwrap_or(0),
+    };
+    tobii_config::save_calibration(&blob.0, &meta)?;
     println!(
         "calibration computed + applied; saved {} bytes.",
         blob.0.len()
