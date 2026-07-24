@@ -1,19 +1,30 @@
 //! Fullscreen display-setup flow (the original's `-S`).
 //!
-//! The screen geometry is **seeded from the monitor's EDID** (`detect_monitors`)
-//! whenever one can be detected: deriving the size purely from dragged lines is
-//! error-prone, because width is *inversely* proportional to the line gap — a
-//! user who dragged the lines to half the tracker's real width ended up with a
-//! 2431 mm "screen" (real monitor: 1193 x 336 mm), which threw gaze mapping off
-//! by centimetres. EDID makes that class of error nearly impossible.
+//! A 3-step wizard, one `gtk::Stack` page per step, no `Back` (Cancel/Esc
+//! returns from any step instead):
 //!
-//! The two vertical lines are still draggable and keep their meaning (width +
-//! horizontal offset via `align`), so absent or wrong EDID can be corrected by
-//! eye. They are *rendered* from the current width/offset, so seeding the width
-//! places them correctly for free. A "Show advanced" toggle reveals the editable
-//! numeric form (compact −[value]+ spinners, two-way synced with the drag), each
-//! row carrying a "?" button whose tooltip explains + diagrams the field.
-//! Apply persists + pushes to the device; Cancel/Esc returns.
+//! 1. **ScreenPick** — shown only when [`crate::screen_pick::should_show_picker`]
+//!    says there's more than one monitor to choose from; skipped straight to
+//!    Align otherwise. Picking a monitor (or the automatic single-monitor
+//!    resolution) seeds the geometry below from its EDID.
+//! 2. **Align** — the screen geometry is **seeded from the monitor's EDID**
+//!    (`detect_monitors`) whenever one can be identified: deriving the size
+//!    purely from dragged lines is error-prone, because width is *inversely*
+//!    proportional to the line gap — a user who dragged the lines to half the
+//!    tracker's real width ended up with a 2431 mm "screen" (real monitor:
+//!    1193 x 336 mm), which threw gaze mapping off by centimetres. EDID makes
+//!    that class of error nearly impossible. The two vertical lines are still
+//!    draggable and keep their meaning (width + horizontal offset via
+//!    `align`), so absent or wrong EDID can be corrected by eye. They are
+//!    *rendered* from the current width/offset, so seeding the width places
+//!    them correctly for free. A "Show advanced" toggle reveals the editable
+//!    numeric form (compact −[value]+ spinners, two-way synced with the
+//!    drag), each row carrying a "?" button whose tooltip explains + diagrams
+//!    the field. Its "Done" button only advances to Posture — no writes yet.
+//! 3. **Posture** — a static reminder to sit up straight. Its "Done" button
+//!    is what used to be Align's Apply: persists the config, pushes the
+//!    display area to the device, and binds the config to the chosen
+//!    monitor via a sidecar file; Cancel/Esc still just closes the window.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -22,7 +33,7 @@ use std::sync::mpsc::Sender;
 use gtk::prelude::*;
 use gtk::{
     cairo, Align, Application, Button, DrawingArea, Entry, GestureDrag, Grid, Label, Orientation,
-    Overlay, ToggleButton,
+    Overlay, Stack, ToggleButton,
 };
 
 use crate::align;
@@ -422,6 +433,15 @@ fn add_spinner(
     Field { entry, get }
 }
 
+/// Which step of the wizard is showing. No `Back` — the captured screenshots
+/// this mirrors only ever move forward (plus Cancel/Esc from anywhere).
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    ScreenPick,
+    Align,
+    Posture,
+}
+
 /// Open the fullscreen display-setup flow window, returning it so the caller
 /// can react to it closing (mirrors `calibrate_flow::launch`/`fine_tune::launch`
 /// — needed by the hub's forced-setup path, which re-enables itself only once
@@ -430,8 +450,18 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     // Seed from EDID when we can: the saved/default config supplies the pose
     // (tilt + offsets), the detected monitor overrides the physical size, which
     // is the part users get catastrophically wrong when dragging the lines.
+    //
+    // With 2+ monitors we cannot guess which one the tracker sits under, so
+    // resolution is deferred to the ScreenPick step instead of happening here
+    // (`chosen`/`edid_arc_mm` start empty and are filled in by a picker click).
     let monitors = tobii_config::detect_monitors();
-    let detected = pick_monitor(&monitors).cloned();
+    let chosen: Rc<RefCell<Option<tobii_config::MonitorInfo>>> = Rc::new(RefCell::new(
+        if crate::screen_pick::should_show_picker(&monitors) {
+            None
+        } else {
+            pick_monitor(&monitors).cloned()
+        },
+    ));
     let mut initial = tobii_config::load()
         .ok()
         .flatten()
@@ -440,13 +470,20 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     // bent into an arc), and the device plane wants exactly that arc, unchanged
     // (see `plane_width_from_edid`) — curvature never shrinks it. The arc is
     // kept for the lifetime of the flow so a later curvature edit (see
-    // `on_curve` below) can keep the width field snapped to it.
-    let edid_arc_mm: Option<f64> = detected.as_ref().map(|m| m.width_mm);
-    if let Some(m) = &detected {
+    // `on_curve` below) can keep the width field snapped to it. A `Cell`
+    // because it may be filled in later, by a ScreenPick button click.
+    let edid_arc_mm: Rc<Cell<Option<f64>>> =
+        Rc::new(Cell::new(chosen.borrow().as_ref().map(|m| m.width_mm)));
+    if let Some(m) = chosen.borrow().as_ref() {
         initial.width_mm = tobii_config::plane_width_from_edid(m.width_mm);
         initial.height_mm = m.height_mm;
     }
     let setup = Rc::new(RefCell::new(initial));
+    let phase = Rc::new(Cell::new(if chosen.borrow().is_some() {
+        Phase::Align
+    } else {
+        Phase::ScreenPick
+    }));
 
     let win = gtk::ApplicationWindow::builder()
         .application(app)
@@ -470,9 +507,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
 
     // Header (instruction + readout + buttons) — anchored at a fixed spot a bit
     // above the middle, so revealing the advanced box below doesn't move it.
-    let instr = Label::new(Some(
-        "Drag the two lines to the marks on the top corners of your eye tracker.",
-    ));
+    let instr = Label::new(Some("Move the lines to the marks on your eye tracker."));
     instr.add_css_class("app-title");
     instr.set_halign(Align::Center);
     instr.set_wrap(true);
@@ -493,17 +528,18 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     let refresh_status: Rc<dyn Fn()> = {
         let setup = setup.clone();
         let status = status.clone();
-        let detected = detected.clone();
+        let chosen = chosen.clone();
         Rc::new(move || {
             let s = *setup.borrow(); // Copy; borrow released here
             let mut warn = false;
-            // Always lead with the current geometry — it is what Apply will
-            // save — then explain where it came from.
+            // Always lead with the current geometry — it is what gets saved —
+            // then explain where it came from.
             let geometry = format!(
                 "Screen ≈ {:.0} × {:.0} mm   ·   horizontal offset {:.0} mm",
                 s.width_mm, s.height_mm, s.offset_x_mm
             );
-            let mut text = match &detected {
+            let detected = chosen.borrow();
+            let mut text = match &*detected {
                 Some(m) => format!(
                     "{geometry}\nDetected {} — {:.0} × {:.0} mm. Drag the lines only if this \
                      looks wrong.",
@@ -540,14 +576,14 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
         })
     };
 
-    let apply = Button::with_label("Apply & save");
+    let align_done = Button::with_label("Done");
     let advanced = ToggleButton::with_label("Show advanced");
-    let cancel = Button::with_label("Cancel");
+    let align_cancel = Button::with_label("Cancel");
     let buttons = gtk::Box::new(Orientation::Horizontal, 10);
     buttons.set_halign(Align::Center);
-    buttons.append(&apply);
+    buttons.append(&align_done);
     buttons.append(&advanced);
-    buttons.append(&cancel);
+    buttons.append(&align_cancel);
 
     let corners = Label::new(Some(""));
     corners.add_css_class("section-desc");
@@ -743,8 +779,9 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
         let setup = setup.clone();
         let syncing = syncing.clone();
         let width_entry = fields[0].entry.clone(); // row 0 is "Width (mm)"
+        let edid_arc_mm = edid_arc_mm.clone();
         *on_curve.borrow_mut() = Some(Rc::new(move || {
-            let Some(arc) = edid_arc_mm else {
+            let Some(arc) = edid_arc_mm.get() else {
                 return;
             };
             let width = tobii_config::plane_width_from_edid(arc);
@@ -786,10 +823,108 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     header.append(&buttons);
     header.append(&adv_panel);
 
-    let overlay = Overlay::new();
-    overlay.set_child(Some(&area));
-    overlay.add_overlay(&header);
-    win.set_child(Some(&overlay));
+    let align_page = Overlay::new();
+    align_page.set_child(Some(&area));
+    align_page.add_overlay(&header);
+
+    // The three wizard steps, as siblings in a Stack (one visible at a time).
+    // ScreenPick is only reachable when `should_show_picker` was true at
+    // launch; otherwise `chosen` already holds the sole monitor and the stack
+    // starts on Align directly.
+    let stack = Stack::new();
+
+    // --- ScreenPick page --------------------------------------------------
+    let pick_heading = Label::new(Some("Which screen is your eye tracker connected to?"));
+    pick_heading.add_css_class("app-title");
+    pick_heading.set_halign(Align::Center);
+    pick_heading.set_wrap(true);
+    pick_heading.set_justify(gtk::Justification::Center);
+
+    let pick_buttons = gtk::Box::new(Orientation::Vertical, 10);
+    pick_buttons.set_halign(Align::Center);
+    for m in &monitors {
+        let btn = Button::with_label(&crate::screen_pick::monitor_label(m));
+        {
+            let m = m.clone();
+            let chosen = chosen.clone();
+            let edid_arc_mm = edid_arc_mm.clone();
+            let setup = setup.clone();
+            let refresh_form = refresh_form.clone();
+            let refresh_view = refresh_view.clone();
+            let phase = phase.clone();
+            let stack = stack.clone();
+            btn.connect_clicked(move |_| {
+                *chosen.borrow_mut() = Some(m.clone());
+                edid_arc_mm.set(Some(m.width_mm));
+                {
+                    let mut s = setup.borrow_mut();
+                    s.width_mm = tobii_config::plane_width_from_edid(m.width_mm);
+                    s.height_mm = m.height_mm;
+                } // borrow released before refresh_form/refresh_view re-read it
+                refresh_form();
+                refresh_view();
+                phase.set(Phase::Align);
+                stack.set_visible_child_name("align");
+            });
+        }
+        pick_buttons.append(&btn);
+    }
+
+    let pick_cancel = Button::with_label("Cancel");
+
+    let screen_pick_page = gtk::Box::new(Orientation::Vertical, 16);
+    screen_pick_page.set_halign(Align::Center);
+    screen_pick_page.set_valign(Align::Start);
+    screen_pick_page.set_margin_top((screen_height() as f64 * 0.34) as i32);
+    screen_pick_page.append(&pick_heading);
+    screen_pick_page.append(&pick_buttons);
+    screen_pick_page.append(&pick_cancel);
+
+    // --- Posture page -------------------------------------------------------
+    let posture_instr = Label::new(Some("Sit up straight in front of the screen."));
+    posture_instr.add_css_class("app-title");
+    posture_instr.set_halign(Align::Center);
+    posture_instr.set_wrap(true);
+    posture_instr.set_justify(gtk::Justification::Center);
+
+    let posture_area = DrawingArea::new();
+    posture_area.set_content_width(520);
+    posture_area.set_content_height(340);
+    posture_area.set_draw_func(|_, cr, w, h| draw_posture(cr, w, h));
+
+    let posture_warn = Label::new(None);
+    posture_warn.add_css_class("guidance");
+    posture_warn.set_halign(Align::Center);
+    posture_warn.set_wrap(true);
+    posture_warn.set_justify(gtk::Justification::Center);
+    posture_warn.set_max_width_chars(70);
+    posture_warn.set_visible(false);
+
+    let posture_done = Button::with_label("Done");
+    let posture_cancel = Button::with_label("Cancel");
+    let posture_buttons = gtk::Box::new(Orientation::Horizontal, 10);
+    posture_buttons.set_halign(Align::Center);
+    posture_buttons.append(&posture_done);
+    posture_buttons.append(&posture_cancel);
+
+    let posture_page = gtk::Box::new(Orientation::Vertical, 16);
+    posture_page.set_halign(Align::Center);
+    posture_page.set_valign(Align::Start);
+    posture_page.set_margin_top((screen_height() as f64 * 0.20) as i32);
+    posture_page.append(&posture_instr);
+    posture_page.append(&posture_area);
+    posture_page.append(&posture_warn);
+    posture_page.append(&posture_buttons);
+
+    stack.add_named(&screen_pick_page, Some("pick"));
+    stack.add_named(&align_page, Some("align"));
+    stack.add_named(&posture_page, Some("posture"));
+    stack.set_visible_child_name(if phase.get() == Phase::Align {
+        "align"
+    } else {
+        "pick"
+    });
+    win.set_child(Some(&stack));
 
     // Advanced toggle: show/hide the form + reflect its state in the label.
     {
@@ -876,35 +1011,57 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     }
     area.add_controller(motion);
 
-    // Esc cancels.
+    // Esc cancels, from any step.
     add_escape_to_close(&win);
 
-    // Apply: persist + push to device, return to hub.
+    // Align's Done: just advances to Posture. Device/config writes moved to
+    // Posture's Done (below) — this step no longer persists anything.
+    {
+        let phase = phase.clone();
+        let stack = stack.clone();
+        align_done.connect_clicked(move |_| {
+            phase.set(Phase::Posture);
+            stack.set_visible_child_name("posture");
+        });
+    }
+
+    // Posture's Done: persist + push to device + bind the monitor, then close.
+    // Same failed-save handling as the old Align/Apply button.
     {
         let setup = setup.clone();
+        let chosen = chosen.clone();
         let win = win.clone();
-        let status = status.clone();
-        apply.connect_clicked(move |_| {
+        let posture_warn = posture_warn.clone();
+        posture_done.connect_clicked(move |_| {
             let s = *setup.borrow();
             let saved = tobii_config::save(&s);
             let _ = cmd_tx.send(DeviceCommand::SetDisplayArea(s.to_corners()));
+            // Whether or not a monitor was actually detected: `None` correctly
+            // clears any stale sidecar value from a previous run.
+            let chosen_ref = chosen.borrow();
+            let monitor_id = chosen_ref.as_ref().and_then(|m| m.id.as_deref());
+            let id_saved = tobii_config::save_setup_monitor_id(monitor_id);
+            drop(chosen_ref);
             // A failed save is not fatal — the geometry is still pushed to the
             // device — but it will not survive a restart, so say so and keep the
             // window open instead of silently closing.
-            if let Err(e) = saved {
-                status.add_css_class("section-warn");
-                status.set_text(&format!(
+            if let Err(e) = saved.and(id_saved) {
+                posture_warn.add_css_class("section-warn");
+                posture_warn.set_text(&format!(
                     "Applied to the tracker, but saving the configuration failed: {e}. \
                      The settings will be lost when the tracker reconnects."
                 ));
+                posture_warn.set_visible(true);
                 return;
             }
             win.close();
         });
     }
-    {
+
+    // Cancel, on every page, all closing the whole wizard the same way.
+    for cancel_btn in [&align_cancel, &pick_cancel, &posture_cancel] {
         let win = win.clone();
-        cancel.connect_clicked(move |_| win.close());
+        cancel_btn.connect_clicked(move |_| win.close());
     }
 
     // Seed the form + readout from the initial setup.
@@ -956,4 +1113,70 @@ fn draw_align(cr: &cairo::Context, w: i32, h: i32, lines: (f64, f64)) {
     let _ = cr.stroke();
     cr.arc(w / 2.0, by + bar_h / 2.0, 5.0, 0.0, std::f64::consts::TAU);
     let _ = cr.fill();
+}
+
+/// Static posture illustration: a monitor, a seated person below it, and a few
+/// thin teal lines fanning from near the person's eyes to the screen's bottom
+/// edge, suggesting a gaze frustum. Original line art scaled to fill whatever
+/// area it is drawn into — not a measurement-critical diagram like the
+/// `diagram_*` helpers above, just a "sit like this, looking at that" cue.
+fn draw_posture(cr: &cairo::Context, w: i32, h: i32) {
+    let (w, h) = (w as f64, h as f64);
+
+    // Monitor: a wide rectangle across the top of the frame.
+    let mon_w = (w * 0.78).min(420.0);
+    let mon_h = mon_w * 0.42;
+    let mon_x = (w - mon_w) / 2.0;
+    let mon_y = h * 0.06;
+    let glass = front_monitor(cr, mon_x, mon_y, mon_w, mon_h);
+
+    // Seated person below the screen: head (circle), shoulders (a shallow
+    // curve), torso (two lines down). Proportions are relative to the
+    // vertical space left below the monitor, so the figure fits at any size
+    // this is drawn at.
+    let mon_bottom = mon_y + mon_h;
+    let avail = (h - mon_bottom).max(1.0);
+    let head_r = (avail * 0.16).clamp(14.0, 34.0);
+    let head_cx = w / 2.0;
+    let head_cy = mon_bottom + avail * 0.32;
+    let shoulder_y = mon_bottom + avail * 0.55;
+    let shoulder_half = head_r * 2.2;
+    let torso_bottom = mon_bottom + avail * 0.90;
+
+    rgb(cr, GREY);
+    cr.set_line_width(2.2);
+    cr.arc(head_cx, head_cy, head_r, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke();
+
+    // Shoulders: a shallow curve spanning out from just under the head.
+    cr.move_to(head_cx - shoulder_half, shoulder_y + head_r * 1.3);
+    cr.curve_to(
+        head_cx - shoulder_half,
+        shoulder_y,
+        head_cx + shoulder_half,
+        shoulder_y,
+        head_cx + shoulder_half,
+        shoulder_y + head_r * 1.3,
+    );
+    let _ = cr.stroke();
+
+    // Torso: two lines from the shoulders' ends down to seat level, converging
+    // slightly — a seated upper body, not a full figure.
+    cr.move_to(head_cx - shoulder_half, shoulder_y + head_r * 1.3);
+    cr.line_to(head_cx - shoulder_half * 0.55, torso_bottom);
+    let _ = cr.stroke();
+    cr.move_to(head_cx + shoulder_half, shoulder_y + head_r * 1.3);
+    cr.line_to(head_cx + shoulder_half * 0.55, torso_bottom);
+    let _ = cr.stroke();
+
+    // Gaze-frustum suggestion: thin teal lines from near the eyes fanning out
+    // to the screen's bottom edge.
+    let eyes_y = head_cy - head_r * 0.15;
+    rgb(cr, TEAL);
+    cr.set_line_width(1.2);
+    for gx in [glass.0, glass.0 + glass.2 / 2.0, glass.0 + glass.2] {
+        cr.move_to(head_cx, eyes_y);
+        cr.line_to(gx, glass.1 + glass.3);
+        let _ = cr.stroke();
+    }
 }
