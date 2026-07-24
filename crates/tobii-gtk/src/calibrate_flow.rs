@@ -1,7 +1,9 @@
-//! Fullscreen follow-the-dot calibration flow. The user picks Quick/Full, then
-//! follows a pulsing dot; each point is sampled by the device thread (see
+//! Fullscreen calibration flow. Opens on a live eye-position preview (see
+//! `eye_preview`); once the user holds a centered position for a moment (or
+//! taps "Continue anyway") it auto-advances into the follow-the-dot sequence,
+//! where each point is sampled by the device thread (see
 //! `device::DeviceCommand::Cal*`). The point sets + `CalMode` are unit-tested;
-//! the GTK window + cairo dot are live-validated.
+//! the GTK window + cairo dot/eye-preview are live-validated.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -14,7 +16,8 @@ use gtk::prelude::*;
 use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Overlay};
 
 use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
-use crate::{add_escape_to_close, screen_height};
+use crate::eyeview::Guidance;
+use crate::{add_escape_to_close, eye_preview, screen_height, widget};
 use tobii_protocol::EnabledEye;
 
 /// Calibration point sets (normalized, top-left origin, center-first — the
@@ -97,7 +100,15 @@ const COMPUTE_TIMEOUT_TICKS: u32 = 1350; // ~45 s for compute+retrieve
 /// UI-side flow state (distinct from the device's `CalPhase`).
 #[derive(Clone)]
 enum Phase {
-    Chooser,
+    /// Live eye-position preview shown before any calibration session opens.
+    /// `ticks` is total time on this step (drives the `eye_preview::message`
+    /// copy and the "Continue anyway" fallback); `centered_ticks` is the
+    /// currently-running streak of `Guidance::Centered` readings — reset to 0
+    /// on any other guidance — that drives auto-advance.
+    EyePreview {
+        ticks: u32,
+        centered_ticks: u32,
+    },
     /// `CalBegin` sent; waiting for the device thread to publish a `CalPhase`
     /// carrying *our* `token`. The token is what makes this an edge and not a
     /// level: `active`, `collected`, `last_error` and `finished` all persist
@@ -161,23 +172,24 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView) {
 fn update_ui(
     phase: &Phase,
     instr: &Label,
-    chooser: &gtk::Box,
+    eye_preview_box: &gtk::Box,
+    continue_btn: &Button,
     done_box: &gtk::Box,
     retry: &Button,
     cancel: &Button,
 ) {
     match phase {
-        Phase::Chooser => {
-            instr.set_text(
-                "Choose a calibration. Sit comfortably, about an arm's length from the screen.",
-            );
-            chooser.set_visible(true);
+        Phase::EyePreview { ticks, .. } => {
+            // `instr`'s text is set live in the tick loop (recomputed every
+            // frame from the current guidance) — don't fight it here.
+            eye_preview_box.set_visible(true);
+            continue_btn.set_visible(eye_preview::should_offer_fallback(*ticks));
             done_box.set_visible(false);
             cancel.set_visible(true);
         }
         Phase::Starting { .. } => {
             instr.set_text("Starting calibration…");
-            chooser.set_visible(false);
+            eye_preview_box.set_visible(false);
             done_box.set_visible(false);
             cancel.set_visible(true);
         }
@@ -194,13 +206,13 @@ fn update_ui(
             } else {
                 format!("Follow the dot with your eyes  ·  {progress}")
             });
-            chooser.set_visible(false);
+            eye_preview_box.set_visible(false);
             done_box.set_visible(false);
             cancel.set_visible(true);
         }
         Phase::Computing { .. } => {
             instr.set_text("Computing your calibration…");
-            chooser.set_visible(false);
+            eye_preview_box.set_visible(false);
             done_box.set_visible(false);
             cancel.set_visible(false);
         }
@@ -209,7 +221,7 @@ fn update_ui(
                 Ok(()) => instr.set_text("Calibration complete."),
                 Err(e) => instr.set_text(e),
             }
-            chooser.set_visible(false);
+            eye_preview_box.set_visible(false);
             done_box.set_visible(true);
             // Success offers only Done; Retry belongs to the failure screen.
             retry.set_visible(res.is_err());
@@ -239,7 +251,10 @@ pub fn launch(
     win.set_modal(true);
     win.fullscreen();
 
-    let phase = Rc::new(RefCell::new(Phase::Chooser));
+    let phase = Rc::new(RefCell::new(Phase::EyePreview {
+        ticks: 0,
+        centered_ticks: 0,
+    }));
     let dot = Rc::new(RefCell::new(DotView {
         point: None,
         progress: 0.0,
@@ -259,12 +274,32 @@ pub fn launch(
     instr.set_justify(gtk::Justification::Center);
     instr.set_wrap(true);
 
-    let quick = Button::with_label("Quick (5 points)");
-    let full = Button::with_label("Full (9 points)");
-    let chooser = gtk::Box::new(Orientation::Horizontal, 10);
-    chooser.set_halign(Align::Center);
-    chooser.append(&quick);
-    chooser.append(&full);
+    // Small centered live preview of the user's eye position + a fallback
+    // button for when they can't get centered (see eye_preview::should_offer_fallback).
+    let eye_panel = DrawingArea::new();
+    eye_panel.set_content_width(360);
+    eye_panel.set_content_height(220);
+    {
+        // Separate Arc handle for this draw func; the tick loop's closure
+        // below moves its own clone/the original in independently.
+        let state = state.clone();
+        eye_panel.set_draw_func(move |_, cr, w, h| {
+            // Same dark-teal background as `draw_scene`; this panel isn't
+            // full-bleed, so it paints its own background here.
+            cr.set_source_rgb(0.08, 0.09, 0.11);
+            let _ = cr.paint();
+            let view = widget::eye_view_for(&state.lock().unwrap());
+            widget::draw_eye_view(cr, w, h, &view);
+        });
+    }
+
+    let continue_btn = Button::with_label("Continue anyway");
+    continue_btn.set_visible(false);
+
+    let eye_preview_box = gtk::Box::new(Orientation::Vertical, 10);
+    eye_preview_box.set_halign(Align::Center);
+    eye_preview_box.append(&eye_panel);
+    eye_preview_box.append(&continue_btn);
 
     let done_btn = Button::with_label("Done");
     let retry_btn = Button::with_label("Retry");
@@ -282,7 +317,7 @@ pub fn launch(
     header.set_valign(Align::Start);
     header.set_margin_top((screen_height() as f64 * 0.30) as i32);
     header.append(&instr);
-    header.append(&chooser);
+    header.append(&eye_preview_box);
     header.append(&done_box);
     header.append(&cancel);
 
@@ -291,41 +326,45 @@ pub fn launch(
     overlay.add_overlay(&header);
     win.set_child(Some(&overlay));
 
-    // Chooser -> begin calibration for the chosen mode. The flow waits in
-    // `Starting` until the device thread acknowledges the new session; it must
-    // not trust any counters until then (see `Phase::Starting`).
-    let start_mode: Rc<dyn Fn(CalMode)> = {
+    // EyePreview -> begin calibration (always Full — there's only one mode
+    // reachable from the UI now). The flow waits in `Starting` until the
+    // device thread acknowledges the new session; it must not trust any
+    // counters until then (see `Phase::Starting`). This mirrors the tick
+    // loop's own `EyePreview` arm (auto-advance), which mints the token
+    // inline instead of calling this closure — see the comment there for why.
+    let begin_calibration: Rc<dyn Fn()> = {
         let phase = phase.clone();
         let cmd_tx = cmd_tx.clone();
-        Rc::new(move |mode: CalMode| {
-            // The chooser buttons stay clickable until the next tick hides
-            // them, so a double-click would otherwise send a second CalBegin
-            // and issue `start` on an already-open realm. Bind the check to
-            // drop the shared borrow before the borrow_mut below.
-            let in_chooser = matches!(&*phase.borrow(), Phase::Chooser);
-            if !in_chooser {
+        Rc::new(move || {
+            // "Continue anyway" stays clickable until the next tick hides it,
+            // so a double-click would otherwise send a second CalBegin and
+            // issue `start` on an already-open realm. Bind the check to drop
+            // the shared borrow before the borrow_mut below.
+            let in_eye_preview = matches!(&*phase.borrow(), Phase::EyePreview { .. });
+            if !in_eye_preview {
                 return;
             }
             let token = next_cal_token();
             let _ = cmd_tx.send(DeviceCommand::CalBegin { eye, token });
             *phase.borrow_mut() = Phase::Starting {
-                mode,
+                mode: CalMode::Full,
                 token,
                 ticks: 0,
             };
         })
     };
     {
-        let s = start_mode.clone();
-        quick.connect_clicked(move |_| s(CalMode::Quick));
-    }
-    {
-        let s = start_mode.clone();
-        full.connect_clicked(move |_| s(CalMode::Full));
+        let b = begin_calibration.clone();
+        continue_btn.connect_clicked(move |_| b());
     }
     {
         let phase = phase.clone();
-        retry_btn.connect_clicked(move |_| *phase.borrow_mut() = Phase::Chooser);
+        retry_btn.connect_clicked(move |_| {
+            *phase.borrow_mut() = Phase::EyePreview {
+                ticks: 0,
+                centered_ticks: 0,
+            }
+        });
     }
     // Every exit routes through `win.close()` so the single close handler below
     // is the one place that aborts the session and stops the tick.
@@ -366,8 +405,47 @@ pub fn launch(
         let mut ph = phase.borrow_mut();
         let mut next: Option<Phase> = None;
         match &*ph {
-            Phase::Chooser => {
-                dot.borrow_mut().point = None;
+            Phase::EyePreview {
+                ticks,
+                centered_ticks,
+            } => {
+                let (ticks, centered_ticks) = (*ticks, *centered_ticks);
+                dot.borrow_mut().point = None; // no calibration dot yet
+                let ev = widget::eye_view_for(&state.lock().unwrap());
+                let centered_ticks = if ev.guidance == Guidance::Centered {
+                    centered_ticks + 1
+                } else {
+                    0
+                };
+                // Live guidance-derived text, recomputed every tick — unlike
+                // every other phase, `update_ui` deliberately does NOT also
+                // set `instr`'s text here (it would just fight this).
+                instr.set_text(eye_preview::message(ticks, ev.guidance));
+                eye_panel.queue_draw();
+                if eye_preview::should_advance(centered_ticks) {
+                    // Mint the token + send CalBegin inline instead of going
+                    // through the shared `begin_calibration` closure: `ph` (a
+                    // `RefMut<Phase>` from `phase.borrow_mut()` above) is held
+                    // across this whole match, and `begin_calibration` does
+                    // its own `phase.borrow()`/`borrow_mut()` — calling it
+                    // from here would double-borrow and panic. We already
+                    // have exclusive access to `phase` via `ph`, so there is
+                    // nothing `begin_calibration` would add; setting `next`
+                    // below (assigned to `*ph` once the match returns) does
+                    // the same transition safely.
+                    let token = next_cal_token();
+                    let _ = tick_cmd.send(DeviceCommand::CalBegin { eye, token });
+                    next = Some(Phase::Starting {
+                        mode: CalMode::Full,
+                        token,
+                        ticks: 0,
+                    });
+                } else {
+                    next = Some(Phase::EyePreview {
+                        ticks: ticks + 1,
+                        centered_ticks,
+                    });
+                }
             }
             Phase::Starting { mode, token, ticks } => {
                 let (mode, token, ticks) = (*mode, *token, *ticks);
@@ -522,7 +600,15 @@ pub fn launch(
         if let Some(n) = next {
             *ph = n;
         }
-        update_ui(&ph, &instr, &chooser, &done_box, &retry_btn, &cancel);
+        update_ui(
+            &ph,
+            &instr,
+            &eye_preview_box,
+            &continue_btn,
+            &done_box,
+            &retry_btn,
+            &cancel,
+        );
         area.queue_draw();
         glib::ControlFlow::Continue
     });
