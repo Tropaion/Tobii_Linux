@@ -25,6 +25,6 @@ pub use setpm::parse_setpm_corners;
 pub use setup::{arc_from_chord, chord_from_arc, plane_width_from_edid, DisplaySetup};
 pub use store::{
     calibration_path, config_path, enabled_eye_path, load, load_calibration, load_calibration_from,
-    load_enabled_eye, load_from, save, save_calibration, save_calibration_to, save_enabled_eye,
-    save_to, CalMeta,
+    load_enabled_eye, load_from, load_setup_monitor_id, save, save_calibration,
+    save_calibration_to, save_enabled_eye, save_setup_monitor_id, save_to, CalMeta,
 };

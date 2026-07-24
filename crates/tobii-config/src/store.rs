@@ -221,6 +221,51 @@ pub fn load_enabled_eye() -> io::Result<Option<tobii_protocol::EnabledEye>> {
     }
 }
 
+/// Path to the persisted setup-time chosen monitor id, beside `config.toml`.
+fn setup_monitor_id_path() -> PathBuf {
+    config_path().with_file_name("setup_monitor_id")
+}
+
+/// Persist which monitor the tracker is set up on (stored as plain UTF-8 text).
+/// `Some(id)` writes it atomically; `None` removes the file.
+pub fn save_setup_monitor_id_to(path: &Path, id: Option<&str>) -> io::Result<()> {
+    match id {
+        Some(id_str) => write_atomic(path, id_str.as_bytes()),
+        None => {
+            // Remove the file if it exists; treat NotFound as success.
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// Load the persisted monitor id. `Ok(None)` if unset, missing, or empty.
+pub fn load_setup_monitor_id_from(path: &Path) -> io::Result<Option<String>> {
+    match read_opt(path)? {
+        Some(bytes) => {
+            match String::from_utf8(bytes) {
+                Ok(s) if !s.is_empty() => Ok(Some(s)),
+                Ok(_) => Ok(None),  // empty string treated as unset
+                Err(_) => Ok(None), // invalid UTF-8 treated as unset
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Save to the default [`setup_monitor_id_path`].
+pub fn save_setup_monitor_id(id: Option<&str>) -> io::Result<()> {
+    save_setup_monitor_id_to(&setup_monitor_id_path(), id)
+}
+
+/// Load from the default [`setup_monitor_id_path`].
+pub fn load_setup_monitor_id() -> io::Result<Option<String>> {
+    load_setup_monitor_id_from(&setup_monitor_id_path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +423,41 @@ mod tests {
         let (blob, m) = load_calibration_from(&bin, &meta_path).unwrap().unwrap();
         assert_eq!(blob, vec![9, 9, 9]);
         assert!(m.is_none(), "missing meta => None (legacy install)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_monitor_id_round_trips() {
+        let dir = std::env::temp_dir().join("tobii-config-test-monitor-id-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("setup_monitor_id");
+        save_setup_monitor_id_to(&path, Some("SAM7454-HNTY900001")).expect("save");
+        let loaded = load_setup_monitor_id_from(&path)
+            .expect("load io")
+            .expect("some");
+        assert_eq!(loaded, "SAM7454-HNTY900001");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setup_monitor_id_missing_file_is_none() {
+        let dir = std::env::temp_dir().join("tobii-config-test-monitor-id-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("setup_monitor_id");
+        let loaded = load_setup_monitor_id_from(&path).expect("load io");
+        assert!(loaded.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_none_clears_the_file() {
+        let dir = std::env::temp_dir().join("tobii-config-test-monitor-id-clear");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("setup_monitor_id");
+        save_setup_monitor_id_to(&path, Some("X")).expect("save");
+        save_setup_monitor_id_to(&path, None).expect("clear");
+        let loaded = load_setup_monitor_id_from(&path).expect("load io");
+        assert!(loaded.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
