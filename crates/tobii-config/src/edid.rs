@@ -12,6 +12,12 @@ pub struct MonitorInfo {
     pub model: String,
     pub width_mm: f64,
     pub height_mm: f64,
+    /// Stable identity derived from EDID manufacturer+product+serial (see
+    /// [`edid_monitor_id`]). `None` if the EDID didn't yield a usable id.
+    pub id: Option<String>,
+    /// DRM connector name (e.g. `"card1-DP-1"`) this EDID was read from.
+    /// Only set by [`detect_monitors`]; `parse_edid` has no access to it.
+    pub connector: Option<String>,
 }
 
 const EDID_HEADER: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
@@ -60,7 +66,45 @@ pub fn parse_edid(edid: &[u8]) -> Option<MonitorInfo> {
         model,
         width_mm: w_mm as f64,
         height_mm: h_mm as f64,
+        id: edid_monitor_id(edid),
+        connector: None,
     })
+}
+
+/// Stable id from EDID: PnP manufacturer + product code, plus the serial
+/// descriptor (0xFF) when present. E.g. `"SAM7454-HNTY900001"`.
+pub fn edid_monitor_id(edid: &[u8]) -> Option<String> {
+    if edid.len() < 128 {
+        return None;
+    }
+    // Manufacturer: bytes 8-9, big-endian, three 5-bit letters (1=A).
+    let m = ((edid[8] as u16) << 8) | edid[9] as u16;
+    let letter = |shift: u16| (((m >> shift) & 0x1f) as u8 + b'A' - 1) as char;
+    let (a, b, c) = (letter(10), letter(5), letter(0));
+    if !a.is_ascii_uppercase() || !b.is_ascii_uppercase() || !c.is_ascii_uppercase() {
+        return None;
+    }
+    // Product code: bytes 10-11, little-endian.
+    let product = (edid[10] as u16) | ((edid[11] as u16) << 8);
+    let mut id = format!("{a}{b}{c}{product:04X}");
+    // Serial string descriptor (tag 0xFF) if present.
+    for off in [54usize, 72, 90, 108] {
+        if edid.get(off..off + 3) == Some(&[0, 0, 0]) && edid.get(off + 3) == Some(&0xFF) {
+            let raw = &edid[off + 5..off + 18];
+            let s: String = raw
+                .iter()
+                .take_while(|&&x| x != 0x0a)
+                .map(|&x| x as char)
+                .collect();
+            let s = s.trim();
+            if !s.is_empty() {
+                id.push('-');
+                id.push_str(s);
+            }
+            break;
+        }
+    }
+    Some(id)
 }
 
 /// Pick the monitor to seed display geometry from: the largest by area among
@@ -82,7 +126,8 @@ pub fn detect_monitors() -> Vec<MonitorInfo> {
     for entry in entries.flatten() {
         let path = entry.path().join("edid");
         if let Ok(bytes) = std::fs::read(&path) {
-            if let Some(info) = parse_edid(&bytes) {
+            if let Some(mut info) = parse_edid(&bytes) {
+                info.connector = Some(entry.file_name().to_string_lossy().into_owned());
                 out.push(info);
             }
         }
@@ -113,11 +158,27 @@ mod tests {
         assert!(parse_edid(&[0xff; 10]).is_none()); // too short
     }
 
+    #[test]
+    fn extracts_stable_monitor_id_from_fixture() {
+        let bytes = include_bytes!("testdata/odyssey-g93sc.edid");
+        assert_eq!(
+            super::edid_monitor_id(bytes).as_deref(),
+            Some("SAM7454-HNTY900001")
+        );
+    }
+
+    #[test]
+    fn monitor_id_none_for_garbage() {
+        assert!(super::edid_monitor_id(&[0u8; 8]).is_none());
+    }
+
     fn mon(model: &str, w: f64, h: f64) -> MonitorInfo {
         MonitorInfo {
             model: model.into(),
             width_mm: w,
             height_mm: h,
+            id: None,
+            connector: None,
         }
     }
 
