@@ -363,10 +363,18 @@ fn finish_calibration<T: Transport>(
     (outcome, stop_acked)
 }
 
-/// Best-effort id of the screen the tracker is on: the largest detected
-/// monitor's EDID id (the same monitor `setup_flow` seeds display geometry
-/// from). `None` if no monitor was detected or it carries no stable id.
+/// Best-effort id of the screen the tracker is on. Prefers the monitor ID
+/// chosen by the user during setup (if one was saved); falls back to the
+/// largest-by-area heuristic for installs from before the monitor picker
+/// existed and for single-monitor systems where nothing needs picking.
+/// `None` if no monitor was detected or it carries no stable id.
 pub(crate) fn active_monitor_id() -> Option<String> {
+    // Try the monitor ID chosen by the user during setup first.
+    if let Ok(Some(id)) = tobii_config::load_setup_monitor_id() {
+        return Some(id);
+    }
+
+    // Fall back to the largest-by-area heuristic.
     let monitors = tobii_config::detect_monitors();
     tobii_config::pick_monitor(&monitors).and_then(|m| m.id.clone())
 }
