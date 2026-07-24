@@ -24,5 +24,5 @@ pub use setup::{arc_from_chord, chord_from_arc, plane_width_from_edid, DisplaySe
 pub use store::{
     calibration_path, config_path, enabled_eye_path, load, load_calibration, load_calibration_from,
     load_enabled_eye, load_from, save, save_calibration, save_calibration_to, save_enabled_eye,
-    save_to,
+    save_to, CalMeta,
 };

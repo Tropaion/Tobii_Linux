@@ -53,18 +53,28 @@ pub fn calibration_path() -> PathBuf {
     config_path().with_file_name("calibration.bin")
 }
 
-/// Write the opaque calibration blob to `path`, creating parent dirs as needed.
+/// Path to the calibration metadata sidecar, beside `calibration.bin`.
+fn calibration_meta_path() -> PathBuf {
+    config_path().with_file_name("calibration.meta.toml")
+}
+
+/// Write `bytes` to `path` atomically (temp file in the same directory, then
+/// rename), creating parent dirs as needed.
 ///
-/// Written atomically (temp file in the same directory, then rename): a plain
-/// write truncates first, so a crash or unplug mid-write would leave a
-/// truncated blob that [`load_calibration_from`] cannot tell from a good one —
-/// and it is re-applied to the device on every connect.
-pub fn save_calibration_to(path: &Path, blob: &[u8]) -> io::Result<()> {
+/// A plain write truncates first, so a crash or unplug mid-write would leave
+/// a truncated file that [`read_opt`] cannot tell from a good one — this
+/// matters both for the calibration blob (re-applied to the device on every
+/// connect) and for its metadata sidecar.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("bin.tmp");
-    std::fs::write(&tmp, blob)?;
+    // Append ".tmp" to the whole file name (not `with_extension`, which would
+    // replace rather than append for names that already have a `.` in them).
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    std::fs::write(&tmp, bytes)?;
     // Same directory, so rename is atomic (never crosses a filesystem).
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
@@ -75,8 +85,8 @@ pub fn save_calibration_to(path: &Path, blob: &[u8]) -> io::Result<()> {
     }
 }
 
-/// Read a calibration blob from `path`. `Ok(None)` if the file does not exist.
-pub fn load_calibration_from(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// Read `path` into bytes. `Ok(None)` if the file does not exist.
+fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(b) => Ok(Some(b)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -84,14 +94,107 @@ pub fn load_calibration_from(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-/// Save to the default [`calibration_path`].
-pub fn save_calibration(blob: &[u8]) -> io::Result<()> {
-    save_calibration_to(&calibration_path(), blob)
+/// Metadata bound to a saved calibration: which monitor it was made for, when,
+/// how (quick/full/cli), and a hash of the display geometry at save time —
+/// lets a caller detect a calibration made for a different screen or since
+/// stale geometry. Always a *separate* file from the calibration blob, which
+/// stays byte-verbatim for device replay (see [`save_calibration_to`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalMeta {
+    pub monitor_id: Option<String>,
+    pub created_utc: i64,
+    pub mode: String,
+    pub display_fingerprint: u64,
 }
 
-/// Load from the default [`calibration_path`].
-pub fn load_calibration() -> io::Result<Option<Vec<u8>>> {
-    load_calibration_from(&calibration_path())
+impl CalMeta {
+    fn to_toml(&self) -> String {
+        format!(
+            "# tobii-linux calibration metadata\nmonitor_id = \"{}\"\ncreated_utc = {}\nmode = \"{}\"\ndisplay_fingerprint = {}\n",
+            self.monitor_id.as_deref().unwrap_or(""),
+            self.created_utc,
+            self.mode,
+            self.display_fingerprint,
+        )
+    }
+
+    /// Best-effort parse. Any missing/unparseable field yields `None` rather
+    /// than a partially-populated struct — a garbled sidecar must read back
+    /// as "no metadata", never a crash or a lie about its contents.
+    fn from_toml(s: &str) -> Option<CalMeta> {
+        let (mut mid, mut created, mut mode, mut fp) = (None, None, None, None);
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let v = v.trim().trim_matches('"');
+            match k.trim() {
+                "monitor_id" => {
+                    mid = Some(if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    })
+                }
+                "created_utc" => created = v.parse::<i64>().ok(),
+                "mode" => mode = Some(v.to_string()),
+                "display_fingerprint" => fp = v.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        Some(CalMeta {
+            monitor_id: mid?,
+            created_utc: created?,
+            mode: mode?,
+            display_fingerprint: fp?,
+        })
+    }
+}
+
+/// Write the opaque calibration blob and its metadata sidecar.
+///
+/// Both are written atomically via [`write_atomic`]. The blob is written
+/// byte-verbatim (it is re-applied to the device on every connect, so any
+/// reformatting would break replay); only the sidecar is human-readable TOML.
+pub fn save_calibration_to(
+    bin: &Path,
+    meta_path: &Path,
+    blob: &[u8],
+    meta: &CalMeta,
+) -> io::Result<()> {
+    write_atomic(bin, blob)?;
+    write_atomic(meta_path, meta.to_toml().as_bytes())
+}
+
+/// Read a calibration blob and its metadata sidecar. `Ok(None)` if the blob
+/// itself does not exist. A missing, unreadable, or unparseable sidecar is
+/// *not* an error — it yields `Some((blob, None))`, treating the install as
+/// legacy/unbound rather than failing the blob load it doesn't own.
+pub fn load_calibration_from(
+    bin: &Path,
+    meta_path: &Path,
+) -> io::Result<Option<(Vec<u8>, Option<CalMeta>)>> {
+    let Some(blob) = read_opt(bin)? else {
+        return Ok(None);
+    };
+    let meta = read_opt(meta_path)?
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| CalMeta::from_toml(&s));
+    Ok(Some((blob, meta)))
+}
+
+/// Save to the default [`calibration_path`] and its metadata sidecar.
+pub fn save_calibration(blob: &[u8], meta: &CalMeta) -> io::Result<()> {
+    save_calibration_to(&calibration_path(), &calibration_meta_path(), blob, meta)
+}
+
+/// Load from the default [`calibration_path`] and its metadata sidecar.
+pub fn load_calibration() -> io::Result<Option<(Vec<u8>, Option<CalMeta>)>> {
+    load_calibration_from(&calibration_path(), &calibration_meta_path())
 }
 
 /// Path to the persisted "select eyes to detect" choice, beside `config.toml`.
@@ -161,20 +264,34 @@ mod tests {
         assert!(p.ends_with("tobii-linux/config.toml"));
     }
 
+    /// A minimal, arbitrary meta for tests that only care about the blob.
+    fn sample_meta() -> CalMeta {
+        CalMeta {
+            monitor_id: None,
+            created_utc: 0,
+            mode: "full".into(),
+            display_fingerprint: 0,
+        }
+    }
+
     #[test]
     fn saving_a_calibration_overwrites_atomically_and_leaves_no_temp_file() {
         // The blob is re-applied to the device on every connect, so a truncated
         // file left by an interrupted write would be indistinguishable from a
-        // good one. Overwriting must also not strand a .tmp beside it.
+        // good one. Overwriting must also not strand a .tmp beside it (blob or
+        // meta).
         let dir = std::env::temp_dir().join("tobii-config-test-cal-atomic");
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("calibration.bin");
-        save_calibration_to(&path, &[0xAA; 64]).expect("first save");
-        save_calibration_to(&path, &[0xBB; 8]).expect("overwrite");
+        let bin = dir.join("calibration.bin");
+        let meta_path = dir.join("calibration.meta.toml");
+        let meta = sample_meta();
+        save_calibration_to(&bin, &meta_path, &[0xAA; 64], &meta).expect("first save");
+        save_calibration_to(&bin, &meta_path, &[0xBB; 8], &meta).expect("overwrite");
+        let (got_blob, _) = load_calibration_from(&bin, &meta_path)
+            .expect("load io")
+            .expect("some");
         assert_eq!(
-            load_calibration_from(&path)
-                .expect("load io")
-                .expect("some"),
+            got_blob,
             vec![0xBB; 8],
             "overwrite fully replaces the previous blob"
         );
@@ -195,29 +312,72 @@ mod tests {
     fn calibration_blob_roundtrips() {
         let dir = std::env::temp_dir().join("tobii-config-test-cal");
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("calibration.bin");
+        let bin = dir.join("calibration.bin");
+        let meta_path = dir.join("calibration.meta.toml");
         let blob = vec![0x01, 0x02, 0x03, 0xFE, 0xFF];
-        save_calibration_to(&path, &blob).expect("save");
-        assert_eq!(
-            load_calibration_from(&path)
-                .expect("load io")
-                .expect("some"),
-            blob
-        );
+        save_calibration_to(&bin, &meta_path, &blob, &sample_meta()).expect("save");
+        let (got_blob, _) = load_calibration_from(&bin, &meta_path)
+            .expect("load io")
+            .expect("some");
+        assert_eq!(got_blob, blob);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_calibration_missing_is_none() {
-        let path = std::env::temp_dir()
-            .join("tobii-config-test-cal-missing")
-            .join("calibration.bin");
-        let _ = std::fs::remove_file(&path);
-        assert!(load_calibration_from(&path).expect("io ok").is_none());
+        let dir = std::env::temp_dir().join("tobii-config-test-cal-missing");
+        let bin = dir.join("calibration.bin");
+        let meta_path = dir.join("calibration.meta.toml");
+        let _ = std::fs::remove_file(&bin);
+        let _ = std::fs::remove_file(&meta_path);
+        assert!(load_calibration_from(&bin, &meta_path)
+            .expect("io ok")
+            .is_none());
     }
 
     #[test]
     fn calibration_path_sits_beside_config() {
         assert!(calibration_path().ends_with("tobii-linux/calibration.bin"));
+    }
+
+    // NOTE: no `tempfile`/`tempdir()` crate is a dependency anywhere in this
+    // workspace yet, so — unlike the plan's literal snippet — these mirror the
+    // hand-rolled `std::env::temp_dir()` + manual cleanup convention the other
+    // calibration tests in this file already use, rather than introducing a
+    // new external dev-dependency for two tests.
+    #[test]
+    fn calibration_meta_round_trips_and_blob_is_verbatim() {
+        let dir = std::env::temp_dir().join("tobii-config-test-cal-meta-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("calibration.bin");
+        let meta_path = dir.join("calibration.meta.toml");
+        let blob = vec![1u8, 2, 3, 4, 5];
+        let m = CalMeta {
+            monitor_id: Some("SAM7454-HNTY900001".into()),
+            created_utc: 42,
+            mode: "full".into(),
+            display_fingerprint: 0xDEAD_BEEF,
+        };
+        save_calibration_to(&bin, &meta_path, &blob, &m).unwrap();
+        let (got_blob, got_meta) = load_calibration_from(&bin, &meta_path).unwrap().unwrap();
+        assert_eq!(got_blob, blob, "blob must round-trip verbatim");
+        let got_meta = got_meta.expect("meta present");
+        assert_eq!(got_meta.monitor_id.as_deref(), Some("SAM7454-HNTY900001"));
+        assert_eq!(got_meta.display_fingerprint, 0xDEAD_BEEF);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_blob_without_meta_loads_with_none_meta() {
+        let dir = std::env::temp_dir().join("tobii-config-test-cal-meta-legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("calibration.bin");
+        let meta_path = dir.join("calibration.meta.toml");
+        std::fs::write(&bin, [9u8, 9, 9]).unwrap(); // no meta file
+        let (blob, m) = load_calibration_from(&bin, &meta_path).unwrap().unwrap();
+        assert_eq!(blob, vec![9, 9, 9]);
+        assert!(m.is_none(), "missing meta => None (legacy install)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
