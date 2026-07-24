@@ -130,8 +130,14 @@ pub enum DeviceCommand {
         x: f64,
         y: f64,
     },
-    /// Compute + apply + stop + retrieve + persist.
-    CalFinish,
+    /// Compute + apply + stop + retrieve + persist. `mode` is the calibration
+    /// mode's label ("quick"/"full"), recorded into the saved `CalMeta` — a
+    /// plain `String` rather than `calibrate_flow::CalMode` so this
+    /// generic/testable device layer takes no dependency on a GTK-flow-owned
+    /// enum.
+    CalFinish {
+        mode: String,
+    },
     /// Abort: stop (best-effort) and reset.
     CalAbort,
 }
@@ -182,8 +188,8 @@ pub fn device_tick<T: Transport>(
                     .map_err(|e| e.to_string());
                 state.lock().unwrap().calibration.on_collect(r);
             }
-            DeviceCommand::CalFinish => {
-                let (r, stop_acked) = finish_calibration(conn);
+            DeviceCommand::CalFinish { mode } => {
+                let (r, stop_acked) = finish_calibration(conn, &mode);
                 let mut s = state.lock().unwrap();
                 // Issuing a stop is not the same as the realm closing: only an
                 // acked stop proves that. If the ack was lost, leave the flag
@@ -211,7 +217,7 @@ pub fn device_tick<T: Transport>(
                     // the rest of the USB session. Having no saved blob is
                     // normal (first ever run), not an error.
                     match tobii_config::load_calibration() {
-                        Ok(Some(blob)) => {
+                        Ok(Some((blob, _meta))) => {
                             if let Err(e) = conn.apply_calibration(&blob) {
                                 eprintln!("warning: could not restore calibration ({e})");
                             }
@@ -274,7 +280,7 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 }
                 // The ET5 wipes calibration on reboot like the display area;
                 // re-apply the saved blob so calibration persists across sessions.
-                if let Ok(Some(blob)) = tobii_config::load_calibration() {
+                if let Ok(Some((blob, _meta))) = tobii_config::load_calibration() {
                     // OP_CAL_APPLY is disasm-derived and runs on every connect;
                     // don't let a rejection pass silently as bad tracking.
                     if let Err(e) = conn.apply_calibration(&blob) {
@@ -326,7 +332,10 @@ fn set_error(state: &Mutex<DeviceState>, e: &UsbError) {
 /// Returns the outcome alongside whether the stop was *acked* — only an acked
 /// stop proves the realm closed, so the caller must not clear
 /// `cal_session_open` without it.
-fn finish_calibration<T: Transport>(conn: &mut Connection<T>) -> (Result<(), String>, bool) {
+fn finish_calibration<T: Transport>(
+    conn: &mut Connection<T>,
+    mode: &str,
+) -> (Result<(), String>, bool) {
     let compute = conn
         .compute_and_apply_calibration()
         .map_err(|e| e.to_string());
@@ -339,9 +348,37 @@ fn finish_calibration<T: Transport>(conn: &mut Connection<T>) -> (Result<(), Str
             // and silently mask that the calibration was never stored.
             return Err("device returned an empty calibration".into());
         }
-        tobii_config::save_calibration(&blob.0).map_err(|e| e.to_string())
+        let meta = tobii_config::CalMeta {
+            monitor_id: active_monitor_id(),
+            created_utc: now_unix_secs(),
+            mode: mode.to_string(),
+            display_fingerprint: tobii_config::load()
+                .ok()
+                .flatten()
+                .map(|s| s.fingerprint())
+                .unwrap_or(0),
+        };
+        tobii_config::save_calibration(&blob.0, &meta).map_err(|e| e.to_string())
     });
     (outcome, stop_acked)
+}
+
+/// Best-effort id of the screen the tracker is on: the largest detected
+/// monitor's EDID id (the same monitor `setup_flow` seeds display geometry
+/// from). `None` if no monitor was detected or it carries no stable id.
+pub(crate) fn active_monitor_id() -> Option<String> {
+    let monitors = tobii_config::detect_monitors();
+    tobii_config::pick_monitor(&monitors).and_then(|m| m.id.clone())
+}
+
+/// Seconds since the Unix epoch, clamped to 0 on a clock before 1970 (never
+/// actually observed; a saturating fallback beats propagating a `Result` for it).
+fn now_unix_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

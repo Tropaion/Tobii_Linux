@@ -53,6 +53,15 @@ impl CalMode {
             CalMode::Full => &FULL_9,
         }
     }
+
+    /// This mode's label, as recorded into the saved `CalMeta` (see
+    /// `device::DeviceCommand::CalFinish`).
+    pub fn label(self) -> &'static str {
+        match self {
+            CalMode::Quick => "quick",
+            CalMode::Full => "full",
+        }
+    }
 }
 
 // Tick cadence is 33 ms (~30 fps), matching the hub.
@@ -439,7 +448,9 @@ pub fn launch(
                 } else if cal.collected > index {
                     let pts = mode.points();
                     if index + 1 >= pts.len() {
-                        let _ = tick_cmd.send(DeviceCommand::CalFinish);
+                        let _ = tick_cmd.send(DeviceCommand::CalFinish {
+                            mode: mode.label().to_string(),
+                        });
                         next = Some(Phase::Computing { token, ticks: 0 });
                     } else {
                         next = Some(Phase::Collecting {

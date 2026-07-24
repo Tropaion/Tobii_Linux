@@ -134,6 +134,10 @@ fn build_ui(app: &Application) {
     // change, and seed the radios from the device only once (on first connect).
     let eye_seeding = Rc::new(Cell::new(false));
     let eye_seeded = Rc::new(Cell::new(false));
+    // Gate for the once-per-connection `decide()` evaluation (force/recommend
+    // calibration). Unlike `eye_seeded`, this must reset on disconnect so a
+    // later reconnect — e.g. moved to a different monitor — is re-evaluated.
+    let cal_evaluated = Rc::new(Cell::new(false));
 
     // --- Header ---
     let title = Label::new(Some("Tobii Configuration"));
@@ -229,7 +233,9 @@ fn build_ui(app: &Application) {
     {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
-        b_setup.connect_clicked(move |_| setup_flow::launch(&app, cmd_tx.clone()));
+        b_setup.connect_clicked(move |_| {
+            setup_flow::launch(&app, cmd_tx.clone());
+        });
     }
 
     let sw_preview = Switch::new();
@@ -376,6 +382,46 @@ fn build_ui(app: &Application) {
         &b_setup,
     ));
 
+    // --- Recommend-recalibration banner: a dismissible row, not a modal. Shown
+    // by the tick's once-per-connection `decide()` evaluation below. ---
+    let banner = gtk::Box::new(Orientation::Horizontal, 12);
+    banner.add_css_class("section-warn"); // reuse the existing warn-color class
+    banner.set_visible(false);
+    let banner_label = Label::new(None);
+    banner_label.set_hexpand(true);
+    banner_label.set_xalign(0.0);
+    let banner_recal = Button::with_label("Recalibrate");
+    let banner_dismiss = Button::with_label("×");
+    banner.append(&banner_label);
+    banner.append(&banner_recal);
+    banner.append(&banner_dismiss);
+    {
+        let banner = banner.clone();
+        banner_dismiss.connect_clicked(move |_| banner.set_visible(false));
+    }
+    {
+        let app = app.clone();
+        let state = state.clone();
+        let cmd_tx = cmd_tx.clone();
+        let sw_preview = sw_preview.clone();
+        let banner = banner.clone();
+        banner_recal.connect_clicked(move |btn| {
+            // Same reasoning as `b_cal`: the gaze-preview overlay would poison
+            // the recalibration's own samples.
+            sw_preview.set_active(false);
+            // A recalibration is now in flight; the recommendation no longer
+            // applies (and would otherwise reappear stale once this closes).
+            banner.set_visible(false);
+            btn.set_sensitive(false);
+            let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone());
+            let btn = btn.clone();
+            win.connect_close_request(move |_| {
+                btn.set_sensitive(true);
+                glib::Propagation::Proceed
+            });
+        });
+    }
+
     // --- Two-column split ---
     let split = gtk::Box::new(Orientation::Horizontal, 30);
     split.set_hexpand(true);
@@ -389,6 +435,7 @@ fn build_ui(app: &Application) {
     root.set_margin_start(24);
     root.set_margin_end(24);
     root.append(&title);
+    root.append(&banner);
     root.append(&split);
     root.append(&status_bar);
 
@@ -402,6 +449,11 @@ fn build_ui(app: &Application) {
 
     // ~30 fps tick: read the device snapshot, refresh status + eye view.
     let tick_view = view.clone();
+    let tick_app = app.clone();
+    let tick_window = window.clone();
+    let tick_cmd_tx = cmd_tx.clone();
+    let tick_banner = banner.clone();
+    let tick_banner_label = banner_label.clone();
     glib::timeout_add_local(Duration::from_millis(33), move || {
         // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
         // under one lock. `new_cam` is None on the ticks between device frames.
@@ -414,6 +466,49 @@ fn build_ui(app: &Application) {
         connected.set(conn);
         status_label.set_text(if conn { "Connected" } else { "Disconnected" });
         status_dot.queue_draw();
+        // Evaluate the calibration state machine once per fresh `Connected`
+        // transition (reset on disconnect so a later reconnect — e.g. moved to
+        // a different monitor — is re-evaluated). All branching logic lives in
+        // `tobii_config::decide`; this only computes its inputs and maps its
+        // output to a UI action.
+        if conn {
+            if !cal_evaluated.get() {
+                cal_evaluated.set(true);
+                let display_configured = tobii_config::load().ok().flatten().is_some();
+                let fp = tobii_config::load()
+                    .ok()
+                    .flatten()
+                    .map(|s| s.fingerprint())
+                    .unwrap_or(0);
+                let cal = tobii_config::load_calibration()
+                    .ok()
+                    .flatten()
+                    .and_then(|(_, m)| m);
+                let active = device::active_monitor_id();
+                match tobii_config::decide(display_configured, cal.as_ref(), active.as_deref(), fp)
+                {
+                    tobii_config::CalAction::ForceSetup => {
+                        launch_forced(&tick_app, &tick_window, {
+                            let cmd_tx = tick_cmd_tx.clone();
+                            move |app| setup_flow::launch(app, cmd_tx.clone())
+                        })
+                    }
+                    tobii_config::CalAction::ForceCalibration => {
+                        launch_forced(&tick_app, &tick_window, {
+                            let state = state.clone();
+                            let cmd_tx = tick_cmd_tx.clone();
+                            move |app| calibrate_flow::launch(app, state.clone(), cmd_tx.clone())
+                        })
+                    }
+                    tobii_config::CalAction::RecommendCalibration(reason) => {
+                        show_recommend_banner(&tick_banner_label, &tick_banner, reason);
+                    }
+                    tobii_config::CalAction::None => {}
+                }
+            }
+        } else {
+            cal_evaluated.set(false);
+        }
         // Seed the eye-selection radios once from the device's current value.
         if conn && !eye_seeded.get() {
             if let Some(e) = snap.enabled_eye {
@@ -443,6 +538,38 @@ fn build_ui(app: &Application) {
     });
 
     window.present();
+}
+
+/// Open a flow the user cannot skip (missing display setup or calibration):
+/// disable the hub while it is open, and re-enable once it closes. Mirrors the
+/// existing `b_cal`/`b_fine` single-flow-at-a-time pattern, but disables the
+/// whole hub window rather than a single button, since a forced flow has no
+/// button of its own to anchor to.
+fn launch_forced(
+    app: &Application,
+    window: &ApplicationWindow,
+    open: impl FnOnce(&Application) -> ApplicationWindow,
+) {
+    window.set_sensitive(false);
+    let win = open(app);
+    let hub = window.clone();
+    win.connect_close_request(move |_| {
+        hub.set_sensitive(true);
+        glib::Propagation::Proceed
+    });
+}
+
+/// Populate and show the "recommend recalibration" banner for `reason`.
+fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config::RecommendReason) {
+    label.set_text(match reason {
+        tobii_config::RecommendReason::OtherScreen => {
+            "This calibration was made for a different screen. Recalibrate?"
+        }
+        tobii_config::RecommendReason::GeometryChanged => {
+            "Display settings changed since calibration. Recalibrate?"
+        }
+    });
+    banner.set_visible(true);
 }
 
 /// A settings section: bold title, wrapped description (original wording), and
