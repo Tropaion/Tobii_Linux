@@ -6,12 +6,12 @@
 //! [`DisplaySetup::from_corners`] inverts a device-reported area back to editable
 //! params. No I/O beyond the config store (see `store`).
 //!
-//! The device only ever accepts a plane. Curved panels therefore need the
-//! arc->chord width conversion below, but deliberately NO runtime gaze
-//! correction: a per-user calibration already absorbs curvature (see
-//! `tobii-gtk/src/overlay.rs`).
-//! [`chord_from_arc`] / [`arc_from_chord`] convert between the arc width EDID
-//! reports and the chord width [`DisplaySetup`] stores.
+//! The device only ever accepts a plane, and [`DisplaySetup::width_mm`] sends it
+//! the EDID **arc** width unchanged (see [`plane_width_from_edid`]) — deliberately
+//! NO runtime gaze correction: a per-user calibration already absorbs curvature
+//! (see `tobii-gtk/src/overlay.rs`).
+//! [`chord_from_arc`] / [`arc_from_chord`] remain as general arc/chord helper
+//! math; the plane sent to the device no longer goes through them.
 
 mod edid;
 mod setpm;
@@ -20,7 +20,7 @@ mod store;
 
 pub use edid::{detect_monitors, pick_monitor, MonitorInfo};
 pub use setpm::parse_setpm_corners;
-pub use setup::{arc_from_chord, chord_from_arc, DisplaySetup};
+pub use setup::{arc_from_chord, chord_from_arc, plane_width_from_edid, DisplaySetup};
 pub use store::{
     calibration_path, config_path, enabled_eye_path, load, load_calibration, load_calibration_from,
     load_enabled_eye, load_from, save, save_calibration, save_calibration_to, save_enabled_eye,

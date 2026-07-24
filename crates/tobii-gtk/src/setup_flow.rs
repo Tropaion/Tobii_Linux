@@ -434,18 +434,13 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
         .flatten()
         .unwrap_or_else(default_setup);
     // On a curved panel EDID reports the *arc* width (the panel is a flat sheet
-    // bent into an arc), but `width_mm` is the straight chord the flat display
-    // area is built from — so convert whenever a curve radius is configured.
-    //
-    // The radius here comes from the *saved* config, which a first-time user of
-    // a curved monitor does not have: it is 0, the conversion is the identity,
-    // and the arc gets seeded as if it were the chord. So keep the arc for the
-    // lifetime of the flow and re-derive the width whenever the radius changes
-    // (see `on_curve` below) — otherwise typing "1800" into the curvature
-    // spinner would leave a 22 mm-too-wide screen on disk and on the device.
+    // bent into an arc), and the device plane wants exactly that arc, unchanged
+    // (see `plane_width_from_edid`) — curvature never shrinks it. The arc is
+    // kept for the lifetime of the flow so a later curvature edit (see
+    // `on_curve` below) can keep the width field snapped to it.
     let edid_arc_mm: Option<f64> = detected.as_ref().map(|m| m.width_mm);
     if let Some(m) = &detected {
-        initial.width_mm = tobii_config::chord_from_arc(m.width_mm, initial.curvature_radius_mm);
+        initial.width_mm = tobii_config::plane_width_from_edid(m.width_mm);
         initial.height_mm = m.height_mm;
     }
     let setup = Rc::new(RefCell::new(initial));
@@ -490,9 +485,8 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
     status.set_justify(gtk::Justification::Center);
     status.set_max_width_chars(70);
 
-    // Rebuilt from the current setup on every change, so the arc→chord
-    // straightening becomes visible the moment a curve radius is entered, and a
-    // physically impossible radius says so instead of silently doing nothing.
+    // Rebuilt from the current setup on every change, so a physically
+    // impossible curve radius says so instead of silently doing nothing.
     let refresh_status: Rc<dyn Fn()> = {
         let setup = setup.clone();
         let status = status.clone();
@@ -507,23 +501,11 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
                 s.width_mm, s.height_mm, s.offset_x_mm
             );
             let mut text = match &detected {
-                Some(m) => {
-                    let chord = tobii_config::chord_from_arc(m.width_mm, s.curvature_radius_mm);
-                    if (chord - m.width_mm).abs() >= 0.5 {
-                        format!(
-                            "{geometry}\nDetected {} — {:.0} × {:.0} mm. That width follows the \
-                             curve; straightened for a {:.0}R screen it is {:.0} mm. Drag the \
-                             lines only if this looks wrong.",
-                            m.model, m.width_mm, m.height_mm, s.curvature_radius_mm, chord
-                        )
-                    } else {
-                        format!(
-                            "{geometry}\nDetected {} — {:.0} × {:.0} mm. Drag the lines only if \
-                             this looks wrong.",
-                            m.model, m.width_mm, m.height_mm
-                        )
-                    }
-                }
+                Some(m) => format!(
+                    "{geometry}\nDetected {} — {:.0} × {:.0} mm. Drag the lines only if this \
+                     looks wrong.",
+                    m.model, m.width_mm, m.height_mm
+                ),
                 None => {
                     warn = true;
                     format!(
@@ -748,12 +730,12 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
         ),
     ]);
 
-    // Curvature changed → re-derive the width from the remembered EDID arc.
-    // Without this a first-time user of a curved monitor saves the arc width as
-    // if it were the chord (22 mm too wide on a 49" 1800R), corrupting both the
-    // plane sent to the device and the arc geometry the gaze correction derives
-    // from it. Deliberately a no-op when EDID told us nothing: then the width in
-    // the form is hand-measured, i.e. already a chord, and must not be rewritten.
+    // Curvature changed. The plane width no longer depends on curvature — the
+    // device plane always uses the EDID arc (see `plane_width_from_edid`) — so
+    // this just re-snaps the width field to that arc in case anything else
+    // changed it meanwhile; the radius itself is kept only as stored metadata.
+    // Deliberately a no-op when EDID told us nothing: then the width in the
+    // form is hand-measured and must not be overwritten.
     {
         let setup = setup.clone();
         let syncing = syncing.clone();
@@ -762,11 +744,10 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) {
             let Some(arc) = edid_arc_mm else {
                 return;
             };
-            let r = setup.borrow().curvature_radius_mm; // borrow released here
-            let chord = tobii_config::chord_from_arc(arc, r);
-            setup.borrow_mut().width_mm = chord;
+            let width = tobii_config::plane_width_from_edid(arc);
+            setup.borrow_mut().width_mm = width;
             syncing.set(true);
-            width_entry.set_text(&fmt_val(chord));
+            width_entry.set_text(&fmt_val(width));
             syncing.set(false);
         }));
     }

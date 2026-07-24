@@ -786,7 +786,7 @@ fn setup() -> CmdResult {
             "detected monitor: {} ({:.0} x {:.0} mm)",
             m.model, m.width_mm, m.height_mm
         );
-        w_def = m.width_mm;
+        w_def = tobii_config::plane_width_from_edid(m.width_mm);
         h_def = m.height_mm;
     }
 

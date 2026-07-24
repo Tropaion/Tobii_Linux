@@ -12,14 +12,13 @@ use tobii_protocol::DisplayCorners;
 /// Physical display-setup parameters a user edits. Lengths in millimetres.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplaySetup {
-    /// Active-area width as the **chord**: the straight, corner-to-corner
-    /// distance along tracker +X — what a rigid ruler laid across the screen
-    /// measures, and what [`to_corners`](DisplaySetup::to_corners) needs, since
-    /// the device is only ever told about a flat plane.
+    /// Active-area width the device projects gaze across, in millimetres.
     ///
-    /// On a curved panel this is *not* the width EDID reports: a curved screen
-    /// is a flat sheet bent into an arc, so EDID gives the **arc** length. Only
-    /// EDID-sourced widths need converting — see [`chord_from_arc`].
+    /// This is the EDID **active-area (arc) width** — for a curved panel the flat
+    /// plane the device is told about spans the *unrolled* pixel width, NOT the
+    /// straight-line chord. Tobii's own captured plane uses the arc; sending the
+    /// chord makes the plane too narrow and compresses gaze toward the edges. For
+    /// a flat panel arc == chord. See [`plane_width_from_edid`].
     pub width_mm: f64,
     /// Active-area height along the screen surface (the tilted side-edge length).
     pub height_mm: f64,
@@ -64,6 +63,15 @@ pub fn arc_from_chord(chord_mm: f64, radius_mm: f64) -> f64 {
     2.0 * radius_mm * ratio.asin()
 }
 
+/// The width to send the device for an EDID-reported active-area width.
+///
+/// Deliberately the identity: the device plane uses the EDID **arc** width, not
+/// the chord (see [`DisplaySetup::width_mm`]). Kept as a named seam so both the
+/// GUI and CLI seed the plane identically and a regression back to chord is caught.
+pub fn plane_width_from_edid(edid_active_width_mm: f64) -> f64 {
+    edid_active_width_mm
+}
+
 impl DisplaySetup {
     /// Forward construction: parameters → the three tracker-space corners
     /// (TL, TR, BL). Bottom-right is implied by the device.
@@ -96,6 +104,24 @@ impl DisplaySetup {
             offset_z_mm: c.bl[2],
             curvature_radius_mm: 0.0,
         }
+    }
+
+    /// Stable hash of the geometry, used to detect that a calibration was
+    /// computed against a since-changed display plane.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in [
+            self.width_mm,
+            self.height_mm,
+            self.tilt_deg,
+            self.offset_x_mm,
+            self.offset_y_mm,
+            self.offset_z_mm,
+        ] {
+            v.to_bits().hash(&mut h);
+        }
+        h.finish()
     }
 
     /// Serialize to a `[display]` TOML section.
@@ -182,6 +208,68 @@ mod tests {
         tr: [479.8, 413.6, 157.5],
         bl: [-451.8, 68.0, -11.0],
     };
+
+    const GOLDEN_SETUP: DisplaySetup = DisplaySetup {
+        width_mm: 1193.0,
+        height_mm: 335.5,
+        tilt_deg: 20.0,
+        offset_x_mm: 0.0,
+        offset_y_mm: 10.27,
+        offset_z_mm: -3.10,
+        curvature_radius_mm: 1800.0,
+    };
+
+    #[test]
+    fn plane_width_is_the_arc_not_the_chord() {
+        // Curved panel: the device plane must use the EDID arc width unchanged,
+        // NOT the chord — Tobii's own capture uses the arc (see golden test below).
+        let arc = 1193.0;
+        assert_eq!(super::plane_width_from_edid(arc), arc);
+        // ...and that is deliberately different from the old chord conversion.
+        assert!(
+            (super::plane_width_from_edid(arc) - super::chord_from_arc(arc, 1800.0)).abs() > 20.0
+        );
+    }
+
+    #[test]
+    fn odyssey_setup_reproduces_tobii_captured_corners() {
+        // Seeding the Odyssey G93SC from EDID (arc width) + current defaults must
+        // land within a few mm of Tobii's own captured plane.
+        let tobii =
+            crate::parse_setpm_corners(include_bytes!("testdata/screenplane.setpm")).unwrap();
+        let s = DisplaySetup {
+            width_mm: super::plane_width_from_edid(1193.0),
+            height_mm: 335.53,
+            tilt_deg: 20.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 10.27,
+            offset_z_mm: -3.10,
+            curvature_radius_mm: 1800.0,
+        };
+        let c = s.to_corners();
+        for (got, exp) in [(c.tl, tobii.tl), (c.tr, tobii.tr), (c.bl, tobii.bl)] {
+            for i in 0..3 {
+                assert!(
+                    (got[i] - exp[i]).abs() < 1.0,
+                    "corner off: got {got:?} exp {exp:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fingerprint_changes_with_geometry() {
+        let a = DisplaySetup {
+            width_mm: 1193.0,
+            ..GOLDEN_SETUP
+        };
+        let b = DisplaySetup {
+            width_mm: 1171.0,
+            ..GOLDEN_SETUP
+        };
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_eq!(a.fingerprint(), a.fingerprint()); // stable
+    }
 
     #[test]
     fn flat_untilted_rectangle() {
@@ -305,14 +393,12 @@ mod tests {
     }
 
     #[test]
-    fn odyssey_g93sc_arc_to_chord() {
-        // 49" 1800R: EDID reports the 1193 mm arc; the ruler chord is ~1171 mm.
+    fn curved_panel_helper_math_still_available_but_plane_uses_arc() {
+        // The chord helper still computes correctly (used nowhere for the plane now).
         let chord = chord_from_arc(1193.0, 1800.0);
         assert!((chord - 1171.0).abs() < 1.0, "chord={chord}");
-        // Sagitta ≈ 98 mm — the depth the flat plane model throws away.
-        let half_w = chord / 2.0;
-        let sagitta = 1800.0 - (1800.0f64 * 1800.0 - half_w * half_w).sqrt();
-        assert!((sagitta - 98.0).abs() < 1.0, "sagitta={sagitta}");
+        // The device plane, however, uses the arc.
+        assert_eq!(super::plane_width_from_edid(1193.0), 1193.0);
     }
 
     #[test]
