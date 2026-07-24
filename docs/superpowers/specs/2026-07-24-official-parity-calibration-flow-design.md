@@ -202,10 +202,12 @@ Match the captured screenshots (`docs/TobiiSetupProcess/`):
 
 No config version exists. Existing installs have a chord `width_mm` (1171.3), fine-tuned
 offsets, and an unbound `calibration.bin`. On upgrade: the absent `calibration.meta.toml`
-makes `decide` return `RecommendCalibration` (or `ForceCalibration` if we also detect the
-legacy chord width via a one-time `[display] monitor_id` absence), prompting the user through
-setup (which now seeds the arc width) + recalibration. No silent geometry rewrite; the user
-re-runs the corrected flow. A `monitor_id` key absence is the migration hook.
+makes `decide` return `ForceCalibration` (matching the primary decision table above — a
+non-dismissible recalibration, not just a recommendation), prompting the user through setup
+(which now seeds the arc width) + recalibration. This is deliberate, not merely permissive: the
+existing calibration was computed against the old chord-width plane, so it is measurably wrong
+under the corrected arc-width plane, not just unbound. No silent geometry rewrite; the user
+re-runs the corrected flow.
 
 ## Testing
 
