@@ -225,12 +225,14 @@ fn update_ui(
             eye_preview_box.set_visible(true);
             continue_btn.set_visible(eye_preview::should_offer_fallback(*ticks));
             done_box.set_visible(false);
+            fail_box.set_visible(false);
             cancel.set_visible(true);
         }
         Phase::Starting { .. } => {
             instr.set_text("Starting calibration…");
             eye_preview_box.set_visible(false);
             done_box.set_visible(false);
+            fail_box.set_visible(false);
             cancel.set_visible(true);
         }
         Phase::Collecting {
@@ -248,12 +250,14 @@ fn update_ui(
             });
             eye_preview_box.set_visible(false);
             done_box.set_visible(false);
+            fail_box.set_visible(false);
             cancel.set_visible(true);
         }
         Phase::Computing { .. } => {
             instr.set_text("Computing your calibration…");
             eye_preview_box.set_visible(false);
             done_box.set_visible(false);
+            fail_box.set_visible(false);
             cancel.set_visible(false);
         }
         Phase::Done(res) => {
