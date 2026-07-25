@@ -20,8 +20,11 @@ use crate::eyeview::Guidance;
 use crate::{add_escape_to_close, eye_preview, screen_height, widget};
 use tobii_protocol::EnabledEye;
 
-/// Calibration point sets (normalized, top-left origin, center-first — the
-/// original's Guest (5) and recalibration (9) sets, verbatim).
+/// The 7-point calibration layout (normalized, top-left origin). Measured from
+/// the captured official screenshots: center, then a row of 3 across the top
+/// inset from the edges, then a row of 3 across the bottom inset from the edges.
+/// Order: center first (matches the captured flow's first visible dot), then top
+/// row left-to-right, then bottom row left-to-right.
 ///
 /// These are deliberately **not** run through `tobii_config::correct_gaze_x`,
 /// even on a curved screen: during calibration the device's flat-plane model is
@@ -29,41 +32,31 @@ use tobii_protocol::EnabledEye;
 /// would bake an unvalidated correction into the calibration itself. The
 /// curvature correction belongs downstream, where we consume gaze (see
 /// `overlay.rs`).
-pub const QUICK_5: [(f64, f64); 5] = [(0.5, 0.5), (0.1, 0.9), (0.5, 0.1), (0.9, 0.9), (0.5, 0.5)];
-pub const FULL_9: [(f64, f64); 9] = [
+pub const FULL_7: [(f64, f64); 7] = [
     (0.5, 0.5),
-    (0.1, 0.9),
+    (0.3, 0.1),
     (0.5, 0.1),
-    (0.9, 0.9),
-    (0.1, 0.1),
+    (0.7, 0.1),
+    (0.3, 0.9),
     (0.5, 0.9),
-    (0.9, 0.1),
-    (0.1, 0.5),
-    (0.9, 0.5),
+    (0.7, 0.9),
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum CalMode {
-    Quick,
     Full,
 }
 
 impl CalMode {
     /// The stimulus points for this mode.
     pub fn points(self) -> &'static [(f64, f64)] {
-        match self {
-            CalMode::Quick => &QUICK_5,
-            CalMode::Full => &FULL_9,
-        }
+        &FULL_7
     }
 
     /// This mode's label, as recorded into the saved `CalMeta` (see
     /// `device::DeviceCommand::CalFinish`).
     pub fn label(self) -> &'static str {
-        match self {
-            CalMode::Quick => "quick",
-            CalMode::Full => "full",
-        }
+        "full"
     }
 }
 
@@ -627,19 +620,30 @@ mod tests {
 
     #[test]
     fn point_sets_have_expected_counts_and_start_centered() {
-        assert_eq!(CalMode::Quick.points().len(), 5);
-        assert_eq!(CalMode::Full.points().len(), 9);
-        assert_eq!(CalMode::Quick.points()[0], (0.5, 0.5));
+        assert_eq!(CalMode::Full.points().len(), 7);
         assert_eq!(CalMode::Full.points()[0], (0.5, 0.5));
     }
 
     #[test]
     fn all_points_are_within_unit_square() {
-        for m in [CalMode::Quick, CalMode::Full] {
-            for &(x, y) in m.points() {
-                assert!((0.0..=1.0).contains(&x), "x in range: {x}");
-                assert!((0.0..=1.0).contains(&y), "y in range: {y}");
-            }
+        for &(x, y) in CalMode::Full.points() {
+            assert!((0.0..=1.0).contains(&x), "x in range: {x}");
+            assert!((0.0..=1.0).contains(&y), "y in range: {y}");
         }
+    }
+
+    #[test]
+    fn full_7_has_correct_layout() {
+        let pts = CalMode::Full.points();
+        // Center first
+        assert_eq!(pts[0], (0.5, 0.5), "point 0: center");
+        // Top row (y=0.1), left-to-right
+        assert_eq!(pts[1], (0.3, 0.1), "point 1: top-left");
+        assert_eq!(pts[2], (0.5, 0.1), "point 2: top-center");
+        assert_eq!(pts[3], (0.7, 0.1), "point 3: top-right");
+        // Bottom row (y=0.9), left-to-right
+        assert_eq!(pts[4], (0.3, 0.9), "point 4: bottom-left");
+        assert_eq!(pts[5], (0.5, 0.9), "point 5: bottom-center");
+        assert_eq!(pts[6], (0.7, 0.9), "point 6: bottom-right");
     }
 }
