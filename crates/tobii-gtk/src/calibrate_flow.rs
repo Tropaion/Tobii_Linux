@@ -618,7 +618,7 @@ pub fn launch(
                 // set `instr`'s text here (it would just fight this).
                 instr.set_text(eye_preview::message(ticks, ev.guidance));
                 eye_panel.queue_draw();
-                if eye_preview::should_advance(centered_ticks) {
+                if eye_preview::should_advance(ticks, centered_ticks) {
                     // Call the free `begin_calibration_phase` helper rather
                     // than the `begin_calibration` closure above: `ph` (a
                     // `RefMut<Phase>` from `phase.borrow_mut()` at the top of

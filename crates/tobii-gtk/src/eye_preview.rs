@@ -34,10 +34,12 @@ pub fn message(ticks: u32, guidance: Guidance) -> &'static str {
 
 /// Decide whether to auto-advance to the next step.
 ///
-/// Returns `true` only after a continuous `CENTERED_DWELL_TICKS` (~1.5 seconds)
-/// of `Guidance::Centered` readings.
-pub fn should_advance(centered_ticks: u32) -> bool {
-    centered_ticks >= CENTERED_DWELL_TICKS
+/// Requires BOTH: the ~2s intro window (`EYE_TEXT_TICKS`) to have elapsed
+/// (so every user sees at least a moment of the range-check guidance text
+/// from `message`, not just the intro line) AND a continuous
+/// `CENTERED_DWELL_TICKS` (~1.5s) of `Guidance::Centered` readings.
+pub fn should_advance(ticks: u32, centered_ticks: u32) -> bool {
+    ticks >= EYE_TEXT_TICKS && centered_ticks >= CENTERED_DWELL_TICKS
 }
 
 /// Decide whether to offer a "Continue anyway" fallback button.
@@ -102,16 +104,33 @@ mod tests {
 
     #[test]
     fn should_advance_requires_full_dwell() {
-        // Auto-advance should only happen after reaching CENTERED_DWELL_TICKS.
+        // Auto-advance should only happen after reaching CENTERED_DWELL_TICKS,
+        // given the intro window has already elapsed.
         let threshold = CENTERED_DWELL_TICKS;
+        let ticks = EYE_TEXT_TICKS + 100; // well past the intro window
 
         // Just shy of the threshold: should not advance.
-        assert!(!should_advance(threshold - 1));
+        assert!(!should_advance(ticks, threshold - 1));
 
         // At and after threshold: should advance.
-        assert!(should_advance(threshold));
-        assert!(should_advance(threshold + 1));
-        assert!(should_advance(threshold + 100));
+        assert!(should_advance(ticks, threshold));
+        assert!(should_advance(ticks, threshold + 1));
+        assert!(should_advance(ticks, threshold + 100));
+    }
+
+    #[test]
+    fn should_advance_requires_intro_window_to_elapse() {
+        // Even with the centered dwell fully satisfied, auto-advance must not
+        // fire until the intro-text window (EYE_TEXT_TICKS) has also elapsed —
+        // otherwise a well-positioned user never sees the range-check guidance
+        // text from `message` before calibration starts.
+        let centered_ticks = CENTERED_DWELL_TICKS + 100; // well past dwell
+
+        assert!(!should_advance(0, centered_ticks));
+        assert!(!should_advance(EYE_TEXT_TICKS - 1, centered_ticks));
+
+        // Once the intro window elapses too, it should advance.
+        assert!(should_advance(EYE_TEXT_TICKS, centered_ticks));
     }
 
     #[test]
