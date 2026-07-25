@@ -230,6 +230,20 @@ fn update_ui(
     }
 }
 
+/// Mints a fresh calibration token, sends `CalBegin`, and returns the
+/// `Phase::Starting` transition. Does not touch `phase` itself, so it is
+/// safe to call whether or not the caller already holds `phase`'s RefCell
+/// borrow (see the two call sites).
+fn begin_calibration_phase(cmd_tx: &Sender<DeviceCommand>, eye: EnabledEye) -> Phase {
+    let token = next_cal_token();
+    let _ = cmd_tx.send(DeviceCommand::CalBegin { eye, token });
+    Phase::Starting {
+        mode: CalMode::Full,
+        token,
+        ticks: 0,
+    }
+}
+
 /// Open the fullscreen follow-the-dot calibration flow, returning the window so
 /// the caller can react to it closing (the hub re-enables its button).
 pub fn launch(
@@ -329,9 +343,11 @@ pub fn launch(
     // EyePreview -> begin calibration (always Full — there's only one mode
     // reachable from the UI now). The flow waits in `Starting` until the
     // device thread acknowledges the new session; it must not trust any
-    // counters until then (see `Phase::Starting`). This mirrors the tick
-    // loop's own `EyePreview` arm (auto-advance), which mints the token
-    // inline instead of calling this closure — see the comment there for why.
+    // counters until then (see `Phase::Starting`). The actual token-mint +
+    // `CalBegin` + `Phase::Starting` transition lives in the free function
+    // `begin_calibration_phase`, shared with the tick loop's own `EyePreview`
+    // arm (auto-advance) — see the comment there for why that call site can't
+    // just invoke this closure directly.
     let begin_calibration: Rc<dyn Fn()> = {
         let phase = phase.clone();
         let cmd_tx = cmd_tx.clone();
@@ -344,13 +360,7 @@ pub fn launch(
             if !in_eye_preview {
                 return;
             }
-            let token = next_cal_token();
-            let _ = cmd_tx.send(DeviceCommand::CalBegin { eye, token });
-            *phase.borrow_mut() = Phase::Starting {
-                mode: CalMode::Full,
-                token,
-                ticks: 0,
-            };
+            *phase.borrow_mut() = begin_calibration_phase(&cmd_tx, eye);
         })
     };
     {
@@ -423,23 +433,17 @@ pub fn launch(
                 instr.set_text(eye_preview::message(ticks, ev.guidance));
                 eye_panel.queue_draw();
                 if eye_preview::should_advance(centered_ticks) {
-                    // Mint the token + send CalBegin inline instead of going
-                    // through the shared `begin_calibration` closure: `ph` (a
-                    // `RefMut<Phase>` from `phase.borrow_mut()` above) is held
-                    // across this whole match, and `begin_calibration` does
-                    // its own `phase.borrow()`/`borrow_mut()` — calling it
-                    // from here would double-borrow and panic. We already
-                    // have exclusive access to `phase` via `ph`, so there is
-                    // nothing `begin_calibration` would add; setting `next`
-                    // below (assigned to `*ph` once the match returns) does
-                    // the same transition safely.
-                    let token = next_cal_token();
-                    let _ = tick_cmd.send(DeviceCommand::CalBegin { eye, token });
-                    next = Some(Phase::Starting {
-                        mode: CalMode::Full,
-                        token,
-                        ticks: 0,
-                    });
+                    // Call the free `begin_calibration_phase` helper rather
+                    // than the `begin_calibration` closure above: `ph` (a
+                    // `RefMut<Phase>` from `phase.borrow_mut()` at the top of
+                    // this tick) is held across this whole match, and
+                    // `begin_calibration` does its own `phase.borrow()` /
+                    // `borrow_mut()` — calling it from here would double-borrow
+                    // and panic. `begin_calibration_phase` never touches
+                    // `phase`, so it's safe here; the transition it returns is
+                    // applied via `next` (assigned to `*ph` once the match
+                    // returns), same as every other arm.
+                    next = Some(begin_calibration_phase(&tick_cmd, eye));
                 } else {
                     next = Some(Phase::EyePreview {
                         ticks: ticks + 1,
