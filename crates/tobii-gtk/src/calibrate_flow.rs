@@ -206,34 +206,45 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool
     }
 }
 
+/// Widgets `update_ui` toggles visibility/text on, bundled into one struct so
+/// adding the failure-detail label (`fail_detail`) didn't push `update_ui` to
+/// a ninth positional argument (it was already at 8, with an `#[allow]` for
+/// it). `phase` and `instr` stay as `update_ui`'s own top-level parameters:
+/// every arm reads/writes both, whereas each field below belongs to a subset
+/// of arms (mostly just `Done`).
+struct FlowWidgets<'a> {
+    eye_preview_box: &'a gtk::Box,
+    continue_btn: &'a Button,
+    done_box: &'a gtk::Box,
+    fail_box: &'a gtk::Box,
+    /// The actual error string, shown small/muted under the friendly tips
+    /// list (see `fail_box`'s construction in `launch`) — the tips are
+    /// generic, but a bug reporter (or the user) still needs to see what
+    /// specifically failed.
+    fail_detail: &'a Label,
+    retry: &'a Button,
+    cancel: &'a Button,
+}
+
 /// Reflect the current phase in the instruction text + visible controls.
-#[allow(clippy::too_many_arguments)]
-fn update_ui(
-    phase: &Phase,
-    instr: &Label,
-    eye_preview_box: &gtk::Box,
-    continue_btn: &Button,
-    done_box: &gtk::Box,
-    fail_box: &gtk::Box,
-    retry: &Button,
-    cancel: &Button,
-) {
+fn update_ui(phase: &Phase, instr: &Label, w: &FlowWidgets) {
     match phase {
         Phase::EyePreview { ticks, .. } => {
             // `instr`'s text is set live in the tick loop (recomputed every
             // frame from the current guidance) — don't fight it here.
-            eye_preview_box.set_visible(true);
-            continue_btn.set_visible(eye_preview::should_offer_fallback(*ticks));
-            done_box.set_visible(false);
-            fail_box.set_visible(false);
-            cancel.set_visible(true);
+            w.eye_preview_box.set_visible(true);
+            w.continue_btn
+                .set_visible(eye_preview::should_offer_fallback(*ticks));
+            w.done_box.set_visible(false);
+            w.fail_box.set_visible(false);
+            w.cancel.set_visible(true);
         }
         Phase::Starting { .. } => {
             instr.set_text("Starting calibration…");
-            eye_preview_box.set_visible(false);
-            done_box.set_visible(false);
-            fail_box.set_visible(false);
-            cancel.set_visible(true);
+            w.eye_preview_box.set_visible(false);
+            w.done_box.set_visible(false);
+            w.fail_box.set_visible(false);
+            w.cancel.set_visible(true);
         }
         Phase::Collecting {
             index, mode, ticks, ..
@@ -248,28 +259,32 @@ fn update_ui(
             } else {
                 format!("Follow the dot with your eyes  ·  {progress}")
             });
-            eye_preview_box.set_visible(false);
-            done_box.set_visible(false);
-            fail_box.set_visible(false);
-            cancel.set_visible(true);
+            w.eye_preview_box.set_visible(false);
+            w.done_box.set_visible(false);
+            w.fail_box.set_visible(false);
+            w.cancel.set_visible(true);
         }
         Phase::Computing { .. } => {
             instr.set_text("Computing your calibration…");
-            eye_preview_box.set_visible(false);
-            done_box.set_visible(false);
-            fail_box.set_visible(false);
-            cancel.set_visible(false);
+            w.eye_preview_box.set_visible(false);
+            w.done_box.set_visible(false);
+            w.fail_box.set_visible(false);
+            w.cancel.set_visible(false);
         }
         Phase::Done(res) => {
             match res {
                 Ok(()) => {
                     instr.set_text("Calibration successful!");
                     instr.add_css_class("cal-success-heading");
-                    fail_box.set_visible(false);
+                    w.fail_box.set_visible(false);
                 }
-                Err(_) => {
+                Err(e) => {
                     // The restyled failure screen now carries its own heading/
-                    // body/tips (fail_box) instead of the raw error string.
+                    // body/tips (fail_box) instead of the raw error string as
+                    // the headline — but the raw string is still shown, small
+                    // and muted, in `fail_detail` below the tips (see Finding 1
+                    // of the final-review fix: it used to be dropped on the
+                    // floor entirely).
                     instr.set_text("");
                     // Defensive only, not load-bearing: `cal-success-heading` is
                     // added only in the `Ok(())` arm above, and `Done(Ok(()))`
@@ -283,16 +298,35 @@ fn update_ui(
                     // costs nothing and guards against that invariant changing
                     // later.
                     instr.remove_css_class("cal-success-heading");
-                    fail_box.set_visible(true);
+                    // Set fresh before `fail_box` becomes visible below, in
+                    // this same call — no other arm ever makes `fail_box`
+                    // visible, so there is no frame in which a stale string
+                    // from an earlier attempt could be showing while the box
+                    // is shown; no separate clear-on-other-arms step is
+                    // needed for the *text* (only for `fail_box`'s own
+                    // visibility, which every other arm above already resets).
+                    w.fail_detail.set_text(e);
+                    w.fail_box.set_visible(true);
                 }
             }
-            eye_preview_box.set_visible(false);
-            done_box.set_visible(true);
+            w.eye_preview_box.set_visible(false);
+            w.done_box.set_visible(true);
             // Success offers only Done; Retry belongs to the failure screen.
-            retry.set_visible(res.is_err());
-            cancel.set_visible(false);
+            w.retry.set_visible(res.is_err());
+            w.cancel.set_visible(false);
         }
     }
+}
+
+/// Wraps every `Phase::Done` construction so a failure is logged exactly
+/// once (at the moment it happens, not every tick `update_ui` re-renders
+/// the resulting screen) — the failure screen shows a generic, friendly
+/// message, but the actual error must not be silently discarded.
+fn done_phase(res: Result<(), String>) -> Phase {
+    if let Err(e) = &res {
+        eprintln!("calibration failed: {e}");
+    }
+    Phase::Done(res)
 }
 
 /// Mints a fresh calibration token, sends `CalBegin`, and returns the
@@ -419,11 +453,23 @@ pub fn launch(
     fail_tips.set_justify(gtk::Justification::Left);
     fail_tips.set_wrap(true);
 
+    // The actual error string (e.g. "device disconnected" vs. "couldn't save
+    // to disk") — small and muted so it doesn't compete with the friendly
+    // tips above, but present, so it isn't silently discarded (see Finding 1
+    // of the final-review fix). Text is set in `update_ui`'s `Phase::Done`
+    // `Err(e)` arm.
+    let fail_detail = Label::new(None);
+    fail_detail.add_css_class("cal-fail-detail");
+    fail_detail.set_halign(Align::Center);
+    fail_detail.set_justify(gtk::Justification::Center);
+    fail_detail.set_wrap(true);
+
     let fail_box = gtk::Box::new(Orientation::Vertical, 8);
     fail_box.set_halign(Align::Center);
     fail_box.append(&fail_heading);
     fail_box.append(&fail_body);
     fail_box.append(&fail_tips);
+    fail_box.append(&fail_detail);
     fail_box.set_visible(false);
 
     let done_btn = Button::with_label("Done");
@@ -490,6 +536,15 @@ pub fn launch(
         let phase = phase.clone();
         let cmd_tx = cmd_tx.clone();
         retry_btn.connect_clicked(move |_| {
+            // `retry_btn` stays clickable until the next tick hides it (same
+            // as `continue_btn` above), so a double-click would otherwise
+            // send a second CalBegin and issue `start` on an already-open
+            // realm. Bind the check to drop the shared borrow before the
+            // borrow_mut below.
+            let in_done = matches!(&*phase.borrow(), Phase::Done(_));
+            if !in_done {
+                return;
+            }
             *phase.borrow_mut() = begin_calibration_phase(&cmd_tx, eye);
         });
     }
@@ -599,7 +654,7 @@ pub fn launch(
                         // The abort is queued *behind* our CalBegin, so the
                         // device thread still closes whatever CalBegin opened.
                         let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                        next = Some(Phase::Done(Err(
+                        next = Some(done_phase(Err(
                             "Could not start calibration. Check that the eye tracker is connected."
                                 .into(),
                         )));
@@ -629,7 +684,7 @@ pub fn launch(
                         _ => "Could not start calibration.".to_string(),
                     };
                     let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                    next = Some(Phase::Done(Err(msg)));
+                    next = Some(done_phase(Err(msg)));
                 }
             }
             Phase::Collecting {
@@ -645,17 +700,17 @@ pub fn launch(
                     // Another session replaced ours — only reachable if a second
                     // flow window ever opened. Never act on counters that are not
                     // ours; that is precisely what the token exists to prevent.
-                    next = Some(Phase::Done(Err("Calibration was interrupted.".into())));
+                    next = Some(done_phase(Err("Calibration was interrupted.".into())));
                 } else if let Some(Err(e)) = &cal.finished {
                     // Defensive: within a session nothing finishes it but our
                     // own CalFinish (which leaves for `Computing`). If a finish
                     // does surface here the session may still be open, so stop
                     // it explicitly.
                     let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                    next = Some(Phase::Done(Err(e.clone())));
+                    next = Some(done_phase(Err(e.clone())));
                 } else if let Some(e) = &cal.last_error {
                     let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                    next = Some(Phase::Done(Err(format!(
+                    next = Some(done_phase(Err(format!(
                         "Couldn't read a point: {e}. Make sure you're seated and looking at the dots."
                     ))));
                 } else if cal.collected > index {
@@ -709,7 +764,7 @@ pub fn launch(
                         });
                     } else if requested && t >= COLLECT_TIMEOUT_TICKS {
                         let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                        next = Some(Phase::Done(Err("Timed out reading a point.".into())));
+                        next = Some(done_phase(Err("Timed out reading a point.".into())));
                     } else {
                         next = Some(Phase::Collecting {
                             token,
@@ -727,16 +782,14 @@ pub fn launch(
                 if cal.token != token {
                     // Another session replaced ours; `finished` below would be
                     // someone else's outcome, so never report it as our own.
-                    next = Some(Phase::Done(Err("Calibration was interrupted.".into())));
+                    next = Some(done_phase(Err("Calibration was interrupted.".into())));
                 } else if let Some(res) = &cal.finished {
-                    next = Some(Phase::Done(res.clone()));
+                    next = Some(done_phase(res.clone()));
                 } else {
                     let t = ticks + 1;
                     if t >= COMPUTE_TIMEOUT_TICKS {
                         let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                        next = Some(Phase::Done(
-                            Err("Calibration computation timed out.".into()),
-                        ));
+                        next = Some(done_phase(Err("Calibration computation timed out.".into())));
                     } else {
                         next = Some(Phase::Computing { token, ticks: t });
                     }
@@ -753,12 +806,15 @@ pub fn launch(
         update_ui(
             &ph,
             &instr,
-            &eye_preview_box,
-            &continue_btn,
-            &done_box,
-            &fail_box,
-            &retry_btn,
-            &cancel,
+            &FlowWidgets {
+                eye_preview_box: &eye_preview_box,
+                continue_btn: &continue_btn,
+                done_box: &done_box,
+                fail_box: &fail_box,
+                fail_detail: &fail_detail,
+                retry: &retry_btn,
+                cancel: &cancel,
+            },
         );
         area.queue_draw();
         glib::ControlFlow::Continue

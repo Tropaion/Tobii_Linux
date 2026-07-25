@@ -42,6 +42,7 @@ window { background-color: #15181c; color: #e6e8ea; }
 .section-warn { color: #f2b134; font-weight: bold; }
 .cal-fail-heading { font-size: 26px; font-weight: bold; }
 .cal-fail-tips { font-size: 14px; color: #9aa4ad; }
+.cal-fail-detail { font-size: 12px; color: #6b7178; font-style: italic; }
 .cal-success-heading { font-size: 32px; font-weight: bold; }
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
          border: none; border-radius: 8px; padding: 10px 18px; min-height: 24px; }
