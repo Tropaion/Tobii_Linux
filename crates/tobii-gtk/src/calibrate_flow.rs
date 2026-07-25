@@ -263,13 +263,26 @@ fn update_ui(
         Phase::Done(res) => {
             match res {
                 Ok(()) => {
-                    instr.set_text("Calibration complete.");
+                    instr.set_text("Calibration successful!");
+                    instr.add_css_class("cal-success-heading");
                     fail_box.set_visible(false);
                 }
                 Err(_) => {
                     // The restyled failure screen now carries its own heading/
                     // body/tips (fail_box) instead of the raw error string.
                     instr.set_text("");
+                    // Defensive only, not load-bearing: `cal-success-heading` is
+                    // added only in the `Ok(())` arm above, and `Done(Ok(()))`
+                    // is a terminal state for this window — retry is hidden on
+                    // success (`retry.set_visible(res.is_err())` below), so the
+                    // only click available is `done_btn`, which closes the
+                    // window outright. There is no reachable path from
+                    // `Done(Ok(()))` back into `Done(Err(_))` (or any other
+                    // phase) within the same window, so this class can never
+                    // actually be set when this arm runs. Removing it here
+                    // costs nothing and guards against that invariant changing
+                    // later.
+                    instr.remove_css_class("cal-success-heading");
                     fail_box.set_visible(true);
                 }
             }
