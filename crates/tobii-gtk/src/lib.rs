@@ -11,6 +11,7 @@ pub mod eye_preview;
 pub mod eyeview;
 pub mod fine_tune;
 pub mod overlay;
+pub mod particles;
 pub mod screen_pick;
 pub mod setup_flow;
 pub mod widget;
