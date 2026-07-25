@@ -17,7 +17,7 @@ use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Ov
 
 use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
 use crate::eyeview::Guidance;
-use crate::{add_escape_to_close, eye_preview, screen_height, widget};
+use crate::{add_escape_to_close, eye_preview, particles, screen_height, widget};
 use tobii_protocol::EnabledEye;
 
 /// The 7-point calibration layout (normalized, top-left origin). Measured from
@@ -70,6 +70,13 @@ const SETTLE_TICKS: u32 = 10; // ~330 ms for the saccade to the new dot to land
 // sample was taken mid-saccade, before the user could even look at the dot.
 const DWELL_TICKS: u32 = 36; // ~1.2 s holding the target before we sample it
 const SAMPLE_AT_TICKS: u32 = SETTLE_TICKS + DWELL_TICKS;
+
+// The captured-point particle burst outlives the dwell it followed — it keeps
+// animating concurrently with the next point fading in (or, on the last
+// point, with nothing at all — see the tick loop's unconditional age/retire
+// block). ~0.6 s: long enough to read as a distinct "captured!" beat, short
+// enough not to still be running when the next point is sampled.
+const EXPLODE_DURATION_TICKS: u32 = 18;
 
 // Every UI deadline below must outlast the device-thread work it is waiting on.
 // If the UI gives up first the device thread keeps running the old command and
@@ -137,26 +144,64 @@ struct DotView {
     /// 0 = the dot just arrived, 1 = sampling now. Drives the converging ring,
     /// which is the user's only cue for *when* fixation actually matters.
     progress: f64,
+    /// The new dot's own fade-in (0 = just arrived, 1 = fully visible), ramping
+    /// over `SETTLE_TICKS` — separate from `progress` (which tracks the
+    /// dwell-to-sample countdown ring, not visibility).
+    fade_in: f64,
+    /// The *previous* point's still-animating burst, if any — drawn
+    /// concurrently with the new point fading in (the captured screenshots'
+    /// brief crossfade overlap, not a hard cut).
+    explosion: Option<Explosion>,
 }
 
-/// Dark background + the pulsing fixation dot (a ring converging on a dot).
-fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView) {
+/// A captured point's outward particle burst, aged independently of whatever
+/// phase/point follows it (see the tick loop's unconditional age/retire block).
+struct Explosion {
+    /// Normalized point coords, same convention as `DotView::point`.
+    origin: (f64, f64),
+    seed: u64,
+    age_ticks: u32,
+}
+
+/// Background + burst particles + the pulsing fixation dot (a ring converging
+/// on a dot). `black_bg` selects the fully-black background used from
+/// `Phase::Starting` onward, vs. today's dark-teal for `Phase::EyePreview`.
+fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool) {
     let (w, h) = (w as f64, h as f64);
-    cr.set_source_rgb(0.08, 0.09, 0.11);
+    if black_bg {
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+    } else {
+        cr.set_source_rgb(0.08, 0.09, 0.11);
+    }
     let _ = cr.paint();
+    if let Some(exp) = &dot.explosion {
+        let (ox, oy) = exp.origin;
+        let (cx, cy) = (ox * w, oy * h);
+        let t = (exp.age_ticks as f64 / EXPLODE_DURATION_TICKS as f64).clamp(0.0, 1.0);
+        for p in particles::burst(exp.seed) {
+            let (dx, dy, alpha) = particles::particle_pos(t, p);
+            if alpha <= 0.0 {
+                continue;
+            }
+            cr.set_source_rgba(0.30, 0.85, 0.85, alpha); // same teal accent as the dot/ring
+            cr.arc(cx + dx, cy + dy, p.size, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+    }
     if let Some((nx, ny)) = dot.point {
         let (cx, cy) = (nx * w, ny * h);
         // The ring shrinks onto the dot as the sample approaches: an
         // unambiguous "hold here, now" countdown. The device samples the
         // instant we ask, so the eye must already be still when it lands.
         let p = dot.progress.clamp(0.0, 1.0);
-        let ring = 9.0 + (1.0 - p) * 42.0;
+        let fade = dot.fade_in.clamp(0.0, 1.0);
+        let ring = (9.0 + (1.0 - p) * 42.0) * fade;
         cr.set_source_rgba(0.30, 0.85, 0.85, 0.35 + 0.45 * p);
         cr.set_line_width(3.0);
         cr.arc(cx, cy, ring, 0.0, std::f64::consts::TAU);
         let _ = cr.stroke();
         cr.set_source_rgb(0.30, 0.85, 0.85);
-        cr.arc(cx, cy, 7.0, 0.0, std::f64::consts::TAU);
+        cr.arc(cx, cy, 7.0 * fade, 0.0, std::f64::consts::TAU);
         let _ = cr.fill();
     }
 }
@@ -265,14 +310,23 @@ pub fn launch(
     let dot = Rc::new(RefCell::new(DotView {
         point: None,
         progress: 0.0,
+        fade_in: 0.0,
+        explosion: None,
     }));
+    // Whether `draw_scene` paints the fully-black background (Starting onward)
+    // vs. the dark-teal used during EyePreview. A separate `Cell` rather than
+    // a `DotView` field: it's phase-derived state, not dot-animation state,
+    // and keeping it out of `DotView` means the draw closure's single
+    // `dot.borrow()` and this `Cell::get()` never contend with each other.
+    let black_bg = Rc::new(Cell::new(false));
 
     let area = DrawingArea::new();
     area.set_hexpand(true);
     area.set_vexpand(true);
     {
         let dot = dot.clone();
-        area.set_draw_func(move |_, cr, w, h| draw_scene(cr, w, h, &dot.borrow()));
+        let black_bg = black_bg.clone();
+        area.set_draw_func(move |_, cr, w, h| draw_scene(cr, w, h, &dot.borrow(), black_bg.get()));
     }
 
     let instr = Label::new(Some("Calibrate your eye tracker"));
@@ -405,6 +459,20 @@ pub fn launch(
             return glib::ControlFlow::Break;
         }
         let cal: CalPhase = state.lock().unwrap().calibration.clone();
+        // Age out any still-animating burst every tick, independent of phase —
+        // this keeps the last point's explosion finishing on its own even once
+        // there is no "next point" to fade in alongside it (e.g. already into
+        // `Computing`). Short-lived borrow, dropped before `phase.borrow_mut()`
+        // below.
+        {
+            let mut d = dot.borrow_mut();
+            if let Some(exp) = &mut d.explosion {
+                exp.age_ticks += 1;
+                if exp.age_ticks >= EXPLODE_DURATION_TICKS {
+                    d.explosion = None;
+                }
+            }
+        }
         let mut ph = phase.borrow_mut();
         let mut next: Option<Phase> = None;
         match &*ph {
@@ -522,6 +590,17 @@ pub fn launch(
                     ))));
                 } else if cal.collected > index {
                     let pts = mode.points();
+                    // A captured point always bursts, whether or not there's a
+                    // next point to follow it — spawn it for the point that
+                    // was JUST captured (the OLD `index`), before advancing.
+                    {
+                        let mut d = dot.borrow_mut();
+                        d.explosion = Some(Explosion {
+                            origin: pts[index],
+                            seed: token ^ (index as u64),
+                            age_ticks: 0,
+                        });
+                    }
                     if index + 1 >= pts.len() {
                         let _ = tick_cmd.send(DeviceCommand::CalFinish {
                             mode: mode.label().to_string(),
@@ -547,6 +626,7 @@ pub fn launch(
                         } else {
                             (t.saturating_sub(SETTLE_TICKS) as f64) / (DWELL_TICKS as f64)
                         };
+                        d.fade_in = (t as f64 / SETTLE_TICKS as f64).clamp(0.0, 1.0);
                     }
                     if !requested && t >= SAMPLE_AT_TICKS {
                         let _ = tick_cmd.send(DeviceCommand::CalCollect { x: px, y: py });
@@ -597,6 +677,9 @@ pub fn launch(
         if let Some(n) = next {
             *ph = n;
         }
+        // Fully black from Starting onward (matches the captured screenshots'
+        // dot phases); dark-teal only during EyePreview.
+        black_bg.set(!matches!(&*ph, Phase::EyePreview { .. }));
         update_ui(
             &ph,
             &instr,
