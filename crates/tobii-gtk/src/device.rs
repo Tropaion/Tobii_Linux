@@ -364,18 +364,33 @@ fn finish_calibration<T: Transport>(
 }
 
 /// Best-effort id of the screen the tracker is on. Prefers the monitor ID
-/// chosen by the user during setup (if one was saved); falls back to the
-/// largest-by-area heuristic for installs from before the monitor picker
-/// existed and for single-monitor systems where nothing needs picking.
-/// `None` if no monitor was detected or it carries no stable id.
+/// chosen by the user during setup, but only if that monitor is still among
+/// the currently detected ones — a stale sidecar value must NOT be trusted
+/// unconditionally, since `decide()`'s "is the tracker on a different screen
+/// now?" check compares this function's result against the calibration's own
+/// saved `monitor_id` (itself written from this same function, at save time)
+/// — if this always returned the static sidecar value regardless of what's
+/// actually connected, that comparison could never detect a real screen
+/// change (see `calibration_state::decide`'s `RecommendReason::OtherScreen`).
+/// Falls back to the largest-by-area heuristic when the sidecar is stale/
+/// missing, for installs from before the monitor picker existed, for
+/// single-monitor systems where nothing needs picking, and for a picked
+/// monitor that's since been disconnected/replaced.
 pub(crate) fn active_monitor_id() -> Option<String> {
-    // Try the monitor ID chosen by the user during setup first.
+    let monitors = tobii_config::detect_monitors();
+
+    // Try the monitor ID chosen by the user during setup first, but only if
+    // it's still among the currently detected monitors.
     if let Ok(Some(id)) = tobii_config::load_setup_monitor_id() {
-        return Some(id);
+        if monitors
+            .iter()
+            .any(|m| m.id.as_deref() == Some(id.as_str()))
+        {
+            return Some(id);
+        }
     }
 
     // Fall back to the largest-by-area heuristic.
-    let monitors = tobii_config::detect_monitors();
     tobii_config::pick_monitor(&monitors).and_then(|m| m.id.clone())
 }
 
