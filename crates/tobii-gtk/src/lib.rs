@@ -40,6 +40,8 @@ window { background-color: #15181c; color: #e6e8ea; }
 .section-title { font-size: 15px; font-weight: bold; }
 .section-desc { font-size: 12px; color: #9aa4ad; }
 .section-warn { color: #f2b134; font-weight: bold; }
+.cal-fail-heading { font-size: 26px; font-weight: bold; }
+.cal-fail-tips { font-size: 14px; color: #9aa4ad; }
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
          border: none; border-radius: 8px; padding: 10px 18px; min-height: 24px; }
 button label { padding: 2px 0; }

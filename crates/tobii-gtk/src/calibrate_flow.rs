@@ -207,12 +207,14 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool
 }
 
 /// Reflect the current phase in the instruction text + visible controls.
+#[allow(clippy::too_many_arguments)]
 fn update_ui(
     phase: &Phase,
     instr: &Label,
     eye_preview_box: &gtk::Box,
     continue_btn: &Button,
     done_box: &gtk::Box,
+    fail_box: &gtk::Box,
     retry: &Button,
     cancel: &Button,
 ) {
@@ -256,8 +258,16 @@ fn update_ui(
         }
         Phase::Done(res) => {
             match res {
-                Ok(()) => instr.set_text("Calibration complete."),
-                Err(e) => instr.set_text(e),
+                Ok(()) => {
+                    instr.set_text("Calibration complete.");
+                    fail_box.set_visible(false);
+                }
+                Err(_) => {
+                    // The restyled failure screen now carries its own heading/
+                    // body/tips (fail_box) instead of the raw error string.
+                    instr.set_text("");
+                    fail_box.set_visible(true);
+                }
             }
             eye_preview_box.set_visible(false);
             done_box.set_visible(true);
@@ -362,6 +372,43 @@ pub fn launch(
     eye_preview_box.append(&eye_panel);
     eye_preview_box.append(&continue_btn);
 
+    // Restyled failure screen (English translation of the captured official
+    // screenshots): a heading, a short body line, and a bulleted tips list —
+    // shown instead of the raw error string when calibration fails (see
+    // `update_ui`'s `Phase::Done` arm).
+    let fail_heading = Label::new(Some("Oops. Nothing found."));
+    fail_heading.add_css_class("cal-fail-heading");
+    fail_heading.set_halign(Align::Center);
+    fail_heading.set_justify(gtk::Justification::Center);
+    fail_heading.set_wrap(true);
+
+    let fail_body = Label::new(Some(
+        "Sorry, the eye tracker can't find your eyes. Let's try again. Here are some tips:",
+    ));
+    fail_body.set_halign(Align::Center);
+    fail_body.set_justify(gtk::Justification::Center);
+    fail_body.set_wrap(true);
+
+    let fail_tips = Label::new(Some(
+        "• Look at the point until it explodes.\n\
+         • If you wear glasses, please clean them.\n\
+         • Avoid bright, direct light for the tracker and your eyes.\n\
+         • Relax, you're allowed to blink.",
+    ));
+    fail_tips.add_css_class("cal-fail-tips");
+    fail_tips.set_halign(Align::Center);
+    // Left-justified within the wrap: this is a bullet list, and a left ragged
+    // edge reads more naturally than centering each line independently.
+    fail_tips.set_justify(gtk::Justification::Left);
+    fail_tips.set_wrap(true);
+
+    let fail_box = gtk::Box::new(Orientation::Vertical, 8);
+    fail_box.set_halign(Align::Center);
+    fail_box.append(&fail_heading);
+    fail_box.append(&fail_body);
+    fail_box.append(&fail_tips);
+    fail_box.set_visible(false);
+
     let done_btn = Button::with_label("Done");
     let retry_btn = Button::with_label("Retry");
     let done_box = gtk::Box::new(Orientation::Horizontal, 10);
@@ -379,6 +426,7 @@ pub fn launch(
     header.set_margin_top((screen_height() as f64 * 0.30) as i32);
     header.append(&instr);
     header.append(&eye_preview_box);
+    header.append(&fail_box);
     header.append(&done_box);
     header.append(&cancel);
 
@@ -414,13 +462,18 @@ pub fn launch(
         let b = begin_calibration.clone();
         continue_btn.connect_clicked(move |_| b());
     }
+    // Retry always restarts straight into point collection (mints a fresh
+    // token, sends `CalBegin`, and lands in `Phase::Starting`) — there is no
+    // eye-preview/chooser step left to route back through on the failure
+    // path (Tasks 6/7 removed it). This is a GTK signal callback, not the
+    // tick loop, so it holds no pre-existing `phase` borrow: calling
+    // `begin_calibration_phase` (which never touches `phase`) and assigning
+    // its result is safe, matching `begin_calibration`'s own pattern above.
     {
         let phase = phase.clone();
+        let cmd_tx = cmd_tx.clone();
         retry_btn.connect_clicked(move |_| {
-            *phase.borrow_mut() = Phase::EyePreview {
-                ticks: 0,
-                centered_ticks: 0,
-            }
+            *phase.borrow_mut() = begin_calibration_phase(&cmd_tx, eye);
         });
     }
     // Every exit routes through `win.close()` so the single close handler below
@@ -686,6 +739,7 @@ pub fn launch(
             &eye_preview_box,
             &continue_btn,
             &done_box,
+            &fail_box,
             &retry_btn,
             &cancel,
         );
