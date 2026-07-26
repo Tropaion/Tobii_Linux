@@ -38,7 +38,7 @@ standalone and the device keeps streaming afterward).
 | `0x42f` compute | `cal_compute_payload` | `00 00` |
 | `0x44c` retrieve | `cal_retrieve_payload` | `00 00` → response is the blob |
 | `0x456` apply | `cal_apply_payload(blob)` | `00 00` + raw blob bytes (no TLV header) |
-| `0x438` discard_point | (memory) | `00 00` + Q42(x) + Q42(y) |
+| `0x438` discard_point | `cal_discard_point_payload(x, y)` | `00 00` + Q42(x) + Q42(y) — no eye arg |
 
 `x`/`y` are normalized display coordinates in `[0,1]`. `eye` is
 **`0 = both, 1 = left, 2 = right`** (NB: this is a *different* enum from the
@@ -54,38 +54,54 @@ standard calibration therefore does not by itself enable single-eye detection.
 
 ## Point sets
 
-Normalized, top-left origin `[0,1]`, center-first order **[CODE-VERIFIED]**
-(memory):
+Normalized, top-left origin `[0,1]`, center-first order. The GTK follow-the-dot
+flow uses a single **7-point** layout — `CalMode::Full`/`FULL_7` in
+`calibrate_flow.rs` — verified byte-for-byte against the decompiled real Windows
+software's `CalibrationStateManager` constructor default: `(.5,.5) (.1,.9)
+(.5,.1) (.9,.9) (.1,.1) (.5,.9) (.9,.1)`. **[CODE-VERIFIED]**.
 
-- **5-point (Quick / Guest):** `(.5,.5) (.1,.9) (.5,.1) (.9,.9) (.5,.5)` — center
-  repeated first and last.
-- **9-point (Full):** `(.5,.5) (.1,.9) (.5,.1) (.9,.9) (.1,.1) (.5,.9) (.9,.1)
-  (.1,.5) (.9,.5)`.
+> Historical note: earlier revisions of this flow had a Quick/Full mode chooser
+> (a 5-point set and a 9-point set). Both were removed — the real product has no
+> such picker in its captured flow; it always runs the same 7-point sequence,
+> for both first-time setup and manual recalibration.
 
 The headless CLI (`tobii calibrate`) uses its own 5-point set
 `(.5,.5) (.1,.1) (.9,.1) (.1,.9) (.9,.9)` and draws no dots — it validates the
 protocol, not accuracy. The accurate flow is the GTK follow-the-dot UI.
 **[CONFIRMED]** — `main.rs::CAL_POINTS`.
 
-## Per-point timing — resolved live
+## Per-point timing — gaze-verified, not a blind timer
 
 `add_point` **acks almost immediately** — it does **not** block while the device
 gathers samples, contrary to what the decompiled managed layer (`Task.Delay(200)`
 then a "blocking" collect) implied. **[CONFIRMED]** live 2026-07-21 (commit
-`6837d24`): a follow-the-dot run flew through all five points in ~1.5 s and every
-sample was taken mid-saccade, producing a garbage calibration — proof the device
-was not waiting.
+`6837d24`): an early follow-the-dot run flew through all five points in ~1.5 s
+and every sample was taken mid-saccade, producing a garbage calibration — proof
+the device was not waiting.
 
-Consequence: **the fixation dwell must be enforced host-side.** The GTK flow
-holds each dot for ~330 ms (saccade settle) + ~1.2 s (dwell) before it sends the
-single `add_point` for that point. The `CAL_POINT_TIMEOUT` = 30 s in
-`connection.rs` is now only a defensive upper bound (never reached in practice),
-not evidence of device-side blocking. Exactly one `add_point` is sent per point;
-there is no host-side sample loop.
+The GTK flow's first response to this (a fixed host-side dwell — settle, then
+hold for a set duration regardless of gaze, then sample) shipped initially but
+turned out to have the same underlying flaw as the "blocking" assumption it
+replaced: neither actually confirms the user is looking at the dot when the
+sample is taken. **This was replaced** with genuine gaze-verified capture,
+matching the decompiled original's real mechanism (`CalibrationProcessViewModel`):
+a live `gaze_point_2d` reading (already streamed by the device, no personal
+calibration required first) is checked against a proximity zone around the
+current point (`focus::zone_radius`/`closest_focused_point`); `add_point` is
+only sent once gaze has been continuously confirmed in that zone for
+`SETTLE_TICKS` (~330 ms, tolerating brief gaps up to `GAZE_GAP_TOLERANCE_TICKS`
+so a blink doesn't reset progress); if gaze leaves the zone again while waiting
+for the device's ack, `discard_point` (`0x438`) is sent and the same point
+retries from scratch rather than silently keeping a bad sample. `CAL_POINT_TIMEOUT`
+= 30 s in `connection.rs` remains a defensive upper bound (rarely reached), not
+evidence of device-side blocking. See `crates/tobii-gtk/src/calibrate_flow.rs`'s
+`Phase::Collecting` and `crates/tobii-gtk/src/focus.rs`.
 
 > Historical note: the memory note `et5-calibration-protocol` and the
 > `add_calibration_point` doc originally said the call *blocks* — that was the
 > pre-hardware hypothesis from the decompile, disproven by the live run above.
+> A later revision then assumed a fixed host-side dwell was sufficient in its
+> place — that too was superseded, by the gaze-verified mechanism described here.
 
 ## Session / realm
 

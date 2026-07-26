@@ -96,9 +96,12 @@ const EXPLODE_DURATION_TICKS: u32 = 18;
 // will not dequeue the abort for the remaining difference — the window in which
 // a queued CalBegin/CalFinish can still land on a session the UI has abandoned.
 //
-// `CalBegin` runs set_enabled_eye + start + clear, three requests each bounded
-// by `tobii-usb` DEFAULT_REQUEST_TIMEOUT (10 s).
-const START_TIMEOUT_TICKS: u32 = 1000; // ~33 s waiting for the device to ack CalBegin
+// `CalBegin` runs set_enabled_eye + retrieve_calibration + start + clear +
+// (conditionally) apply_calibration — up to five requests, each bounded by
+// `tobii-usb` DEFAULT_REQUEST_TIMEOUT (10 s). (Grew from three to five when
+// "Improve calibration" seeding was added — this budget must stay in step
+// with whatever `CalBegin`'s handler in `device.rs` actually does.)
+const START_TIMEOUT_TICKS: u32 = 2000; // ~66 s waiting for the device to ack CalBegin
 
 // One point is bounded by `tobii-usb` CAL_POINT_TIMEOUT (30 s) — keep this
 // above it, or a point the USB layer would still have acked is failed here.
@@ -290,14 +293,23 @@ fn update_ui(phase: &Phase, instr: &Label, w: &FlowWidgets) {
             w.cancel.set_visible(true);
         }
         Phase::Collecting {
-            index, mode, ticks, ..
+            index,
+            mode,
+            in_zone_ticks,
+            requested,
+            ..
         } => {
             let progress = format!("point {} of {}", index + 1, mode.points().len());
-            // Once the saccade has landed the ring is counting down to the
-            // sample, so fixation matters from here on. (`requested` is true
-            // only for a blink — the device acks instantly — so it is the dwell,
-            // not the request, that the hint must track.)
-            instr.set_text(&if *ticks >= SETTLE_TICKS {
+            // Fixation matters once gaze is actually confirmed in the
+            // target's zone (or a sample has already been requested) — NOT
+            // once overall elapsed time on this point crosses a threshold.
+            // Before gaze-verified capture, `ticks` alone was a reliable
+            // proxy for "the user is looking" (the old blind timer always
+            // captured within ~1.5s of arrival regardless of gaze); now
+            // `in_zone_ticks` can stay 0 indefinitely if the user hasn't
+            // looked at the dot yet, so checking `ticks` here would tell
+            // them to "hold still" before they've even found it.
+            instr.set_text(&if *in_zone_ticks > 0 || *requested {
                 format!("Hold still — keep looking at the dot  ·  {progress}")
             } else {
                 format!("Follow the dot with your eyes  ·  {progress}")
@@ -869,6 +881,28 @@ pub fn launch(
                     // ack? (If `in_zone_ticks` was already 0 before this tick,
                     // there was no streak to lose — don't re-trigger a discard
                     // on every subsequent still-out-of-zone tick.)
+                    //
+                    // KNOWN LIMITATION: this can only see a lost streak using
+                    // `state.latest_gaze`, which the device thread only
+                    // refreshes between commands (`device_tick` drains its
+                    // whole command queue, including any blocking
+                    // `CalCollect`/`CalDiscard` USB round-trip, before it next
+                    // reads notifications — see `device.rs`). While a
+                    // `CalCollect` this tick loop just sent is still in
+                    // flight, `latest_gaze` is frozen at whatever it was when
+                    // that command was sent (which showed the user in-zone —
+                    // that's why the sample was requested), so a real
+                    // look-away during an unusually slow ack cannot be
+                    // detected until the NEXT fresh gaze sample arrives, by
+                    // which point the ack may have already landed and
+                    // advanced `index`. In measured practice `add_point` acks
+                    // near-instantly (see the HARDWARE-OBSERVED comment
+                    // above), so this blind spot is normally far under one
+                    // tick; it only widens on unusually slow hardware/USB
+                    // latency, up to `CAL_POINT_TIMEOUT` (30s, `tobii-usb`).
+                    // Closing it fully would need gaze visibility during a
+                    // blocking device call (e.g. a non-blocking request path)
+                    // — out of scope here, but worth knowing this exists.
                     let lost_focus_while_requested =
                         requested && new_in_zone_ticks == 0 && in_zone_ticks > 0;
 
