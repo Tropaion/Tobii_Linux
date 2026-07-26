@@ -32,6 +32,18 @@ pub const RADIUS_SIZE_MODIFIER: f64 = 0.45;
 /// staying on the same target) — matches the original's ~150ms
 /// `WouldItBeSuitableToChange` debounce, expressed in ticks at this app's
 /// 33ms/tick cadence (150/33 ≈ 4.5, round to 5).
+///
+/// Currently unused by `calibrate_flow.rs`: that flow presents one
+/// calibration dot at a time, so its `calibrated_mask` excludes every point
+/// except the one currently on screen, and [`closest_focused_point`] can only
+/// ever return `Some(index)` (that one live target) or `None` — there is no
+/// "different point" for gaze to change TO, so no change-of-target to
+/// debounce. `GAZE_GAP_TOLERANCE_TICKS` in `calibrate_flow.rs` instead covers
+/// the analogous noise-tolerance need for a single target (a brief gaze gap
+/// while still on the one dot). This constant stays public and tested for a
+/// future UI that shows several calibration targets simultaneously (as the
+/// decompiled original does), where a real change-of-target debounce would
+/// apply.
 pub const FOCUS_CHANGE_DEBOUNCE_TICKS: u32 = 5;
 
 /// Aspect-ratio-corrected Euclidean distance between two normalized `[0,1]`

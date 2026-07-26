@@ -855,7 +855,21 @@ pub fn launch(
                         // WITHOUT advancing `index` — this is the actual fix
                         // for the reported bug (a sample taken while the user
                         // looked away is no longer silently accepted).
-                        let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
+                        //
+                        // Re-check with a FRESH read, not the tick-start `cal`
+                        // snapshot: `CalCollect`/`CalDiscard` are FIFO on the
+                        // same device-thread queue, so if the device's ack for
+                        // this point actually landed in the gap between this
+                        // tick's snapshot and now, discarding it anyway would
+                        // silently throw away an already-accepted sample.
+                        // Skipping the discard here when the fresh read shows
+                        // it already collected closes that race; the normal
+                        // `cal.collected > index` branch above will pick up
+                        // the advance on a later tick.
+                        let already_collected = state.lock().unwrap().calibration.collected > index;
+                        if !already_collected {
+                            let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
+                        }
                         next = Some(Phase::Collecting {
                             token,
                             mode,
