@@ -96,7 +96,20 @@ fn group_zone_radii(points: &[(f64, f64); 7], aspect: f64) -> [f64; 7] {
 // `focus::closest_focused_point`) before we sample it" rather than "how long
 // to wait after arrival regardless of gaze" — the actual fix for the reported
 // bug (dots exploding whether or not the user was looking at them).
-const SETTLE_TICKS: u32 = 10; // ~330 ms of continuously-confirmed in-zone gaze
+//
+// USER-FEEDBACK (2026-07-26): raised from 10 to 30 (~330ms -> ~990ms, roughly
+// a full second) after direct hands-on comparison against the real Windows
+// product: the 10-tick figure captured "too fast", reading as instantaneous
+// rather than a deliberate hold ("user should have to focus a bit longer,
+// like in the original"). Unlike `EXPLODE_DURATION_TICKS` below (matched
+// byte-for-byte against the decompiled particle-storyboard timing), this
+// duration is NOT independently ground-truth-verified — the real per-point
+// dwell/sampling duration lives inside the native SDK's blocking
+// `add_calibration_point` call, not in the decompiled managed layer (whose
+// own `CalibratePointAsync` shows only a 200ms `Task.Delay` before invoking
+// that native call, which says nothing about real-hardware dwell time). 30
+// is a reasoned response to hands-on feedback, not a decompiled figure.
+const SETTLE_TICKS: u32 = 30; // ~990 ms of continuously-confirmed in-zone gaze
 
 // How long a gaze-data gap (blink, brief tracking dropout) is tolerated
 // without resetting the in-zone confirmation streak — matches the
