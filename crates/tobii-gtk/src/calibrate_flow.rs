@@ -25,11 +25,12 @@ use crate::{
 use tobii_protocol::gaze::present;
 use tobii_protocol::EnabledEye;
 
-/// The 7-point calibration layout (normalized, top-left origin). Measured from
-/// the captured official screenshots: center, then a row of 3 across the top
-/// inset from the edges, then a row of 3 across the bottom inset from the edges.
-/// Order: center first (matches the captured flow's first visible dot), then top
-/// row left-to-right, then bottom row left-to-right.
+/// The 7-point calibration layout (normalized, top-left origin), verified
+/// byte-for-byte against the decompiled real Windows software's
+/// `CalibrationStateManager` constructor default (see the Phase 3 plan's Context
+/// section for decompilation details). Order: center first, then six corner/edge
+/// points spread across the screen with edge-aligned coordinates (not an inset
+/// grid — these are the exact values from ground truth).
 ///
 /// These are deliberately **not** run through `tobii_config::correct_gaze_x`,
 /// even on a curved screen: during calibration the device's flat-plane model is
@@ -39,12 +40,12 @@ use tobii_protocol::EnabledEye;
 /// `overlay.rs`).
 pub const FULL_7: [(f64, f64); 7] = [
     (0.5, 0.5),
-    (0.3, 0.1),
+    (0.1, 0.9),
     (0.5, 0.1),
-    (0.7, 0.1),
-    (0.3, 0.9),
+    (0.9, 0.9),
+    (0.1, 0.1),
     (0.5, 0.9),
-    (0.7, 0.9),
+    (0.9, 0.1),
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -985,13 +986,13 @@ mod tests {
         let pts = CalMode::Full.points();
         // Center first
         assert_eq!(pts[0], (0.5, 0.5), "point 0: center");
-        // Top row (y=0.1), left-to-right
-        assert_eq!(pts[1], (0.3, 0.1), "point 1: top-left");
+        // First group of three corner/edge points
+        assert_eq!(pts[1], (0.1, 0.9), "point 1: bottom-left");
         assert_eq!(pts[2], (0.5, 0.1), "point 2: top-center");
-        assert_eq!(pts[3], (0.7, 0.1), "point 3: top-right");
-        // Bottom row (y=0.9), left-to-right
-        assert_eq!(pts[4], (0.3, 0.9), "point 4: bottom-left");
+        assert_eq!(pts[3], (0.9, 0.9), "point 3: bottom-right");
+        // Second group of three corner/edge points
+        assert_eq!(pts[4], (0.1, 0.1), "point 4: top-left");
         assert_eq!(pts[5], (0.5, 0.9), "point 5: bottom-center");
-        assert_eq!(pts[6], (0.7, 0.9), "point 6: bottom-right");
+        assert_eq!(pts[6], (0.9, 0.1), "point 6: top-right");
     }
 }
