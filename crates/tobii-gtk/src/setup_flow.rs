@@ -443,9 +443,9 @@ enum Phase {
 }
 
 /// Open the fullscreen display-setup flow window, returning it so the caller
-/// can react to it closing (mirrors `calibrate_flow::launch`/`fine_tune::launch`
-/// — needed by the hub's forced-setup path, which re-enables itself only once
-/// this window closes).
+/// can react to it closing (mirrors `calibrate_flow::launch` — needed by the
+/// hub's forced-setup path, which re-enables itself only once this window
+/// closes).
 pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::ApplicationWindow {
     // Seed from EDID when we can: the saved/default config supplies the pose
     // (tilt + offsets), the detected monitor overrides the physical size, which
