@@ -274,14 +274,17 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool
             let _ = cr.fill();
         }
 
-        // Expanding, thinning shockwave ring: uses the exact same ease-out
-        // curve and `DISTANCE_SCALE` as `particles::particle_pos` so its reach
-        // can never visually drift out of sync with how far the particles
-        // themselves travel. Kept subtle (max alpha 0.5) so it reads as a
+        // Expanding, thinning shockwave ring: uses the exact same CircleEase
+        // ease-out curve and `DISTANCE_SCALE` as `particles::particle_pos` so
+        // its reach can never visually drift out of sync with how far the
+        // particles themselves travel. Its own fade is a simple ease-in (not
+        // the particles' per-particle staggered linear fade) since it's a
+        // single shape, not 20 independent particles needing to desynchronize
+        // from each other. Kept subtle (max alpha 0.5) so it reads as a
         // supporting ring, not a dominant shape.
         let ring_alpha = (1.0 - t * t).max(0.0) * 0.5;
         if ring_alpha > 0.0 {
-            let ring_r = (1.0 - (1.0 - t) * (1.0 - t)) * particles::DISTANCE_SCALE;
+            let ring_r = (1.0 - (1.0 - t) * (1.0 - t)).sqrt() * particles::DISTANCE_SCALE;
             cr.set_source_rgba(1.0, 1.0, 1.0, ring_alpha);
             cr.set_line_width(2.5 * (1.0 - t));
             cr.arc(cx, cy, ring_r, 0.0, std::f64::consts::TAU);
