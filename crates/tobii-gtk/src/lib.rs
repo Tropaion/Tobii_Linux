@@ -10,6 +10,7 @@ pub mod device;
 pub mod eye_preview;
 pub mod eyeview;
 pub mod fine_tune;
+pub mod focus;
 pub mod overlay;
 pub mod particles;
 pub mod screen_pick;
