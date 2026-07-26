@@ -20,7 +20,8 @@ use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Ov
 use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
 use crate::eyeview::Guidance;
 use crate::{
-    add_escape_to_close, eye_preview, focus, particles, screen_aspect, screen_height, widget,
+    add_escape_to_close, calibration_area, eye_preview, focus, particles, screen_aspect,
+    screen_height, widget,
 };
 use tobii_protocol::gaze::present;
 use tobii_protocol::EnabledEye;
@@ -412,11 +413,29 @@ pub fn launch(
         .enabled_eye
         .unwrap_or(EnabledEye::Both);
 
+    // If the physical screen is large enough that gaze estimation near the
+    // literal edge isn't reliable pre-calibration, confine every calibration
+    // point to a centered sub-rectangle instead of the raw full-screen
+    // positions in `CalMode::Full.points()` (which otherwise puts 6 of 7
+    // points at the literal 0.1/0.9 screen edges) — matches the decompiled
+    // original's `CalibrationAreaCalculator`. `tobii_config::load()`'s
+    // failure/absence just means "use the full screen" (`cal_area = None`),
+    // matching this flow's existing behavior before this fix — calibration
+    // is only ever reachable after display setup has already succeeded, so
+    // this should always find a saved setup in practice.
+    let cal_area = tobii_config::load()
+        .ok()
+        .flatten()
+        .and_then(|s| calibration_area::capped_area(s.width_mm, s.height_mm));
+    let raw_points = CalMode::Full.points();
+    let cal_points: [(f64, f64); 7] =
+        std::array::from_fn(|i| calibration_area::remap_point(raw_points[i], cal_area));
+
     // The proximity radius gaze must fall within to count as "on" a point —
-    // constant across the flow's lifetime (depends only on the point set and
-    // the screen's aspect ratio, neither of which change mid-session), so
-    // computed once here rather than every tick.
-    let zone_radius = focus::zone_radius(CalMode::Full.points(), screen_aspect());
+    // constant across the flow's lifetime (depends on the ACTUAL, possibly
+    // remapped point set and the screen's aspect ratio, neither of which
+    // change mid-session), so computed once here rather than every tick.
+    let zone_radius = focus::zone_radius(&cal_points, screen_aspect());
 
     let win = gtk::ApplicationWindow::builder()
         .application(app)
@@ -809,7 +828,7 @@ pub fn launch(
                         "Couldn't read a point: {e}. Make sure you're seated and looking at the dots."
                     ))));
                 } else if cal.collected > index {
-                    let pts = mode.points();
+                    let pts = &cal_points;
                     // A captured point always bursts, whether or not there's a
                     // next point to follow it — spawn it for the point that
                     // was JUST captured (the OLD `index`), before advancing.
@@ -838,7 +857,7 @@ pub fn launch(
                         });
                     }
                 } else {
-                    let (px, py) = mode.points()[index];
+                    let (px, py) = cal_points[index];
                     let t = ticks + 1;
 
                     // Is gaze right now confirmed within `index`'s proximity
@@ -861,7 +880,7 @@ pub fn launch(
                         .and_then(|g| {
                             focus::closest_focused_point(
                                 g,
-                                mode.points(),
+                                &cal_points,
                                 &calibrated_mask,
                                 zone_radius,
                                 screen_aspect(),
