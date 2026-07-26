@@ -225,13 +225,50 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool
         let (ox, oy) = exp.origin;
         let (cx, cy) = (ox * w, oy * h);
         let t = (exp.age_ticks as f64 / EXPLODE_DURATION_TICKS as f64).clamp(0.0, 1.0);
+
+        // Brief central flash: a soft white disc that shrinks and fades out
+        // over the burst's first ~35% — reads as the "pop" moment the
+        // particles are flying out from, drawn before them so they render on
+        // top of it rather than underneath.
+        let flash_t = (t / 0.35).min(1.0);
+        let flash_alpha = (1.0 - flash_t) * 0.6;
+        if flash_alpha > 0.0 {
+            let flash_r = 14.0 * (1.0 - flash_t);
+            cr.set_source_rgba(1.0, 1.0, 1.0, flash_alpha);
+            cr.arc(cx, cy, flash_r, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+
+        // Expanding, thinning shockwave ring: uses the exact same ease-out
+        // curve and `DISTANCE_SCALE` as `particles::particle_pos` so its reach
+        // can never visually drift out of sync with how far the particles
+        // themselves travel. Kept subtle (max alpha 0.5) so it reads as a
+        // supporting ring, not a dominant shape.
+        let ring_alpha = (1.0 - t * t).max(0.0) * 0.5;
+        if ring_alpha > 0.0 {
+            let ring_r = (1.0 - (1.0 - t) * (1.0 - t)) * particles::DISTANCE_SCALE;
+            cr.set_source_rgba(1.0, 1.0, 1.0, ring_alpha);
+            cr.set_line_width(2.5 * (1.0 - t));
+            cr.arc(cx, cy, ring_r, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+        }
+
         for p in particles::burst(exp.seed) {
             let (dx, dy, alpha) = particles::particle_pos(t, p);
             if alpha <= 0.0 {
                 continue;
             }
-            cr.set_source_rgba(0.30, 0.85, 0.85, alpha); // same teal accent as the dot/ring
-            cr.arc(cx + dx, cy + dy, p.size, 0.0, std::f64::consts::TAU);
+            // Blend the base teal toward white by this particle's own
+            // `brightness` draw, so the burst isn't perfectly uniform dots.
+            let base = (0.30, 0.85, 0.85);
+            let r = base.0 + (1.0 - base.0) * p.brightness;
+            let g = base.1 + (1.0 - base.1) * p.brightness;
+            let b = base.2 + (1.0 - base.2) * p.brightness;
+            cr.set_source_rgba(r, g, b, alpha);
+            // Shrinks to 70% by t=0.5, floored at 30% of its original size so
+            // it doesn't vanish to a point before it's fully faded.
+            let size_now = p.size * (1.0 - 0.5 * t).max(0.3);
+            cr.arc(cx + dx, cy + dy, size_now, 0.0, std::f64::consts::TAU);
             let _ = cr.fill();
         }
     }
