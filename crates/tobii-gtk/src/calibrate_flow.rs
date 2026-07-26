@@ -479,24 +479,24 @@ pub fn launch(
     // screenshots): a heading, a short body line, and a bulleted tips list —
     // shown instead of the raw error string when calibration fails (see
     // `update_ui`'s `Phase::Done` arm).
-    let fail_heading = Label::new(Some("Oops. Nothing found."));
+    let fail_heading = Label::new(Some("Oops. No detection."));
     fail_heading.add_css_class("cal-fail-heading");
     fail_heading.set_halign(Align::Center);
     fail_heading.set_justify(gtk::Justification::Center);
     fail_heading.set_wrap(true);
 
     let fail_body = Label::new(Some(
-        "Sorry, the eye tracker can't find your eyes. Let's try again. Here are some tips:",
+        "Sorry about this, but the eye tracker can't detect your eyes. Let's try again and maybe follow these tips:",
     ));
     fail_body.set_halign(Align::Center);
     fail_body.set_justify(gtk::Justification::Center);
     fail_body.set_wrap(true);
 
     let fail_tips = Label::new(Some(
-        "• Look at the point until it explodes.\n\
-         • If you wear glasses, please clean them.\n\
-         • Avoid bright, direct light for the tracker and your eyes.\n\
-         • Relax, you're allowed to blink.",
+        "• Keep looking at the dot until it explodes.\n\
+         • Bright and direct light is no friend of the eye tracker or your eyes. Try to avoid it.\n\
+         • Remember to relax, it's ok to blink.\n\
+         • If you're wearing glasses, give them a wipe.",
     ));
     fail_tips.add_css_class("cal-fail-tips");
     fail_tips.set_halign(Align::Center);
@@ -525,7 +525,7 @@ pub fn launch(
     fail_box.set_visible(false);
 
     let done_btn = Button::with_label("Done");
-    let retry_btn = Button::with_label("Retry");
+    let retry_btn = Button::with_label("Try again");
     let done_box = gtk::Box::new(Orientation::Horizontal, 10);
     done_box.set_halign(Align::Center);
     done_box.append(&retry_btn);
