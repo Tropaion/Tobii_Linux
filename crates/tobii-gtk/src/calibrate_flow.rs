@@ -976,6 +976,13 @@ pub fn launch(
                                 seed: token ^ (captured as u64),
                                 age_ticks: 0,
                             });
+                            // Drop the just-captured point from the displayed
+                            // set immediately, in this same tick — otherwise
+                            // it would still render its dwell ring for one
+                            // extra frame alongside its own explosion, since
+                            // `d.points` is only otherwise recomputed in the
+                            // no-capture-this-tick branch below.
+                            d.points.retain(|gp| gp.point != cal_points[captured]);
                         }
 
                         let group_done = active_group.iter().all(|&i| calibrated[i]);
