@@ -130,6 +130,14 @@ pub enum DeviceCommand {
         x: f64,
         y: f64,
     },
+    /// "Redo" a point: tell the device to discard whatever it collected for
+    /// (x, y), so a later `CalCollect` for the same coordinates starts fresh.
+    /// Best-effort — `discard_calibration_point` is reverse-engineered and
+    /// unverified on real hardware; a failure here does not abort the session.
+    CalDiscard {
+        x: f64,
+        y: f64,
+    },
     /// Compute + apply + stop + retrieve + persist. `mode` is the calibration
     /// mode's label ("quick"/"full"), recorded into the saved `CalMeta` — a
     /// plain `String` rather than `calibrate_flow::CalMode` so this
@@ -187,6 +195,11 @@ pub fn device_tick<T: Transport>(
                     .add_calibration_point(x, y, 0)
                     .map_err(|e| e.to_string());
                 state.lock().unwrap().calibration.on_collect(r);
+            }
+            DeviceCommand::CalDiscard { x, y } => {
+                if let Err(e) = conn.discard_calibration_point(x, y) {
+                    eprintln!("warning: could not discard calibration point ({e})");
+                }
             }
             DeviceCommand::CalFinish { mode } => {
                 let (r, stop_acked) = finish_calibration(conn, &mode);

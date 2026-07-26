@@ -2,7 +2,9 @@
 //! `eye_preview`); once the user holds a centered position for a moment (or
 //! taps "Continue anyway") it auto-advances into the follow-the-dot sequence,
 //! where each point is sampled by the device thread (see
-//! `device::DeviceCommand::Cal*`). The point sets + `CalMode` are unit-tested;
+//! `device::DeviceCommand::Cal*`) once the user's own gaze has been verified
+//! (see `focus`) to actually be on the presented point — capture is no longer
+//! a blind elapsed-time timer. The point sets + `CalMode` are unit-tested;
 //! the GTK window + cairo dot/eye-preview are live-validated.
 
 use std::cell::{Cell, RefCell};
@@ -17,7 +19,10 @@ use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Ov
 
 use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
 use crate::eyeview::Guidance;
-use crate::{add_escape_to_close, eye_preview, particles, screen_height, widget};
+use crate::{
+    add_escape_to_close, eye_preview, focus, particles, screen_aspect, screen_height, widget,
+};
+use tobii_protocol::gaze::present;
 use tobii_protocol::EnabledEye;
 
 /// The 7-point calibration layout (normalized, top-left origin). Measured from
@@ -61,15 +66,22 @@ impl CalMode {
 }
 
 // Tick cadence is 33 ms (~30 fps), matching the hub.
-const SETTLE_TICKS: u32 = 10; // ~330 ms for the saccade to the new dot to land
-
+//
 // HARDWARE-OBSERVED (2026-07-21): the ET5 acks add_calibration_point almost
 // immediately — it does NOT block while gathering samples, contrary to what the
-// original's managed layer implied. So the fixation dwell is entirely ours to
-// enforce: without it the whole 5-point set flew past in ~1.5 s and every
-// sample was taken mid-saccade, before the user could even look at the dot.
-const DWELL_TICKS: u32 = 36; // ~1.2 s holding the target before we sample it
-const SAMPLE_AT_TICKS: u32 = SETTLE_TICKS + DWELL_TICKS;
+// original's managed layer implied. So the fixation wait is entirely ours to
+// enforce: without it a sample could be taken mid-saccade, before the user
+// could even look at the dot. `SETTLE_TICKS` now means "how long gaze must be
+// CONTINUOUSLY confirmed within the current point's proximity zone (see
+// `focus::closest_focused_point`) before we sample it" rather than "how long
+// to wait after arrival regardless of gaze" — the actual fix for the reported
+// bug (dots exploding whether or not the user was looking at them).
+const SETTLE_TICKS: u32 = 10; // ~330 ms of continuously-confirmed in-zone gaze
+
+// How long a gaze-data gap (blink, brief tracking dropout) is tolerated
+// without resetting the in-zone confirmation streak — matches the
+// decompiled original's `GazeLeftInterval` (~250ms).
+const GAZE_GAP_TOLERANCE_TICKS: u32 = 8;
 
 // The captured-point particle burst outlives the dwell it followed — it keeps
 // animating concurrently with the next point fading in (or, on the last
@@ -127,7 +139,25 @@ enum Phase {
         token: u64,
         mode: CalMode,
         index: usize,
+        /// Ticks gaze has been CONTINUOUSLY confirmed within the current
+        /// point's proximity zone (see `focus::closest_focused_point`) — the
+        /// actual fix for the reported bug: capture no longer fires on a blind
+        /// timer, only once this reaches `SETTLE_TICKS`. Resets to 0 once a
+        /// gaze-data gap has exceeded `GAZE_GAP_TOLERANCE_TICKS` (see
+        /// `gap_ticks`) — a single dropped/invalid frame does not reset it.
+        in_zone_ticks: u32,
+        /// Ticks since the gaze-in-zone confirmation was last true this tick —
+        /// used only to decide when a gap has exceeded `GAZE_GAP_TOLERANCE_TICKS`
+        /// (at which point `in_zone_ticks` resets). Reset to 0 whenever gaze IS
+        /// confirmed in-zone.
+        gap_ticks: u32,
+        /// True once `CalCollect` has been sent for `index` and we're waiting
+        /// for the device to ack it (`cal.collected > index`).
         requested: bool,
+        /// Overall ticks spent on this point since it was first shown — bounds
+        /// the point by `COLLECT_TIMEOUT_TICKS` regardless of gaze state (a
+        /// user who never looks at the dot at all must still eventually time
+        /// out, same safety property as before this task).
         ticks: u32,
     },
     Computing {
@@ -356,6 +386,12 @@ pub fn launch(
         .unwrap()
         .enabled_eye
         .unwrap_or(EnabledEye::Both);
+
+    // The proximity radius gaze must fall within to count as "on" a point —
+    // constant across the flow's lifetime (depends only on the point set and
+    // the screen's aspect ratio, neither of which change mid-session), so
+    // computed once here rather than every tick.
+    let zone_radius = focus::zone_radius(CalMode::Full.points(), screen_aspect());
 
     let win = gtk::ApplicationWindow::builder()
         .application(app)
@@ -672,6 +708,8 @@ pub fn launch(
                         token,
                         mode,
                         index: 0,
+                        in_zone_ticks: 0,
+                        gap_ticks: 0,
                         requested: false,
                         ticks: 0,
                     });
@@ -691,11 +729,20 @@ pub fn launch(
                 token,
                 mode,
                 index,
+                in_zone_ticks,
+                gap_ticks,
                 requested,
                 ticks,
             } => {
-                let (token, mode, index, requested, ticks) =
-                    (*token, *mode, *index, *requested, *ticks);
+                let (token, mode, index, in_zone_ticks, gap_ticks, requested, ticks) = (
+                    *token,
+                    *mode,
+                    *index,
+                    *in_zone_ticks,
+                    *gap_ticks,
+                    *requested,
+                    *ticks,
+                );
                 if cal.token != token {
                     // Another session replaced ours — only reachable if a second
                     // flow window ever opened. Never act on counters that are not
@@ -736,6 +783,8 @@ pub fn launch(
                             token,
                             mode,
                             index: index + 1,
+                            in_zone_ticks: 0,
+                            gap_ticks: 0,
                             requested: false,
                             ticks: 0,
                         });
@@ -743,26 +792,99 @@ pub fn launch(
                 } else {
                     let (px, py) = mode.points()[index];
                     let t = ticks + 1;
+
+                    // Is gaze right now confirmed within `index`'s proximity
+                    // zone? This app shows one dot at a time, so the
+                    // `calibrated` mask excludes every point except the one
+                    // currently presented — `closest_focused_point` can only
+                    // ever return `Some(index)` or `None` here, never a
+                    // different index.
+                    let calibrated_mask: Vec<bool> =
+                        (0..mode.points().len()).map(|i| i != index).collect();
+                    let in_zone_now = state
+                        .lock()
+                        .unwrap()
+                        .latest_gaze
+                        .as_ref()
+                        .filter(|s| {
+                            s.has(present::GAZE_2D) && s.validity_l == 0 && s.validity_r == 0
+                        })
+                        .map(|s| (s.gaze_point_2d[0], s.gaze_point_2d[1]))
+                        .and_then(|g| {
+                            focus::closest_focused_point(
+                                g,
+                                mode.points(),
+                                &calibrated_mask,
+                                zone_radius,
+                                screen_aspect(),
+                            )
+                        })
+                        .is_some();
+
+                    let (new_in_zone_ticks, new_gap_ticks) = if in_zone_now {
+                        (in_zone_ticks + 1, 0)
+                    } else if gap_ticks + 1 < GAZE_GAP_TOLERANCE_TICKS {
+                        (in_zone_ticks, gap_ticks + 1) // brief gap: hold the streak
+                    } else {
+                        (0, gap_ticks + 1) // gap exceeded tolerance: streak lost
+                    };
+                    // Only meaningful once `requested` — did we just lose a
+                    // previously-held streak while waiting for the device's
+                    // ack? (If `in_zone_ticks` was already 0 before this tick,
+                    // there was no streak to lose — don't re-trigger a discard
+                    // on every subsequent still-out-of-zone tick.)
+                    let lost_focus_while_requested =
+                        requested && new_in_zone_ticks == 0 && in_zone_ticks > 0;
+
                     {
                         let mut d = dot.borrow_mut();
                         d.point = Some((px, py));
                         d.progress = if requested {
                             1.0
                         } else {
-                            (t.saturating_sub(SETTLE_TICKS) as f64) / (DWELL_TICKS as f64)
+                            (new_in_zone_ticks as f64 / SETTLE_TICKS as f64).clamp(0.0, 1.0)
                         };
                         d.fade_in = (t as f64 / SETTLE_TICKS as f64).clamp(0.0, 1.0);
                     }
-                    if !requested && t >= SAMPLE_AT_TICKS {
+
+                    if lost_focus_while_requested {
+                        // The original's FocusChangedDuringCalibration ->
+                        // discard+retry: the device may still be mid-collect
+                        // for this point; ask it to discard whatever it
+                        // gathered and restart the settle wait from zero,
+                        // WITHOUT advancing `index` — this is the actual fix
+                        // for the reported bug (a sample taken while the user
+                        // looked away is no longer silently accepted).
+                        let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
+                        next = Some(Phase::Collecting {
+                            token,
+                            mode,
+                            index,
+                            in_zone_ticks: 0,
+                            gap_ticks: 0,
+                            requested: false,
+                            ticks: t,
+                        });
+                    } else if !requested && new_in_zone_ticks >= SETTLE_TICKS {
                         let _ = tick_cmd.send(DeviceCommand::CalCollect { x: px, y: py });
                         next = Some(Phase::Collecting {
                             token,
                             mode,
                             index,
+                            in_zone_ticks: new_in_zone_ticks,
+                            gap_ticks: new_gap_ticks,
                             requested: true,
-                            ticks: 0,
+                            ticks: t,
                         });
-                    } else if requested && t >= COLLECT_TIMEOUT_TICKS {
+                    } else if t >= COLLECT_TIMEOUT_TICKS {
+                        // Applies REGARDLESS of `requested` now (a deliberate
+                        // behavior change from before this task): previously
+                        // this timeout only fired while `requested`, because
+                        // the old blind timer always reached `requested=true`
+                        // within ~1.5s regardless of gaze. Now a user who
+                        // never looks at the dot at all could otherwise wait
+                        // here forever — this ceiling must still catch that
+                        // case.
                         let _ = tick_cmd.send(DeviceCommand::CalAbort);
                         next = Some(done_phase(Err("Timed out reading a point.".into())));
                     } else {
@@ -770,6 +892,8 @@ pub fn launch(
                             token,
                             mode,
                             index,
+                            in_zone_ticks: new_in_zone_ticks,
+                            gap_ticks: new_gap_ticks,
                             requested,
                             ticks: t,
                         });

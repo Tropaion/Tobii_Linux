@@ -93,7 +93,7 @@ fn primary_monitor() -> Option<gtk::gdk::Monitor> {
 
 /// Aspect ratio (w/h) of the primary monitor, so the eye-position box mirrors
 /// the screen's shape (e.g. 21:9). Falls back to 16:9.
-fn screen_aspect() -> f64 {
+pub(crate) fn screen_aspect() -> f64 {
     primary_monitor()
         .map(|m| {
             let g = m.geometry();
