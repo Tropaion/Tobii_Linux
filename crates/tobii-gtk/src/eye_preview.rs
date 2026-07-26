@@ -23,7 +23,12 @@ pub const STUCK_FALLBACK_TICKS: u32 = 450;
 pub const CENTERED_GAP_TOLERANCE_TICKS: u32 = 15;
 
 /// Consecutive-tick threshold for leaving a shown `Guidance::Centered`
-/// message (matches the original's `MaxCountOfInvalidGazeDataFrom2To3`).
+/// message for anything OTHER than `Guidance::NoEyes` (matches the
+/// original's `MaxCountOfInvalidGazeDataFrom2To3`). A direct
+/// `Centered -> NoEyes` transition is gated by BOTH this AND
+/// `RETURN_TO_NO_EYES_DEBOUNCE_TICKS` (see `debounced_guidance`'s two
+/// sequential — not `else if` — checks), so it actually takes the longer
+/// threshold, not this one.
 pub const LEAVE_CENTERED_DEBOUNCE_TICKS: u32 = 11;
 /// Consecutive-tick threshold for falling all the way back to the `NoEyes`
 /// message from any other shown state (matches the original's
@@ -86,6 +91,11 @@ pub fn update_centered_streak(
 /// differed from `shown` (the caller tracks this: reset to 0 whenever
 /// `raw == shown`, else increment — see the call site in `calibrate_flow.rs`).
 /// Returns the guidance to actually display this tick.
+///
+/// Note the two threshold checks below are sequential `if`s, not
+/// `else if`-linked: a `Centered -> NoEyes` transition matches BOTH, so it is
+/// gated by the longer `RETURN_TO_NO_EYES_DEBOUNCE_TICKS` threshold even
+/// though it is also a "leaving Centered" case.
 pub fn debounced_guidance(raw: Guidance, shown: Guidance, unstable_ticks: u32) -> Guidance {
     if raw == shown {
         return shown;
@@ -333,6 +343,38 @@ mod tests {
                 RETURN_TO_NO_EYES_DEBOUNCE_TICKS + 5
             ),
             Guidance::NoEyes
+        );
+    }
+
+    #[test]
+    fn debounced_guidance_centered_to_no_eyes_requires_the_longer_threshold() {
+        // A direct Centered -> NoEyes transition matches BOTH sequential
+        // checks in debounced_guidance: "leaving Centered" (shown ==
+        // Centered) AND "falling back to NoEyes" (raw == NoEyes && shown !=
+        // NoEyes). Because the checks are separate `if`s, not `else if`s,
+        // clearing the shorter LEAVE_CENTERED_DEBOUNCE_TICKS gate (11) is not
+        // enough — the second check still blocks the switch until the
+        // longer RETURN_TO_NO_EYES_DEBOUNCE_TICKS threshold (49) is also
+        // met. This test guards against a future refactor accidentally
+        // turning these into `else if`s, which would let this transition
+        // through early.
+        assert_eq!(
+            debounced_guidance(
+                Guidance::NoEyes,
+                Guidance::Centered,
+                RETURN_TO_NO_EYES_DEBOUNCE_TICKS - 1
+            ),
+            Guidance::Centered,
+            "still short of the longer threshold: must stay held at Centered"
+        );
+        assert_eq!(
+            debounced_guidance(
+                Guidance::NoEyes,
+                Guidance::Centered,
+                RETURN_TO_NO_EYES_DEBOUNCE_TICKS
+            ),
+            Guidance::NoEyes,
+            "at the longer threshold: switches to NoEyes"
         );
     }
 
