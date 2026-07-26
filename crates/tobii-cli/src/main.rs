@@ -91,6 +91,15 @@ fn enabled_eye_cmd(which: Option<&str>) -> CmdResult {
 /// `start` then `stop` (NOT `clear`, which would wipe the calibration, and no
 /// compute, so nothing is written). Useful for checking that a device still
 /// accepts these ops standalone, independently of the GUI's calibration flow.
+///
+/// Also samples live gaze for a few seconds WHILE calibration mode is active,
+/// to check whether `gaze_point_2d` (the device's own point-of-regard
+/// estimate) stays valid and tracks where you're looking during a session.
+/// This is the exact signal the real Windows software uses (decompiled from
+/// `Tobii.Configuration.Common.dll`'s `CalibrationProcessViewModel.OnGazeData`)
+/// to detect when the user's gaze has actually landed on a stimulus point,
+/// instead of the fixed dwell timer this driver currently uses. If it comes
+/// back valid and plausible here, gaze-verified point capture is feasible.
 fn cal_probe() -> CmdResult {
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
@@ -102,8 +111,41 @@ fn cal_probe() -> CmdResult {
     eprintln!("probing calibration session ops (start -> stop; non-destructive)...");
     match conn.start_calibration() {
         Ok(()) => println!("  calibration_start (0x3f2): ACK"),
-        Err(e) => println!("  calibration_start (0x3f2): FAILED ({e})"),
+        Err(e) => {
+            println!("  calibration_start (0x3f2): FAILED ({e})");
+            return Ok(());
+        }
     }
+
+    eprintln!(
+        "sampling gaze_point_2d for 8s WHILE calibration mode is active — look around \
+         the screen (corners, center) and watch whether the values track. Ctrl-C stops \
+         early (calibration_stop below then will not run)."
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (mut total_frames, mut valid_frames) = (0u32, 0u32);
+    while Instant::now() < deadline {
+        let Some(s) = conn.next_gaze() else {
+            continue;
+        };
+        total_frames += 1;
+        let valid = s.has(present::GAZE_2D) && s.validity_l == 0 && s.validity_r == 0;
+        valid_frames += valid as u32;
+        println!(
+            "  t={:>12}  gaze=({:.4}, {:.4})  valL={} valR={}{}",
+            s.timestamp_us,
+            s.gaze_point_2d[0],
+            s.gaze_point_2d[1],
+            s.validity_l,
+            s.validity_r,
+            if valid { "" } else { "  (invalid)" }
+        );
+    }
+    println!(
+        "  summary: {valid_frames}/{total_frames} frames had a valid gaze_point_2d \
+         during calibration mode"
+    );
+
     match conn.stop_calibration() {
         Ok(()) => println!("  calibration_stop  (0x3fc): ACK"),
         Err(e) => println!("  calibration_stop  (0x3fc): FAILED ({e})"),
