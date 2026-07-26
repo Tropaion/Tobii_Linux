@@ -136,53 +136,22 @@ fn decode_eye(
     })
 }
 
-/// Resolve one eye's position for the current frame from its rolling history:
-/// use this frame's own reading directly if it's valid; otherwise hold the
-/// last known-good value if only one is available, or linearly extrapolate
-/// from the last two known-good values (frame-index-based — see
-/// `EyeHistory`'s doc comment), clamping the extrapolated position to
-/// `[0,1]`. Returns `None` only once the entire window has no valid sample.
+/// Resolve one eye's position for the current frame from its rolling
+/// history: use this frame's own reading if valid, otherwise hold the most
+/// recent valid reading from the buffer unchanged. Returns `None` only once
+/// every entry in the window is invalid (the eye has been genuinely lost for
+/// the whole window).
+///
+/// Deliberately does NOT extrapolate/project a new position from the trend
+/// of the last two valid samples: doing so let error grow with the gap
+/// length and could overshoot to the `[0,1]` clamp and get stuck there for
+/// the rest of the gap, reading as the eye position freezing at a wrong,
+/// extreme location instead of holding steady at its last known-good spot.
+/// The decompiled original's `EyesPositioningViewModel` has no position
+/// extrapolation either — it reads the raw position directly every frame and
+/// only debounces the discrete status *message* (not the coordinate itself).
 fn resolve_eye(buf: &VecDeque<Option<EyeSample>>) -> Option<EyeSample> {
-    // This frame's own reading is valid: no extrapolation needed.
-    if let Some(Some(latest)) = buf.back() {
-        return Some(*latest);
-    }
-
-    let n = buf.len();
-    // Scan for the two most recent valid entries (p2 = newer, p3 = older),
-    // excluding the just-pushed (guaranteed-`None`) current entry.
-    let mut p3: Option<(usize, EyeSample)> = None;
-    let mut p2: Option<(usize, EyeSample)> = None;
-    for (i, entry) in buf.iter().enumerate().take(n.saturating_sub(1)) {
-        if let Some(e) = entry {
-            p3 = p2;
-            p2 = Some((i, *e));
-        }
-    }
-
-    let (idx_p2, p2) = p2?;
-    let Some((idx_p3, p3)) = p3 else {
-        // Exactly one valid sample in the window: hold it, no slope to extrapolate.
-        return Some(p2);
-    };
-
-    // Frame-index-based gaps (NOT wall-clock time or velocity): how many
-    // frames since p2, and how many frames separated p3 from p2.
-    let gap_p2 = (n - 1 - idx_p2) as f32;
-    let gap_p2_p3 = (idx_p2 - idx_p3) as f32;
-
-    let x = (p2.pos[0] + (p2.pos[0] - p3.pos[0]) * gap_p2 / gap_p2_p3).clamp(0.0, 1.0);
-    let y = (p2.pos[1] + (p2.pos[1] - p3.pos[1]) * gap_p2 / gap_p2_p3).clamp(0.0, 1.0);
-    let distance_mm = match (p2.distance_mm, p3.distance_mm) {
-        (Some(d2), Some(d3)) => Some(d2 + (d2 - d3) * gap_p2 / gap_p2_p3),
-        (Some(d2), None) => Some(d2),
-        (None, _) => None,
-    };
-
-    Some(EyeSample {
-        pos: [x, y],
-        distance_mm,
-    })
+    buf.iter().rev().find_map(|e| *e)
 }
 
 /// Push one frame's decoded (or absent) sample onto an eye's history buffer,
@@ -442,44 +411,42 @@ mod tests {
     }
 
     #[test]
-    fn extrapolates_in_the_direction_of_movement() {
-        // Two valid samples showing movement (raw x decreasing => mirrored x
-        // increasing), then a gap: the extrapolated position must continue
-        // moving in that same direction, by the expected amount.
+    fn gap_holds_steady_instead_of_continuing_the_trend() {
+        // Two valid samples showing clear movement (raw x decreasing =>
+        // mirrored x increasing), then a gap: the held position must equal
+        // the second valid frame's position exactly, NOT continue moving
+        // further along that trend (that was the old extrapolation
+        // behavior, which is now deliberately gone).
         let mut hist = EyeHistory::new();
         hist.update(&sample([0.7, 0.5, 0.5], [0.7, 0.5, 0.5], 680.0, true)); // mirrored x=0.3
         let v_second = hist.update(&sample([0.6, 0.5, 0.5], [0.6, 0.5, 0.5], 680.0, true)); // mirrored x=0.4
         let v_gap = hist.update(&sample([0.6, 0.5, 0.5], [0.6, 0.5, 0.5], 680.0, false));
 
-        let x_second = v_second.left.unwrap()[0];
-        let x_extrapolated = v_gap.left.unwrap()[0];
-        assert!(
-            x_extrapolated > x_second,
-            "expected continued movement in the same direction: {x_extrapolated} <= {x_second}"
-        );
-        assert!((x_extrapolated - 0.5).abs() < 1e-5);
+        assert_eq!(v_gap.left, v_second.left);
+        assert_eq!(v_gap.right, v_second.right);
     }
 
     #[test]
-    fn extrapolated_position_is_clamped_to_unit_range() {
-        // Two valid samples trending toward the upper edge; the frame-index
-        // extrapolation from them would overshoot past 1.0 — must clamp.
+    fn gap_near_an_edge_holds_without_drifting_further() {
+        // A position already validly near the upper edge must simply hold at
+        // that same value during a gap — unchanged, and with no clamping
+        // needed since nothing is being projected past it.
         let mut hist = EyeHistory::new();
         hist.update(&sample([0.2, 0.5, 0.5], [0.2, 0.5, 0.5], 680.0, true)); // mirrored 0.8
-        hist.update(&sample([0.05, 0.5, 0.5], [0.05, 0.5, 0.5], 680.0, true)); // mirrored 0.95
-        let v = hist.update(&sample([0.05, 0.5, 0.5], [0.05, 0.5, 0.5], 680.0, false));
-        // Unclamped this would be 0.95 + (0.95 - 0.8) = 1.10.
-        assert!((v.left.unwrap()[0] - 1.0).abs() < 1e-6);
-        assert!((v.right.unwrap()[0] - 1.0).abs() < 1e-6);
+        let v_last_valid = hist.update(&sample([0.05, 0.5, 0.5], [0.05, 0.5, 0.5], 680.0, true)); // mirrored 0.95
+        let v_gap = hist.update(&sample([0.05, 0.5, 0.5], [0.05, 0.5, 0.5], 680.0, false));
 
-        // Same check trending toward the lower edge.
+        assert_eq!(v_gap.left, v_last_valid.left);
+        assert_eq!(v_gap.right, v_last_valid.right);
+
+        // Same check near the lower edge.
         let mut hist = EyeHistory::new();
         hist.update(&sample([0.8, 0.5, 0.5], [0.8, 0.5, 0.5], 680.0, true)); // mirrored 0.2
-        hist.update(&sample([0.95, 0.5, 0.5], [0.95, 0.5, 0.5], 680.0, true)); // mirrored 0.05
-        let v = hist.update(&sample([0.95, 0.5, 0.5], [0.95, 0.5, 0.5], 680.0, false));
-        // Unclamped this would be 0.05 + (0.05 - 0.2) = -0.10.
-        assert!(v.left.unwrap()[0].abs() < 1e-6);
-        assert!(v.right.unwrap()[0].abs() < 1e-6);
+        let v_last_valid = hist.update(&sample([0.95, 0.5, 0.5], [0.95, 0.5, 0.5], 680.0, true)); // mirrored 0.05
+        let v_gap = hist.update(&sample([0.95, 0.5, 0.5], [0.95, 0.5, 0.5], 680.0, false));
+
+        assert_eq!(v_gap.left, v_last_valid.left);
+        assert_eq!(v_gap.right, v_last_valid.right);
     }
 
     #[test]
