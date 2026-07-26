@@ -116,11 +116,23 @@ enum Phase {
     /// Live eye-position preview shown before any calibration session opens.
     /// `ticks` is total time on this step (drives the `eye_preview::message`
     /// copy and the "Continue anyway" fallback); `centered_ticks` is the
-    /// currently-running streak of `Guidance::Centered` readings — reset to 0
-    /// on any other guidance — that drives auto-advance.
+    /// currently-running streak of `Guidance::Centered` readings — tolerant
+    /// of brief gaps (see `eye_preview::update_centered_streak`) — that
+    /// drives auto-advance.
     EyePreview {
         ticks: u32,
         centered_ticks: u32,
+        /// Gap-tolerance counter for the centered-dwell streak (see
+        /// `eye_preview::update_centered_streak`).
+        gap_ticks: u32,
+        /// The debounced guidance actually being shown via `message()` right
+        /// now (see `eye_preview::debounced_guidance`) — distinct from the
+        /// raw, possibly-noisy per-frame reading.
+        shown_guidance: Guidance,
+        /// Consecutive ticks the raw guidance has differed from
+        /// `shown_guidance` (see `eye_preview::debounced_guidance`'s
+        /// `unstable_ticks` parameter).
+        unstable_ticks: u32,
     },
     /// `CalBegin` sent; waiting for the device thread to publish a `CalPhase`
     /// carrying *our* `token`. The token is what makes this an edge and not a
@@ -404,6 +416,9 @@ pub fn launch(
     let phase = Rc::new(RefCell::new(Phase::EyePreview {
         ticks: 0,
         centered_ticks: 0,
+        gap_ticks: 0,
+        shown_guidance: Guidance::NoEyes,
+        unstable_ticks: 0,
     }));
     let dot = Rc::new(RefCell::new(DotView {
         point: None,
@@ -641,19 +656,36 @@ pub fn launch(
             Phase::EyePreview {
                 ticks,
                 centered_ticks,
+                gap_ticks,
+                shown_guidance,
+                unstable_ticks,
             } => {
-                let (ticks, centered_ticks) = (*ticks, *centered_ticks);
+                let (ticks, centered_ticks, gap_ticks, shown_guidance, unstable_ticks) = (
+                    *ticks,
+                    *centered_ticks,
+                    *gap_ticks,
+                    *shown_guidance,
+                    *unstable_ticks,
+                );
                 dot.borrow_mut().point = None; // no calibration dot yet
                 let ev = widget::eye_view_for(&state.lock().unwrap());
-                let centered_ticks = if ev.guidance == Guidance::Centered {
-                    centered_ticks + 1
-                } else {
+
+                let (centered_ticks, gap_ticks) =
+                    eye_preview::update_centered_streak(ev.guidance, centered_ticks, gap_ticks);
+
+                let unstable_ticks = if ev.guidance == shown_guidance {
                     0
+                } else {
+                    unstable_ticks + 1
                 };
-                // Live guidance-derived text, recomputed every tick — unlike
-                // every other phase, `update_ui` deliberately does NOT also
-                // set `instr`'s text here (it would just fight this).
-                instr.set_text(eye_preview::message(ticks, ev.guidance));
+                let shown_guidance =
+                    eye_preview::debounced_guidance(ev.guidance, shown_guidance, unstable_ticks);
+
+                // Live guidance-derived text, recomputed every tick from the
+                // DEBOUNCED guidance (not the raw reading) — unlike every
+                // other phase, `update_ui` deliberately does NOT also set
+                // `instr`'s text here (it would just fight this).
+                instr.set_text(eye_preview::message(ticks, shown_guidance));
                 eye_panel.queue_draw();
                 if eye_preview::should_advance(ticks, centered_ticks) {
                     // Call the free `begin_calibration_phase` helper rather
@@ -671,6 +703,9 @@ pub fn launch(
                     next = Some(Phase::EyePreview {
                         ticks: ticks + 1,
                         centered_ticks,
+                        gap_ticks,
+                        shown_guidance,
+                        unstable_ticks,
                     });
                 }
             }
