@@ -97,9 +97,19 @@ impl EyeView {
 }
 
 /// How many past frames (per eye) are kept for hold/extrapolation across a
-/// brief invalid/missing reading — matches the decompiled real software's
-/// `EyesPositioningParametersCalculator.MaxCountOfExtrapolatedGazeDataPosition`.
-pub const MAX_HISTORY_FRAMES: usize = 11;
+/// brief invalid/missing reading.
+///
+/// This is an empirically-tuned value, not a ground-truth-matched constant:
+/// the real position source (`IEyesPositioningParametersCalculator`) is an
+/// interface whose concrete implementation lives outside the decompiled
+/// managed layer (native code), so its actual internal hold/smoothing window
+/// isn't inspectable. Two rounds of on-hardware feedback shaped this number:
+/// 11 frames (~360ms at this app's 33ms/tick cadence) fixed the original
+/// "instant flicker to no eyes" bug but was itself reported as laggy, even
+/// after removing extrapolation in favor of a plain hold. Shrunk to 6
+/// (~200ms) to bridge only genuinely brief, multi-frame drops without
+/// holding a stale position long enough to read as lag.
+pub const MAX_HISTORY_FRAMES: usize = 6;
 
 /// One eye's decoded per-frame reading: mirror-view trackbox position plus
 /// operating distance (mm), or absent if that eye's reading was invalid this
