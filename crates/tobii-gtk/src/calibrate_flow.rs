@@ -85,6 +85,12 @@ fn group_zone_radii(points: &[(f64, f64); 7], aspect: f64) -> [f64; 7] {
     [center, group_b, group_b, group_b, group_c, group_c, group_c]
 }
 
+/// The three simultaneously-shown groups of the decompiled original's
+/// `CalibrationStateManager`: the center point alone, then indices 1-3
+/// together, then indices 4-6 together. Indices into `FULL_7`/`cal_points`/
+/// `group_zone_radii`'s output.
+const GROUPS: [&[usize]; 3] = [&[0], &[1, 2, 3], &[4, 5, 6]];
+
 // Tick cadence is 33 ms (~30 fps), matching the hub.
 //
 // HARDWARE-OBSERVED (2026-07-21): the ET5 acks add_calibration_point almost
@@ -190,26 +196,37 @@ enum Phase {
         /// The session token this phase belongs to (see `Starting`).
         token: u64,
         mode: CalMode,
-        index: usize,
-        /// Ticks gaze has been CONTINUOUSLY confirmed within the current
-        /// point's proximity zone (see `focus::closest_focused_point`) — the
-        /// actual fix for the reported bug: capture no longer fires on a blind
-        /// timer, only once this reaches `SETTLE_TICKS`. Resets to 0 once a
-        /// gaze-data gap has exceeded `GAZE_GAP_TOLERANCE_TICKS` (see
-        /// `gap_ticks`) — a single dropped/invalid frame does not reset it.
+        /// Which of `GROUPS` is currently active (0, 1, or 2).
+        group: usize,
+        /// Which of the 7 points have been captured so far (persists across
+        /// groups — a point's `true` never reverts).
+        calibrated: [bool; 7],
+        /// The point (global 0..7 index) currently established as the dwell
+        /// target within the active group, if any — see
+        /// `focus::resolve_group_focus`.
+        focused: Option<usize>,
+        /// Focus-change debounce counter for `focused` (see
+        /// `focus::resolve_group_focus`'s `pending_ticks` parameter).
+        pending_ticks: u32,
+        /// Ticks gaze has been CONTINUOUSLY confirmed in `focused`'s zone —
+        /// meaningless while `focused` is `None`. Same role as before this
+        /// task, just no longer tied to a fixed sequential index.
         in_zone_ticks: u32,
         /// Ticks since the gaze-in-zone confirmation was last true this tick —
         /// used only to decide when a gap has exceeded `GAZE_GAP_TOLERANCE_TICKS`
         /// (at which point `in_zone_ticks` resets). Reset to 0 whenever gaze IS
         /// confirmed in-zone.
         gap_ticks: u32,
-        /// True once `CalCollect` has been sent for `index` and we're waiting
-        /// for the device to ack it (`cal.collected > index`).
+        /// True once `CalCollect` has been sent for `focused` and we're
+        /// waiting for the device to ack it. While `true`, `focused` must NOT
+        /// be switched away from by `resolve_group_focus` — see the tick arm
+        /// below for how this is enforced (only run focus-resolution when NOT
+        /// `requested`, exactly like the pre-existing single-point design
+        /// did).
         requested: bool,
-        /// Overall ticks spent on this point since it was first shown — bounds
-        /// the point by `COLLECT_TIMEOUT_TICKS` regardless of gaze state (a
-        /// user who never looks at the dot at all must still eventually time
-        /// out, same safety property as before this task).
+        /// Elapsed ticks since the ACTIVE GROUP first appeared (not
+        /// per-point) — drives the whole group's simultaneous fade-in and the
+        /// group-level timeout (see `COLLECT_TIMEOUT_TICKS` usage below).
         ticks: u32,
     },
     Computing {
@@ -220,20 +237,28 @@ enum Phase {
     Done(Result<(), String>),
 }
 
+/// One currently-visible, not-yet-captured point in the active group.
+struct GroupPoint {
+    point: (f64, f64),
+    /// This point's OWN dwell-to-sample countdown ring progress (0..1) —
+    /// nonzero ONLY for whichever point is currently `focused`; 0 for its
+    /// still-visible, not-yet-focused siblings.
+    progress: f64,
+}
+
 /// What the cairo surface draws this frame.
 struct DotView {
-    point: Option<(f64, f64)>,
-    /// 0 = the dot just arrived, 1 = sampling now. Drives the converging ring,
-    /// which is the user's only cue for *when* fixation actually matters.
-    progress: f64,
-    /// The new dot's own fade-in (0 = just arrived, 1 = fully visible), ramping
-    /// over `SETTLE_TICKS` — separate from `progress` (which tracks the
-    /// dwell-to-sample countdown ring, not visibility).
+    /// The active group's not-yet-captured points, all sharing one
+    /// simultaneous fade-in (the group appears together, not one at a time —
+    /// see `fade_in`).
+    points: Vec<GroupPoint>,
+    /// 0 = the group just arrived, 1 = fully visible — shared by every point
+    /// in `points` (they fade in together as a group).
     fade_in: f64,
-    /// The *previous* point's still-animating burst, if any — drawn
-    /// concurrently with the new point fading in (the captured screenshots'
-    /// brief crossfade overlap, not a hard cut).
-    explosion: Option<Explosion>,
+    /// Every still-animating burst — plural because two points in the same
+    /// group can be captured close together, each getting its own
+    /// independently-aged explosion.
+    explosions: Vec<Explosion>,
 }
 
 /// A captured point's outward particle burst, aged independently of whatever
@@ -256,7 +281,7 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool
         cr.set_source_rgb(0.08, 0.09, 0.11);
     }
     let _ = cr.paint();
-    if let Some(exp) = &dot.explosion {
+    for exp in &dot.explosions {
         let (ox, oy) = exp.origin;
         let (cx, cy) = (ox * w, oy * h);
         let t = (exp.age_ticks as f64 / EXPLODE_DURATION_TICKS as f64).clamp(0.0, 1.0);
@@ -310,12 +335,13 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool
             let _ = cr.fill();
         }
     }
-    if let Some((nx, ny)) = dot.point {
+    for gp in &dot.points {
+        let (nx, ny) = gp.point;
         let (cx, cy) = (nx * w, ny * h);
         // The ring shrinks onto the dot as the sample approaches: an
         // unambiguous "hold here, now" countdown. The device samples the
         // instant we ask, so the eye must already be still when it lands.
-        let p = dot.progress.clamp(0.0, 1.0);
+        let p = gp.progress.clamp(0.0, 1.0);
         let fade = dot.fade_in.clamp(0.0, 1.0);
         let ring = (9.0 + (1.0 - p) * 42.0) * fade;
         cr.set_source_rgba(0.30, 0.85, 0.85, 0.35 + 0.45 * p);
@@ -369,23 +395,23 @@ fn update_ui(phase: &Phase, instr: &Label, w: &FlowWidgets) {
             w.cancel.set_visible(true);
         }
         Phase::Collecting {
-            index,
-            mode,
-            in_zone_ticks,
+            calibrated,
+            focused,
             requested,
             ..
         } => {
-            let progress = format!("point {} of {}", index + 1, mode.points().len());
-            // Fixation matters once gaze is actually confirmed in the
-            // target's zone (or a sample has already been requested) — NOT
-            // once overall elapsed time on this point crosses a threshold.
-            // Before gaze-verified capture, `ticks` alone was a reliable
-            // proxy for "the user is looking" (the old blind timer always
-            // captured within ~1.5s of arrival regardless of gaze); now
-            // `in_zone_ticks` can stay 0 indefinitely if the user hasn't
-            // looked at the dot yet, so checking `ticks` here would tell
-            // them to "hold still" before they've even found it.
-            instr.set_text(&if *in_zone_ticks > 0 || *requested {
+            let done = calibrated.iter().filter(|c| **c).count();
+            let progress = format!("{done} of {} points", calibrated.len());
+            // Fixation matters once gaze is actually confirmed on a target
+            // (or a sample has already been requested) — NOT once overall
+            // elapsed time on the group crosses a threshold. `focused.is_some()`
+            // plays the same role `in_zone_ticks > 0` played before this task
+            // (equivalent once `in_zone_ticks` only ever advances while
+            // `focused` is established): before gaze-verified capture, `ticks`
+            // alone was a reliable proxy for "the user is looking"; now
+            // nothing may be focused yet if the user hasn't found a dot in
+            // the newly-shown group.
+            instr.set_text(&if focused.is_some() || *requested {
                 format!("Hold still — keep looking at the dot  ·  {progress}")
             } else {
                 format!("Follow the dot with your eyes  ·  {progress}")
@@ -529,10 +555,9 @@ pub fn launch(
         unstable_ticks: 0,
     }));
     let dot = Rc::new(RefCell::new(DotView {
-        point: None,
-        progress: 0.0,
+        points: Vec::new(),
         fade_in: 0.0,
-        explosion: None,
+        explosions: Vec::new(),
     }));
     // Whether `draw_scene` paints the fully-black background (Starting onward)
     // vs. the dark-teal used during EyePreview. A separate `Cell` rather than
@@ -751,12 +776,11 @@ pub fn launch(
         // below.
         {
             let mut d = dot.borrow_mut();
-            if let Some(exp) = &mut d.explosion {
+            for exp in &mut d.explosions {
                 exp.age_ticks += 1;
-                if exp.age_ticks >= EXPLODE_DURATION_TICKS {
-                    d.explosion = None;
-                }
             }
+            d.explosions
+                .retain(|exp| exp.age_ticks < EXPLODE_DURATION_TICKS);
         }
         let mut ph = phase.borrow_mut();
         let mut next: Option<Phase> = None;
@@ -775,7 +799,7 @@ pub fn launch(
                     *shown_guidance,
                     *unstable_ticks,
                 );
-                dot.borrow_mut().point = None; // no calibration dot yet
+                dot.borrow_mut().points.clear(); // no calibration dot yet
                 let ev = widget::eye_view_for(&state.lock().unwrap());
 
                 let (centered_ticks, gap_ticks) =
@@ -819,7 +843,7 @@ pub fn launch(
             }
             Phase::Starting { mode, token, ticks } => {
                 let (mode, token, ticks) = (*mode, *token, *ticks);
-                dot.borrow_mut().point = None;
+                dot.borrow_mut().points.clear();
                 // Keep waiting while EITHER our CalBegin has not been dequeued
                 // (token mismatch — nothing in `cal` is ours, so not `finished`,
                 // not `last_error`, not `active`, not `collected` may be read)
@@ -851,7 +875,10 @@ pub fn launch(
                     next = Some(Phase::Collecting {
                         token,
                         mode,
-                        index: 0,
+                        group: 0,
+                        calibrated: [false; 7],
+                        focused: None,
+                        pending_ticks: 0,
                         in_zone_ticks: 0,
                         gap_ticks: 0,
                         requested: false,
@@ -872,16 +899,33 @@ pub fn launch(
             Phase::Collecting {
                 token,
                 mode,
-                index,
+                group,
+                calibrated,
+                focused,
+                pending_ticks,
                 in_zone_ticks,
                 gap_ticks,
                 requested,
                 ticks,
             } => {
-                let (token, mode, index, in_zone_ticks, gap_ticks, requested, ticks) = (
+                let (
+                    token,
+                    mode,
+                    group,
+                    calibrated,
+                    focused,
+                    pending_ticks,
+                    in_zone_ticks,
+                    gap_ticks,
+                    requested,
+                    ticks,
+                ) = (
                     *token,
                     *mode,
-                    *index,
+                    *group,
+                    *calibrated,
+                    *focused,
+                    *pending_ticks,
                     *in_zone_ticks,
                     *gap_ticks,
                     *requested,
@@ -904,185 +948,289 @@ pub fn launch(
                     next = Some(done_phase(Err(format!(
                         "Couldn't read a point: {e}. Make sure you're seated and looking at the dots."
                     ))));
-                } else if cal.collected > index {
-                    let pts = &cal_points;
-                    // A captured point always bursts, whether or not there's a
-                    // next point to follow it — spawn it for the point that
-                    // was JUST captured (the OLD `index`), before advancing.
-                    {
-                        let mut d = dot.borrow_mut();
-                        d.explosion = Some(Explosion {
-                            origin: pts[index],
-                            seed: token ^ (index as u64),
-                            age_ticks: 0,
-                        });
-                    }
-                    if index + 1 >= pts.len() {
-                        let _ = tick_cmd.send(DeviceCommand::CalFinish {
-                            mode: mode.label().to_string(),
-                        });
-                        next = Some(Phase::Computing { token, ticks: 0 });
-                    } else {
-                        next = Some(Phase::Collecting {
-                            token,
-                            mode,
-                            index: index + 1,
-                            in_zone_ticks: 0,
-                            gap_ticks: 0,
-                            requested: false,
-                            ticks: 0,
-                        });
-                    }
                 } else {
-                    let (px, py) = cal_points[index];
-                    let t = ticks + 1;
+                    let active_group = GROUPS[group];
+                    // The device's `cal.collected` is a plain counter of how
+                    // many `add_point` calls have succeeded so far, total —
+                    // not indexed by which point. Comparing it against the
+                    // total captured-so-far tells us a NEW capture landed
+                    // this tick.
+                    let total_captured = calibrated.iter().filter(|c| **c).count();
 
-                    // Is gaze right now confirmed within `index`'s proximity
-                    // zone? This app shows one dot at a time, so the
-                    // `calibrated` mask excludes every point except the one
-                    // currently presented — `closest_focused_point` can only
-                    // ever return `Some(index)` or `None` here, never a
-                    // different index.
-                    let calibrated_mask: Vec<bool> =
-                        (0..mode.points().len()).map(|i| i != index).collect();
-                    let in_zone_now = state
-                        .lock()
-                        .unwrap()
-                        .latest_gaze
-                        .as_ref()
-                        .filter(|s| {
-                            s.has(present::GAZE_2D) && s.validity_l == 0 && s.validity_r == 0
-                        })
-                        .map(|s| (s.gaze_point_2d[0], s.gaze_point_2d[1]))
-                        .and_then(|g| {
-                            focus::closest_focused_point(
-                                g,
-                                &cal_points,
-                                &calibrated_mask,
-                                zone_radii[index],
-                                screen_aspect(),
-                            )
-                        })
-                        .is_some();
-
-                    let (new_in_zone_ticks, new_gap_ticks) = if in_zone_now {
-                        (in_zone_ticks + 1, 0)
-                    } else if gap_ticks + 1 < GAZE_GAP_TOLERANCE_TICKS {
-                        (in_zone_ticks, gap_ticks + 1) // brief gap: hold the streak
-                    } else {
-                        (0, gap_ticks + 1) // gap exceeded tolerance: streak lost
-                    };
-                    // Only meaningful once `requested` — did we just lose a
-                    // previously-held streak while waiting for the device's
-                    // ack? (If `in_zone_ticks` was already 0 before this tick,
-                    // there was no streak to lose — don't re-trigger a discard
-                    // on every subsequent still-out-of-zone tick.)
-                    //
-                    // KNOWN LIMITATION: this can only see a lost streak using
-                    // `state.latest_gaze`, which the device thread only
-                    // refreshes between commands (`device_tick` drains its
-                    // whole command queue, including any blocking
-                    // `CalCollect`/`CalDiscard` USB round-trip, before it next
-                    // reads notifications — see `device.rs`). While a
-                    // `CalCollect` this tick loop just sent is still in
-                    // flight, `latest_gaze` is frozen at whatever it was when
-                    // that command was sent (which showed the user in-zone —
-                    // that's why the sample was requested), so a real
-                    // look-away during an unusually slow ack cannot be
-                    // detected until the NEXT fresh gaze sample arrives, by
-                    // which point the ack may have already landed and
-                    // advanced `index`. In measured practice `add_point` acks
-                    // near-instantly (see the HARDWARE-OBSERVED comment
-                    // above), so this blind spot is normally far under one
-                    // tick; it only widens on unusually slow hardware/USB
-                    // latency, up to `CAL_POINT_TIMEOUT` (30s, `tobii-usb`).
-                    // Closing it fully would need gaze visibility during a
-                    // blocking device call (e.g. a non-blocking request path)
-                    // — out of scope here, but worth knowing this exists.
-                    let lost_focus_while_requested =
-                        requested && new_in_zone_ticks == 0 && in_zone_ticks > 0;
-
-                    {
-                        let mut d = dot.borrow_mut();
-                        d.point = Some((px, py));
-                        d.progress = if requested {
-                            1.0
-                        } else {
-                            (new_in_zone_ticks as f64 / SETTLE_TICKS as f64).clamp(0.0, 1.0)
-                        };
-                        d.fade_in = (t as f64 / SETTLE_TICKS as f64).clamp(0.0, 1.0);
-                    }
-
-                    if lost_focus_while_requested {
-                        // The original's FocusChangedDuringCalibration ->
-                        // discard+retry: the device may still be mid-collect
-                        // for this point; ask it to discard whatever it
-                        // gathered and restart the settle wait from zero,
-                        // WITHOUT advancing `index` — this is the actual fix
-                        // for the reported bug (a sample taken while the user
-                        // looked away is no longer silently accepted).
-                        //
-                        // Re-check with a FRESH read, not the tick-start `cal`
-                        // snapshot: `CalCollect`/`CalDiscard` are FIFO on the
-                        // same device-thread queue, so if the device's ack for
-                        // this point actually landed in the gap between this
-                        // tick's snapshot and now, discarding it anyway would
-                        // silently throw away an already-accepted sample.
-                        // Skipping the discard here when the fresh read shows
-                        // it already collected closes that race; the normal
-                        // `cal.collected > index` branch above will pick up
-                        // the advance on a later tick.
-                        let already_collected = state.lock().unwrap().calibration.collected > index;
-                        if !already_collected {
-                            let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
+                    if cal.collected > total_captured {
+                        // Capture requests are issued ONE AT A TIME, only
+                        // ever for whichever point is `focused` when
+                        // `requested` is set — and focus-resolution below
+                        // never runs while `requested` is true, so `focused`
+                        // cannot have moved since we sent that request.
+                        // Reading it here is therefore safe and correct.
+                        let captured = focused.expect(
+                            "cal.collected increased implies a CalCollect is in flight, which implies focused is set",
+                        );
+                        let mut calibrated = calibrated;
+                        calibrated[captured] = true; // accumulates only — never reverts to false
+                        {
+                            let mut d = dot.borrow_mut();
+                            d.explosions.push(Explosion {
+                                origin: cal_points[captured],
+                                seed: token ^ (captured as u64),
+                                age_ticks: 0,
+                            });
                         }
-                        next = Some(Phase::Collecting {
-                            token,
-                            mode,
-                            index,
-                            in_zone_ticks: 0,
-                            gap_ticks: 0,
-                            requested: false,
-                            ticks: t,
-                        });
-                    } else if !requested && new_in_zone_ticks >= SETTLE_TICKS {
-                        let _ = tick_cmd.send(DeviceCommand::CalCollect { x: px, y: py });
-                        next = Some(Phase::Collecting {
-                            token,
-                            mode,
-                            index,
-                            in_zone_ticks: new_in_zone_ticks,
-                            gap_ticks: new_gap_ticks,
-                            requested: true,
-                            ticks: t,
-                        });
-                    } else if t >= COLLECT_TIMEOUT_TICKS {
-                        // Applies REGARDLESS of `requested` now (a deliberate
-                        // behavior change from before this task): previously
-                        // this timeout only fired while `requested`, because
-                        // the old blind timer always reached `requested=true`
-                        // within ~1.5s regardless of gaze. Now a user who
-                        // never looks at the dot at all could otherwise wait
-                        // here forever — this ceiling must still catch that
-                        // case.
-                        let _ = tick_cmd.send(DeviceCommand::CalAbort);
-                        next = Some(done_phase(Err("Timed out reading a point.".into())));
+
+                        let group_done = active_group.iter().all(|&i| calibrated[i]);
+                        if group_done && group == GROUPS.len() - 1 {
+                            let _ = tick_cmd.send(DeviceCommand::CalFinish {
+                                mode: mode.label().to_string(),
+                            });
+                            next = Some(Phase::Computing { token, ticks: 0 });
+                        } else if group_done {
+                            next = Some(Phase::Collecting {
+                                token,
+                                mode,
+                                group: group + 1,
+                                calibrated,
+                                focused: None,
+                                pending_ticks: 0,
+                                in_zone_ticks: 0,
+                                gap_ticks: 0,
+                                requested: false,
+                                ticks: 0, // fresh fade-in for the new group
+                            });
+                        } else {
+                            // Points remain in this group: stay on it (same
+                            // `ticks` — the group's fade-in does not restart)
+                            // so gaze can settle on one of the siblings.
+                            next = Some(Phase::Collecting {
+                                token,
+                                mode,
+                                group,
+                                calibrated,
+                                focused: None,
+                                pending_ticks: 0,
+                                in_zone_ticks: 0,
+                                gap_ticks: 0,
+                                requested: false,
+                                ticks,
+                            });
+                        }
                     } else {
-                        next = Some(Phase::Collecting {
-                            token,
-                            mode,
-                            index,
-                            in_zone_ticks: new_in_zone_ticks,
-                            gap_ticks: new_gap_ticks,
-                            requested,
-                            ticks: t,
-                        });
+                        let t = ticks + 1;
+
+                        // A point counts as "already calibrated" (excluded
+                        // from focus consideration) if it's genuinely
+                        // captured OR simply not a member of the active
+                        // group — points outside the current group must
+                        // never be considered focusable even though they
+                        // aren't literally captured yet.
+                        let calibrated_mask: [bool; 7] =
+                            std::array::from_fn(|i| calibrated[i] || !active_group.contains(&i));
+
+                        // Every member of a given group shares one radius by
+                        // construction (see `group_zone_radii`'s own tests),
+                        // so any member's index is a valid representative —
+                        // `active_group[0]` is simplest and always valid
+                        // since every group has at least one member.
+                        let raw_focus: Option<usize> = state
+                            .lock()
+                            .unwrap()
+                            .latest_gaze
+                            .as_ref()
+                            .filter(|s| {
+                                s.has(present::GAZE_2D) && s.validity_l == 0 && s.validity_r == 0
+                            })
+                            .map(|s| (s.gaze_point_2d[0], s.gaze_point_2d[1]))
+                            .and_then(|g| {
+                                focus::closest_focused_point(
+                                    g,
+                                    &cal_points,
+                                    &calibrated_mask,
+                                    zone_radii[active_group[0]],
+                                    screen_aspect(),
+                                )
+                            });
+
+                        // Focus resolution only runs while no capture is in
+                        // flight — while `requested`, `focused` must not
+                        // move, exactly like the pre-existing single-point
+                        // design never advanced `index` while `requested`.
+                        let (new_focused, new_pending_ticks) = if requested {
+                            (focused, pending_ticks)
+                        } else {
+                            focus::resolve_group_focus(raw_focus, focused, pending_ticks)
+                        };
+
+                        // A real focus transition (gaining, losing, or
+                        // switching) resets the dwell streak — a fresh point
+                        // to dwell on, or nothing to dwell on at all now.
+                        // While `requested`, `new_focused == focused` always,
+                        // so this never fires mid-capture.
+                        let (base_in_zone_ticks, base_gap_ticks) = if new_focused != focused {
+                            (0, 0)
+                        } else {
+                            (in_zone_ticks, gap_ticks)
+                        };
+
+                        // Gaze is confirmed in-zone on the established focus
+                        // THIS tick if the raw reading matches it — same
+                        // gap-tolerance mechanic as before this task, just no
+                        // longer tied to a fixed sequential index. While
+                        // nothing is focused there is nothing to dwell on.
+                        let in_zone_now = new_focused.is_some() && raw_focus == new_focused;
+                        let (new_in_zone_ticks, new_gap_ticks) = if new_focused.is_none() {
+                            (0, 0)
+                        } else if in_zone_now {
+                            (base_in_zone_ticks + 1, 0)
+                        } else if base_gap_ticks + 1 < GAZE_GAP_TOLERANCE_TICKS {
+                            (base_in_zone_ticks, base_gap_ticks + 1) // brief gap: hold the streak
+                        } else {
+                            (0, base_gap_ticks + 1) // gap exceeded tolerance: streak lost
+                        };
+                        // Only meaningful once `requested` — did we just lose
+                        // a previously-held streak while waiting for the
+                        // device's ack? (If `in_zone_ticks` was already 0
+                        // before this tick, there was no streak to lose —
+                        // don't re-trigger a discard on every subsequent
+                        // still-out-of-zone tick.)
+                        //
+                        // KNOWN LIMITATION (unchanged from before this task):
+                        // this can only see a lost streak using
+                        // `state.latest_gaze`, which the device thread only
+                        // refreshes between commands (`device_tick` drains
+                        // its whole command queue, including any blocking
+                        // `CalCollect`/`CalDiscard` USB round-trip, before it
+                        // next reads notifications — see `device.rs`). While
+                        // a `CalCollect` this tick loop just sent is still in
+                        // flight, `latest_gaze` is frozen at whatever it was
+                        // when that command was sent (which showed the user
+                        // in-zone — that's why the sample was requested), so
+                        // a real look-away during an unusually slow ack
+                        // cannot be detected until the NEXT fresh gaze sample
+                        // arrives, by which point the ack may have already
+                        // landed and advanced past this point. In measured
+                        // practice `add_point` acks near-instantly (see the
+                        // HARDWARE-OBSERVED comment above), so this blind
+                        // spot is normally far under one tick; it only widens
+                        // on unusually slow hardware/USB latency, up to
+                        // `CAL_POINT_TIMEOUT` (30s, `tobii-usb`). Closing it
+                        // fully would need gaze visibility during a blocking
+                        // device call (e.g. a non-blocking request path) —
+                        // out of scope here, but worth knowing this exists.
+                        let lost_focus_while_requested =
+                            requested && new_in_zone_ticks == 0 && in_zone_ticks > 0;
+
+                        {
+                            let mut d = dot.borrow_mut();
+                            d.fade_in = (t as f64 / SETTLE_TICKS as f64).clamp(0.0, 1.0);
+                            d.points = active_group
+                                .iter()
+                                .copied()
+                                .filter(|&i| !calibrated[i])
+                                .map(|i| GroupPoint {
+                                    point: cal_points[i],
+                                    progress: if Some(i) == new_focused {
+                                        if requested {
+                                            1.0
+                                        } else {
+                                            (new_in_zone_ticks as f64 / SETTLE_TICKS as f64)
+                                                .clamp(0.0, 1.0)
+                                        }
+                                    } else {
+                                        0.0
+                                    },
+                                })
+                                .collect();
+                        }
+
+                        if lost_focus_while_requested {
+                            // The original's FocusChangedDuringCalibration ->
+                            // discard+retry: the device may still be
+                            // mid-collect for this point; ask it to discard
+                            // whatever it gathered and restart the settle
+                            // wait from zero, WITHOUT marking it calibrated —
+                            // this is the actual fix for the reported bug (a
+                            // sample taken while the user looked away is no
+                            // longer silently accepted).
+                            //
+                            // Re-check with a FRESH read, not the tick-start
+                            // `cal` snapshot: `CalCollect`/`CalDiscard` are
+                            // FIFO on the same device-thread queue, so if the
+                            // device's ack for this point actually landed in
+                            // the gap between this tick's snapshot and now,
+                            // discarding it anyway would silently throw away
+                            // an already-accepted sample. Skipping the
+                            // discard here when the fresh read shows it
+                            // already collected closes that race; the normal
+                            // `cal.collected > total_captured` branch above
+                            // will pick up the advance on a later tick.
+                            let (px, py) =
+                                cal_points[focused.expect("requested implies focused is set")];
+                            let already_collected =
+                                state.lock().unwrap().calibration.collected > total_captured;
+                            if !already_collected {
+                                let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
+                            }
+                            next = Some(Phase::Collecting {
+                                token,
+                                mode,
+                                group,
+                                calibrated,
+                                focused,
+                                pending_ticks: new_pending_ticks,
+                                in_zone_ticks: 0,
+                                gap_ticks: 0,
+                                requested: false,
+                                ticks: t,
+                            });
+                        } else if !requested
+                            && new_focused.is_some()
+                            && new_in_zone_ticks >= SETTLE_TICKS
+                        {
+                            let (px, py) = cal_points[new_focused.expect("checked is_some above")];
+                            let _ = tick_cmd.send(DeviceCommand::CalCollect { x: px, y: py });
+                            next = Some(Phase::Collecting {
+                                token,
+                                mode,
+                                group,
+                                calibrated,
+                                focused: new_focused,
+                                pending_ticks: new_pending_ticks,
+                                in_zone_ticks: new_in_zone_ticks,
+                                gap_ticks: new_gap_ticks,
+                                requested: true,
+                                ticks: t,
+                            });
+                        } else if t >= COLLECT_TIMEOUT_TICKS * active_group.len() as u32 {
+                            // Applies REGARDLESS of `requested`/`focused` (a
+                            // deliberate behavior carried over unmodified
+                            // from before this task): a user who never looks
+                            // at any dot in the group at all must still
+                            // eventually time out. Scaled by the group's size
+                            // since a group can have up to 3 points to get
+                            // through — a defensive-only ceiling, same spirit
+                            // as before, just scaled to the group's size.
+                            let _ = tick_cmd.send(DeviceCommand::CalAbort);
+                            next = Some(done_phase(Err("Timed out reading a point.".into())));
+                        } else {
+                            next = Some(Phase::Collecting {
+                                token,
+                                mode,
+                                group,
+                                calibrated,
+                                focused: new_focused,
+                                pending_ticks: new_pending_ticks,
+                                in_zone_ticks: new_in_zone_ticks,
+                                gap_ticks: new_gap_ticks,
+                                requested,
+                                ticks: t,
+                            });
+                        }
                     }
                 }
             }
             Phase::Computing { token, ticks } => {
                 let token = *token;
-                dot.borrow_mut().point = None;
+                dot.borrow_mut().points.clear();
                 if cal.token != token {
                     // Another session replaced ours; `finished` below would be
                     // someone else's outcome, so never report it as our own.
@@ -1247,6 +1395,23 @@ mod tests {
             (group_c_radius - 2.0 * old_whole_array_radius).abs() < 1e-9,
             "group C's correct radius ({group_c_radius}) should be exactly double the old, \
              wrong, whole-array radius ({old_whole_array_radius})"
+        );
+    }
+
+    /// `GROUPS` must partition all 7 point indices exactly once each — no
+    /// gaps, no overlaps — and the center point (index 0) must be its own,
+    /// lone first group, matching the decompiled original's
+    /// `FirstCalibrationSinglePoint` -> `SecondCalibrationThreePoints` ->
+    /// `ThirdCalibrationThreePoints` sequence.
+    #[test]
+    fn groups_cover_all_seven_indices_exactly_once() {
+        let mut indices: Vec<usize> = GROUPS.iter().flat_map(|g| g.iter().copied()).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            GROUPS[0],
+            [0],
+            "the center point must be alone in the first group"
         );
     }
 }

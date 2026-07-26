@@ -33,17 +33,13 @@ pub const RADIUS_SIZE_MODIFIER: f64 = 0.45;
 /// `WouldItBeSuitableToChange` debounce, expressed in ticks at this app's
 /// 33ms/tick cadence (150/33 ≈ 4.5, round to 5).
 ///
-/// Currently unused by `calibrate_flow.rs`: that flow presents one
-/// calibration dot at a time, so its `calibrated_mask` excludes every point
-/// except the one currently on screen, and [`closest_focused_point`] can only
-/// ever return `Some(index)` (that one live target) or `None` — there is no
-/// "different point" for gaze to change TO, so no change-of-target to
-/// debounce. `GAZE_GAP_TOLERANCE_TICKS` in `calibrate_flow.rs` instead covers
-/// the analogous noise-tolerance need for a single target (a brief gaze gap
-/// while still on the one dot). This constant stays public and tested for a
-/// future UI that shows several calibration targets simultaneously (as the
-/// decompiled original does), where a real change-of-target debounce would
-/// apply.
+/// Used by [`resolve_group_focus`], which `calibrate_flow.rs`'s
+/// group-collecting state machine calls every tick: that flow shows up to
+/// three calibration dots simultaneously (see its `GROUPS`), so
+/// [`closest_focused_point`] can genuinely return a *different* live target
+/// from one tick to the next as gaze wanders among the group's siblings —
+/// this constant is what stops a momentary glance at a neighbor from
+/// stealing focus from the point actually being dwelled on.
 pub const FOCUS_CHANGE_DEBOUNCE_TICKS: u32 = 5;
 
 /// Aspect-ratio-corrected Euclidean distance between two normalized `[0,1]`
@@ -111,6 +107,41 @@ pub fn closest_focused_point(
         }
     }
     best.map(|(i, _)| i)
+}
+
+/// Resolve which point (if any) is the CURRENTLY ESTABLISHED focus this
+/// tick, given this tick's fresh `closest_focused_point` reading and
+/// whatever was established before — mirrors the decompiled original's
+/// `ResolveFocusedCalibrationPoint`/`WouldItBeSuitableToChange`: gaining
+/// focus from nothing is immediate (there's nothing to protect yet), but
+/// SWITCHING away from an already-established focus — to a different point,
+/// or to nothing at all — requires the new reading to persist for
+/// `FOCUS_CHANGE_DEBOUNCE_TICKS` consecutive ticks first, so a momentary
+/// glance at a sibling point (when several are shown simultaneously) doesn't
+/// steal focus from the point actually being dwelled on.
+///
+/// `raw` is this tick's fresh `closest_focused_point` result. `focused` is
+/// the currently-established focus (`None` if nothing is established yet).
+/// `pending_ticks` is how many consecutive ticks `raw` has differed from
+/// `focused` (the caller tracks this: reset to 0 whenever `raw == focused`,
+/// else increment — see the call site). Returns `(new_focused,
+/// new_pending_ticks)`.
+pub fn resolve_group_focus(
+    raw: Option<usize>,
+    focused: Option<usize>,
+    pending_ticks: u32,
+) -> (Option<usize>, u32) {
+    if raw == focused {
+        return (focused, 0);
+    }
+    if focused.is_none() {
+        return (raw, 0); // gaining initial focus is immediate
+    }
+    if pending_ticks + 1 >= FOCUS_CHANGE_DEBOUNCE_TICKS {
+        (raw, 0) // switch accepted
+    } else {
+        (focused, pending_ticks + 1) // not yet enough consecutive ticks; hold
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +286,64 @@ mod tests {
         assert_eq!(
             closest_focused_point(gaze, &points, &calibrated, radius, 2.5),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_group_focus_gaining_initial_focus_is_immediate() {
+        // No prior focus: any `pending_ticks` value (even one that would be
+        // well past the debounce threshold for a SWITCH) is irrelevant —
+        // there is nothing established yet to protect.
+        assert_eq!(resolve_group_focus(Some(2), None, 0), (Some(2), 0));
+        assert_eq!(resolve_group_focus(Some(2), None, 9), (Some(2), 0));
+    }
+
+    #[test]
+    fn resolve_group_focus_staying_on_same_point_resets_pending_ticks() {
+        // Same `Some` target, regardless of accumulated `pending_ticks`.
+        assert_eq!(resolve_group_focus(Some(1), Some(1), 3), (Some(1), 0));
+        // Same "nothing" on both sides also counts as "staying" and resets.
+        assert_eq!(resolve_group_focus(None, None, 3), (None, 0));
+    }
+
+    #[test]
+    fn resolve_group_focus_switching_to_a_different_point_is_debounced() {
+        // Below the threshold: held at the OLD focus, counter increments.
+        for pending in 0..FOCUS_CHANGE_DEBOUNCE_TICKS - 1 {
+            assert_eq!(
+                resolve_group_focus(Some(2), Some(1), pending),
+                (Some(1), pending + 1),
+                "pending_ticks={pending} should still be held"
+            );
+        }
+        // At/above the threshold: the switch is accepted.
+        assert_eq!(
+            resolve_group_focus(Some(2), Some(1), FOCUS_CHANGE_DEBOUNCE_TICKS - 1),
+            (Some(2), 0)
+        );
+        assert_eq!(
+            resolve_group_focus(Some(2), Some(1), FOCUS_CHANGE_DEBOUNCE_TICKS),
+            (Some(2), 0)
+        );
+    }
+
+    /// Losing focus entirely (`raw = None` while `focused = Some(_)`) must
+    /// follow the EXACT SAME debounce rule as switching to a different
+    /// point — not a separate, immediate case. It's easy to accidentally
+    /// special-case `raw.is_none()` as "always immediate"; this test exists
+    /// specifically to catch that regression.
+    #[test]
+    fn resolve_group_focus_losing_focus_entirely_is_debounced_like_a_switch() {
+        for pending in 0..FOCUS_CHANGE_DEBOUNCE_TICKS - 1 {
+            assert_eq!(
+                resolve_group_focus(None, Some(1), pending),
+                (Some(1), pending + 1),
+                "pending_ticks={pending}: losing focus should still be held, not immediate"
+            );
+        }
+        assert_eq!(
+            resolve_group_focus(None, Some(1), FOCUS_CHANGE_DEBOUNCE_TICKS),
+            (None, 0)
         );
     }
 }
