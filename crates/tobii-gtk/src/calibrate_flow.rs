@@ -286,51 +286,27 @@ fn draw_scene(cr: &cairo::Context, w: i32, h: i32, dot: &DotView, black_bg: bool
         let (cx, cy) = (ox * w, oy * h);
         let t = (exp.age_ticks as f64 / EXPLODE_DURATION_TICKS as f64).clamp(0.0, 1.0);
 
-        // Brief central flash: a soft white disc that shrinks and fades out
-        // over the burst's first ~35% — reads as the "pop" moment the
-        // particles are flying out from, drawn before them so they render on
-        // top of it rather than underneath.
-        let flash_t = (t / 0.35).min(1.0);
-        let flash_alpha = (1.0 - flash_t) * 0.6;
-        if flash_alpha > 0.0 {
-            let flash_r = 14.0 * (1.0 - flash_t);
-            cr.set_source_rgba(1.0, 1.0, 1.0, flash_alpha);
-            cr.arc(cx, cy, flash_r, 0.0, std::f64::consts::TAU);
-            let _ = cr.fill();
-        }
-
-        // Expanding, thinning shockwave ring: uses the exact same CircleEase
-        // ease-out curve and `DISTANCE_SCALE` as `particles::particle_pos` so
-        // its reach can never visually drift out of sync with how far the
-        // particles themselves travel. Its own fade is a simple ease-in (not
-        // the particles' per-particle staggered linear fade) since it's a
-        // single shape, not 20 independent particles needing to desynchronize
-        // from each other. Kept subtle (max alpha 0.5) so it reads as a
-        // supporting ring, not a dominant shape.
-        let ring_alpha = (1.0 - t * t).max(0.0) * 0.5;
-        if ring_alpha > 0.0 {
-            let ring_r = (1.0 - (1.0 - t) * (1.0 - t)).sqrt() * particles::DISTANCE_SCALE;
-            cr.set_source_rgba(1.0, 1.0, 1.0, ring_alpha);
-            cr.set_line_width(2.5 * (1.0 - t));
-            cr.arc(cx, cy, ring_r, 0.0, std::f64::consts::TAU);
-            let _ = cr.stroke();
-        }
-
         for p in particles::burst(exp.seed) {
             let (dx, dy, alpha) = particles::particle_pos(t, p);
             if alpha <= 0.0 {
                 continue;
             }
-            // Blend the base teal toward white by this particle's own
-            // `brightness` draw, so the burst isn't perfectly uniform dots.
-            let base = (0.30, 0.85, 0.85);
-            let r = base.0 + (1.0 - base.0) * p.brightness;
-            let g = base.1 + (1.0 - base.1) * p.brightness;
-            let b = base.2 + (1.0 - base.2) * p.brightness;
-            cr.set_source_rgba(r, g, b, alpha);
-            // Shrinks to 70% by t=0.5, floored at 30% of its original size so
-            // it doesn't vanish to a point before it's fully faded.
-            let size_now = p.size * (1.0 - 0.5 * t).max(0.3);
+            // Every particle draws in the same uniform base teal accent color
+            // — matching the decompiled original's `GenerateParticles()`,
+            // where all 20 particles share one `Fill` brush with no
+            // per-particle color/brightness variation.
+            cr.set_source_rgba(0.30, 0.85, 0.85, alpha);
+            // Matches the decompiled original's storyboard
+            // (`CreateParticleCalibratedAnimation`): each particle's scale
+            // animates to 50% over just ~10ms, then holds there for the rest
+            // of the burst — it does not continue shrinking gradually
+            // throughout. `0.05` approximates that ~10ms/~800ms ratio of the
+            // burst's total duration.
+            let size_now = if t < 0.05 {
+                p.size * (1.0 - 0.5 * (t / 0.05))
+            } else {
+                p.size * 0.5
+            };
             cr.arc(cx + dx, cy + dy, size_now, 0.0, std::f64::consts::TAU);
             let _ = cr.fill();
         }

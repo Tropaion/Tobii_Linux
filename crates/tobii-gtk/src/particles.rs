@@ -30,12 +30,6 @@ const SPEED_MAX: f64 = 1.5;
 const SIZE_MIN: f64 = 2.0;
 const SIZE_MAX: f64 = 6.0;
 
-/// Per-particle "blend toward white" factor range (consumed by the cairo draw
-/// code): `0.0` renders the particle in the plain base teal, `0.5` blends it
-/// halfway to white. Keeps the burst from reading as perfectly uniform dots.
-const BRIGHTNESS_MIN: f64 = 0.0;
-const BRIGHTNESS_MAX: f64 = 0.5;
-
 /// Per-particle fade-start delay range, as a fraction of the whole burst's
 /// normalized `t` timeline (see `particle_pos`): the particle stays fully
 /// opaque until `t` passes its own `fade_delay`, then fades linearly. Mirrors
@@ -49,31 +43,29 @@ const FADE_DELAY_MAX: f64 = 0.5;
 /// `speed = 1.0` particle travels ~60px over the ~0.6s burst referenced in the
 /// task brief — enough to clearly leave the calibration dot without flying off
 /// a typical stimulus's immediate surroundings.
-///
-/// `pub` so the cairo draw code (`calibrate_flow::draw_scene`) can scale its
-/// own shockwave-ring effect off this exact constant instead of hardcoding a
-/// second magic number that could silently drift out of sync with the
-/// particles' own travel distance.
 pub const DISTANCE_SCALE: f64 = 60.0;
 
 /// One outward-flying particle of a burst.
 ///
 /// `angle` is the direction of travel in radians (`0` = along +x, increasing
 /// counter-clockwise, standard math convention), `speed` is a per-particle
-/// outward-motion multiplier, `size` is a per-particle rendering size in
-/// pixels (interpreted by the caller, e.g. as a circle radius), and
-/// `brightness` is a per-particle "blend toward white" factor in
-/// `[0.0, 0.5]` (`0.0` = plain base color, `0.5` = halfway to white) that the
-/// draw code uses to give particles some color/brightness variation instead
-/// of perfectly uniform dots, and `fade_delay` is a per-particle fraction of
-/// the burst's `t` timeline (`[0.0, 0.5]`) that the particle stays fully
-/// opaque for before it starts fading — see `particle_pos`.
+/// outward-motion multiplier, and `size` is a per-particle rendering size in
+/// pixels (interpreted by the caller, e.g. as a circle radius) — every
+/// particle draws in the same single uniform color, matching the decompiled
+/// original's `GenerateParticles()` (all 20 `Ellipse`s share one `Fill`
+/// brush; there is no per-particle brightness/color variation at all).
+/// Particle index 0 in a `burst()`'s output always has `size == SIZE_MAX`, a
+/// fixed, more-prominent "core" particle matching the original's
+/// `(i == 0) ? 18.0 : GetRandomNumber(4.0, 18.0)` special-case; every other
+/// particle's size is independently randomized as usual. `fade_delay` is a
+/// per-particle fraction of the burst's `t` timeline (`[0.0, 0.5]`) that the
+/// particle stays fully opaque for before it starts fading — see
+/// `particle_pos`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Particle {
     pub angle: f64,
     pub speed: f64,
     pub size: f64,
-    pub brightness: f64,
     pub fade_delay: f64,
 }
 
@@ -102,24 +94,29 @@ fn unit_f64(bits: u64) -> f64 {
 /// Same `seed` always produces bit-identical output, so a retried
 /// calibration point replays the same-looking burst instead of a new random
 /// one, and the animation is testable without capturing real device input.
+///
+/// Matches the decompiled original's `GenerateParticles()` special-casing
+/// index 0 with a fixed diameter (`(i == 0) ? 18.0 : GetRandomNumber(4.0,
+/// 18.0)`): after the per-particle random draws below, particle 0's `size` is
+/// forced to `SIZE_MAX` regardless of what its own draw produced, giving
+/// every burst one deterministic, always-full-size "core" particle.
 pub fn burst(seed: u64) -> [Particle; PARTICLE_COUNT] {
     let mut state = seed;
-    std::array::from_fn(|_| {
+    let mut particles: [Particle; PARTICLE_COUNT] = std::array::from_fn(|_| {
         let angle = unit_f64(splitmix64(&mut state)) * TAU;
         let speed = SPEED_MIN + unit_f64(splitmix64(&mut state)) * (SPEED_MAX - SPEED_MIN);
         let size = SIZE_MIN + unit_f64(splitmix64(&mut state)) * (SIZE_MAX - SIZE_MIN);
-        let brightness =
-            BRIGHTNESS_MIN + unit_f64(splitmix64(&mut state)) * (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
         let fade_delay =
             FADE_DELAY_MIN + unit_f64(splitmix64(&mut state)) * (FADE_DELAY_MAX - FADE_DELAY_MIN);
         Particle {
             angle,
             speed,
             size,
-            brightness,
             fade_delay,
         }
-    })
+    });
+    particles[0].size = SIZE_MAX;
+    particles
 }
 
 /// Position and opacity of particle `p` at normalized animation progress `t`
@@ -194,11 +191,6 @@ mod tests {
                 );
                 assert!((SIZE_MIN..=SIZE_MAX).contains(&p.size), "size={}", p.size);
                 assert!(
-                    (BRIGHTNESS_MIN..=BRIGHTNESS_MAX).contains(&p.brightness),
-                    "brightness={}",
-                    p.brightness
-                );
-                assert!(
                     (FADE_DELAY_MIN..=FADE_DELAY_MAX).contains(&p.fade_delay),
                     "fade_delay={}",
                     p.fade_delay
@@ -208,25 +200,37 @@ mod tests {
     }
 
     #[test]
-    fn brightness_is_deterministic_per_seed() {
-        // Same property as `burst_is_deterministic`, but called out separately
-        // by name for the new field: a regression that reorders/adds a PRNG
-        // draw could shift `brightness` alone while leaving angle/speed/size
-        // (and thus `burst_is_deterministic`'s `assert_eq!`) unaffected on
-        // some seeds, so this gets its own explicit check.
-        let a = burst(99);
-        let b = burst(99);
-        for (pa, pb) in a.iter().zip(b.iter()) {
-            assert!((pa.brightness - pb.brightness).abs() < 1e-12);
+    fn index_zero_is_always_fixed_at_size_max() {
+        // Matches the decompiled original's `GenerateParticles()` special-casing
+        // index 0 with a fixed diameter (`(i == 0) ? 18.0 : GetRandomNumber(4.0,
+        // 18.0)`): particle 0 must always be the fixed-size "core" particle,
+        // regardless of what its own random draw would otherwise have produced —
+        // checked across multiple seeds so this isn't a coincidence of one seed.
+        for seed in [0, 1, 42, 99, u64::MAX] {
+            assert_eq!(burst(seed)[0].size, SIZE_MAX, "seed={seed}");
+        }
+    }
+
+    #[test]
+    fn other_indices_keep_their_normal_random_size() {
+        // Direct proof the special-casing is index-0-only: index 1's size
+        // should still fall within the normal randomized range rather than
+        // being forced to SIZE_MAX like index 0.
+        for seed in [0, 1, 42, 99, u64::MAX] {
+            let size = burst(seed)[1].size;
+            assert!(
+                (SIZE_MIN..=SIZE_MAX).contains(&size),
+                "seed={seed} size={size}"
+            );
         }
     }
 
     #[test]
     fn fade_delay_is_deterministic_per_seed() {
-        // Same property as `burst_is_deterministic`/`brightness_is_deterministic_per_seed`,
-        // called out separately for `fade_delay` since it's the newest field
-        // and a regression that reorders/adds a PRNG draw could shift it
-        // alone while leaving the others unaffected on some seeds.
+        // Same property as `burst_is_deterministic`, but called out separately
+        // for `fade_delay` since a regression that reorders/adds a PRNG draw
+        // could shift it alone while leaving the others unaffected on some
+        // seeds.
         let a = burst(99);
         let b = burst(99);
         for (pa, pb) in a.iter().zip(b.iter()) {
@@ -240,7 +244,6 @@ mod tests {
             angle: 0.7,
             speed: 1.2,
             size: 4.0,
-            brightness: 0.25,
             fade_delay: 0.0,
         };
         let (dx0, dy0, alpha0) = particle_pos(0.0, p);
@@ -258,7 +261,6 @@ mod tests {
             angle: 0.3,
             speed: 1.4,
             size: 3.0,
-            brightness: 0.1,
             fade_delay: 0.2,
         };
         let (dx, dy, alpha) = particle_pos(1.0, p);
@@ -280,7 +282,6 @@ mod tests {
             angle: 1.1,
             speed: 1.0,
             size: 5.0,
-            brightness: 0.4,
             fade_delay: 0.1,
         };
         let dist_at = |t: f64| {
@@ -304,7 +305,6 @@ mod tests {
             angle: 2.0,
             speed: 0.8,
             size: 2.5,
-            brightness: 0.0,
             fade_delay: 0.4,
         };
         let (_, _, alpha) = particle_pos(0.3, p);
@@ -324,7 +324,6 @@ mod tests {
             angle: 2.0,
             speed: 0.8,
             size: 2.5,
-            brightness: 0.0,
             fade_delay: 0.0,
         };
         let (_, _, alpha_half) = particle_pos(0.5, p);
@@ -343,7 +342,6 @@ mod tests {
             angle: 0.0,
             speed: 1.0,
             size: 3.0,
-            brightness: 0.0,
             fade_delay: 0.0,
         };
         let high_delay = Particle {
