@@ -9,6 +9,8 @@
 //! - the camera frame is left-right mirrored vs. the user, so x is flipped so
 //!   the view reads like a mirror (you move left → your dot moves left).
 
+use std::collections::VecDeque;
+
 use tobii_protocol::gaze::present;
 use tobii_protocol::GazeSample;
 
@@ -94,6 +96,193 @@ impl EyeView {
     }
 }
 
+/// How many past frames (per eye) are kept for hold/extrapolation across a
+/// brief invalid/missing reading — matches the decompiled real software's
+/// `EyesPositioningParametersCalculator.MaxCountOfExtrapolatedGazeDataPosition`.
+pub const MAX_HISTORY_FRAMES: usize = 11;
+
+/// One eye's decoded per-frame reading: mirror-view trackbox position plus
+/// operating distance (mm), or absent if that eye's reading was invalid this
+/// frame. Mirrors exactly what `EyeView::from_gaze` already decodes per eye —
+/// this struct just lets that decoded value be buffered/extrapolated instead
+/// of used-or-discarded immediately.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EyeSample {
+    pos: [f32; 2],
+    distance_mm: Option<f32>,
+}
+
+/// Decode one eye's reading from a gaze frame: mirrors `EyeView::from_gaze`'s
+/// per-eye decode (mirrored x, y passes through unchanged, distance from that
+/// eye's own eye-origin z in mm) but keyed to a single eye instead of gating
+/// on both eyes being valid at once.
+fn decode_eye(
+    trackbox_present: bool,
+    validity: u32,
+    trackbox: [f64; 3],
+    origin_present: bool,
+    origin_mm: [f64; 3],
+) -> Option<EyeSample> {
+    if !trackbox_present || validity != 0 {
+        return None;
+    }
+    Some(EyeSample {
+        pos: [1.0 - trackbox[0] as f32, trackbox[1] as f32],
+        distance_mm: if origin_present {
+            Some(origin_mm[2] as f32)
+        } else {
+            None
+        },
+    })
+}
+
+/// Resolve one eye's position for the current frame from its rolling history:
+/// use this frame's own reading directly if it's valid; otherwise hold the
+/// last known-good value if only one is available, or linearly extrapolate
+/// from the last two known-good values (frame-index-based — see
+/// `EyeHistory`'s doc comment), clamping the extrapolated position to
+/// `[0,1]`. Returns `None` only once the entire window has no valid sample.
+fn resolve_eye(buf: &VecDeque<Option<EyeSample>>) -> Option<EyeSample> {
+    // This frame's own reading is valid: no extrapolation needed.
+    if let Some(Some(latest)) = buf.back() {
+        return Some(*latest);
+    }
+
+    let n = buf.len();
+    // Scan for the two most recent valid entries (p2 = newer, p3 = older),
+    // excluding the just-pushed (guaranteed-`None`) current entry.
+    let mut p3: Option<(usize, EyeSample)> = None;
+    let mut p2: Option<(usize, EyeSample)> = None;
+    for (i, entry) in buf.iter().enumerate().take(n.saturating_sub(1)) {
+        if let Some(e) = entry {
+            p3 = p2;
+            p2 = Some((i, *e));
+        }
+    }
+
+    let (idx_p2, p2) = p2?;
+    let Some((idx_p3, p3)) = p3 else {
+        // Exactly one valid sample in the window: hold it, no slope to extrapolate.
+        return Some(p2);
+    };
+
+    // Frame-index-based gaps (NOT wall-clock time or velocity): how many
+    // frames since p2, and how many frames separated p3 from p2.
+    let gap_p2 = (n - 1 - idx_p2) as f32;
+    let gap_p2_p3 = (idx_p2 - idx_p3) as f32;
+
+    let x = (p2.pos[0] + (p2.pos[0] - p3.pos[0]) * gap_p2 / gap_p2_p3).clamp(0.0, 1.0);
+    let y = (p2.pos[1] + (p2.pos[1] - p3.pos[1]) * gap_p2 / gap_p2_p3).clamp(0.0, 1.0);
+    let distance_mm = match (p2.distance_mm, p3.distance_mm) {
+        (Some(d2), Some(d3)) => Some(d2 + (d2 - d3) * gap_p2 / gap_p2_p3),
+        (Some(d2), None) => Some(d2),
+        (None, _) => None,
+    };
+
+    Some(EyeSample {
+        pos: [x, y],
+        distance_mm,
+    })
+}
+
+/// Push one frame's decoded (or absent) sample onto an eye's history buffer,
+/// capping it at `MAX_HISTORY_FRAMES`.
+fn push_capped(buf: &mut VecDeque<Option<EyeSample>>, sample: Option<EyeSample>) {
+    buf.push_back(sample);
+    if buf.len() > MAX_HISTORY_FRAMES {
+        buf.pop_front();
+    }
+}
+
+/// Combine both eyes' resolved samples into an `EyeView`, reusing
+/// `EyeView::from_gaze`'s exact guidance thresholds/selection logic —
+/// generalized to let either eye be independently absent (`None`) instead of
+/// gating on both eyes at once.
+fn combine(left: Option<EyeSample>, right: Option<EyeSample>) -> EyeView {
+    if left.is_none() && right.is_none() {
+        return EyeView::none();
+    }
+
+    let distance_mm = match (
+        left.and_then(|e| e.distance_mm),
+        right.and_then(|e| e.distance_mm),
+    ) {
+        (Some(dl), Some(dr)) => Some((dl + dr) / 2.0),
+        (Some(d), None) | (None, Some(d)) => Some(d),
+        (None, None) => None,
+    };
+
+    let near_edge = [left.map(|e| e.pos), right.map(|e| e.pos)]
+        .into_iter()
+        .flatten()
+        .any(|p| {
+            p[0] < EDGE_MARGIN
+                || p[0] > 1.0 - EDGE_MARGIN
+                || p[1] < EDGE_MARGIN
+                || p[1] > 1.0 - EDGE_MARGIN
+        });
+
+    let guidance = match distance_mm {
+        Some(d) if d < DIST_MIN_MM => Guidance::MoveBack,
+        Some(d) if d > DIST_MAX_MM => Guidance::MoveCloser,
+        _ if near_edge => Guidance::OffCenter,
+        _ => Guidance::Centered,
+    };
+
+    EyeView {
+        left: left.map(|e| e.pos),
+        right: right.map(|e| e.pos),
+        distance_mm,
+        guidance,
+    }
+}
+
+/// Rolling per-eye history providing hold+linear-extrapolation across brief
+/// invalid/missing frames instead of instantly reporting "no eyes" for that
+/// eye — mirrors the decompiled original's `SyncEyesPositioningParameters`/
+/// `ExtrapolatePosition` (frame-index-based, NOT wall-clock-time or velocity-
+/// based: a fast head movement produces a bigger per-frame delta, which gets
+/// extrapolated further, but is not treated specially otherwise — same as
+/// the original).
+#[derive(Debug, Clone, Default)]
+pub struct EyeHistory {
+    left: VecDeque<Option<EyeSample>>,
+    right: VecDeque<Option<EyeSample>>,
+}
+
+impl EyeHistory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one incoming gaze frame and return the resulting (held or
+    /// extrapolated) `EyeView` for THIS frame. Call exactly once per incoming
+    /// gaze notification, in arrival order — do not call this more than once
+    /// per actual frame (the frame-index-based extrapolation assumes one
+    /// buffer push per real frame).
+    pub fn update(&mut self, s: &GazeSample) -> EyeView {
+        let left_sample = decode_eye(
+            s.has(present::TRACKBOX_L),
+            s.validity_l,
+            s.trackbox_eye_l,
+            s.has(present::EYE_ORIGIN_L),
+            s.eye_origin_l_mm,
+        );
+        let right_sample = decode_eye(
+            s.has(present::TRACKBOX_R),
+            s.validity_r,
+            s.trackbox_eye_r,
+            s.has(present::EYE_ORIGIN_R),
+            s.eye_origin_r_mm,
+        );
+
+        push_capped(&mut self.left, left_sample);
+        push_capped(&mut self.right, right_sample);
+
+        combine(resolve_eye(&self.left), resolve_eye(&self.right))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +354,158 @@ mod tests {
         // Raw x=0.95 → mirrored 0.05, within EDGE_MARGIN of the edge.
         let v = EyeView::from_gaze(&sample([0.95, 0.5, 0.5], [0.9, 0.5, 0.5], 680.0, true));
         assert!(matches!(v.guidance, Guidance::OffCenter));
+    }
+
+    /// Build a sample with independent per-eye validity — for testing that
+    /// each eye's history/extrapolation is resolved independently.
+    fn sample_split(
+        tb_l: [f64; 3],
+        tb_r: [f64; 3],
+        origin_z_mm: f64,
+        valid_l: bool,
+        valid_r: bool,
+    ) -> GazeSample {
+        GazeSample {
+            trackbox_eye_l: tb_l,
+            trackbox_eye_r: tb_r,
+            eye_origin_l_mm: [0.0, 0.0, origin_z_mm],
+            eye_origin_r_mm: [0.0, 0.0, origin_z_mm],
+            present_mask: present::TRACKBOX_L
+                | present::TRACKBOX_R
+                | present::EYE_ORIGIN_L
+                | present::EYE_ORIGIN_R
+                | present::VALIDITY_L
+                | present::VALIDITY_R,
+            validity_l: if valid_l { 0 } else { 4 },
+            validity_r: if valid_r { 0 } else { 4 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn history_single_valid_frame_matches_from_gaze() {
+        // No history yet: EyeHistory::update on the very first frame must be
+        // identical to the pure, stateless EyeView::from_gaze on that frame.
+        let g = sample([0.6, 0.5, 0.5], [0.4, 0.5, 0.5], 680.0, true);
+        let via_history = EyeHistory::new().update(&g);
+        let direct = EyeView::from_gaze(&g);
+        assert_eq!(via_history, direct);
+    }
+
+    #[test]
+    fn brief_invalid_gap_holds_through_it_instead_of_no_eyes() {
+        // Regression test for the reported bug: valid, valid, invalid x3, valid.
+        // The invalid stretch must NOT report "no eyes" (it must hold/extrapolate).
+        let mut hist = EyeHistory::new();
+        hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, true));
+        hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, true));
+        for _ in 0..3 {
+            let v = hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, false));
+            assert!(
+                !matches!(v.guidance, Guidance::NoEyes),
+                "a brief gap within the history window must not report no eyes"
+            );
+            assert!(v.left.is_some() && v.right.is_some());
+        }
+        // Recovery: a subsequent valid frame is used directly again.
+        let v = hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, true));
+        assert!(!matches!(v.guidance, Guidance::NoEyes));
+    }
+
+    #[test]
+    fn full_window_of_invalid_frames_eventually_reports_no_eyes() {
+        // The hold/extrapolation window is finite: once MAX_HISTORY_FRAMES
+        // consecutive invalid frames have pushed every valid sample out of the
+        // buffer, the eye must be reported absent again (no infinite buffering).
+        let mut hist = EyeHistory::new();
+        hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, true));
+        let mut last = None;
+        for _ in 0..MAX_HISTORY_FRAMES {
+            last = Some(hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, false)));
+        }
+        let v = last.unwrap();
+        assert!(matches!(v.guidance, Guidance::NoEyes));
+        assert!(v.left.is_none() && v.right.is_none());
+    }
+
+    #[test]
+    fn single_historical_sample_holds_without_extrapolating() {
+        // Only one valid sample in the window: no slope to derive, so the
+        // position must hold unchanged (and must not panic on a would-be
+        // divide-by-zero from a missing second sample).
+        let mut hist = EyeHistory::new();
+        let v0 = hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, true));
+        let v1 = hist.update(&sample([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], 680.0, false));
+        assert_eq!(v1.left, v0.left);
+        assert_eq!(v1.right, v0.right);
+        assert!(!matches!(v1.guidance, Guidance::NoEyes));
+    }
+
+    #[test]
+    fn extrapolates_in_the_direction_of_movement() {
+        // Two valid samples showing movement (raw x decreasing => mirrored x
+        // increasing), then a gap: the extrapolated position must continue
+        // moving in that same direction, by the expected amount.
+        let mut hist = EyeHistory::new();
+        hist.update(&sample([0.7, 0.5, 0.5], [0.7, 0.5, 0.5], 680.0, true)); // mirrored x=0.3
+        let v_second = hist.update(&sample([0.6, 0.5, 0.5], [0.6, 0.5, 0.5], 680.0, true)); // mirrored x=0.4
+        let v_gap = hist.update(&sample([0.6, 0.5, 0.5], [0.6, 0.5, 0.5], 680.0, false));
+
+        let x_second = v_second.left.unwrap()[0];
+        let x_extrapolated = v_gap.left.unwrap()[0];
+        assert!(
+            x_extrapolated > x_second,
+            "expected continued movement in the same direction: {x_extrapolated} <= {x_second}"
+        );
+        assert!((x_extrapolated - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn extrapolated_position_is_clamped_to_unit_range() {
+        // Two valid samples trending toward the upper edge; the frame-index
+        // extrapolation from them would overshoot past 1.0 — must clamp.
+        let mut hist = EyeHistory::new();
+        hist.update(&sample([0.2, 0.5, 0.5], [0.2, 0.5, 0.5], 680.0, true)); // mirrored 0.8
+        hist.update(&sample([0.05, 0.5, 0.5], [0.05, 0.5, 0.5], 680.0, true)); // mirrored 0.95
+        let v = hist.update(&sample([0.05, 0.5, 0.5], [0.05, 0.5, 0.5], 680.0, false));
+        // Unclamped this would be 0.95 + (0.95 - 0.8) = 1.10.
+        assert!((v.left.unwrap()[0] - 1.0).abs() < 1e-6);
+        assert!((v.right.unwrap()[0] - 1.0).abs() < 1e-6);
+
+        // Same check trending toward the lower edge.
+        let mut hist = EyeHistory::new();
+        hist.update(&sample([0.8, 0.5, 0.5], [0.8, 0.5, 0.5], 680.0, true)); // mirrored 0.2
+        hist.update(&sample([0.95, 0.5, 0.5], [0.95, 0.5, 0.5], 680.0, true)); // mirrored 0.05
+        let v = hist.update(&sample([0.95, 0.5, 0.5], [0.95, 0.5, 0.5], 680.0, false));
+        // Unclamped this would be 0.05 + (0.05 - 0.2) = -0.10.
+        assert!(v.left.unwrap()[0].abs() < 1e-6);
+        assert!(v.right.unwrap()[0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn each_eye_is_resolved_independently() {
+        // The left eye has a brief gap; the right eye stays continuously
+        // valid. The right eye's reported position must be completely
+        // unaffected by the left eye's gap/extrapolation.
+        let mut hist = EyeHistory::new();
+        hist.update(&sample_split(
+            [0.5, 0.5, 0.5],
+            [0.3, 0.5, 0.5],
+            680.0,
+            true,
+            true,
+        ));
+        let v = hist.update(&sample_split(
+            [0.5, 0.5, 0.5],
+            [0.3, 0.5, 0.5],
+            680.0,
+            false,
+            true,
+        ));
+        // Right eye: mirrored 1-0.3=0.7, exactly as this frame's own reading.
+        assert!((v.right.unwrap()[0] - 0.7).abs() < 1e-6);
+        // Left eye: held from the prior valid frame, not dropped.
+        assert!(v.left.is_some());
+        assert!(!matches!(v.guidance, Guidance::NoEyes));
     }
 }
