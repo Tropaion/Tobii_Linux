@@ -173,6 +173,18 @@ pub fn device_tick<T: Transport>(
                 state.lock().unwrap().calibration = CalPhase::begin(token);
                 let _ = conn.set_enabled_eye(eye); // best-effort select-eyes experiment
 
+                // Retrieve whatever calibration is currently active on the
+                // device BEFORE clearing it, so a successful start+clear below
+                // can be re-seeded with it. This is what makes "Improve
+                // calibration" (the hub's manual recalibration path)
+                // meaningfully different from a from-scratch calibration: new
+                // points refine the existing calibration instead of replacing
+                // it outright. An empty/failed retrieve just means there was
+                // nothing to improve on (e.g. a true first-ever calibration) —
+                // proceed as a plain fresh session in that case, exactly as
+                // before this change.
+                let previous_blob = conn.retrieve_calibration().ok().filter(|b| !b.0.is_empty());
+
                 // Pessimistic: a request fails on a wall-clock deadline, which
                 // is NOT proof the device ignored it — it may have entered the
                 // realm while the ack was lost or late. Record "possibly open"
@@ -183,6 +195,10 @@ pub fn device_tick<T: Transport>(
                 let r = conn
                     .start_calibration()
                     .and_then(|()| conn.clear_calibration())
+                    .and_then(|()| match &previous_blob {
+                        Some(blob) => conn.apply_calibration(&blob.0),
+                        None => Ok(()),
+                    })
                     .map_err(|e| e.to_string());
                 match r {
                     // Only now is the session really open for point collection.
@@ -581,11 +597,13 @@ mod tests {
 
     #[test]
     fn cal_begin_echoes_the_token_and_marks_the_session_open() {
-        // Post-handshake seqs run 5, 6, 7: set_enabled_eye, start, clear.
+        // Post-handshake seqs run 5, 6, 7, 8: set_enabled_eye, retrieve
+        // (empty -> no previous blob, so no reapply follows), start, clear.
         let mut conn = connected(vec![
             inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
-            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
-            inbound(TTP_MAGIC_RSP, 7, 0x424, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 8, 0x424, &[]),
         ]);
         let state = Mutex::new(DeviceState::default());
         let (tx, rx) = channel::<DeviceCommand>();
@@ -599,15 +617,48 @@ mod tests {
         assert_eq!(s.calibration.token, 99, "UI's token is echoed back");
         assert!(s.calibration.active);
         assert!(s.cal_session_open);
+        assert!(s.calibration.started, "start+clear both acked");
+        assert!(
+            !sent_op(&conn, 0x456),
+            "no blob retrieved -> no CAL_APPLY reseed"
+        );
+    }
+
+    #[test]
+    fn cal_begin_reapplies_the_previously_retrieved_calibration_blob() {
+        // A non-empty retrieve response must be re-applied (CAL_APPLY, 0x456)
+        // after start+clear, before the session is reported as started — this
+        // is what makes "Improve calibration" build on the old calibration
+        // instead of behaving like a from-scratch one.
+        let mut conn = connected(vec![
+            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[0xde, 0xad, 0xbe, 0xef]),
+            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 8, 0x424, &[]),
+            inbound(TTP_MAGIC_RSP, 9, 0x456, &[]),
+        ]);
+        let state = Mutex::new(DeviceState::default());
+        let (tx, rx) = channel::<DeviceCommand>();
+        tx.send(DeviceCommand::CalBegin {
+            eye: EnabledEye::Both,
+            token: 1,
+        })
+        .unwrap();
+        device_tick(&mut conn, &state, &rx);
+        assert!(sent_op(&conn, 0x456), "retrieved blob was re-applied");
+        let s = state.lock().unwrap();
+        assert!(s.calibration.started, "start+clear+reapply all acked");
+        assert!(s.cal_session_open);
     }
 
     #[test]
     fn cal_begin_marks_session_open_even_when_clear_fails() {
-        // start (seq 6) acks, clear (seq 7) gets no response: the realm IS open
+        // start (seq 7) acks, clear (seq 8) gets no response: the realm IS open
         // and a later abort must still stop it, even though `active` is false.
         let mut conn = connected(vec![
             inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
-            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
         ]);
         conn.set_request_timeout(Duration::from_millis(10));
         let state = Mutex::new(DeviceState::default());
