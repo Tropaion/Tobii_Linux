@@ -106,9 +106,13 @@ const GAZE_GAP_TOLERANCE_TICKS: u32 = 8;
 // The captured-point particle burst outlives the dwell it followed — it keeps
 // animating concurrently with the next point fading in (or, on the last
 // point, with nothing at all — see the tick loop's unconditional age/retire
-// block). ~0.6 s: long enough to read as a distinct "captured!" beat, short
-// enough not to still be running when the next point is sampled.
-const EXPLODE_DURATION_TICKS: u32 = 18;
+// block). ~0.8 s, matching the decompiled original's per-particle storyboard
+// (`CalibrationProcessStoryboardFactory.CreateParticleCalibratedAnimation`):
+// particles fully fade out anywhere from ~400ms to ~799ms after capture,
+// staggered by each particle's own random `FadeBeginTime` — long enough to
+// read as a distinct "captured!" beat, short enough not to still be running
+// when the next point is sampled.
+const EXPLODE_DURATION_TICKS: u32 = 24;
 
 // Every UI deadline below must outlast the device-thread work it is waiting on.
 // If the UI gives up first the device thread keeps running the old command and

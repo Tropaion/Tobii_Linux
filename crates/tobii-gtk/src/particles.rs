@@ -12,8 +12,10 @@
 
 use std::f64::consts::TAU;
 
-/// Number of particles in one burst.
-pub const PARTICLE_COUNT: usize = 10;
+/// Number of particles in one burst. Matches the decompiled original's
+/// `GenerateParticles()` (`Tobii.Configuration.Common.Calibration.Views.
+/// CalibrationProcessView`), which allocates a fixed `ParticleTarget[20]`.
+pub const PARTICLE_COUNT: usize = 20;
 
 /// Speed multiplier range (relative units, see `particle_pos`'s `SPEED_SCALE`
 /// for how this maps to on-screen pixels): centered on 1.0 with +/-50% spread
@@ -33,6 +35,15 @@ const SIZE_MAX: f64 = 6.0;
 /// halfway to white. Keeps the burst from reading as perfectly uniform dots.
 const BRIGHTNESS_MIN: f64 = 0.0;
 const BRIGHTNESS_MAX: f64 = 0.5;
+
+/// Per-particle fade-start delay range, as a fraction of the whole burst's
+/// normalized `t` timeline (see `particle_pos`): the particle stays fully
+/// opaque until `t` passes its own `fade_delay`, then fades linearly. Mirrors
+/// the decompiled original's per-particle `Rand.Next(400)` `FadeBeginTime`
+/// (0-399ms) staggered within its overall ~800ms burst lifetime — a
+/// proportionally similar `0.0..=0.5` fraction of the total duration.
+const FADE_DELAY_MIN: f64 = 0.0;
+const FADE_DELAY_MAX: f64 = 0.5;
 
 /// Pixels of outward travel per unit of `speed` at `t = 1.0`. Chosen so a
 /// `speed = 1.0` particle travels ~60px over the ~0.6s burst referenced in the
@@ -54,13 +65,16 @@ pub const DISTANCE_SCALE: f64 = 60.0;
 /// `brightness` is a per-particle "blend toward white" factor in
 /// `[0.0, 0.5]` (`0.0` = plain base color, `0.5` = halfway to white) that the
 /// draw code uses to give particles some color/brightness variation instead
-/// of perfectly uniform dots.
+/// of perfectly uniform dots, and `fade_delay` is a per-particle fraction of
+/// the burst's `t` timeline (`[0.0, 0.5]`) that the particle stays fully
+/// opaque for before it starts fading — see `particle_pos`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Particle {
     pub angle: f64,
     pub speed: f64,
     pub size: f64,
     pub brightness: f64,
+    pub fade_delay: f64,
 }
 
 /// Splitmix64 mix step: deterministic, well-distributed, public-domain
@@ -96,11 +110,14 @@ pub fn burst(seed: u64) -> [Particle; PARTICLE_COUNT] {
         let size = SIZE_MIN + unit_f64(splitmix64(&mut state)) * (SIZE_MAX - SIZE_MIN);
         let brightness =
             BRIGHTNESS_MIN + unit_f64(splitmix64(&mut state)) * (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
+        let fade_delay =
+            FADE_DELAY_MIN + unit_f64(splitmix64(&mut state)) * (FADE_DELAY_MAX - FADE_DELAY_MIN);
         Particle {
             angle,
             speed,
             size,
             brightness,
+            fade_delay,
         }
     })
 }
@@ -110,27 +127,40 @@ pub fn burst(seed: u64) -> [Particle; PARTICLE_COUNT] {
 /// done, fully faded).
 ///
 /// Returns `(dx, dy, alpha)`: `dx`/`dy` are the outward displacement in pixels
-/// from the burst's origin, and `alpha` fades from `1.0` to `0.0`. Both curves
-/// are eased rather than linear, so the burst reads as a real explosion
-/// instead of a mechanically uniform expansion:
+/// from the burst's origin, and `alpha` fades from `1.0` to `0.0`. This
+/// mirrors the decompiled original's actual per-particle storyboard
+/// (`CalibrationProcessStoryboardFactory.CreateParticleCalibratedAnimation`)
+/// rather than a synchronized, uniformly-eased approximation:
 ///
-/// - Motion uses an ease-out curve (`1 - (1-t)^2`): fast initial motion that
-///   decelerates, reaching the exact same total distance at `t = 1.0` as the
-///   old plain `speed * t * DISTANCE_SCALE` linear formula did — only the
-///   curve getting there changes, not the resting distance.
-/// - Alpha uses an ease-in fade (`1 - t^2`): stays close to fully opaque for
-///   longer, then drops off faster near the end, instead of fading evenly
-///   from the very first frame.
+/// - Motion uses a `CircleEase`-EaseOut curve (`sqrt(1 - (1-t)^2)`): a
+///   sharper, more front-loaded deceleration than a plain quadratic ease-out,
+///   reaching the exact same total distance at `t = 1.0` (`sqrt(1-0) = 1`) as
+///   the old plain `speed * t * DISTANCE_SCALE` linear formula did — only the
+///   curve getting there changes, not the resting distance. `eased_t = 0.0`
+///   at `t = 0.0` (`sqrt(1-1) = 0`), so the particle still starts at the
+///   origin.
+/// - Alpha stays fully opaque (`1.0`) until `t` passes the particle's own
+///   `fade_delay`, then fades **linearly** (matching the original's
+///   `DoubleAnimation` with no `EasingFunction`, i.e. WPF's default linear
+///   interpolation) down to `0.0` over the remaining `1.0 - fade_delay`
+///   fraction of the timeline. Because every particle in a burst has its own
+///   random `fade_delay`, particles fade out at staggered times rather than
+///   all together.
 ///
 /// Motion is purely radial and still monotonically non-decreasing in `t` (the
 /// ease-out curve is itself monotonic over `[0, 1]`), so distance from the
 /// origin never decreases as `t` increases from 0 to 1.
 pub fn particle_pos(t: f64, p: Particle) -> (f64, f64, f64) {
-    let eased_t = 1.0 - (1.0 - t) * (1.0 - t);
+    let eased_t = (1.0 - (1.0 - t) * (1.0 - t)).sqrt();
     let dist = p.speed * eased_t * DISTANCE_SCALE;
     let dx = p.angle.cos() * dist;
     let dy = p.angle.sin() * dist;
-    let alpha = (1.0 - t * t).max(0.0);
+    let alpha = if t < p.fade_delay {
+        1.0
+    } else {
+        let fade_t = (t - p.fade_delay) / (1.0 - p.fade_delay);
+        (1.0 - fade_t).max(0.0)
+    };
     (dx, dy, alpha)
 }
 
@@ -168,6 +198,11 @@ mod tests {
                     "brightness={}",
                     p.brightness
                 );
+                assert!(
+                    (FADE_DELAY_MIN..=FADE_DELAY_MAX).contains(&p.fade_delay),
+                    "fade_delay={}",
+                    p.fade_delay
+                );
             }
         }
     }
@@ -187,12 +222,26 @@ mod tests {
     }
 
     #[test]
+    fn fade_delay_is_deterministic_per_seed() {
+        // Same property as `burst_is_deterministic`/`brightness_is_deterministic_per_seed`,
+        // called out separately for `fade_delay` since it's the newest field
+        // and a regression that reorders/adds a PRNG draw could shift it
+        // alone while leaving the others unaffected on some seeds.
+        let a = burst(99);
+        let b = burst(99);
+        for (pa, pb) in a.iter().zip(b.iter()) {
+            assert!((pa.fade_delay - pb.fade_delay).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn position_starts_at_origin_full_alpha_and_ends_faded() {
         let p = Particle {
             angle: 0.7,
             speed: 1.2,
             size: 4.0,
             brightness: 0.25,
+            fade_delay: 0.0,
         };
         let (dx0, dy0, alpha0) = particle_pos(0.0, p);
         assert!((dx0 - 0.0).abs() < 1e-9);
@@ -210,6 +259,7 @@ mod tests {
             speed: 1.4,
             size: 3.0,
             brightness: 0.1,
+            fade_delay: 0.2,
         };
         let (dx, dy, alpha) = particle_pos(1.0, p);
         let dist = (dx * dx + dy * dy).sqrt();
@@ -231,6 +281,7 @@ mod tests {
             speed: 1.0,
             size: 5.0,
             brightness: 0.4,
+            fade_delay: 0.1,
         };
         let dist_at = |t: f64| {
             let (dx, dy, _) = particle_pos(t, p);
@@ -245,17 +296,65 @@ mod tests {
     }
 
     #[test]
-    fn ease_in_fade_lingers_above_the_old_linear_midpoint() {
+    fn alpha_stays_fully_opaque_before_its_fade_delay() {
+        // Mirrors the original's `DoubleAnimation.BeginTime = FadeBeginTime`:
+        // the particle does not start fading at all until `t` passes its own
+        // `fade_delay`.
         let p = Particle {
             angle: 2.0,
             speed: 0.8,
             size: 2.5,
             brightness: 0.0,
+            fade_delay: 0.4,
+        };
+        let (_, _, alpha) = particle_pos(0.3, p);
+        assert!(
+            (alpha - 1.0).abs() < 1e-9,
+            "particle should still be fully opaque before its fade_delay elapses: {alpha}"
+        );
+    }
+
+    #[test]
+    fn alpha_fades_linearly_once_past_fade_delay() {
+        // Direct behavioral proof the fade is no longer eased: with
+        // `fade_delay: 0.0` the fade starts immediately, so at the burst's
+        // halfway point a LINEAR fade should read close to 0.5 — not the old
+        // ease-in curve's 0.75 (`1 - 0.5^2`).
+        let p = Particle {
+            angle: 2.0,
+            speed: 0.8,
+            size: 2.5,
+            brightness: 0.0,
+            fade_delay: 0.0,
         };
         let (_, _, alpha_half) = particle_pos(0.5, p);
         assert!(
-            alpha_half > 0.5,
-            "ease-in fade should still read above the old linear formula's 0.5 at t=0.5: {alpha_half}"
+            (alpha_half - 0.5).abs() < 1e-9,
+            "linear fade with fade_delay=0.0 should read ~0.5 at t=0.5, not the old ease-in 0.75: {alpha_half}"
+        );
+    }
+
+    #[test]
+    fn higher_fade_delay_stays_more_opaque_at_the_same_t() {
+        // Direct proof of staggering: two particles differing only in
+        // `fade_delay`, evaluated at the same `t`, must show the higher-delay
+        // one strictly more opaque.
+        let low_delay = Particle {
+            angle: 0.0,
+            speed: 1.0,
+            size: 3.0,
+            brightness: 0.0,
+            fade_delay: 0.0,
+        };
+        let high_delay = Particle {
+            fade_delay: 0.4,
+            ..low_delay
+        };
+        let (_, _, alpha_low) = particle_pos(0.6, low_delay);
+        let (_, _, alpha_high) = particle_pos(0.6, high_delay);
+        assert!(
+            alpha_high > alpha_low,
+            "higher fade_delay should still be more opaque at the same t: alpha_low={alpha_low} alpha_high={alpha_high}"
         );
     }
 
