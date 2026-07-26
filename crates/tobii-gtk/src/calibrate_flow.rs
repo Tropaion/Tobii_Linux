@@ -67,6 +67,24 @@ impl CalMode {
     }
 }
 
+/// Per-point calibration hit-zone radius, matching the decompiled original's
+/// `CalibrationProcessViewModel.SetCalibrationPointsAndUpdateZoneRadius`:
+/// the real product shows these 7 points in three groups (center alone;
+/// indices 1-3 together; indices 4-6 together — see `CalibrationStateManager`)
+/// and recomputes the hit-zone radius fresh per group, from only that
+/// group's own points. Our UI shows one point at a time rather than the
+/// original's simultaneous groups, but the *tolerance* for each point should
+/// still match whichever group it conceptually belongs to — using the
+/// spacing of all 7 points at once (as this code did before) gives roughly
+/// half the correct radius for the corner points in the last group, making
+/// them very hard to hold focus on.
+fn group_zone_radii(points: &[(f64, f64); 7], aspect: f64) -> [f64; 7] {
+    let center = focus::zone_radius(&points[0..1], aspect); // fewer than 2 points -> f64::MAX, i.e. "always in zone", matching the original's "whole screen" radius for the lone center point
+    let group_b = focus::zone_radius(&points[1..4], aspect);
+    let group_c = focus::zone_radius(&points[4..7], aspect);
+    [center, group_b, group_b, group_b, group_c, group_c, group_c]
+}
+
 // Tick cadence is 33 ms (~30 fps), matching the hub.
 //
 // HARDWARE-OBSERVED (2026-07-21): the ET5 acks add_calibration_point almost
@@ -469,10 +487,12 @@ pub fn launch(
         std::array::from_fn(|i| calibration_area::remap_point(raw_points[i], cal_area));
 
     // The proximity radius gaze must fall within to count as "on" a point —
+    // one radius per point (see `group_zone_radii`; the original recomputes
+    // this per simultaneously-shown group rather than once for all 7 points),
     // constant across the flow's lifetime (depends on the ACTUAL, possibly
     // remapped point set and the screen's aspect ratio, neither of which
     // change mid-session), so computed once here rather than every tick.
-    let zone_radius = focus::zone_radius(&cal_points, screen_aspect());
+    let zone_radii = group_zone_radii(&cal_points, screen_aspect());
 
     let win = gtk::ApplicationWindow::builder()
         .application(app)
@@ -919,7 +939,7 @@ pub fn launch(
                                 g,
                                 &cal_points,
                                 &calibrated_mask,
-                                zone_radius,
+                                zone_radii[index],
                                 screen_aspect(),
                             )
                         })
@@ -1119,5 +1139,94 @@ mod tests {
         assert_eq!(pts[4], (0.1, 0.1), "point 4: top-left");
         assert_eq!(pts[5], (0.5, 0.9), "point 5: bottom-center");
         assert_eq!(pts[6], (0.9, 0.1), "point 6: top-right");
+    }
+
+    /// Regression test for the reported bug ("I cannot focus in point 5"):
+    /// point 5 (1-based) = index 4 (0-based), the top-left corner, belongs to
+    /// the original's third simultaneous-group `{4,5,6}`. Computing the zone
+    /// radius from ALL 7 `FULL_7` points at once (the old, wrong behavior)
+    /// gives 0.09 (see `focus.rs`'s own `zone_radius_matches_hand_derivation`)
+    /// — exactly half of the 0.18 the original actually uses for this group,
+    /// hand-derived below. `group_zone_radii` must produce 0.18 for index 4,
+    /// not 0.09.
+    #[test]
+    fn group_zone_radii_center_point_is_always_in_zone() {
+        let radii = group_zone_radii(&FULL_7, 1.0);
+        assert_eq!(radii[0], f64::MAX, "center point (index 0) must be `f64::MAX` (whole-screen, always-in-zone), matching the original's single-point-calibration radius");
+    }
+
+    /// Hand-derivation for group B (indices 1-3): `(0.1,0.9)`, `(0.5,0.1)`,
+    /// `(0.9,0.9)`.
+    ///   (0.1,0.9)-(0.5,0.1): dx=0.4, dy=0.8 -> dist = sqrt(0.16+0.64) = sqrt(0.8) ≈ 0.894
+    ///   (0.1,0.9)-(0.9,0.9): dx=0.8, dy=0.0 -> dist = 0.8
+    ///   (0.5,0.1)-(0.9,0.9): dx=0.4, dy=0.8 -> dist = sqrt(0.8) ≈ 0.894
+    /// Minimum is 0.8 (NOT 0.4, the whole-7-point minimum) -> radius = (0.8 / 2.0) * 0.45 = 0.18.
+    #[test]
+    fn group_zone_radii_group_b_matches_hand_derivation() {
+        let radii = group_zone_radii(&FULL_7, 1.0);
+        assert_eq!(
+            radii[1], radii[2],
+            "group B (indices 1-3) shares one radius"
+        );
+        assert_eq!(
+            radii[2], radii[3],
+            "group B (indices 1-3) shares one radius"
+        );
+        assert!(
+            (radii[1] - 0.18).abs() < 1e-9,
+            "expected 0.18, got {}",
+            radii[1]
+        );
+    }
+
+    /// Hand-derivation for group C (indices 4-6, containing the reported
+    /// point 5/index 4): `(0.1,0.1)`, `(0.5,0.9)`, `(0.9,0.1)`.
+    ///   (0.1,0.1)-(0.5,0.9): dx=0.4, dy=0.8 -> dist = sqrt(0.8) ≈ 0.894
+    ///   (0.1,0.1)-(0.9,0.1): dx=0.8, dy=0.0 -> dist = 0.8
+    ///   (0.5,0.9)-(0.9,0.1): dx=0.4, dy=0.8 -> dist = sqrt(0.8) ≈ 0.894
+    /// Minimum is 0.8 -> radius = (0.8 / 2.0) * 0.45 = 0.18 — NOT 0.09, the
+    /// old, wrong, whole-7-point-derived value (see
+    /// `group_zone_radii_old_whole_array_value_is_half_the_correct_one`
+    /// below for a direct side-by-side).
+    #[test]
+    fn group_zone_radii_group_c_matches_hand_derivation() {
+        let radii = group_zone_radii(&FULL_7, 1.0);
+        assert_eq!(
+            radii[4], radii[5],
+            "group C (indices 4-6) shares one radius"
+        );
+        assert_eq!(
+            radii[5], radii[6],
+            "group C (indices 4-6) shares one radius"
+        );
+        assert!(
+            (radii[4] - 0.18).abs() < 1e-9,
+            "expected 0.18, got {}",
+            radii[4]
+        );
+        assert_ne!(
+            radii[4], 0.09,
+            "must NOT be the old whole-array-derived value (see the sanity check below)"
+        );
+    }
+
+    /// Direct side-by-side with the OLD (wrong) computation: deriving the
+    /// radius from all 7 points at once instead of per-group gives 0.09 —
+    /// exactly half of the 0.18 that `group_zone_radii` correctly gives for
+    /// group C above. This is the entire reason the reported bug happened:
+    /// the corner points' hit-zone was half the size it should have been.
+    #[test]
+    fn group_zone_radii_old_whole_array_value_is_half_the_correct_one() {
+        let old_whole_array_radius = focus::zone_radius(&FULL_7, 1.0);
+        assert!(
+            (old_whole_array_radius - 0.09).abs() < 1e-9,
+            "expected 0.09, got {old_whole_array_radius}"
+        );
+        let group_c_radius = group_zone_radii(&FULL_7, 1.0)[4];
+        assert!(
+            (group_c_radius - 2.0 * old_whole_array_radius).abs() < 1e-9,
+            "group C's correct radius ({group_c_radius}) should be exactly double the old, \
+             wrong, whole-array radius ({old_whole_array_radius})"
+        );
     }
 }
