@@ -4,17 +4,18 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use tobii_protocol::calibration::{
-    cal_add_point_payload, cal_apply_payload, cal_compute_payload, cal_retrieve_payload,
-    cal_session_payload, CalibrationBlob,
+    cal_add_point_payload, cal_apply_payload, cal_compute_payload, cal_discard_point_payload,
+    cal_retrieve_payload, cal_session_payload, CalibrationBlob,
 };
 use tobii_protocol::commands::{
     parse_enabled_eye, set_display_area_corners_payload, set_enabled_eye_payload,
     subscribe_payload, EnabledEye,
 };
 use tobii_protocol::frame::{
-    build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_CLEAR, OP_CAL_COMPUTE, OP_CAL_RETRIEVE,
-    OP_CAL_START, OP_CAL_STOP, OP_GAZE_NOTIFY, OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA,
-    OP_SET_ENABLED_EYE, OP_SUBSCRIBE, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_CLEAR, OP_CAL_COMPUTE,
+    OP_CAL_DISCARD_POINT, OP_CAL_RETRIEVE, OP_CAL_START, OP_CAL_STOP, OP_GAZE_NOTIFY,
+    OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA, OP_SET_ENABLED_EYE, OP_SUBSCRIBE, STREAM_GAZE,
+    TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
 use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
@@ -172,6 +173,24 @@ impl<T: Transport> Connection<T> {
         )?
         .ok_or(UsbError::NoResponse {
             op: OP_CAL_ADD_POINT,
+        })?;
+        Ok(())
+    }
+
+    /// "Redo" a previously-sampled point: discard whatever data collection
+    /// gathered for it, so a later `add_calibration_point` call for the same
+    /// (x, y) starts fresh. Reverse-engineered from native disassembly;
+    /// UNVERIFIED ON REAL HARDWARE — callers should treat a failure here as
+    /// best-effort (log and continue) rather than a fatal error, matching this
+    /// codebase's existing `set_enabled_eye` best-effort precedent.
+    pub fn discard_calibration_point(&mut self, x: f64, y: f64) -> Result<(), UsbError> {
+        self.request_until(
+            OP_CAL_DISCARD_POINT,
+            &cal_discard_point_payload(x, y),
+            CAL_POINT_TIMEOUT,
+        )?
+        .ok_or(UsbError::NoResponse {
+            op: OP_CAL_DISCARD_POINT,
         })?;
         Ok(())
     }

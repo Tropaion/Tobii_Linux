@@ -24,6 +24,20 @@ pub fn cal_add_point_payload(x: f64, y: f64, eye: u32) -> Vec<u8> {
     p.into_vec()
 }
 
+/// `cal_discard_data_2d` payload: `00 00` + Q42(x) + Q42(y) — same point
+/// encoding as `cal_add_point_payload` but with NO trailing eye argument
+/// (reverse-engineered from native disassembly; unlike `add_point`, this op
+/// takes no eye selector). Used to "redo" a point whose sample was taken
+/// while the user's gaze wasn't actually on the target.
+pub fn cal_discard_point_payload(x: f64, y: f64) -> Vec<u8> {
+    let mut p = Writer::new();
+    p.push_u8(0);
+    p.push_u8(0);
+    write_f64_q42(&mut p, x);
+    write_f64_q42(&mut p, y);
+    p.into_vec()
+}
+
 /// `cal_start` / `cal_stop` / `cal_clear` payload: the `00 00` prefix only.
 /// These session-control ops carry no arguments on the ET5 (the native
 /// `tobii_calibration_start` even drops its `enabled_eye` argument on the wire).
@@ -68,6 +82,21 @@ mod tests {
         ];
         assert_eq!(p, expected);
         assert_eq!(p.len(), 37); // frame will be 8 + 24 + 37 = 69
+    }
+
+    #[test]
+    fn discard_point_payload_is_exact() {
+        // x=0.25 -> q42 = 0x0000_0100_0000_0000; y=0.75 -> 0x0000_0300_0000_0000; no eye.
+        let p = cal_discard_point_payload(0.25, 0.75);
+        let expected: &[u8] = &[
+            0x00, 0x00, // universal prefix
+            0x04, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, // Q42(0.25)
+            0x04, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, // Q42(0.75)
+        ];
+        assert_eq!(p, expected);
+        assert_eq!(p.len(), 28); // frame will be 8 + 24 + 28 = 60
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub const OP_CAL_START: u32 = 0x3f2;
 pub const OP_CAL_STOP: u32 = 0x3fc;
 pub const OP_CAL_CLEAR: u32 = 0x424;
 pub const OP_CAL_ADD_POINT: u32 = 0x408;
+pub const OP_CAL_DISCARD_POINT: u32 = 0x438; // redo a point
 pub const OP_CAL_COMPUTE: u32 = 0x42f; // compute AND apply
 pub const OP_CAL_RETRIEVE: u32 = 0x44c;
 pub const OP_CAL_APPLY: u32 = 0x456;
