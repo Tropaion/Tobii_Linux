@@ -214,32 +214,40 @@ fn push_capped(buf: &mut VecDeque<Option<EyeSample>>, sample: Option<EyeSample>)
 }
 
 /// Combine both eyes' resolved samples into an `EyeView`, reusing
-/// `EyeView::from_gaze`'s exact guidance thresholds/selection logic —
-/// generalized to let either eye be independently absent (`None`) instead of
-/// gating on both eyes at once.
+/// `EyeView::from_gaze`'s exact guidance thresholds/selection logic.
+///
+/// Requires BOTH eyes to have resolved (held/extrapolated or fresh) before
+/// showing anything — matching `EyeView::from_gaze`'s original AND-gate.
+///
+/// This is a deliberate DISPLAY-level choice, not a per-eye-tracking one: each
+/// eye's history/extrapolation in `EyeHistory` still runs fully independently
+/// (a brief dropout on one eye doesn't touch the other's own state at all).
+/// But live-hardware measurement showed the two eyes' invalid stretches are
+/// NOT always symmetric — one eye can occasionally run out its whole
+/// extrapolation window while the other is still fine, and showing only the
+/// surviving eye's dot reads as a confusing, never-happens-on-the-original
+/// "one eye" state (the original's own per-eye-independent status logic can
+/// technically do this too, but its much more robust native position source
+/// makes it rare enough not to be noticed in practice). Requiring both
+/// restores `EyeView::none()` for that specific case instead — an honest
+/// "can't show this reliably" rather than a half-populated view.
 fn combine(left: Option<EyeSample>, right: Option<EyeSample>) -> EyeView {
-    if left.is_none() && right.is_none() {
+    let (Some(left), Some(right)) = (left, right) else {
         return EyeView::none();
-    }
+    };
 
-    let distance_mm = match (
-        left.and_then(|e| e.distance_mm),
-        right.and_then(|e| e.distance_mm),
-    ) {
+    let distance_mm = match (left.distance_mm, right.distance_mm) {
         (Some(dl), Some(dr)) => Some((dl + dr) / 2.0),
         (Some(d), None) | (None, Some(d)) => Some(d),
         (None, None) => None,
     };
 
-    let near_edge = [left.map(|e| e.pos), right.map(|e| e.pos)]
-        .into_iter()
-        .flatten()
-        .any(|p| {
-            p[0] < EDGE_MARGIN
-                || p[0] > 1.0 - EDGE_MARGIN
-                || p[1] < EDGE_MARGIN
-                || p[1] > 1.0 - EDGE_MARGIN
-        });
+    let near_edge = [left.pos, right.pos].iter().any(|p| {
+        p[0] < EDGE_MARGIN
+            || p[0] > 1.0 - EDGE_MARGIN
+            || p[1] < EDGE_MARGIN
+            || p[1] > 1.0 - EDGE_MARGIN
+    });
 
     let guidance = match distance_mm {
         Some(d) if d < DIST_MIN_MM => Guidance::MoveBack,
@@ -249,8 +257,8 @@ fn combine(left: Option<EyeSample>, right: Option<EyeSample>) -> EyeView {
     };
 
     EyeView {
-        left: left.map(|e| e.pos),
-        right: right.map(|e| e.pos),
+        left: Some(left.pos),
+        right: Some(right.pos),
         distance_mm,
         guidance,
     }
@@ -503,8 +511,12 @@ mod tests {
     #[test]
     fn each_eye_is_resolved_independently() {
         // The left eye has a brief gap; the right eye stays continuously
-        // valid. The right eye's reported position must be completely
-        // unaffected by the left eye's gap/extrapolation.
+        // valid. Each eye's OWN history/hold must be computed independently
+        // (a left-eye gap must not touch the right eye's own resolved
+        // value) — this is about `EyeHistory`'s internal per-eye tracking,
+        // not the DISPLAY gate (see `both_eyes_required_to_show_anything`
+        // below for that): here the left eye is still held (`Some`), so
+        // both eyes are populated and this doesn't exercise the gate at all.
         let mut hist = EyeHistory::new();
         hist.update(&sample_split(
             [0.5, 0.5, 0.5],
@@ -525,5 +537,42 @@ mod tests {
         // Left eye: held from the prior valid frame, not dropped.
         assert!(v.left.is_some());
         assert!(!matches!(v.guidance, Guidance::NoEyes));
+    }
+
+    #[test]
+    fn both_eyes_required_to_show_anything() {
+        // Regression test: live-hardware capture showed the two eyes' invalid
+        // stretches are not symmetric — one eye's ENTIRE extrapolation window
+        // can exhaust (genuinely `None`) while the other stays continuously
+        // valid. Showing just the surviving eye's dot reads as a confusing
+        // "one eye only" state that never happens on the raw, pre-history
+        // display (which ANDs both eyes together) — `combine` must require
+        // BOTH eyes to have resolved before showing anything, falling back
+        // to `EyeView::none()` otherwise, even though the right eye here is
+        // perfectly fine the whole time.
+        let mut hist = EyeHistory::new();
+        hist.update(&sample_split(
+            [0.5, 0.5, 0.5],
+            [0.3, 0.5, 0.5],
+            680.0,
+            true,
+            true,
+        ));
+        let mut last = None;
+        for _ in 0..MAX_HISTORY_FRAMES {
+            last = Some(hist.update(&sample_split(
+                [0.5, 0.5, 0.5],
+                [0.3, 0.5, 0.5],
+                680.0,
+                false, // left eye: invalid for the whole window, exhausting it
+                true,  // right eye: continuously valid throughout
+            )));
+        }
+        let v = last.unwrap();
+        assert!(
+            matches!(v.guidance, Guidance::NoEyes),
+            "must show NoEyes, not a lone right eye, once the left eye's window is exhausted"
+        );
+        assert!(v.left.is_none() && v.right.is_none());
     }
 }
