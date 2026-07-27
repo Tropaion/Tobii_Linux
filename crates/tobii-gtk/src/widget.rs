@@ -13,7 +13,11 @@ pub fn eye_view_for(state: &DeviceState) -> EyeView {
     if !matches!(state.status, ConnStatus::Connected) {
         return EyeView::none();
     }
-    state.eye_view.unwrap_or_else(EyeView::none)
+    state
+        .latest_gaze
+        .as_ref()
+        .map(EyeView::from_gaze)
+        .unwrap_or_else(EyeView::none)
 }
 
 /// Human-readable eye-position guidance line.
@@ -157,18 +161,16 @@ mod tests {
 
     #[test]
     fn eye_view_for_not_connected_is_no_eyes_even_with_cached_gaze() {
-        // A stale sample/view must not render as live when disconnected.
+        // A stale sample must not render as live when disconnected.
         let mut s = DeviceState {
             status: ConnStatus::Error("unplugged".into()),
             latest_gaze: Some(valid_sample()),
-            eye_view: Some(EyeView::from_gaze(&valid_sample())),
             ..Default::default()
         };
         assert!(matches!(eye_view_for(&s).guidance, Guidance::NoEyes));
-        // Connected + no view is also "no eyes".
+        // Connected + no sample is also "no eyes".
         s.status = ConnStatus::Connected;
         s.latest_gaze = None;
-        s.eye_view = None;
         assert!(matches!(eye_view_for(&s).guidance, Guidance::NoEyes));
     }
 }

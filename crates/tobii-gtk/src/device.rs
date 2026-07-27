@@ -103,17 +103,6 @@ pub struct DeviceState {
     /// Most recent decoded eye-camera frame ([`CAMERA_STREAM`]), for the hub
     /// preview. `None` until the camera stream is subscribed and a frame arrives.
     pub latest_camera: Option<CameraFrame>,
-    /// Rolling per-eye position/distance history for hold/extrapolation across
-    /// brief invalid/missing frames (see `eyeview::EyeHistory`) — updated once
-    /// per incoming gaze notification, here, not at display-consumption time
-    /// (consumption can happen from multiple UI surfaces on independent redraw
-    /// cadences; the frame-index-based extrapolation needs exactly one buffer
-    /// push per real incoming frame).
-    pub(crate) eye_history: crate::eyeview::EyeHistory,
-    /// The (held-or-extrapolated) eye-position view for the CURRENT frame, or
-    /// `None` before any gaze data has ever arrived. `widget::eye_view_for`
-    /// reads this instead of recomputing from `latest_gaze` directly.
-    pub eye_view: Option<crate::eyeview::EyeView>,
     pub enabled_eye: Option<EnabledEye>,
     pub calibration: CalPhase,
     /// Whether the device *may* be inside an open calibration realm. Set
@@ -279,7 +268,6 @@ pub fn device_tick<T: Transport>(
             OP_GAZE_NOTIFY => {
                 if let Some(g) = GazeSample::decode(&payload) {
                     let mut s = state.lock().unwrap();
-                    s.eye_view = Some(s.eye_history.update(&g));
                     s.latest_gaze = Some(g);
                     s.status = ConnStatus::Connected;
                 }
