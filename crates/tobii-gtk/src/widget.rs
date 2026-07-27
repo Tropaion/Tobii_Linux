@@ -32,7 +32,9 @@ pub fn guidance_message(view: &EyeView) -> String {
 
 /// Draw the trackbox rectangle + both eyes into a cairo context of size `w`×`h`.
 /// Eyes are green when centered, amber otherwise; positions are the mirror-view
-/// normalized `[0,1]` coords from `EyeView`.
+/// normalized `[0,1]` coords from `EyeView`. Each eye's dot renders at its own
+/// `left_alpha`/`right_alpha` opacity — see `eyeview::EyeHistory`'s doc
+/// comment for why a held-but-fading eye reads better than an abrupt cut.
 pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     let (w, h) = (w as f64, h as f64);
     let pad = 10.0;
@@ -45,15 +47,17 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     let _ = cr.stroke();
 
     let centered = matches!(view.guidance, Guidance::Centered);
-    if centered {
-        cr.set_source_rgb(0.18, 0.80, 0.55);
+    let (r, g, b) = if centered {
+        (0.18, 0.80, 0.55)
     } else {
-        cr.set_source_rgb(0.95, 0.80, 0.25);
-    }
+        (0.95, 0.80, 0.25)
+    };
     let radius = (rw.min(rh) * 0.06).clamp(6.0, 22.0);
-    for eye in [view.left, view.right].into_iter().flatten() {
+    for (eye, alpha) in [(view.left, view.left_alpha), (view.right, view.right_alpha)] {
+        let Some(eye) = eye else { continue };
         let ex = rx + (eye[0].clamp(0.0, 1.0) as f64) * rw;
         let ey = ry + (eye[1].clamp(0.0, 1.0) as f64) * rh;
+        cr.set_source_rgba(r, g, b, alpha as f64);
         cr.arc(ex, ey, radius, 0.0, std::f64::consts::TAU);
         let _ = cr.fill();
     }
@@ -119,6 +123,8 @@ mod tests {
         EyeView {
             left: None,
             right: None,
+            left_alpha: 0.0,
+            right_alpha: 0.0,
             distance_mm: d,
             guidance: g,
         }
