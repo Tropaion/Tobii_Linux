@@ -315,6 +315,11 @@ fn edge_alpha(pos: Option<[f32; 2]>) -> f32 {
 /// Head tilt implied by the two dots, in degrees, damped — the original's
 /// `EyeAngle`. Zero unless both eyes are placed. Rounded to whole degrees as
 /// the original does, which also quantizes away small jitter.
+///
+/// Ported for completeness, but deliberately **not** rendered: the original
+/// computes this on every frame and then binds it to nothing, so its dots never
+/// actually tilt (see `widget::draw_eye_view`). Kept because "the original
+/// computes a head angle and discards it" is a finding worth not re-discovering.
 fn tilt_deg(left: Option<[f32; 2]>, right: Option<[f32; 2]>) -> f32 {
     let (Some(l), Some(r)) = (left, right) else {
         return 0.0;

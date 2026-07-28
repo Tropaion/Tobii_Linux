@@ -7,6 +7,11 @@ use gtk::cairo;
 use crate::device::{ConnStatus, DeviceState};
 use crate::eyeview::{EyeView, Guidance};
 
+/// Inset, in pixels, from a drawing area's edge to the drawn trackbox rectangle.
+/// Callers sizing a container that should hold a specific trackbox *aspect* must
+/// add `2 * EYE_VIEW_PAD` to both axes to compensate.
+pub const EYE_VIEW_PAD: f64 = 10.0;
+
 /// The `EyeView` to render for a device snapshot: never show stale gaze — force
 /// "no eyes" unless the device is connected AND a sample is present.
 pub fn eye_view_for(state: &DeviceState) -> EyeView {
@@ -58,7 +63,7 @@ pub fn guidance_message(view: &EyeView) -> String {
 /// dimming to grey), so keeping hue is a deliberate, additive departure.
 pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     let (w, h) = (w as f64, h as f64);
-    let pad = 10.0;
+    let pad = EYE_VIEW_PAD;
     let (rx, ry, rw, rh) = (pad, pad, (w - 2.0 * pad).max(0.0), (h - 2.0 * pad).max(0.0));
 
     // Trackbox outline.
@@ -87,21 +92,25 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
         1.0
     };
     let radius = base * size_scale;
-    // Eyes are wider than they are tall, and the pair tilts with the head.
-    let tilt = (view.angle_deg as f64).to_radians();
 
+    // Plain circles, deliberately. The original renders each eye as a single
+    // `Ellipse Stretch="UniformToFill"` in a Grid whose only size binding is
+    // `Width={Binding EyeSize}` — a circle of that diameter, with no rotation
+    // and no anisotropic scale. It *does* compute a head-tilt `EyeAngle` every
+    // frame, but binds it to nothing at all (verified by decoding the view's
+    // BAML record stream: `Canvas.Left`/`Top`/`EyeSize`/`LeftEyeColor` are all
+    // bound, `EyeAngle` appears nowhere), so the shipped screen never tilts.
+    // `EyeView::angle_deg` mirrors that computation for completeness and is
+    // likewise unread here: rotating an eccentric shape by an angle rederived
+    // from two noisy dot positions makes the dots visibly rock even when the
+    // head is still, which reads as instability rather than as head tracking.
     for (eye, alpha) in [(view.left, view.left_alpha), (view.right, view.right_alpha)] {
         let Some(eye) = eye else { continue };
         let ex = rx + (eye[0].clamp(0.0, 1.0) as f64) * rw;
         let ey = ry + (eye[1].clamp(0.0, 1.0) as f64) * rh;
         cr.set_source_rgba(r, g, b, alpha as f64);
-        cr.save().ok();
-        cr.translate(ex, ey);
-        cr.rotate(tilt);
-        cr.scale(1.3, 1.0);
-        cr.arc(0.0, 0.0, radius, 0.0, std::f64::consts::TAU);
+        cr.arc(ex, ey, radius, 0.0, std::f64::consts::TAU);
         let _ = cr.fill();
-        cr.restore().ok();
     }
 }
 

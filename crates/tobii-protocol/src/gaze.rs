@@ -665,7 +665,7 @@ mod tests {
         write_tag(&mut w, TAG_XDS_COLUMN);
         write_u32(&mut w, 0x03);
         write_point(&mut w, 0.25, 0.75, 0.55); // z is a NORMALIZED depth, not mm
-        // col 0x09 = trackbox right (point3d)
+                                               // col 0x09 = trackbox right (point3d)
         write_tag(&mut w, TAG_XDS_COLUMN);
         write_u32(&mut w, 0x09);
         write_point(&mut w, 0.30, 0.70, 0.60);

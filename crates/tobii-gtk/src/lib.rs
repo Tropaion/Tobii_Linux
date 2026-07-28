@@ -28,7 +28,6 @@ use gtk::{
     Switch,
 };
 
-use crate::eyeview::EyeView;
 use tobii_protocol::EnabledEye;
 
 const APP_ID: &str = "com.tobiilinux.Configuration";
@@ -134,8 +133,6 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
 
 fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
-    // Latest view shared with the DrawingArea's draw callback (UI thread only).
-    let view = Rc::new(RefCell::new(EyeView::none()));
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
     // "Select eyes to detect": guard against echoing our own seeding as a user
@@ -198,16 +195,45 @@ fn build_ui(app: &Application) {
     eye_title.add_css_class("section-title");
     eye_title.set_halign(Align::Start);
 
-    // Eye-position box mirrors the monitor's aspect (e.g. 21:9).
+    // The trackbox is a volume in front of the sensor, not a window onto the
+    // screen, so its preview must NOT take the monitor's aspect: the original
+    // always stretches the normalized [0,1] box into a fixed golden-ratio
+    // rectangle (`SetTrackBoxToGoldenRatio`: height = min(W,H)/2.25, width =
+    // height * 1.618). Mirroring the monitor instead — as this did — badly skews
+    // the motion gain on a wide screen: on this machine's 5120x1440 (3.56:1)
+    // panel the drawn box came out 4.1:1, compressing vertical head movement by
+    // ~2.6x relative to horizontal, which reads as the dot being sluggish
+    // vertically and twitchy horizontally.
+    //
+    // `draw_eye_view` insets by `EYE_VIEW_PAD` on each side, so the *content*
+    // size is padded out to make the DRAWN rectangle golden.
+    const GOLDEN_RATIO: f64 = 1.618;
     let area = DrawingArea::new();
     let box_w = 380;
-    let box_h = ((box_w as f64) / screen_aspect()).round().max(80.0) as i32;
+    let pad = 2 * widget::EYE_VIEW_PAD as i32;
+    let box_h = (((box_w - pad) as f64) / GOLDEN_RATIO).round() as i32 + pad;
     area.set_content_width(box_w);
     area.set_content_height(box_h);
     {
-        let view = view.clone();
-        area.set_draw_func(move |_, cr, w, h| widget::draw_eye_view(cr, w, h, &view.borrow()));
+        // Sample at PAINT time (as the calibration flow's preview already does)
+        // rather than reading a snapshot written by the 33 ms tick: that tick is
+        // slightly slower than the ~33 Hz gaze stream, so it silently dropped
+        // roughly 3 frames a second — making the dot take an occasional
+        // double-length step — and showed the rest up to 33 ms stale.
+        let state = state.clone();
+        area.set_draw_func(move |_, cr, w, h| {
+            let view = widget::eye_view_for(&state.lock().unwrap());
+            widget::draw_eye_view(cr, w, h, &view);
+        });
     }
+    // Redraw on the frame clock so every gaze frame reaches the screen exactly
+    // once, instead of being resampled on the 33 ms tick. Same pattern as
+    // `overlay.rs`. The original is likewise push-driven: its stream callback
+    // marshals one update per frame straight onto the UI dispatcher.
+    area.add_tick_callback(|a, _clock| {
+        a.queue_draw();
+        glib::ControlFlow::Continue
+    });
 
     let guidance = Label::new(None);
     guidance.add_css_class("guidance");
@@ -434,7 +460,6 @@ fn build_ui(app: &Application) {
     window.set_child(Some(&root));
 
     // ~30 fps tick: read the device snapshot, refresh status + eye view.
-    let tick_view = view.clone();
     let tick_app = app.clone();
     let tick_window = window.clone();
     let tick_cmd_tx = cmd_tx.clone();
@@ -516,18 +541,24 @@ fn build_ui(app: &Application) {
                 eye_seeded.set(true);
             }
         }
-        let ev = widget::eye_view_for(&snap);
-        guidance.set_text(&widget::guidance_message(&ev));
-        *tick_view.borrow_mut() = ev;
-        area.queue_draw();
+        // Only the guidance *text* is driven from this tick — the dots redraw
+        // themselves on the frame clock (see `area.add_tick_callback` above).
+        // Text at 33 ms is ample: it is damped over 11-49 frames upstream.
+        guidance.set_text(&widget::guidance_message(&widget::eye_view_for(&snap)));
         // Camera preview: keep the last frame between device frames; update on a
-        // new one; clear on disconnect so nothing stale lingers.
+        // new one; clear on disconnect so nothing stale lingers. Only redraw when
+        // something actually changed — repainting a 78 KB frame every tick is
+        // pure waste on the ticks between device frames.
         if !conn {
+            let had = cam_frame.borrow().is_some();
             *cam_frame.borrow_mut() = None;
+            if had {
+                cam_area.queue_draw();
+            }
         } else if new_cam.is_some() {
             *cam_frame.borrow_mut() = new_cam;
+            cam_area.queue_draw();
         }
-        cam_area.queue_draw();
         glib::ControlFlow::Continue
     });
 

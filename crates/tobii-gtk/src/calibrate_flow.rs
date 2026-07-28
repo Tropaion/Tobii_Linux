@@ -553,9 +553,20 @@ pub fn launch(
 
     // Small centered live preview of the user's eye position + a fallback
     // button for when they can't get centered (see eye_preview::should_offer_fallback).
+    // Golden-ratio trackbox, matching the original's `SetTrackBoxToGoldenRatio`
+    // (see the hub's own box in `lib.rs` for why the monitor's aspect is wrong
+    // here). Padded out by `draw_eye_view`'s inset so the DRAWN box is 1.618:1.
     let eye_panel = DrawingArea::new();
+    let eye_pad = 2 * widget::EYE_VIEW_PAD as i32;
     eye_panel.set_content_width(360);
-    eye_panel.set_content_height(220);
+    eye_panel.set_content_height((((360 - eye_pad) as f64) / 1.618).round() as i32 + eye_pad);
+    // Redraw on the frame clock, so each gaze frame is shown exactly once
+    // rather than being resampled by the 33 ms tick (which is marginally slower
+    // than the ~33 Hz stream and so drops ~3 frames a second).
+    eye_panel.add_tick_callback(|p, _clock| {
+        p.queue_draw();
+        glib::ControlFlow::Continue
+    });
     {
         // Separate Arc handle for this draw func; the tick loop's closure
         // below moves its own clone/the original in independently.
@@ -774,7 +785,8 @@ pub fn launch(
                 // deliberately does NOT also set `instr`'s text here (it would
                 // just fight this).
                 instr.set_text(eye_preview::message(ticks, ev.guidance));
-                eye_panel.queue_draw();
+                // No `eye_panel.queue_draw()` here — the panel drives its own
+                // redraws off the frame clock (see its `add_tick_callback`).
                 if eye_preview::should_advance(ticks, centered_ticks) {
                     // Call the free `begin_calibration_phase` helper rather
                     // than the `begin_calibration` closure above: `ph` (a
