@@ -103,16 +103,19 @@ pub struct DeviceState {
     /// Most recent decoded eye-camera frame ([`CAMERA_STREAM`]), for the hub
     /// preview. `None` until the camera stream is subscribed and a frame arrives.
     pub latest_camera: Option<CameraFrame>,
-    /// Rolling per-eye position/distance hold+fade state across brief
-    /// invalid/missing frames (see `eyeview::EyeHistory`) — updated once per
-    /// incoming gaze notification, here, not at display-consumption time
-    /// (consumption can happen from multiple UI surfaces on independent redraw
-    /// cadences; the tick-based fade counting needs exactly one update per
-    /// real incoming frame).
+    /// Rolling per-eye extrapolation windows, smoothed depth and guidance
+    /// damping (see `eyeview::EyeHistory`) — updated once per incoming gaze
+    /// notification, here, not at display-consumption time. This placement is
+    /// load-bearing twice over: consumption happens from several UI surfaces on
+    /// independent redraw cadences, and both the extrapolation window and the
+    /// text damping count in *frames*, so they need exactly one update per real
+    /// incoming frame. It also matches the original software, which runs the
+    /// same computation in its stream callback rather than its UI timer.
     pub(crate) eye_history: crate::eyeview::EyeHistory,
-    /// The (held/faded) eye-position view for the CURRENT frame, or `None`
-    /// before any gaze data has ever arrived. `widget::eye_view_for` reads
-    /// this instead of recomputing from `latest_gaze` directly.
+    /// The eye-position view for the CURRENT frame (gap-filled by
+    /// extrapolation), or `None` before any gaze data has ever arrived.
+    /// `widget::eye_view_for` reads this instead of recomputing from
+    /// `latest_gaze` directly.
     pub eye_view: Option<crate::eyeview::EyeView>,
     pub enabled_eye: Option<EnabledEye>,
     pub calibration: CalPhase,
