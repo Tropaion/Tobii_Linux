@@ -17,12 +17,22 @@ pub fn eye_view_for(state: &DeviceState) -> EyeView {
 }
 
 /// Human-readable eye-position guidance line.
+///
+/// The nudge wording is the original Windows software's own, recovered from its
+/// `LanguageResources` string table (`EyesPositioning_FullScreenMessage_*`), so
+/// the guidance reads exactly as it does there. `Centered` is the one
+/// deliberate departure: the original shows "Press a key to continue" on its
+/// fullscreen step, which would be wrong on our always-on hub, so we report the
+/// live distance instead.
 pub fn guidance_message(view: &EyeView) -> String {
     match view.guidance {
-        Guidance::NoEyes => "No eyes detected — sit in front of the tracker.".to_string(),
-        Guidance::MoveCloser => "Move a little closer.".to_string(),
-        Guidance::MoveBack => "Move back a little.".to_string(),
-        Guidance::OffCenter => "Center yourself in front of the screen.".to_string(),
+        Guidance::NoEyes => "Are you there?".to_string(),
+        Guidance::MoveCloser => "Move closer".to_string(),
+        Guidance::MoveBack => "Lean back".to_string(),
+        Guidance::MoveRight => "Move right".to_string(),
+        Guidance::MoveLeft => "Move left".to_string(),
+        Guidance::MoveDown => "Move down".to_string(),
+        Guidance::MoveUp => "Move up".to_string(),
         Guidance::Centered => match view.distance_mm {
             Some(d) => format!("Good position ({d:.0} mm)."),
             None => "Good position.".to_string(),
@@ -31,10 +41,21 @@ pub fn guidance_message(view: &EyeView) -> String {
 }
 
 /// Draw the trackbox rectangle + both eyes into a cairo context of size `w`×`h`.
-/// Eyes are green when centered, amber otherwise; positions are the mirror-view
-/// normalized `[0,1]` coords from `EyeView`. Each eye's dot renders at its own
-/// `left_alpha`/`right_alpha` opacity — see `eyeview::EyeHistory`'s doc
-/// comment for why a held-but-fading eye reads better than an abrupt cut.
+///
+/// Positions are the mirror-view normalized `[0,1]` coords from `EyeView`, and
+/// the three visual channels all mirror the original software's own encoding
+/// (see `eyeview`'s module header for provenance):
+/// - **size** tracks operating distance — the dot grows as you lean in and
+///   shrinks as you move away (`EyeView::eye_size`, `50` being ideal);
+/// - **brightness** peaks in the comfortable distance band and dims toward
+///   either extreme (`EyeView::brightness`);
+/// - **opacity** fades a dot out as it nears the trackbox edge, so a position
+///   projected across a tracking gap glides away rather than parking itself
+///   against the boundary (`left_alpha`/`right_alpha`).
+///
+/// Hue is this project's own: green when well-positioned, amber while being
+/// nudged. The original encodes that in brightness alone (its dots are white
+/// dimming to grey), so keeping hue is a deliberate, additive departure.
 pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     let (w, h) = (w as f64, h as f64);
     let pad = 10.0;
@@ -52,14 +73,35 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     } else {
         (0.95, 0.80, 0.25)
     };
-    let radius = (rw.min(rh) * 0.06).clamp(6.0, 22.0);
+    // Dim toward the distance extremes, but never all the way to invisible —
+    // opacity is the channel that carries "gone", brightness only carries
+    // "poorly positioned".
+    let dim = view.brightness.clamp(0.0, 1.0) as f64;
+    let (r, g, b) = (r * dim, g * dim, b * dim);
+
+    // `eye_size` is the original's own 25..100 scale about an ideal of 50.
+    let base = (rw.min(rh) * 0.06).clamp(6.0, 22.0);
+    let size_scale = if view.eye_size > 0 {
+        view.eye_size as f64 / crate::eyeview::EYE_SIZE_DEFAULT as f64
+    } else {
+        1.0
+    };
+    let radius = base * size_scale;
+    // Eyes are wider than they are tall, and the pair tilts with the head.
+    let tilt = (view.angle_deg as f64).to_radians();
+
     for (eye, alpha) in [(view.left, view.left_alpha), (view.right, view.right_alpha)] {
         let Some(eye) = eye else { continue };
         let ex = rx + (eye[0].clamp(0.0, 1.0) as f64) * rw;
         let ey = ry + (eye[1].clamp(0.0, 1.0) as f64) * rh;
         cr.set_source_rgba(r, g, b, alpha as f64);
-        cr.arc(ex, ey, radius, 0.0, std::f64::consts::TAU);
+        cr.save().ok();
+        cr.translate(ex, ey);
+        cr.rotate(tilt);
+        cr.scale(1.3, 1.0);
+        cr.arc(0.0, 0.0, radius, 0.0, std::f64::consts::TAU);
         let _ = cr.fill();
+        cr.restore().ok();
     }
 }
 
@@ -121,12 +163,9 @@ mod tests {
 
     fn view(g: Guidance, d: Option<f32>) -> EyeView {
         EyeView {
-            left: None,
-            right: None,
-            left_alpha: 0.0,
-            right_alpha: 0.0,
             distance_mm: d,
             guidance: g,
+            ..EyeView::none()
         }
     }
 
@@ -151,14 +190,37 @@ mod tests {
 
     #[test]
     fn guidance_messages_match_each_state() {
-        assert!(guidance_message(&view(Guidance::NoEyes, None)).contains("No eyes"));
-        assert!(guidance_message(&view(Guidance::MoveCloser, None)).contains("closer"));
-        assert!(guidance_message(&view(Guidance::MoveBack, None)).contains("back"));
-        assert!(guidance_message(&view(Guidance::OffCenter, None)).contains("Center"));
+        // Wording is the original software's own (see `guidance_message`).
+        assert_eq!(
+            guidance_message(&view(Guidance::NoEyes, None)),
+            "Are you there?"
+        );
+        assert_eq!(
+            guidance_message(&view(Guidance::MoveCloser, None)),
+            "Move closer"
+        );
+        assert_eq!(
+            guidance_message(&view(Guidance::MoveBack, None)),
+            "Lean back"
+        );
         assert_eq!(
             guidance_message(&view(Guidance::Centered, Some(680.0))),
             "Good position (680 mm)."
         );
+    }
+
+    #[test]
+    fn guidance_messages_name_every_direction() {
+        // The original nudges the user a specific way rather than saying
+        // "center yourself", so each direction needs its own line.
+        for (g, want) in [
+            (Guidance::MoveRight, "Move right"),
+            (Guidance::MoveLeft, "Move left"),
+            (Guidance::MoveDown, "Move down"),
+            (Guidance::MoveUp, "Move up"),
+        ] {
+            assert_eq!(guidance_message(&view(g, None)), want);
+        }
     }
 
     #[test]

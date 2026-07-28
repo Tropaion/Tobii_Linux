@@ -18,7 +18,6 @@ use gtk::prelude::*;
 use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Overlay};
 
 use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
-use crate::eyeview::Guidance;
 use crate::{
     add_escape_to_close, calibration_area, eye_preview, focus, particles, screen_aspect,
     screen_height, widget,
@@ -164,20 +163,17 @@ enum Phase {
     /// currently-running streak of `Guidance::Centered` readings — tolerant
     /// of brief gaps (see `eye_preview::update_centered_streak`) — that
     /// drives auto-advance.
+    ///
+    /// The guidance this reads is already damped against per-frame chatter by
+    /// `eyeview::EyeHistory`, which does it per gaze frame exactly as the
+    /// original software does (in its stream callback, not its UI timer), so
+    /// this phase holds no debounce state of its own.
     EyePreview {
         ticks: u32,
         centered_ticks: u32,
         /// Gap-tolerance counter for the centered-dwell streak (see
         /// `eye_preview::update_centered_streak`).
         gap_ticks: u32,
-        /// The debounced guidance actually being shown via `message()` right
-        /// now (see `eye_preview::debounced_guidance`) — distinct from the
-        /// raw, possibly-noisy per-frame reading.
-        shown_guidance: Guidance,
-        /// Consecutive ticks the raw guidance has differed from
-        /// `shown_guidance` (see `eye_preview::debounced_guidance`'s
-        /// `unstable_ticks` parameter).
-        unstable_ticks: u32,
     },
     /// `CalBegin` sent; waiting for the device thread to publish a `CalPhase`
     /// carrying *our* `token`. The token is what makes this an edge and not a
@@ -527,8 +523,6 @@ pub fn launch(
         ticks: 0,
         centered_ticks: 0,
         gap_ticks: 0,
-        shown_guidance: Guidance::NoEyes,
-        unstable_ticks: 0,
     }));
     let dot = Rc::new(RefCell::new(DotView {
         points: Vec::new(),
@@ -765,35 +759,21 @@ pub fn launch(
                 ticks,
                 centered_ticks,
                 gap_ticks,
-                shown_guidance,
-                unstable_ticks,
             } => {
-                let (ticks, centered_ticks, gap_ticks, shown_guidance, unstable_ticks) = (
-                    *ticks,
-                    *centered_ticks,
-                    *gap_ticks,
-                    *shown_guidance,
-                    *unstable_ticks,
-                );
+                let (ticks, centered_ticks, gap_ticks) = (*ticks, *centered_ticks, *gap_ticks);
                 dot.borrow_mut().points.clear(); // no calibration dot yet
                 let ev = widget::eye_view_for(&state.lock().unwrap());
 
                 let (centered_ticks, gap_ticks) =
                     eye_preview::update_centered_streak(ev.guidance, centered_ticks, gap_ticks);
 
-                let unstable_ticks = if ev.guidance == shown_guidance {
-                    0
-                } else {
-                    unstable_ticks + 1
-                };
-                let shown_guidance =
-                    eye_preview::debounced_guidance(ev.guidance, shown_guidance, unstable_ticks);
-
-                // Live guidance-derived text, recomputed every tick from the
-                // DEBOUNCED guidance (not the raw reading) — unlike every
-                // other phase, `update_ui` deliberately does NOT also set
-                // `instr`'s text here (it would just fight this).
-                instr.set_text(eye_preview::message(ticks, shown_guidance));
+                // Live guidance-derived text, recomputed every tick. The
+                // guidance is already damped per gaze frame by
+                // `eyeview::EyeHistory`, so it is stable enough to show
+                // directly — unlike every other phase, `update_ui`
+                // deliberately does NOT also set `instr`'s text here (it would
+                // just fight this).
+                instr.set_text(eye_preview::message(ticks, ev.guidance));
                 eye_panel.queue_draw();
                 if eye_preview::should_advance(ticks, centered_ticks) {
                     // Call the free `begin_calibration_phase` helper rather
@@ -812,8 +792,6 @@ pub fn launch(
                         ticks: ticks + 1,
                         centered_ticks,
                         gap_ticks,
-                        shown_guidance,
-                        unstable_ticks,
                     });
                 }
             }
