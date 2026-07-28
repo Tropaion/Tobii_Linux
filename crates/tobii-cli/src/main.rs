@@ -548,19 +548,33 @@ fn stream(json: bool, eyes: bool) -> CmdResult {
             // capture volume (independent of any display config), origin is
             // the eye position in tracker-space mm.
             if eyes {
+                // Trackbox z is printed too: it is a NORMALIZED depth, and it is
+                // what drives the eye-position dot size/brightness ladder (see
+                // `tobii-gtk`'s `eyeview`), so validating that it actually
+                // sweeps a useful part of [0,1] on real hardware needs it
+                // visible. The raw origins (cols 0x17/0x18, pre-calibration
+                // detection output) are printed alongside the filtered ones to
+                // show whether they lead in phase.
                 println!(
-                    "                trackbox L=({:.3}, {:.3})  R=({:.3}, {:.3})   \
-                     origin L=({:.0}, {:.0}, {:.0})mm  R=({:.0}, {:.0}, {:.0})mm",
+                    "                trackbox L=({:.3}, {:.3}, z={:.3})  R=({:.3}, {:.3}, z={:.3})",
                     s.trackbox_eye_l[0],
                     s.trackbox_eye_l[1],
+                    s.trackbox_eye_l[2],
                     s.trackbox_eye_r[0],
                     s.trackbox_eye_r[1],
+                    s.trackbox_eye_r[2],
+                );
+                println!(
+                    "                origin L=({:.0}, {:.0}, {:.0})mm  R=({:.0}, {:.0}, {:.0})mm   \
+                     raw L z={:.0} R z={:.0}",
                     s.eye_origin_l_mm[0],
                     s.eye_origin_l_mm[1],
                     s.eye_origin_l_mm[2],
                     s.eye_origin_r_mm[0],
                     s.eye_origin_r_mm[1],
                     s.eye_origin_r_mm[2],
+                    s.eye_origin_raw_l_mm[2],
+                    s.eye_origin_raw_r_mm[2],
                 );
             }
         } else {
