@@ -41,7 +41,7 @@ from a live six-axis capture (2026-07-22, memory note
 | `0x01` | s64 | **timestamp**, microseconds | **[CONFIRMED]** |
 | `0x02` | point3d | **eye origin L**, tracker-space mm | **[CONFIRMED]** |
 | `0x08` | point3d | **eye origin R**, tracker-space mm | **[CONFIRMED]** |
-| `0x03` | point3d | **trackbox eye L** — x/y normalized in the trackbox `[0,1]`, z = distance mm | **[CONFIRMED]** |
+| `0x03` | point3d | **trackbox eye L** — x/y **and z** all normalized in the trackbox `[0,1]`; z is *not* mm (use `0x02`/`0x08` for a real distance) | **[CONFIRMED]** live |
 | `0x09` | point3d | **trackbox eye R** | **[CONFIRMED]** |
 | `0x04` | point3d | **per-eye gaze direction L** (`gaze_point_3d_l`); x tracks yaw, y tracks pitch — where the eye *looks* | **[CONFIRMED]** decoder; direction semantics **[CONFIRMED]** live |
 | `0x0a` | point3d | **per-eye gaze direction R** | **[CONFIRMED]** |

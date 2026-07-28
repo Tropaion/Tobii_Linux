@@ -49,7 +49,9 @@ pub struct GazeSample {
     pub eye_origin_raw_r_mm: [f64; 3],
     pub gaze_point_3d_l_mm: [f64; 3],
     pub gaze_point_3d_r_mm: [f64; 3],
-    /// Left/right eye position normalized in the trackbox ([0,1] x/y; z = distance mm).
+    /// Left/right eye position normalized in the trackbox: x, y AND z are all
+    /// `[0,1]` — z is a normalized depth, NOT millimetres (live-confirmed in
+    /// 3a980d1). For a real distance use `eye_origin_l_mm`/`eye_origin_r_mm`.
     pub trackbox_eye_l: [f64; 3],
     pub trackbox_eye_r: [f64; 3],
 }
@@ -662,16 +664,16 @@ mod tests {
                                                   // col 0x03 = trackbox left (point3d)
         write_tag(&mut w, TAG_XDS_COLUMN);
         write_u32(&mut w, 0x03);
-        write_point(&mut w, 0.25, 0.75, 500.0);
+        write_point(&mut w, 0.25, 0.75, 0.55); // z is a NORMALIZED depth, not mm
         // col 0x09 = trackbox right (point3d)
         write_tag(&mut w, TAG_XDS_COLUMN);
         write_u32(&mut w, 0x09);
-        write_point(&mut w, 0.30, 0.70, 510.0);
+        write_point(&mut w, 0.30, 0.70, 0.60);
 
         let s = GazeSample::decode(&w.into_vec()).expect("decode");
         assert!(s.has(present::TRACKBOX_L) && s.has(present::TRACKBOX_R));
         assert!((s.trackbox_eye_l[0] - 0.25).abs() < 1e-9);
-        assert!((s.trackbox_eye_l[2] - 500.0).abs() < 1e-6);
+        assert!((s.trackbox_eye_l[2] - 0.55).abs() < 1e-6);
         assert!((s.trackbox_eye_r[1] - 0.70).abs() < 1e-9);
     }
 }
