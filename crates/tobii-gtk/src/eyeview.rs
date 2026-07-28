@@ -108,6 +108,18 @@ pub enum Guidance {
 /// are shared by both dots and encode operating distance. `angle_deg` is the
 /// head tilt implied by the two dots. `distance_mm` is the real operating
 /// distance, for the human-readable readout only.
+///
+/// There are deliberately **two** guidance fields, because the original damps
+/// only one of the two things it drives:
+/// - `guidance` is damped over 11-49 frames and is what the *text* should say;
+/// - `raw_guidance` is this frame's undamped verdict, and is what any *visual*
+///   channel must use.
+///
+/// The original recomputes dot position, size and colour unconditionally every
+/// frame (`Refresh`), keying colour off `EyeSize` and the raw position, never
+/// off its debounced status. Driving a visual from `guidance` instead makes the
+/// dots contradict themselves for up to ~1.5 s — green while the user has
+/// already moved out of position — which reads as display lag.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EyeView {
     pub left: Option<[f32; 2]>,
@@ -119,6 +131,7 @@ pub struct EyeView {
     pub angle_deg: f32,
     pub distance_mm: Option<f32>,
     pub guidance: Guidance,
+    pub raw_guidance: Guidance,
 }
 
 impl EyeView {
@@ -135,6 +148,7 @@ impl EyeView {
             angle_deg: 0.0,
             distance_mm: None,
             guidance: Guidance::NoEyes,
+            raw_guidance: Guidance::NoEyes,
         }
     }
 
@@ -535,7 +549,9 @@ impl EyeHistory {
             (None, None) => None,
         };
 
-        let guidance = self.damper.update(guidance_for(left, right, self.eye_size));
+        // Damp only the text; every visual channel must use the raw verdict.
+        let raw_guidance = guidance_for(left, right, self.eye_size);
+        let guidance = self.damper.update(raw_guidance);
 
         EyeView {
             left,
@@ -547,6 +563,7 @@ impl EyeHistory {
             angle_deg: tilt_deg(left, right),
             distance_mm,
             guidance,
+            raw_guidance,
         }
     }
 }
@@ -1060,6 +1077,39 @@ mod tests {
         assert_eq!(d.update(Guidance::MoveLeft), Guidance::MoveLeft);
         assert_eq!(d.update(Guidance::MoveUp), Guidance::MoveUp);
         assert_eq!(d.update(Guidance::MoveCloser), Guidance::MoveCloser);
+    }
+
+    #[test]
+    fn visual_channels_see_the_undamped_verdict_while_text_stays_damped() {
+        // The damping must NOT reach anything visual. Losing the eyes right
+        // after a good position keeps the TEXT reading "Centered" for
+        // HYST_TO_NO_EYES frames, but `raw_guidance` has to report the loss on
+        // the very first frame, or the dot colour contradicts the dots for over
+        // a second and reads as display lag.
+        let mut hist = EyeHistory::new();
+        let good_view = hist.update(&good(true));
+        assert_eq!(good_view.guidance, Guidance::Centered);
+        assert_eq!(good_view.raw_guidance, Guidance::Centered);
+
+        let mut lost = hist.update(&good(false));
+        assert_eq!(
+            lost.guidance,
+            Guidance::Centered,
+            "text should still be damped"
+        );
+        // Within the extrapolation window the eyes are still placed, so the raw
+        // verdict is whatever the projected position implies -- what matters is
+        // that once they are genuinely gone, raw reports it immediately while
+        // the text has not yet given up.
+        for _ in 0..WINDOW {
+            lost = hist.update(&good(false));
+        }
+        assert_eq!(lost.raw_guidance, Guidance::NoEyes);
+        assert_eq!(
+            lost.guidance,
+            Guidance::Centered,
+            "text must still be damped well past the extrapolation window"
+        );
     }
 
     #[test]

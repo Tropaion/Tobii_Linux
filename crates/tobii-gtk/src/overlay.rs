@@ -66,7 +66,12 @@ pub fn show(app: &Application, state: Arc<Mutex<DeviceState>>) -> ApplicationWin
             let snap = state.lock().unwrap().clone();
             let g = if matches!(snap.status, ConnStatus::Connected) {
                 snap.latest_gaze.as_ref().and_then(|s| {
-                    if s.has(present::GAZE_2D) && s.validity_l == 0 {
+                    // Either eye valid is enough. Gating on the LEFT eye alone
+                    // (as this did) makes the overlay work in left-eye-only
+                    // mode and silently show nothing in right-eye-only mode.
+                    // The combined gaze point is device-computed from whichever
+                    // eyes it has, so one valid eye is a usable reading.
+                    if s.has(present::GAZE_2D) && (s.validity_l == 0 || s.validity_r == 0) {
                         // NO curvature correction here. A per-user
                         // calibration already absorbs screen curvature: the
                         // stimulus dots are drawn on the physical (curved)

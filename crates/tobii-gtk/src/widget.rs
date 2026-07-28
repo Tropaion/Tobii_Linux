@@ -72,7 +72,10 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     cr.rectangle(rx, ry, rw, rh);
     let _ = cr.stroke();
 
-    let centered = matches!(view.guidance, Guidance::Centered);
+    // `raw_guidance`, not `guidance`: the damping exists to steady the *text*,
+    // and colouring from it would leave the dots green for up to ~1.5 s after
+    // the user has already moved out of position. See `EyeView`'s doc comment.
+    let centered = matches!(view.raw_guidance, Guidance::Centered);
     let (r, g, b) = if centered {
         (0.18, 0.80, 0.55)
     } else {

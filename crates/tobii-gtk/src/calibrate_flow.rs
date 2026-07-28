@@ -776,7 +776,7 @@ pub fn launch(
                 let ev = widget::eye_view_for(&state.lock().unwrap());
 
                 let (centered_ticks, gap_ticks) =
-                    eye_preview::update_centered_streak(ev.guidance, centered_ticks, gap_ticks);
+                    eye_preview::update_presence_streak(ev.guidance, centered_ticks, gap_ticks);
 
                 // Live guidance-derived text, recomputed every tick. The
                 // guidance is already damped per gaze frame by
@@ -787,7 +787,7 @@ pub fn launch(
                 instr.set_text(eye_preview::message(ticks, ev.guidance));
                 // No `eye_panel.queue_draw()` here — the panel drives its own
                 // redraws off the frame clock (see its `add_tick_callback`).
-                if eye_preview::should_advance(ticks, centered_ticks) {
+                if eye_preview::should_advance(ticks, centered_ticks, ev.guidance) {
                     // Call the free `begin_calibration_phase` helper rather
                     // than the `begin_calibration` closure above: `ph` (a
                     // `RefMut<Phase>` from `phase.borrow_mut()` at the top of
