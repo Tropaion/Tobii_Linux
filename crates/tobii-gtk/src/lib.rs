@@ -4,6 +4,7 @@
 //! thread, from which the guided display-setup and calibration flows, the
 //! gaze-preview overlay, and the select-eyes control are driven.
 
+pub mod accuracy;
 pub mod align;
 pub mod calibrate_flow;
 pub mod calibration_area;
@@ -133,6 +134,12 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
 
 fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
+    // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
+    // needs the device thread, so it branches here rather than in `run`.
+    if std::env::args().any(|a| a == "--accuracy") {
+        accuracy::launch(app, state);
+        return;
+    }
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
     // "Select eyes to detect": guard against echoing our own seeding as a user
