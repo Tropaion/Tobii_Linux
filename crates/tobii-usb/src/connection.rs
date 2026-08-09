@@ -368,14 +368,17 @@ impl<T: Transport> Connection<T> {
     /// share a chunk are all kept. Essential for accurately characterizing
     /// multiple concurrent streams (a small stream co-occurring with gaze in the
     /// same chunk would otherwise be dropped). Non-notify frames are routed.
-    pub fn read_notifications(&mut self) -> Vec<(u32, Vec<u8>)> {
+    pub fn read_notifications(&mut self) -> Notifications {
         // Reuse the large heap buffer (disjoint field borrows: transport,
         // read_buf, parser are separate fields).
         let Some(n) = self.transport.recv(&mut self.read_buf, GAZE_TIMEOUT) else {
-            return Vec::new();
+            return Notifications::silent();
         };
         let Ok(frames) = self.parser.feed(&self.read_buf[..n]) else {
-            return Vec::new();
+            return Notifications {
+                frames: Vec::new(),
+                saw_traffic: true,
+            };
         };
         let mut out = Vec::new();
         for f in frames {
@@ -385,7 +388,52 @@ impl<T: Transport> Connection<T> {
                 self.route(f, None);
             }
         }
-        out
+        Notifications {
+            frames: out,
+            saw_traffic: true,
+        }
+    }
+}
+
+/// One streaming read: the complete notifications it yielded, plus whether the
+/// transport delivered any bytes at all.
+///
+/// These are different things, and only one of them means the device has gone
+/// quiet. A chunk that ends mid-frame yields **no complete notification** while
+/// being perfectly healthy traffic — the rest of that frame is in the next
+/// chunk. A caller that reads "no frames" as "no device" and backs off will
+/// stall in the middle of a busy stream, which on the gaze path shows up as a
+/// freeze followed by a jump when the queued samples all arrive at once.
+///
+/// Iterates and derefs as the frame list, so it reads exactly like the `Vec` it
+/// replaced; check [`Notifications::saw_traffic`] only where the distinction
+/// matters.
+#[derive(Debug, Default)]
+pub struct Notifications {
+    frames: Vec<(u32, Vec<u8>)>,
+    /// `false` only when the transport returned nothing within its timeout.
+    pub saw_traffic: bool,
+}
+
+impl Notifications {
+    /// The transport timed out: nothing arrived at all.
+    fn silent() -> Self {
+        Self::default()
+    }
+}
+
+impl IntoIterator for Notifications {
+    type Item = (u32, Vec<u8>);
+    type IntoIter = std::vec::IntoIter<(u32, Vec<u8>)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.frames.into_iter()
+    }
+}
+
+impl std::ops::Deref for Notifications {
+    type Target = [(u32, Vec<u8>)];
+    fn deref(&self) -> &Self::Target {
+        &self.frames
     }
 }
 
@@ -638,6 +686,31 @@ mod tests {
             ops.contains(&0x500) && ops.contains(&0x504),
             "got ops {ops:?}"
         );
+    }
+
+    #[test]
+    fn a_chunk_ending_mid_frame_is_traffic_not_silence() {
+        // Half a gaze frame: no complete notification, but the device is very
+        // much alive and the rest is on its way. Callers that back off on "no
+        // frames" would stall the stream here, so the two must stay separable.
+        let full = inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload());
+        let half = full[..full.len() / 2].to_vec();
+        let mut conn = connected_with(vec![half]);
+
+        let got = conn.read_notifications();
+        assert!(got.is_empty(), "a truncated frame must not decode");
+        assert!(
+            got.saw_traffic,
+            "bytes did arrive — this is not a silent device"
+        );
+    }
+
+    #[test]
+    fn a_transport_timeout_reports_silence() {
+        let mut conn = connected_with(vec![]);
+        let got = conn.read_notifications();
+        assert!(got.is_empty());
+        assert!(!got.saw_traffic);
     }
 
     #[test]

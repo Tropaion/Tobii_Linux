@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tobii_protocol::camera::decode_camera_frame;
 use tobii_protocol::frame::OP_GAZE_NOTIFY;
@@ -164,15 +164,16 @@ pub enum DeviceCommand {
     CalAbort,
 }
 
-/// One iteration: apply any queued commands, then poll one gaze sample.
-/// Returns `true` if a gaze sample was received this tick — the thread loop
-/// uses sustained `false` to detect a stalled/unplugged device (a healthy
-/// device streams gaze continuously).
+/// One iteration: apply any queued commands, then read one transport chunk.
+///
+/// See [`Tick`] for what the return value distinguishes. The thread loop uses
+/// sustained silence — not merely a tick that published nothing — to detect a
+/// stalled or unplugged device.
 pub fn device_tick<T: Transport>(
     conn: &mut Connection<T>,
     state: &Mutex<DeviceState>,
     cmd_rx: &Receiver<DeviceCommand>,
-) -> bool {
+) -> Tick {
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
             DeviceCommand::SetDisplayArea(c) => {
@@ -275,9 +276,11 @@ pub fn device_tick<T: Transport>(
     }
     // Read one transport chunk and publish every gaze + camera frame in it (the
     // camera stream co-occurs with gaze, so read them together rather than via
-    // the gaze-only queue). Returns whether any frame arrived, for the watchdog.
+    // the gaze-only queue).
+    let notifications = conn.read_notifications();
+    let saw_traffic = notifications.saw_traffic;
     let mut got = false;
-    for (op, payload) in conn.read_notifications() {
+    for (op, payload) in notifications {
         match op {
             OP_GAZE_NOTIFY => {
                 if let Some(g) = GazeSample::decode(&payload) {
@@ -297,7 +300,21 @@ pub fn device_tick<T: Transport>(
             _ => {}
         }
     }
-    got
+    Tick {
+        published: got,
+        saw_traffic,
+    }
+}
+
+/// What one [`device_tick`] observed, for the reconnect watchdog.
+///
+/// `published` and `saw_traffic` differ exactly when a transport chunk ended
+/// mid-frame: real traffic, no complete frame yet. Only a lack of *traffic*
+/// says anything about the device still being there.
+#[derive(Debug, Clone, Copy)]
+pub struct Tick {
+    pub published: bool,
+    pub saw_traffic: bool,
 }
 
 /// Spawn the device thread. It handshakes, then loops `device_tick`; on any
@@ -343,17 +360,26 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                     // realm, whatever the previous one was doing.
                     s.cal_session_open = false;
                 }
-                let mut idle_ticks = 0u32;
+                // Watchdog on the wall clock, not on a tick count. A tick that
+                // publishes no frame is not evidence of a disconnect: a
+                // transport chunk that ends mid-frame is ordinary traffic, and
+                // sleeping on it stalls the gaze path for as long as the sleep
+                // lasts while samples queue up behind it — a freeze, then a
+                // jump when they all land at once. Back off only when the
+                // transport itself went silent, and even then only briefly,
+                // since `read_notifications` already blocks for up to a second.
+                let mut quiet_since = Instant::now();
                 loop {
-                    let got = device_tick(&mut conn, &thread_state, &rx);
+                    let tick = device_tick(&mut conn, &thread_state, &rx);
                     let calibrating = thread_state.lock().unwrap().calibration.active;
-                    if got || calibrating {
-                        idle_ticks = 0;
+                    if tick.published || calibrating {
+                        quiet_since = Instant::now();
                     } else {
-                        idle_ticks += 1;
-                        std::thread::sleep(Duration::from_millis(100));
-                        if idle_ticks >= 20 {
-                            break; // ~2s without gaze -> assume disconnect; outer loop reconnects
+                        if !tick.saw_traffic {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        if quiet_since.elapsed() >= Duration::from_secs(2) {
+                            break; // silent for 2s -> assume disconnect; outer loop reconnects
                         }
                     }
                 }
@@ -530,7 +556,7 @@ mod tests {
         let mut conn = connected(vec![inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload())]);
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
-        assert!(device_tick(&mut conn, &state, &rx));
+        assert!(device_tick(&mut conn, &state, &rx).published);
         let g = state
             .lock()
             .unwrap()
@@ -545,7 +571,7 @@ mod tests {
         let mut conn = connected(vec![]);
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
-        assert!(!device_tick(&mut conn, &state, &rx));
+        assert!(!device_tick(&mut conn, &state, &rx).published);
     }
 
     #[test]
