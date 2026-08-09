@@ -111,7 +111,29 @@ better-centred position signal hiding in these columns. **[CONFIRMED]** live.
 | `0x0501` | eye-camera image (secondary) | decoded, `camera.rs` |
 | `0x050e` | eye-camera image (primary) | decoded, `camera.rs` |
 | `0x0508` | named "image collection" by `njmill/tobii-linux` | **[UNCONFIRMED]** — subscribing it produced no frames here |
+| `0x1770` | **algodbg** — 38-byte payload, one u32 column, constant `0` at ~133 Hz | **[CONFIRMED]** live — carries no data |
 | `0x1771` | **sync** — 73-byte payload, two s64 columns: `0x01` device timestamp µs, `0x02` a second, consistently *earlier* timestamp | **[CONFIRMED]** live |
+| `0x1772` | **log** — the device's own text log | **[CONFIRMED]** live |
+| `0x1774` | named "custom" by the third-party catalog | **[UNCONFIRMED]** |
+
+These ids came from `njmill/tobii-linux`; our own sweep only ever covered
+`0x501..=0x520`, so they had never been probed here. Verified by
+`tobii probe-streams 1770 1780` — `0x1770`, `0x1771` and `0x1772` all deliver.
+
+`0x1770` runs at **~133 Hz**, four times the gaze rate, which made it a
+promising home for internal per-eye state. It is not: the single column reads
+`0` in every frame. Do not spend time here again.
+
+`0x1772` is a genuine find — the device streams its **own log** as
+length-prefixed ASCII (TLV type `0x14`), with uptime, severity and subsystem:
+
+```text
+[ 17340.014877] (I) PROT: Client 0 qid 260 subscribing for 'log' stream (id 6002)
+[ 17382.143495] (I) USB pow: Requesting low power
+```
+
+Worth wiring into diagnostics. The power-state lines in particular are the
+device narrating something we otherwise have to infer.
 
 The `0x1771` pair is a device↔host clock reference: the two stamps sat
 **10.7 ms and 11.0 ms** apart across consecutive frames. That bounds transport
