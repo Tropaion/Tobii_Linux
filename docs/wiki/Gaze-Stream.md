@@ -105,20 +105,31 @@ better-centred position signal hiding in these columns. **[CONFIRMED]** live.
 
 ## Sibling streams
 
-| Id | What | Status |
-|----|------|--------|
-| `0x0500` | gaze — this document | subscribed by us |
-| `0x0501` | eye-camera image (secondary) | decoded, `camera.rs` |
-| `0x050e` | eye-camera image (primary) | decoded, `camera.rs` |
-| `0x0508` | named "image collection" by `njmill/tobii-linux` | **[UNCONFIRMED]** — subscribing it produced no frames here |
-| `0x1770` | **algodbg** — 38-byte payload, one u32 column, constant `0` at ~133 Hz | **[CONFIRMED]** live — carries no data |
-| `0x1771` | **sync** — 73-byte payload, two s64 columns: `0x01` device timestamp µs, `0x02` a second, consistently *earlier* timestamp | **[CONFIRMED]** live |
-| `0x1772` | **log** — the device's own text log | **[CONFIRMED]** live |
-| `0x1774` | named "custom" by the third-party catalog | **[UNCONFIRMED]** |
+**The device enumerates its own streams.** Op `0x4b0` returns a catalog of
+id → name; `tobii streams` prints it, and `commands::parse_stream_catalog`
+decodes it. The names below are the **firmware's own**, not ours — a 509-byte
+reply captured 2026-08-09:
 
-These ids came from `njmill/tobii-linux`; our own sweep only ever covered
-`0x501..=0x520`, so they had never been probed here. Verified by
-`tobii probe-streams 1770 1780` — `0x1770`, `0x1771` and `0x1772` all deliver.
+| Id | Device's name | What we know | Status |
+|----|---------------|--------------|--------|
+| `0x0500` | `gaze` | this document | subscribed by us |
+| `0x0501` | `image` | eye-camera image | decoded, `camera.rs` |
+| `0x0504` | `presence` | 69 bytes, 2 columns: s64 timestamp + a type-`0x01` enum. **Event-driven, not periodic** — one notification in 6 s. Value `2` with nobody in view | **[CONFIRMED]** live; enum meaning **[HYPOTHESIS]** |
+| `0x0508` | `image_collection` | subscribing it produced no frames here | **[UNCONFIRMED]** |
+| `0x050e` | `primary_camera_image` | eye-camera image | decoded, `camera.rs` |
+| `0x1770` | `algodbg` | 38-byte payload, one u32 column, constant `0` at ~133 Hz | **[CONFIRMED]** live — carries no data |
+| `0x1771` | `is5_sync_stream` | 73 bytes, two s64 columns: `0x01` device timestamp µs, `0x02` a second, consistently *earlier* stamp | **[CONFIRMED]** live |
+| `0x1772` | `log` | the device's own text log — see below | **[CONFIRMED]** live |
+| `0x1774` | `custom` | never subscribed | **[UNCONFIRMED]** |
+
+The `0x177x` ids came to our attention via `njmill/tobii-linux`; our own sweep
+only ever covered `0x501..=0x520`, so they had never been probed here. That is
+the argument for asking the device rather than guessing a range: **prefer
+`tobii streams` over `tobii probe-streams`**.
+
+`0x0504 presence` is the interesting one for future work — the device
+volunteering "a user arrived / left" instead of us inferring it from gaze
+validity. It needs one capture with somebody in view to name its enum.
 
 `0x1770` runs at **~133 Hz**, four times the gaze rate, which made it a
 promising home for internal per-eye state. It is not: the single column reads

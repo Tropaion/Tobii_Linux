@@ -14,8 +14,8 @@ use tobii_protocol::commands::{
 use tobii_protocol::frame::{
     build_out_frame, OP_CAL_ADD_POINT, OP_CAL_APPLY, OP_CAL_CLEAR, OP_CAL_COMPUTE,
     OP_CAL_DISCARD_POINT, OP_CAL_RETRIEVE, OP_CAL_START, OP_CAL_STOP, OP_GAZE_NOTIFY,
-    OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA, OP_SET_ENABLED_EYE, OP_SUBSCRIBE, STREAM_GAZE,
-    TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
+    OP_GET_ENABLED_EYE, OP_SET_DISPLAY_AREA, OP_SET_ENABLED_EYE, OP_STREAM_CATALOG, OP_SUBSCRIBE,
+    OP_UNSUBSCRIBE, STREAM_GAZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP,
 };
 use tobii_protocol::{DisplayCorners, Frame, GazeSample, Handshake, HandshakeAction, Parser};
 
@@ -339,6 +339,25 @@ impl<T: Transport> Connection<T> {
         Ok(self
             .request(OP_SUBSCRIBE, &subscribe_payload(stream_id))?
             .is_some())
+    }
+
+    /// Stop a stream. Returns whether the device acked.
+    ///
+    /// Matters for probing: subscribing a range to see what answers leaves every
+    /// one of them running for the rest of the session, so a probe permanently
+    /// changes the traffic it was trying to characterize. See
+    /// [`OP_UNSUBSCRIBE`] for how confident we are in the op number.
+    pub fn unsubscribe_stream(&mut self, stream_id: u16) -> Result<bool, UsbError> {
+        Ok(self
+            .request(OP_UNSUBSCRIBE, &subscribe_payload(stream_id))?
+            .is_some())
+    }
+
+    /// Ask the device to enumerate its own streams. Returns the raw reply
+    /// payload; the encoding is not yet known well enough to model.
+    /// See [`OP_STREAM_CATALOG`] — this may simply not be a real op.
+    pub fn stream_catalog(&mut self) -> Result<Option<Vec<u8>>, UsbError> {
+        self.request(OP_STREAM_CATALOG, &[])
     }
 
     /// Read the next NOTIFICATION frame of ANY op — the general form of

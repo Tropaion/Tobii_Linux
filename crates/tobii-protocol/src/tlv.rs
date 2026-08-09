@@ -10,11 +10,23 @@ use crate::error::ProtocolError;
 /// Q42 fixed-point scale: 2^42.
 pub const Q42_SCALE: f64 = 4_398_046_511_104.0;
 
-/// Struct tags (found after a type=5 prolog).
+/// Struct tags (found after a type=5 prolog). A whole tag packs an element
+/// count into its high 16 bits — see [`split_tag`]; `TAG_XDS_ROW_MASK` is the
+/// low half on its own, because a row's count varies per frame.
 pub const TAG_XDS_ROW_MASK: u32 = 0x0bb8; // low 16 bits of an xds_row tag
 pub const TAG_XDS_COLUMN: u32 = 0x020bb9;
 pub const TAG_POINT2D: u32 = 0x021f40;
 pub const TAG_POINT3D: u32 = 0x031f41;
+
+/// Split a container prolog tag into `(element_count, type_id)`. Tags are
+/// `(count << 16) | type_id`, where `count` is the number of TLV elements that
+/// follow the prolog: point3d `0x031f41` is 3 × Q42, point2d `0x021f40` is
+/// 2 × Q42, an xds_column `0x020bb9` is its id plus one value, and the
+/// display-area tag `0x010100` in `commands.rs` is followed by a single u32.
+/// Live gaze rows confirm it for a variable count: `0x00270bb8` = 39 columns.
+pub fn split_tag(tag: u32) -> (u32, u32) {
+    (tag >> 16, tag & 0xffff)
+}
 
 /// Encode millimetres as a Q42 fixed-point integer: round(mm * 2^42).
 pub fn q42_encode(mm: f64) -> i64 {
@@ -101,9 +113,9 @@ impl<'a> Reader<'a> {
         Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    /// Read and validate a TLV field header: a 1-byte type and 4-byte BE size,
-    /// erroring if either does not match the expectation.
-    fn read_header(&mut self, expected_type: u8, expected_size: u32) -> Result<(), ProtocolError> {
+    /// Read a TLV field header of a type whose body length varies, returning the
+    /// declared size.
+    fn read_header_var(&mut self, expected_type: u8) -> Result<u32, ProtocolError> {
         let t = self.u8()?;
         if t != expected_type {
             return Err(ProtocolError::WrongType {
@@ -111,7 +123,13 @@ impl<'a> Reader<'a> {
                 found: t,
             });
         }
-        let s = self.u32_be()?;
+        self.u32_be()
+    }
+
+    /// Read and validate a TLV field header: a 1-byte type and 4-byte BE size,
+    /// erroring if either does not match the expectation.
+    fn read_header(&mut self, expected_type: u8, expected_size: u32) -> Result<(), ProtocolError> {
+        let s = self.read_header_var(expected_type)?;
         if s != expected_size {
             return Err(ProtocolError::WrongSize {
                 expected: expected_size,
@@ -132,6 +150,55 @@ impl<'a> Reader<'a> {
         self.u32_be()
     }
 
+    /// type=1, a 4-byte body. **[CONFIRMED]** live 2026-08-09 — the `presence`
+    /// stream (`0x504`) ends with `01 00000004 00000002`.
+    ///
+    /// A third-party decoder calls this type a boolean, and that reading is
+    /// **[HYPOTHESIS]** — arguably a refuted one. The single value we have
+    /// observed is **2**, captured with nobody in front of the tracker, which no
+    /// plain true/false encoding produces. It is more likely a small enum. So
+    /// this returns the raw `u32`: a caller can decide what 2 means, whereas a
+    /// `bool` would have quietly reported "present" for an empty room.
+    ///
+    /// Renaming this once the enum is known is expected. Sit in front of the
+    /// tracker with `tobii dump-stream 504 1` to get the other value.
+    pub fn read_enum4(&mut self) -> Result<u32, ProtocolError> {
+        self.read_header(1, 4)?;
+        self.u32_be()
+    }
+
+    /// type=0x14 ASCII text: a 4-byte BE character count, then that many bytes,
+    /// so `size == count + 4`.
+    ///
+    /// **[CONFIRMED]** live 2026-08-09 from the stream-catalog reply (op
+    /// `0x4b0`), whose bytes we hold verbatim: `14 00000008 00000004 67617a65`
+    /// — size 8, count 4, `"gaze"`. Every one of the nine records in that reply
+    /// has the same shape, and the empty second string is `14 00000004 00000000`,
+    /// which pins the `+4` exactly. An earlier note here rated the framing a
+    /// hypothesis derived from character-counting one log line; the catalog
+    /// settles it from raw bytes.
+    ///
+    /// The size check below still refuses a field whose two lengths disagree,
+    /// rather than returning text shifted by four bytes.
+    pub fn read_string(&mut self) -> Result<String, ProtocolError> {
+        let size = self.read_header_var(0x14)?;
+        let count = self.u32_be()?;
+        // The count is the authority on the text length; a size that disagrees
+        // means the field is mis-framed, so refuse it rather than return a
+        // string built from whatever the cursor happens to be sitting on.
+        let expected = count.saturating_add(4);
+        if size != expected {
+            return Err(ProtocolError::WrongSize {
+                expected,
+                found: size,
+            });
+        }
+        let body = self.take(count as usize)?;
+        // The only producer we have seen is the device's own log stream, where a
+        // stray non-UTF-8 byte should cost one character, not the whole line.
+        Ok(String::from_utf8_lossy(body).into_owned())
+    }
+
     pub fn read_fixed16x16(&mut self) -> Result<f64, ProtocolError> {
         self.read_header(3, 4)?;
         Ok(self.i32_be()? as f64 / 65536.0)
@@ -150,13 +217,14 @@ impl<'a> Reader<'a> {
     /// Consume an xds_row prolog; returns the column count packed in the tag.
     pub fn read_xds_row(&mut self) -> Result<u32, ProtocolError> {
         let tag = self.read_prolog_tag()?;
-        if tag & 0xffff != TAG_XDS_ROW_MASK {
+        let (count, type_id) = split_tag(tag);
+        if type_id != TAG_XDS_ROW_MASK {
             return Err(ProtocolError::WrongTag {
                 expected: TAG_XDS_ROW_MASK,
                 found: tag,
             });
         }
-        Ok((tag >> 16) & 0xfff)
+        Ok(count)
     }
 
     /// Consume an xds_column prolog + u32; returns the column id.
@@ -274,5 +342,100 @@ mod reader_tests {
         let buf = [0x02u8, 0, 0, 0]; // truncated u32 header
         let mut r = Reader::new(&buf);
         assert_eq!(r.read_u32(), Err(crate::error::ProtocolError::ShortRead));
+    }
+
+    /// A `0x1772` (device log) field. The line and the TLV size 0x55 = 85 are
+    /// live; the inner count 0x51 = 81 is **reconstructed** from `read_string`'s
+    /// hypothesised framing, not captured — see [`Reader::read_string`].
+    const LIVE_LOG_LINE: &str =
+        "[ 17340.014877] (I) PROT: Client 0 qid 260 subscribing for 'log' stream (id 6002)";
+
+    fn live_log_field() -> Vec<u8> {
+        let mut buf = vec![0x14, 0x00, 0x00, 0x00, 0x55, 0x00, 0x00, 0x00, 0x51];
+        buf.extend_from_slice(LIVE_LOG_LINE.as_bytes());
+        buf
+    }
+
+    #[test]
+    fn a_counted_string_yields_the_whole_log_line_and_nothing_else() {
+        let buf = live_log_field();
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.read_string().unwrap(), LIVE_LOG_LINE);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn a_string_whose_size_disagrees_with_its_count_is_rejected() {
+        let mut buf = live_log_field();
+        buf[4] = 0x51; // TLV size that forgot to account for the 4-byte count
+        let mut r = Reader::new(&buf);
+        assert_eq!(
+            r.read_string(),
+            Err(ProtocolError::WrongSize {
+                expected: 0x55,
+                found: 0x51
+            })
+        );
+    }
+
+    #[test]
+    fn a_string_truncated_mid_body_is_a_short_read() {
+        let buf = live_log_field();
+        let mut r = Reader::new(&buf[..30]);
+        assert_eq!(r.read_string(), Err(ProtocolError::ShortRead));
+    }
+
+    #[test]
+    fn a_string_truncated_before_its_count_is_a_short_read() {
+        let buf = [0x14u8, 0, 0, 0, 0x55, 0, 0];
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.read_string(), Err(ProtocolError::ShortRead));
+    }
+
+    #[test]
+    fn a_type_1_field_yields_its_body_verbatim_not_a_truth_value() {
+        // The tail of a real 69-byte `presence` (0x504) payload, captured
+        // 2026-08-09 with nobody in front of the tracker. The body is 2 — which
+        // is why this returns the number rather than collapsing it to `true`.
+        let presence_tail = [0x01u8, 0, 0, 0, 4, 0, 0, 0, 2];
+        assert_eq!(Reader::new(&presence_tail).read_enum4(), Ok(2));
+
+        for body in [0u32, 1, 0xffff_ffff] {
+            let mut buf = vec![0x01u8, 0, 0, 0, 4];
+            buf.extend_from_slice(&body.to_be_bytes());
+            assert_eq!(Reader::new(&buf).read_enum4(), Ok(body));
+        }
+    }
+
+    #[test]
+    fn a_truncated_type_1_field_is_a_short_read() {
+        let buf = [0x01u8, 0, 0, 0, 4, 0, 0];
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.read_enum4(), Err(ProtocolError::ShortRead));
+    }
+
+    #[test]
+    fn a_type_1_field_with_the_wrong_type_byte_is_rejected() {
+        let buf = [0x02u8, 0, 0, 0, 4, 0, 0, 0, 1];
+        let mut r = Reader::new(&buf);
+        assert_eq!(
+            r.read_enum4(),
+            Err(ProtocolError::WrongType {
+                expected: 1,
+                found: 2
+            })
+        );
+    }
+
+    #[test]
+    fn container_tags_split_into_an_element_count_and_a_type_id() {
+        assert_eq!(split_tag(TAG_POINT2D), (2, 0x1f40));
+        assert_eq!(split_tag(TAG_POINT3D), (3, 0x1f41));
+        assert_eq!(split_tag(TAG_XDS_COLUMN), (2, 0x0bb9));
+        // Live captures: a 39-column gaze row and the 2-column 0x504 event row.
+        assert_eq!(split_tag(0x0027_0bb8), (39, TAG_XDS_ROW_MASK));
+        assert_eq!(split_tag(0x0002_0bb8), (2, TAG_XDS_ROW_MASK));
+        // The display-area tag from `commands.rs`, followed by exactly one u32.
+        assert_eq!(split_tag(0x0001_0100), (1, 0x0100));
     }
 }

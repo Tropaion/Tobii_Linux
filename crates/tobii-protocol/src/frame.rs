@@ -19,6 +19,18 @@ pub const TTP_MAGIC_NOTIFY: u32 = 0x53;
 // Operation codes used in v1 (calibration ops deferred to Phase 2).
 pub const OP_HELLO: u32 = 0x3e8;
 pub const OP_SUBSCRIBE: u32 = 0x4c4;
+/// Stop a stream started with [`OP_SUBSCRIBE`]. Every mapped request/companion
+/// pair in this catalog sits exactly +10 apart (`0x596`/`0x5a0`, `0x3f2`/`0x3fc`,
+/// `0x424`/`0x42e`, `0x44c`/`0x456`, `0x76c`/`0x776`, `0xc58`/`0xc62`), and
+/// `0x4c4 + 10 = 0x4ce`, which is also what `njmill/tobii-linux` sends to stop a
+/// stream. **[UNCONFIRMED]** — the pattern and the third-party use agree, but we
+/// have not watched a stream actually fall silent after sending it.
+pub const OP_UNSUBSCRIBE: u32 = 0x4ce;
+/// Ask the device to enumerate its own streams (id → name).
+/// **[UNCONFIRMED]** — the op number comes from a third-party middleware
+/// emulator's canned reply, not from a capture of real hardware. `tobii streams`
+/// exists to settle it.
+pub const OP_STREAM_CATALOG: u32 = 0x4b0;
 pub const OP_SET_DISPLAY_AREA: u32 = 0x5a0;
 pub const OP_GET_DISPLAY_AREA: u32 = 0x596;
 pub const OP_QUERY_REALM: u32 = 0x640;

@@ -49,6 +49,37 @@ Master table of every known TTP op code. Op constants live in
 > display-area/calibration convention. This is real; do not "correct" it.
 > **[CODE-VERIFIED]** — memory `et5-enabled-eye-op`.
 
+## Windows startup discovery (third-party log — names not ours)
+
+`njmill/tobii-linux` logged the stock Windows Star Citizen Tobii DLL requesting
+these object ids while it enumerated the device, and named some of them. **We
+have not reproduced that capture and have never sent one of these ops**, so the
+ids are **[UNCONFIRMED]** and every name below is that project's reading, not a
+finding of ours (**[HYPOTHESIS]**). Ids they logged without a name stay unnamed
+here rather than getting an invented one. Treat this whole table as a list of
+leads.
+
+| Op (hex) | Dec | Name | Dir | Request payload | Response | Conf | Source |
+|---------|----:|------|-----|-----------------|----------|------|--------|
+| `0x532` | 1330 | *observed, unnamed* | host→dev | unknown | unknown | **[UNCONFIRMED]** | `njmill/tobii-linux` startup log |
+| `0x546` | 1350 | capabilities | host→dev | unknown | unknown | name **[HYPOTHESIS]**, id **[UNCONFIRMED]** | same |
+| `0x58c` | 1420 | device_info | host→dev | unknown | unknown | name **[HYPOTHESIS]**, id **[UNCONFIRMED]** | same |
+| `0x5b4` | 1460 | *observed, unnamed* | host→dev | unknown | unknown | **[UNCONFIRMED]** | same |
+| `0x5d2` | 1490 | *observed, unnamed* | host→dev | unknown | unknown | **[UNCONFIRMED]** | same |
+| `0x672` | 1650 | *observed, unnamed* | host→dev | unknown | unknown | **[UNCONFIRMED]** | same |
+| `0x6a4` | 1700 | model_name | host→dev | unknown | unknown | name **[HYPOTHESIS]**, id **[UNCONFIRMED]** | same |
+| `0x83e` | 2110 | session_metadata | host→dev | unknown | unknown | name **[HYPOTHESIS]**, id **[UNCONFIRMED]** | same |
+| `0xbf4` | 3060 | *observed, unnamed* | host→dev | unknown | unknown | **[UNCONFIRMED]** | same |
+
+> The same log names `0xc62` **"runtime_metadata"**. That is wrong — we have
+> `0xc62` live-verified as `get_enabled_eye` (above). Ours wins; do not import
+> their label for it.
+
+`tobii-recap` renders these as `?3p:<name>` (or `?3p:unnamed`) in its timeline —
+the `?` marks them as unverified exactly like `?unknown` does, and `3p` says the
+label came from a third party. They stay out of `opnames.rs::op_name`, so the
+op catalog still counts them as mapping targets.
+
 ## Notifications (device → host, op == stream id)
 
 | Op (hex) | Name | Payload | Conf | Source |
@@ -59,11 +90,17 @@ Master table of every known TTP op code. Op constants live in
 
 ## Unmapped / targets
 
-Any op not above is a **mapping target**. `tobii-recap` prints these as
-`?unknown` in its timeline (`opnames.rs::op_label`). Known open targets:
+Any op not named above is a **mapping target**. `tobii-recap` prints these as
+`?unknown` in its timeline (`opnames.rs::op_label`), or `?3p:…` for the
+third-party-labelled ids. Known open targets:
 
 - The **head-pose** subscription/notify op, if one exists — never observed. See
   [[Head-Pose]]. **[HYPOTHESIS]**
 - Streams `0x502`, `0x503`, `0x505`..`0x50d`, `0x50f`..`0x520`: all **ACK** a
   subscribe but streamed no data in a 5 s window. **[CONFIRMED]** ack, purpose
   unknown. See [[Streams]].
+- Every op in *Windows startup discovery* above. Having a third party's label
+  for `0x58c` is not the same as knowing what `0x58c` does — these are the
+  best-signposted targets we have, because the stock runtime is reported to ask
+  for all of them at startup. Whether the device *answers* is not something the
+  log tells us. **[UNCONFIRMED]**

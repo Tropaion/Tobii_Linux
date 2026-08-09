@@ -4,7 +4,7 @@ use crate::bytes::Writer;
 use crate::frame::{
     build_out_frame, OP_GET_DISPLAY_AREA, OP_HELLO, OP_SET_DISPLAY_AREA, OP_SUBSCRIBE,
 };
-use crate::tlv::{write_point, write_tag, write_u32};
+use crate::tlv::{split_tag, write_point, write_tag, write_u32, Reader};
 
 /// Which eye(s) the tracker should detect ("Select eyes to detect"). The wire
 /// encoding is 1-based (`LEFT=1, RIGHT=2, BOTH=3`) — the stream-engine
@@ -41,6 +41,61 @@ pub fn set_enabled_eye_payload(eye: EnabledEye) -> Vec<u8> {
     let mut p = vec![0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04];
     p.extend_from_slice(&eye.to_wire().to_be_bytes());
     p
+}
+
+/// One entry of the device's own stream catalog: the subscribe id and the name
+/// the firmware calls it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEntry {
+    pub id: u16,
+    pub name: String,
+}
+
+/// Parse the reply to [`OP_STREAM_CATALOG`], the device enumerating its streams.
+///
+/// **[CONFIRMED]** live 2026-08-09 against real hardware: a 509-byte reply
+/// listing nine streams. The layout is an outer row whose first element is a
+/// u32 (`0x1389`, the catalog's own object id) followed by one 4-element record
+/// per stream: `u32 id`, the name as a type-`0x14` string, a second string that
+/// is always empty, and a trailing u32.
+///
+/// Worth having because it makes the device self-describing: `probe-streams`
+/// otherwise has to brute-force a range and can only find what it thought to
+/// look for — which is how ids `0x1770`-`0x1774` went unnoticed for so long.
+///
+/// Returns what it managed to parse; a malformed tail truncates the list rather
+/// than discarding the entries already recovered.
+pub fn parse_stream_catalog(payload: &[u8]) -> Vec<StreamEntry> {
+    let mut r = Reader::new(payload);
+    r.skip(2);
+    let Ok(tag) = r.read_prolog_tag() else {
+        return Vec::new();
+    };
+    let (elements, _) = split_tag(tag);
+    // The leading u32 is the catalog object itself, not a stream.
+    if r.read_u32().is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for _ in 1..elements {
+        let parsed = (|| {
+            r.read_prolog_tag()?;
+            let id = r.read_u32()?;
+            let name = r.read_string()?;
+            // Always empty on this firmware; read it to stay in step.
+            r.read_string()?;
+            r.read_u32()?;
+            Ok::<_, crate::error::ProtocolError>(StreamEntry {
+                id: id as u16,
+                name,
+            })
+        })();
+        match parsed {
+            Ok(e) => out.push(e),
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 /// Parse an `enabled_eye` GET response — the value is the trailing big-endian
@@ -160,6 +215,73 @@ pub fn build_set_display_area_corners(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real 509-byte `0x4b0` reply, captured from an ET5 on 2026-08-09.
+    /// Trimmed to the first three records plus the row prolog, which is enough
+    /// to exercise the record walk, the string framing and the early stop.
+    const STREAM_CATALOG_REPLY: &[u8] = &[
+        0x00, 0x00, // payload prefix
+        0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0a, 0x01, 0x00, // row: 10 elements
+        0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x13, 0x89, // the catalog object itself
+        0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x13, 0x89, // record: 4 elements
+        0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x05, 0x00, // id 0x0500
+        0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x04, b'g', b'a', b'z', b'e', 0x14, 0x00,
+        0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, // empty second string
+        0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, //
+        0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x13, 0x89, //
+        0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x05, 0x01, // id 0x0501
+        0x14, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x05, b'i', b'm', b'a', b'g', b'e', 0x14,
+        0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, //
+        0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, //
+        0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x13, 0x89, //
+        0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x05, 0x04, // id 0x0504
+        0x14, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x08, b'p', b'r', b'e', b's', b'e', b'n',
+        b'c', b'e', //
+        0x14, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, //
+        0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, //
+    ];
+
+    #[test]
+    fn stream_catalog_names_the_device_own_streams() {
+        let got = parse_stream_catalog(STREAM_CATALOG_REPLY);
+        assert_eq!(
+            got,
+            vec![
+                StreamEntry {
+                    id: 0x0500,
+                    name: "gaze".into()
+                },
+                StreamEntry {
+                    id: 0x0501,
+                    name: "image".into()
+                },
+                StreamEntry {
+                    id: 0x0504,
+                    name: "presence".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_truncated_stream_catalog_keeps_what_it_already_read() {
+        // The row prolog promises 10 elements but the bytes run out after three
+        // records. Losing the tail must not lose the head — this reply is how we
+        // learn stream ids, so a partial answer is still worth having.
+        let got = parse_stream_catalog(STREAM_CATALOG_REPLY);
+        assert_eq!(got.len(), 3, "row claimed 9 streams, only 3 are present");
+    }
+
+    #[test]
+    fn a_stream_catalog_that_is_not_one_yields_nothing() {
+        assert!(parse_stream_catalog(&[]).is_empty());
+        assert!(parse_stream_catalog(&[0x00, 0x00]).is_empty());
+        // A well-formed row prolog with no records after it.
+        assert!(parse_stream_catalog(&[
+            0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x0a, 0x01, 0x00,
+        ])
+        .is_empty());
+    }
 
     #[test]
     fn enabled_eye_wire_round_trips() {

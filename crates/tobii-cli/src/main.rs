@@ -27,6 +27,8 @@ fn main() -> ExitCode {
         (Some("headpose"), _) => headpose(&args),
         (Some("columns"), _) => columns(),
         (Some("probe-streams"), _) => probe_streams(&args),
+        (Some("streams"), _) => stream_catalog(),
+        (Some("log"), _) => device_log(&args),
         (Some("probe-stream"), _) => probe_stream(&args),
         (Some("dump-stream"), _) => dump_stream(&args),
         (Some("camera"), _) => camera(&args),
@@ -43,6 +45,8 @@ fn main() -> ExitCode {
                  tobii headpose [--udp ADDR] [--rate HZ]\n  \
                  tobii columns\n  \
                  tobii probe-streams [START] [END]\n  \
+                 tobii streams\n  \
+                 tobii log [SECS]\n  \
                  tobii probe-stream <ID> [SECS]\n  \
                  tobii dump-stream <ID> [COUNT]\n  \
                  tobii camera [ID] [COUNT]\n  \
@@ -293,7 +297,105 @@ fn probe_streams(args: &[String]) -> CmdResult {
              e.g. `tobii probe-streams 0x400 0x600`, or the head pose is host-derived."
         );
     }
+
+    // Leave the session as we found it. Without this, every id that acked keeps
+    // streaming for the rest of the connection, so a probe permanently changes
+    // the traffic pattern it was measuring — and anything run afterwards in the
+    // same session sees a device that is busier than normal.
+    let mut released = 0u32;
+    for id in start..=end {
+        if let Ok(true) = conn.unsubscribe_stream(id) {
+            released += 1;
+        }
+    }
+    eprintln!("released {released} subscription(s) (op 0x4ce, unverified — see frame.rs)");
     Ok(())
+}
+
+/// Ask the device to enumerate its own streams (op `0x4b0`).
+///
+/// The op number comes from a third-party middleware *emulator*'s canned reply,
+/// not from a capture of real hardware, so this command exists mainly to settle
+/// whether it is real at all. It prints the raw reply: we have no model for the
+/// encoding, and inventing one from an emulator's fixture would be how a wrong
+/// "fact" enters the wiki.
+fn stream_catalog() -> CmdResult {
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    conn.set_request_timeout(Duration::from_secs(2));
+    match conn.stream_catalog()? {
+        Some(payload) => {
+            let entries = tobii_protocol::commands::parse_stream_catalog(&payload);
+            if entries.is_empty() {
+                println!(
+                    "op 0x4b0 answered {} bytes but did not parse as a",
+                    payload.len()
+                );
+                println!("catalog — the layout may differ on this firmware. Raw:");
+                println!("  {}", hex(&payload));
+                return Ok(());
+            }
+            println!("the device reports {} streams:", entries.len());
+            for e in entries {
+                println!("  0x{:04x}  {}", e.id, e.name);
+            }
+        }
+        None => println!(
+            "op 0x4b0 got no response in 2s — most likely not a real op on this device. \
+             The third-party source for it was an emulator, not hardware."
+        ),
+    }
+    Ok(())
+}
+
+/// Print the device's own log stream (`0x1772`) until interrupted.
+///
+/// The tracker narrates its internal state — protocol events, USB power
+/// transitions — as length-prefixed ASCII. Everything here we would otherwise
+/// have to infer from the outside.
+fn device_log(args: &[String]) -> CmdResult {
+    let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+    conn.set_request_timeout(Duration::from_millis(500));
+    if !conn.subscribe_stream(0x1772)? {
+        return Err("device refused the log subscription (0x1772)".into());
+    }
+    eprintln!("device log for {secs}s (Ctrl-C to stop)...");
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        for (op, payload) in conn.read_notifications() {
+            if op != 0x1772 {
+                continue;
+            }
+            // The text sits under two levels of nesting whose shape differs
+            // between message kinds, and we have only a handful of examples.
+            // Finding the string beats modelling a structure we do not yet
+            // understand: `read_string` validates its own framing, so a false
+            // positive on a stray 0x14 byte fails rather than prints garbage.
+            let line = (0..payload.len()).find_map(|i| {
+                if payload[i] != 0x14 {
+                    return None;
+                }
+                tobii_protocol::tlv::Reader::new(&payload[i..])
+                    .read_string()
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            });
+            match line {
+                Some(l) => println!("{}", l.trim_end()),
+                None => eprintln!("(no text found in a {}-byte log payload)", payload.len()),
+            }
+        }
+    }
+    let _ = conn.unsubscribe_stream(0x1772);
+    Ok(())
+}
+
+/// Lowercase hex, for dumping a payload we cannot yet decode.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Capture DECODED camera frames (0x501/0x50e) and save them as viewable PGM

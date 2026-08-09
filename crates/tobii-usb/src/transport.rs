@@ -7,6 +7,10 @@ use std::time::Duration;
 pub enum UsbError {
     /// The Tobii ET5 (2104:0313) was not found on the bus.
     DeviceNotFound,
+    /// The device is on the bus but this process may not open it.
+    PermissionDenied,
+    /// The device is on the bus but another process holds interface 0.
+    DeviceBusy,
     /// A libusb operation failed.
     Usb(rusb::Error),
     /// A bulk write transferred fewer bytes than requested.
@@ -23,6 +27,16 @@ impl std::fmt::Display for UsbError {
             UsbError::DeviceNotFound => write!(
                 f,
                 "Tobii ET5 (2104:0313) not found — is it plugged in, and is the udev rule installed?"
+            ),
+            UsbError::PermissionDenied => write!(
+                f,
+                "no permission to open the Tobii ET5 (2104:0313) — install assets/99-tobii.rules \
+                 into /etc/udev/rules.d/ and replug the tracker"
+            ),
+            UsbError::DeviceBusy => write!(
+                f,
+                "the Tobii ET5 (2104:0313) is already claimed by another process — usually \
+                 tobii-gtk; close it and retry"
             ),
             UsbError::Usb(e) => write!(f, "libusb error: {e}"),
             UsbError::ShortWrite { wrote, expected } => {
@@ -71,13 +85,17 @@ impl UsbTransport {
     /// Open the device, detach any kernel driver, claim interface 0, and send
     /// the vendor session-open control transfer.
     pub fn open() -> Result<Self, UsbError> {
-        let handle = rusb::open_device_with_vid_pid(VID, PID).ok_or(UsbError::DeviceNotFound)?;
+        let handle = open_handle()?;
 
         // Best-effort kernel driver detach (ignored if not attached / unsupported).
         if handle.kernel_driver_active(IFACE).unwrap_or(false) {
             let _ = handle.detach_kernel_driver(IFACE);
         }
-        handle.claim_interface(IFACE)?;
+        // Claiming is where a second client loses the race, so this failure gets
+        // the same treatment as the open above rather than a bare libusb code.
+        handle
+            .claim_interface(IFACE)
+            .map_err(classify_open_failure)?;
 
         // Vendor session-open: bmRequestType = vendor | host-to-device | interface.
         let req_type =
@@ -92,6 +110,46 @@ impl UsbTransport {
         )?;
 
         Ok(Self { handle })
+    }
+}
+
+/// Find the ET5 and open it, keeping libusb's reason for any failure.
+///
+/// `rusb::open_device_with_vid_pid` returns an `Option`, so a permission problem
+/// and an absent tracker are indistinguishable to the caller — the reason a
+/// running GUI used to be reported as "not plugged in". Enumerating by hand
+/// costs one descriptor read per device and keeps the error.
+fn open_handle() -> Result<rusb::DeviceHandle<GlobalContext>, UsbError> {
+    let mut open_failure = None;
+    for device in rusb::devices()?.iter() {
+        // A descriptor we cannot read cannot be matched against VID/PID; some
+        // other device on the bus is not our problem.
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
+        if desc.vendor_id() != VID || desc.product_id() != PID {
+            continue;
+        }
+        match device.open() {
+            Ok(handle) => return Ok(handle),
+            // Keep looking: with two trackers attached, one being busy says
+            // nothing about the other. The last reason survives if none open.
+            Err(e) => open_failure = Some(e),
+        }
+    }
+    Err(open_failure.map_or(UsbError::DeviceNotFound, classify_open_failure))
+}
+
+/// Map a libusb failure from `Device::open` or `claim_interface` onto an error
+/// that tells the user what to do about it.
+fn classify_open_failure(e: rusb::Error) -> UsbError {
+    match e {
+        rusb::Error::Access => UsbError::PermissionDenied,
+        rusb::Error::Busy => UsbError::DeviceBusy,
+        // The tracker was enumerated but gone by the time we opened it — from
+        // here that is the same situation as never having been there.
+        rusb::Error::NoDevice => UsbError::DeviceNotFound,
+        other => UsbError::Usb(other),
     }
 }
 
@@ -148,5 +206,54 @@ mod tests {
         }
         .to_string()
         .contains("short"));
+    }
+
+    #[test]
+    fn a_libusb_access_failure_becomes_a_permission_error() {
+        assert!(matches!(
+            classify_open_failure(rusb::Error::Access),
+            UsbError::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn a_libusb_busy_failure_becomes_a_device_busy_error() {
+        assert!(matches!(
+            classify_open_failure(rusb::Error::Busy),
+            UsbError::DeviceBusy
+        ));
+    }
+
+    #[test]
+    fn a_device_that_vanished_between_enumeration_and_open_reads_as_not_found() {
+        assert!(matches!(
+            classify_open_failure(rusb::Error::NoDevice),
+            UsbError::DeviceNotFound
+        ));
+    }
+
+    #[test]
+    fn an_unclassified_libusb_failure_keeps_its_original_error() {
+        assert!(matches!(
+            classify_open_failure(rusb::Error::Pipe),
+            UsbError::Usb(rusb::Error::Pipe)
+        ));
+        assert!(matches!(
+            classify_open_failure(rusb::Error::NoMem),
+            UsbError::Usb(rusb::Error::NoMem)
+        ));
+    }
+
+    #[test]
+    fn the_permission_error_names_the_udev_rule_and_the_replug() {
+        let msg = UsbError::PermissionDenied.to_string();
+        assert!(msg.contains("assets/99-tobii.rules"), "{msg}");
+        assert!(msg.contains("replug"), "{msg}");
+    }
+
+    #[test]
+    fn the_busy_error_names_the_gui_as_the_likely_holder() {
+        let msg = UsbError::DeviceBusy.to_string();
+        assert!(msg.contains("tobii-gtk"), "{msg}");
     }
 }
