@@ -108,8 +108,16 @@ pub enum Cause {
     /// Error is small inside the calibrated band and jumps outside it: the
     /// device is extrapolating past its evidence.
     CalibrationCoverage,
+    /// The device stops producing gaze data toward the edges. No host-side
+    /// arithmetic fixes an eye rotation the sensor cannot resolve; the lever is
+    /// where the user sits, or a smaller screen.
+    DeviceAngularLimit,
     /// Nothing stands out above the measurement noise.
     NoneApparent,
+    /// The profile does not commit. Said out loud rather than resolved by
+    /// picking the closest-looking cause, because on this problem every
+    /// confident guess so far has been wrong.
+    Inconclusive,
 }
 
 /// A diagnosis, with the numbers it rests on so it can be argued with.
@@ -186,12 +194,60 @@ pub fn diagnose(measurements: &[Measurement], calibrated_band: (f64, f64)) -> Di
     let inner_is_real = inner_gain.abs() > NOISE_FLOOR;
     let outer_is_worse = outer_gain.abs() > inner_gain.abs().max(NOISE_FLOOR) * GAIN_RATIO;
 
-    let (cause, detail) = if worst_error <= NOISE_FLOOR && dead_targets == 0 {
+    // Capture rate outranks every geometric reading. If the device stops
+    // answering toward the edges it has run out of eye rotation it can resolve,
+    // and no amount of host-side arithmetic recovers a sample that was never
+    // produced. Diagnosing "curvature" off the wild errors that surround such a
+    // collapse is how a real physical limit gets mistaken for a software bug.
+    let capture = |ms: &[&Measurement]| -> f64 {
+        let total: usize = ms.len();
+        if total == 0 {
+            return 1.0;
+        }
+        ms.iter()
+            .filter(|m| m.samples >= SAMPLE_TICKS as usize)
+            .count() as f64
+            / total as f64
+    };
+    let edge: Vec<&Measurement> = measurements
+        .iter()
+        .filter(|m| m.offset_x().abs() > 0.35)
+        .collect();
+    let middle: Vec<&Measurement> = measurements
+        .iter()
+        .filter(|m| m.offset_x().abs() <= 0.35)
+        .collect();
+    let (edge_capture, mid_capture) = (capture(&edge), capture(&middle));
+
+    let (cause, detail) = if !edge.is_empty() && edge_capture < 0.75 && mid_capture >= 0.9 {
+        (
+            Cause::DeviceAngularLimit,
+            format!(
+                "the device returns full gaze data for {:.0}% of mid-screen targets but only \
+                 {:.0}% at the edges. It is running out of resolvable eye rotation, which is \
+                 a property of the sensor and the geometry, not of this code. The levers are \
+                 where you sit (further back, and centred) and screen size — not a correction.",
+                mid_capture * 100.0,
+                edge_capture * 100.0
+            ),
+        )
+    } else if worst_error <= NOISE_FLOOR && dead_targets == 0 {
         (
             Cause::NoneApparent,
             format!(
                 "worst error {:.1}% of screen width — at the noise floor",
                 worst_error * 100.0
+            ),
+        )
+    } else if inside.len() < 3 || outside.len() < 3 {
+        (
+            Cause::Inconclusive,
+            format!(
+                "only {} usable target(s) inside the calibrated band and {} outside — too few \
+                 to separate a scale error from a shape error. Re-run with more of the sweep \
+                 completed.",
+                inside.len(),
+                outside.len()
             ),
         )
     } else if outer_is_worse && !inner_is_real {
@@ -558,6 +614,35 @@ mod tests {
     }
 
     #[test]
+    fn a_device_that_stops_answering_at_the_edges_outranks_any_geometry() {
+        // The shape that fooled the first version of this: wild errors at the
+        // edges read as "curvature", when the real story is that the device
+        // returned barely any data out there. Capture rate has to win.
+        let mut ms: Vec<Measurement> = [0.35, 0.5, 0.65]
+            .iter()
+            .map(|&x| m(x, (x - 0.5) * 0.1))
+            .collect();
+        for x in [0.02, 0.1, 0.9, 0.98] {
+            ms.push(Measurement {
+                target: (x, 0.5),
+                reported: (x + (x - 0.5) * 0.4, 0.5),
+                samples: 8, // device managed a fraction of the window
+            });
+        }
+        let d = diagnose(&ms, (0.30, 0.70));
+        assert_eq!(d.cause, Cause::DeviceAngularLimit, "{}", d.detail);
+    }
+
+    #[test]
+    fn too_few_points_on_one_side_refuses_to_name_a_cause() {
+        // Two inner points cannot distinguish a scale error from a shape error,
+        // however tidy the ratio between them looks.
+        let ms = vec![m(0.35, -0.03), m(0.65, 0.001), m(0.1, -0.1), m(0.9, 0.1)];
+        let d = diagnose(&ms, (0.30, 0.70));
+        assert_eq!(d.cause, Cause::Inconclusive, "{}", d.detail);
+    }
+
+    #[test]
     fn a_clean_profile_is_not_talked_into_a_diagnosis() {
         let ms: Vec<Measurement> = [0.02, 0.2, 0.5, 0.8, 0.98]
             .iter()
@@ -581,6 +666,88 @@ mod tests {
         assert_eq!(d.dead_targets, 1);
         // The (0,0) placeholder would be a -0.98 error if it were counted.
         assert!(d.worst_error < 0.01, "worst {}", d.worst_error);
+    }
+
+    /// A real sweep, captured 2026-08-10 on a Samsung Odyssey G93SC (49",
+    /// 32:9, 1193 x 336 mm, 1800R) with a calibrated ET5. `(x, y, reported_x,
+    /// samples)`.
+    ///
+    /// Kept because it is the only ground truth this project has for how the
+    /// ET5 behaves on a screen far wider than it was designed for, and because
+    /// the first version of [`diagnose`] read it as `Curvature` — confidently,
+    /// and wrongly. A flat-plane-versus-1800R model accounts for only about
+    /// half the measured error and gets the sign wrong at x = 0.80. What the
+    /// numbers actually show is the device running out of resolvable eye
+    /// rotation: full sample windows for 93% of mid-screen targets against 42%
+    /// at the edges.
+    const REAL_SWEEP: &[(f64, f64, f64, usize)] = &[
+        (0.50, 0.50, 0.4915, 30),
+        (0.50, 0.15, 0.4885, 30),
+        (0.50, 0.85, 0.4910, 30),
+        (0.35, 0.15, 0.3185, 30),
+        (0.35, 0.85, 0.3191, 30),
+        (0.35, 0.50, 0.3216, 30),
+        (0.65, 0.85, 0.6521, 30),
+        (0.65, 0.50, 0.6535, 30),
+        (0.65, 0.15, 0.6397, 26),
+        (0.20, 0.50, 0.1506, 30),
+        (0.20, 0.15, 0.1746, 30),
+        (0.20, 0.85, 0.0829, 30),
+        (0.80, 0.15, 0.7966, 30),
+        (0.80, 0.85, 0.7428, 30),
+        (0.80, 0.50, 0.7621, 30),
+        (0.10, 0.85, 0.0634, 30),
+        (0.10, 0.50, -0.0153, 30),
+        (0.10, 0.15, 0.0000, 0),
+        (0.90, 0.50, 1.0217, 29),
+        (0.90, 0.15, 0.0000, 0),
+        (0.90, 0.85, 1.0347, 30),
+        (0.02, 0.15, 0.0000, 0),
+        (0.02, 0.85, -0.1442, 30),
+        (0.02, 0.50, -0.0957, 30),
+        (0.98, 0.85, 1.0902, 7),
+        (0.98, 0.50, 1.0930, 20),
+        (0.98, 0.15, 1.1807, 18),
+    ];
+
+    fn real_sweep() -> Vec<Measurement> {
+        REAL_SWEEP
+            .iter()
+            .map(|&(tx, ty, rx, n)| Measurement {
+                target: (tx, ty),
+                reported: (rx, ty),
+                samples: n,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_real_sweep_reads_as_the_device_running_out_of_angle() {
+        let band = calibrated_band(1193.0, 336.0, &crate::calibrate_flow::FULL_7);
+        let d = diagnose(&real_sweep(), band);
+        assert_eq!(
+            d.cause,
+            Cause::DeviceAngularLimit,
+            "curvature was the seductive reading here and it explains only half \
+             the error: {}",
+            d.detail
+        );
+    }
+
+    #[test]
+    fn the_real_sweep_is_accurate_across_the_middle_of_the_screen() {
+        // Whatever is wrong at the edges, the middle is not the problem, and a
+        // future change must not trade the middle away to flatten the edges.
+        let worst_mid = real_sweep()
+            .iter()
+            .filter(|m| m.samples > 0 && m.offset_x().abs() <= 0.2)
+            .map(|m| m.error_x().abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst_mid < 0.04,
+            "middle 40% of the screen drifted to {:.3} of screen width",
+            worst_mid
+        );
     }
 
     #[test]
