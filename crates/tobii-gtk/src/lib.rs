@@ -66,10 +66,32 @@ pub fn run() -> glib::ExitCode {
     if std::env::var_os("GSK_RENDERER").is_none() {
         std::env::set_var("GSK_RENDERER", "gl");
     }
-    let app = Application::builder().application_id(APP_ID).build();
+    let mut builder = Application::builder().application_id(APP_ID);
+    if accuracy_mode() {
+        // GApplication is single-instance by default: with the hub already
+        // running, a second launch would hand off to it and merely raise its
+        // window — in a process whose argv has no `--accuracy`, so the
+        // diagnostic would silently never run.
+        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
     app.connect_startup(|_| load_css());
     app.connect_activate(build_ui);
-    app.run()
+    // GApplication also parses argv itself and aborts on any option it does
+    // not recognise, so our own flags have to be withheld from it.
+    // `accuracy_mode` reads them straight from the environment instead.
+    let gtk_args: Vec<String> = std::env::args().filter(|a| !is_our_flag(a)).collect();
+    app.run_with_args(&gtk_args)
+}
+
+/// Flags this binary handles itself, which must never reach GTK's parser.
+fn is_our_flag(arg: &str) -> bool {
+    matches!(arg, "--accuracy")
+}
+
+/// Whether to run the gaze-accuracy diagnostic instead of the hub.
+pub(crate) fn accuracy_mode() -> bool {
+    std::env::args().any(|a| a == "--accuracy")
 }
 
 fn load_css() {
@@ -136,7 +158,7 @@ fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
     // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
     // needs the device thread, so it branches here rather than in `run`.
-    if std::env::args().any(|a| a == "--accuracy") {
+    if accuracy_mode() {
         accuracy::launch(app, state);
         return;
     }
