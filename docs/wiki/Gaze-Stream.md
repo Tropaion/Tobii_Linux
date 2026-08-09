@@ -56,13 +56,79 @@ from a live six-axis capture (2026-07-22, memory note
 | `0x07` | u32 | **validity L** (`0` = tracked; `4` = not detected) | **[CONFIRMED]** |
 | `0x0d` | u32 | **validity R** | **[CONFIRMED]** |
 | `0x14` | u32 | **frame counter** | **[CONFIRMED]** |
-| `0x22` | point3d | eye/head **position** point-pair, ~45 mm above + ~15 mm behind the eye origins (moves with the head) — investigated as head-pose, ruled out | position **[CONFIRMED]** live; not head orientation |
-| `0x24` | point3d | second of the higher position pair (with `0x22`) | **[CONFIRMED]** live |
-| `0x25` | point3d | stays ~zero in captures | **[CONFIRMED]** live (value); meaning unknown **[HYPOTHESIS]** |
-| `0x27` | point3d | stays ~zero in captures | **[CONFIRMED]** live (value); meaning unknown **[HYPOTHESIS]** |
+| `0x22` | point3d | **eye origin L, display-space mm** — `0x02` rotated **exactly −20.00° about x** and translated | **[CONFIRMED]** live (see below) |
+| `0x24` | point3d | **eye origin R, display-space mm** (same transform from `0x08`) | **[CONFIRMED]** live |
+| `0x25` | point3d | **trackbox eye L, display-space**, normalized | **[CONFIRMED]** live |
+| `0x27` | point3d | **trackbox eye R, display-space** | **[CONFIRMED]** live |
+| `0x15` | u32 | **eye-present R** — `1` exactly when `0x0d == 0` (400/400 frames). Note the **crossed** ordering: `0x15` tracks the *right* eye | **[CONFIRMED]** live |
+| `0x16` | u32 | **eye-present L** — `1` exactly when `0x07 == 0` (400/400) | **[CONFIRMED]** live |
+| `0x1b` | u32 | **binocular flag** — `{0,1}` | **[CONFIRMED]** live (values); label **[HYPOTHESIS]** |
+| `0x1d` `0x1e` `0x1f` | u32 | **gaze validity** combined / L / R (`1` = valid). Independent of eye validity `0x07`/`0x0d` — they disagree on ~9% of frames | **[CONFIRMED]** live |
+| `0x21` | u32 | **unfiltered-gaze validity** — identical to `0x1d` in 400/400 frames | **[CONFIRMED]** live |
+| `0x23` `0x26` `0x28` | u32 | validity companions to the display-space columns, `{0,1}` | **[CONFIRMED]** live (values) |
+| `0x11` | u32 | constant `4` in every frame captured | **[CONFIRMED]** live |
+| `0x2a` `0x2c` | u32 | constant `0` in every frame captured | **[CONFIRMED]** live |
 | `0x19` `0x1a` | point2d | present; `(-1,-1)` / `(0,0)` sentinels in the no-eyes capture — likely more per-eye 2D gaze | **[HYPOTHESIS]** |
 | `0x29` `0x2b` | fixed16x16 | present with `-1.0` sentinel in captures — likely more per-eye scalars (pupil/quality) | **[HYPOTHESIS]** |
-| `0x0e 0x11 0x15 0x16 0x1b 0x1d 0x1e 0x1f 0x21 0x23 0x26 0x28 0x2a 0x2c` | u32 | **constant flags** — every one had range 0 across all six head axes; no orientation data | constant across motion **[CONFIRMED]** live; exact meaning **[HYPOTHESIS]** |
+| `0x0e` | u32 | not observed carrying a non-zero value | **[HYPOTHESIS]** |
+
+> **Correction (2026-08-09).** This table previously called `0x25`/`0x27`
+> "stays ~zero" and grouped `0x15 0x16 0x1b 0x1d 0x1e 0x1f 0x21 0x23 0x26 0x28`
+> as "constant flags — range 0 across all six head axes". Both were artefacts of
+> reading a capture in which **no eyes were ever detected**: the device zeroes
+> every eye-derived column when `validity == 4`, so the whole block reads
+> constant. A 400-frame capture with a user in view shows all of them varying.
+> Cross-checked against the independent decoder in `njmill/tobii-linux`
+> (`tools/probes/tobii-ttp-mux.c`), which names the same ids — except that it
+> labels `0x15`/`0x16` left/right, which the live data shows is **swapped**.
+
+## Display-space columns and the tracker's 20° tilt
+
+The ET5 emits every eye position **twice**: once in tracker-space and once in a
+display-space frame. Fitting the two against 589 live samples gives an exact
+rigid transform (max residual **0.000 mm**):
+
+```text
+x' = x                            - 4.85 mm
+y' =  cos20°·y + sin20°·z       - 212.71 mm
+z' = -sin20°·y + cos20°·z        + 14.81 mm
+```
+
+The rotation is exactly **−20.00°** about x: the ET5's fixed mounting tilt (the
+camera looks upward past the bottom bezel). The translation is the display-area
+offset. This makes `0x22`/`0x24` genuinely useful — they answer "where are the
+eyes relative to the *screen*" without the caller having to know the tilt.
+
+The **normalized** display-space trackbox (`0x25`/`0x27`) is *not* re-centred by
+this: it tracks `0x03`/`0x09` to within ~0.003 in x and y. There is no
+better-centred position signal hiding in these columns. **[CONFIRMED]** live.
+
+## Sibling streams
+
+| Id | What | Status |
+|----|------|--------|
+| `0x0500` | gaze — this document | subscribed by us |
+| `0x0501` | eye-camera image (secondary) | decoded, `camera.rs` |
+| `0x050e` | eye-camera image (primary) | decoded, `camera.rs` |
+| `0x0508` | named "image collection" by `njmill/tobii-linux` | **[UNCONFIRMED]** — subscribing it produced no frames here |
+| `0x1771` | **sync** — 73-byte payload, two s64 columns: `0x01` device timestamp µs, `0x02` a second, consistently *earlier* timestamp | **[CONFIRMED]** live |
+
+The `0x1771` pair is a device↔host clock reference: the two stamps sat
+**10.7 ms and 11.0 ms** apart across consecutive frames. That bounds transport
+latency and is the tool to reach for before blaming the display for "lag".
+We do not subscribe it today.
+
+Op `0x04ce` is used as unsubscribe/stream-disable by `njmill/tobii-linux`; we
+have no equivalent and have not exercised it. **[UNCONFIRMED]** here.
+
+## No separate user-position stream
+
+The eye-position display is driven by the trackbox columns above. There is **no
+distinct device stream** carrying head or user position: an independent
+implementation (`njmill/tobii-linux`) subscribes only `0x0500` (gaze),
+`0x0501`/`0x0508`/`0x050e` (images) and `0x1771` (sync). The Windows SDK's
+`UserPositionGuide` is computed host-side from these same columns, not
+subscribed from the device. **[CONFIRMED]** — cross-implementation agreement.
 
 ## Present-bit vs validity — the critical gotcha
 
@@ -80,6 +146,15 @@ detected (`validity == 4`).
 no-eyes frame: both validities `4`, both eye origins `[0,0,0]`, `gaze_point_2d`
 `(-1,-1)`, yet all present bits set); `tobii-headpose::pose_from_sample` gates on
 `validity == 0` for exactly this reason.
+
+The zeroing is **total**, so no alternative gate can recover data the validity
+gate rejects: across 400 live frames there were **0** frames in which `0x07`/
+`0x0d` said "not detected" yet the matching trackbox column held a non-zero
+value. Every candidate gate (`0x1e`/`0x1f`, `0x26`/`0x28`, non-zero trackbox,
+non-zero display trackbox) admits the same 91% of frames. If a dot is missing,
+the fix is upstream of the wire — aim, lighting, occlusion — or reconstruction
+from the *other* eye (`eyeview::PairOffset`), never a looser gate.
+**[CONFIRMED]** live.
 
 ## No head pose here
 
