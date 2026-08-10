@@ -63,6 +63,60 @@ pub fn arc_from_chord(chord_mm: f64, radius_mm: f64) -> f64 {
     2.0 * radius_mm * ratio.asin()
 }
 
+/// Far edge of the ET5's tracking volume along the view axis, in mm.
+///
+/// The gaze frame's normalized trackbox depth is `(|eye| - 400) / 500`
+/// (**[CONFIRMED]** live), so the volume runs 400–900 mm and the eye-position
+/// screen's "move closer" fires at depth 0.8 — exactly 800 mm, which matches
+/// the distance a user independently reported it appearing at.
+pub const TRACKING_FAR_MM: f64 = 900.0;
+
+/// Gaze angle past which the ET5 stops being useful, in degrees.
+///
+/// Measured, not from a datasheet: a 27-target sweep on a 1193 mm panel gave
+/// 16 mm mean error below 15°, 58 mm from 15–28°, and 147 mm beyond 28° — with
+/// the device returning a full sample window for only 5 of 12 targets out
+/// there. The error and the data loss climb together and symmetrically, which
+/// is what a sensor running out of resolvable eye rotation looks like rather
+/// than any mapping error. See `tobii-gtk`'s `accuracy` module.
+pub const USABLE_GAZE_DEG: f64 = 28.0;
+
+/// How much of a screen this device can ever track well, and from where.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coverage {
+    /// Distance that maximises coverage: as far back as the tracker allows,
+    /// since every millimetre back shrinks the angle to the screen edges.
+    pub best_distance_mm: f64,
+    /// Eye rotation the screen edges demand from there, in degrees.
+    pub edge_angle_deg: f64,
+    /// Fraction of the screen's width inside [`USABLE_GAZE_DEG`] at that
+    /// distance. `1.0` means the whole screen is reachable.
+    pub usable_fraction: f64,
+}
+
+/// What fraction of a screen this width can be tracked well, at best.
+///
+/// Worth stating up front because the two constraints can simply fail to
+/// overlap, and no amount of software closes the gap. A 1193 mm panel needs the
+/// user 1122 mm away to bring its edges inside [`USABLE_GAZE_DEG`], but the
+/// tracker loses them past 900 mm — so its outer fifth cannot work at *any*
+/// seating position. Being told that once beats rediscovering it as "the edges
+/// feel bad", which is indistinguishable from a dozen software bugs and was
+/// mistaken for several of them.
+pub fn tracking_coverage(width_mm: f64) -> Coverage {
+    let half = width_mm.max(0.0) / 2.0;
+    let d = TRACKING_FAR_MM;
+    Coverage {
+        best_distance_mm: d,
+        edge_angle_deg: half.atan2(d).to_degrees(),
+        usable_fraction: if width_mm <= 0.0 {
+            1.0
+        } else {
+            (2.0 * d * USABLE_GAZE_DEG.to_radians().tan() / width_mm).min(1.0)
+        },
+    }
+}
+
 /// The width to send the device for an EDID-reported active-area width.
 ///
 /// Deliberately the identity: the device plane uses the EDID **arc** width, not
@@ -414,6 +468,40 @@ mod tests {
         for &r in &[0.0, -1.0, -1800.0, f64::NAN, f64::INFINITY] {
             assert_eq!(chord_from_arc(1193.0, r), 1193.0);
             assert_eq!(arc_from_chord(1171.0, r), 1171.0);
+        }
+    }
+
+    #[test]
+    fn a_screen_the_tracker_can_fully_cover_reports_all_of_it() {
+        // 27" 16:9 is ~600mm wide — inside what the ET5 is sold for.
+        let c = tracking_coverage(600.0);
+        assert_eq!(c.usable_fraction, 1.0);
+        assert!(c.edge_angle_deg < USABLE_GAZE_DEG);
+    }
+
+    #[test]
+    fn a_49_inch_ultrawide_cannot_be_fully_covered_at_any_distance() {
+        // The measured case: 1193mm needs the user 1122mm back, and the
+        // tracker loses them past 900mm. The gap does not close.
+        let c = tracking_coverage(1193.0);
+        assert!(
+            c.usable_fraction < 0.85,
+            "claimed {:.0}% coverage of a panel that measured 20% unusable",
+            c.usable_fraction * 100.0
+        );
+        assert!(
+            c.edge_angle_deg > USABLE_GAZE_DEG,
+            "edges at {:.1} deg from the far limit",
+            c.edge_angle_deg
+        );
+    }
+
+    #[test]
+    fn coverage_never_exceeds_the_whole_screen_or_divides_by_zero() {
+        for w in [0.0, -5.0, 1.0, 10_000.0] {
+            let c = tracking_coverage(w);
+            assert!((0.0..=1.0).contains(&c.usable_fraction), "width {w}: {c:?}");
+            assert!(c.edge_angle_deg.is_finite());
         }
     }
 

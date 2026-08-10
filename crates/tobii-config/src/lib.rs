@@ -22,7 +22,10 @@ mod store;
 pub use calibration_state::{decide, CalAction, RecommendReason};
 pub use edid::{detect_monitors, pick_monitor, MonitorInfo};
 pub use setpm::parse_setpm_corners;
-pub use setup::{arc_from_chord, chord_from_arc, plane_width_from_edid, DisplaySetup};
+pub use setup::{
+    arc_from_chord, chord_from_arc, plane_width_from_edid, tracking_coverage, Coverage,
+    DisplaySetup, TRACKING_FAR_MM, USABLE_GAZE_DEG,
+};
 pub use store::{
     calibration_path, config_path, enabled_eye_path, load, load_calibration, load_calibration_from,
     load_enabled_eye, load_from, load_setup_monitor_id, save, save_calibration,

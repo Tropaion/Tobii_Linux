@@ -826,6 +826,39 @@ fn print_setup(s: &DisplaySetup) {
             s.curvature_radius_mm
         );
     }
+    print_coverage(s.width_mm);
+}
+
+/// State plainly whether this screen is wider than the tracker can cover.
+///
+/// The two limits can simply fail to overlap: a screen wide enough needs the
+/// user further away than the tracker can still find them. When that happens no
+/// software closes the gap, and saying so once is worth more than leaving it to
+/// surface later as "the edges feel bad" — a symptom indistinguishable from a
+/// dozen real bugs, and mistaken for several of them on this project.
+fn print_coverage(width_mm: f64) {
+    let c = tobii_config::tracking_coverage(width_mm);
+    if c.usable_fraction >= 1.0 {
+        println!("  gaze coverage: the whole screen is within reach of this tracker");
+        return;
+    }
+    println!(
+        "  gaze coverage: at best {:.0}% of the width, sitting {:.0}mm back",
+        c.usable_fraction * 100.0,
+        c.best_distance_mm
+    );
+    println!(
+        "    the edges need {:.0}° of eye rotation; past ~{:.0}° this device's error \
+         jumps and it starts returning no gaze at all.",
+        c.edge_angle_deg,
+        tobii_config::USABLE_GAZE_DEG
+    );
+    println!(
+        "    {:.0}mm is already the far edge of its tracking volume, so the outer \
+         {:.0}% cannot be fixed by moving — or by us.",
+        tobii_config::TRACKING_FAR_MM,
+        (1.0 - c.usable_fraction) * 100.0
+    );
 }
 
 /// Apply corners to a connected device. Returns whether the device
