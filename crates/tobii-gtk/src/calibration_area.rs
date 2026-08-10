@@ -52,59 +52,6 @@ pub fn capped_area(width_mm: f64, height_mm: f64) -> Option<(f64, f64, f64, f64)
     Some((x0, y0, cap_w, cap_h))
 }
 
-/// Where the outermost stimulus of the point set sits, as a fraction of the
-/// calibration area's width from its centre. `FULL_7` spans 0.1..0.9 of the
-/// area, so its extremes are 0.4 of the width out.
-pub const OUTERMOST_POINT_FRACTION: f64 = 0.4;
-
-/// [`capped_area`], but sized so the outermost stimulus lands at the edge of
-/// the gaze angle this device still resolves, instead of at a fixed 600 mm.
-///
-/// Tobii's 600 mm is a proxy: it is the width of the largest screen they
-/// support, and on such a screen it *is* the whole screen. The real constraint
-/// is angular — their two size limits work out to ±24.7° and ±28.3° at the
-/// ideal viewing distance, and a live 27-target sweep put the collapse at 28°.
-/// Using millimetres instead of degrees has one bad consequence: the outermost
-/// stimulus lands at **±16.8° on every screen**, 27-inch or 49-inch, so on a
-/// wide panel the 15–28° band is never calibrated even though the device still
-/// returns perfectly good data there. That band measured 58 mm of error against
-/// the centre's 16 mm, with full sample windows throughout — good signal, bad
-/// mapping, which is the fixable combination.
-///
-/// On a supported screen this changes nothing: at any distance in the ET5's
-/// range the angular cap exceeds 600 mm, and the area was already the whole
-/// screen. It only widens the area on panels bigger than Tobii ever intended,
-/// where their own documentation says accuracy outside the centred area "cannot
-/// be guaranteed" — i.e. exactly where there is nothing to lose.
-///
-/// `distance_mm` is the user's *measured* eye distance. `None` falls back to
-/// [`capped_area`] rather than assuming one, since the answer scales directly
-/// with it.
-pub fn capped_area_at(
-    width_mm: f64,
-    height_mm: f64,
-    distance_mm: Option<f64>,
-) -> Option<(f64, f64, f64, f64)> {
-    let base = capped_area(width_mm, height_mm)?;
-    let Some(d) = distance_mm.filter(|d| d.is_finite() && *d > 0.0) else {
-        return Some(base);
-    };
-    let reach_mm = d * USABLE_GAZE_DEG.to_radians().tan() / OUTERMOST_POINT_FRACTION;
-    // Never narrower than Tobii's own area, never wider than the screen.
-    let cap_mm = reach_mm.clamp(
-        MAX_CALIBRATION_AREA_MM.0,
-        width_mm.max(MAX_CALIBRATION_AREA_MM.0),
-    );
-    let cap_w = (cap_mm / width_mm).min(1.0);
-    let (_, y0, _, h) = base;
-    Some(((1.0 - cap_w) / 2.0, y0, cap_w, h))
-}
-
-/// Gaze angle past which this device's accuracy collapses. Mirrors
-/// `tobii_config::USABLE_GAZE_DEG`; kept local so this stays a pure-geometry
-/// module with no config dependency, as the rest of it already is.
-pub const USABLE_GAZE_DEG: f64 = 28.0;
-
 /// Remap a point from the "conceptual full-screen" [0,1]x[0,1] space (where
 /// the calibration flow's raw point-set values live) into the capped,
 /// centered sub-rectangle — or return it unchanged if `area` is `None`.
@@ -314,78 +261,6 @@ mod tests {
                 assert!(approx(cx, 0.5), "center.x drifted for {w_mm}x{h_mm}");
                 assert!(approx(cy, 0.5), "center.y drifted for {w_mm}x{h_mm}");
             }
-        }
-    }
-
-    #[test]
-    fn a_supported_screen_is_unaffected_by_the_angular_cap() {
-        // 27" 16:9 is ~598mm: already the whole screen under Tobii's own cap,
-        // and it must stay that way at every distance the ET5 can track.
-        for d in [450.0, 650.0, 795.0, 900.0] {
-            assert_eq!(
-                capped_area_at(598.0, 336.0, Some(d)),
-                capped_area(598.0, 336.0),
-                "distance {d} changed a supported screen's calibration area"
-            );
-        }
-    }
-
-    #[test]
-    fn a_wide_screen_gets_a_wider_area_the_further_back_you_sit() {
-        let w = 1193.0;
-        let narrow = capped_area_at(w, 336.0, Some(600.0)).unwrap().2;
-        let wide = capped_area_at(w, 336.0, Some(900.0)).unwrap().2;
-        assert!(wide > narrow, "{wide} !> {narrow}");
-        // Tobii's fixed cap covers half of this panel; at a real sitting
-        // distance the angular one covers most of it.
-        assert!((capped_area(w, 336.0).unwrap().2 - 0.503).abs() < 0.01);
-        assert!(
-            capped_area_at(w, 336.0, Some(795.0)).unwrap().2 > 0.85,
-            "expected most of the width at 795mm"
-        );
-    }
-
-    #[test]
-    fn the_outermost_stimulus_lands_on_the_reliability_limit() {
-        let (w, d) = (1193.0, 795.0);
-        let area = capped_area_at(w, 336.0, Some(d));
-        let x = remap_point((0.9, 0.5), area).0;
-        let angle = (((x - 0.5) * w) / d).atan().to_degrees();
-        assert!(
-            (angle - USABLE_GAZE_DEG).abs() < 1.0,
-            "outermost point at {angle:.1} deg, wanted {USABLE_GAZE_DEG}"
-        );
-    }
-
-    #[test]
-    fn the_angular_area_never_leaves_the_screen_or_goes_below_tobiis_own() {
-        for w in [400.0, 598.0, 700.0, 1193.0, 2000.0] {
-            for d in [1.0, 450.0, 900.0, 5000.0] {
-                if let Some((x0, _, cw, _)) = capped_area_at(w, 400.0, Some(d)) {
-                    assert!((0.0..=1.0).contains(&cw), "w={w} d={d} cap={cw}");
-                    assert!(x0 >= 0.0 && x0 + cw <= 1.0 + 1e-9, "w={w} d={d}");
-                    assert!(
-                        cw * w >= MAX_CALIBRATION_AREA_MM.0.min(w) - 1e-6,
-                        "w={w} d={d}: {} mm is narrower than Tobii's own area",
-                        cw * w
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn no_measured_distance_falls_back_to_tobiis_area() {
-        assert_eq!(
-            capped_area_at(1193.0, 336.0, None),
-            capped_area(1193.0, 336.0)
-        );
-        for bad in [f64::NAN, 0.0, -100.0, f64::INFINITY] {
-            assert_eq!(
-                capped_area_at(1193.0, 336.0, Some(bad)),
-                capped_area(1193.0, 336.0),
-                "distance {bad} should not be trusted"
-            );
         }
     }
 }

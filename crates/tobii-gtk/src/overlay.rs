@@ -25,6 +25,13 @@ pub fn show(app: &Application, state: Arc<Mutex<DeviceState>>) -> ApplicationWin
     for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
         win.set_anchor(edge, true);
     }
+    // Cover the WHOLE output, panels included. Anchoring to four edges is not
+    // enough: a layer surface is shrunk to whatever other surfaces' exclusive
+    // zones leave behind, so a desktop panel silently steals a strip. The gaze
+    // point is normalized against the full screen, so a surface that is short
+    // by a 44px taskbar draws every dot about 3% high — around 10mm up at the
+    // bottom of a 336mm-tall screen, uniformly, forever. -1 opts out.
+    win.set_exclusive_zone(-1);
     win.set_keyboard_mode(KeyboardMode::None);
 
     // Latest gaze point (normalized), shared with the draw callback.
@@ -35,7 +42,29 @@ pub fn show(app: &Application, state: Arc<Mutex<DeviceState>>) -> ApplicationWin
     area.set_vexpand(true);
     {
         let gaze = gaze.clone();
+        let checked = Cell::new(false);
         area.set_draw_func(move |_, cr, w, h| {
+            // Gaze is normalized against the whole screen, so this surface has
+            // to BE the whole screen. If a compositor hands us less, every dot
+            // is offset and scaled by exactly that difference — an error which
+            // looks identical to the tracker being miscalibrated, and which no
+            // amount of recalibration fixes. Say so once rather than let it
+            // masquerade.
+            if !checked.replace(true) {
+                if let Some(geo) = crate::primary_monitor().map(|m| m.geometry()) {
+                    if (geo.width() - w).abs() > 1 || (geo.height() - h).abs() > 1 {
+                        eprintln!(
+                            "gaze overlay: drawing into {w}x{h} but the monitor is {}x{} — \
+                             every dot will be off by up to ({}, {}) px. Something is \
+                             reserving screen space (a panel/taskbar).",
+                            geo.width(),
+                            geo.height(),
+                            geo.width() - w,
+                            geo.height() - h,
+                        );
+                    }
+                }
+            }
             if let Some((gx, gy)) = gaze.get() {
                 let (w, h) = (w as f64, h as f64);
                 let x = gx.clamp(0.0, 1.0) * w;
