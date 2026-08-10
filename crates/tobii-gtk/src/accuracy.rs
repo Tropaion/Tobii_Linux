@@ -38,7 +38,14 @@
 /// edges are the thing under investigation. Points are ordered centre-outwards
 /// so that an aborted run still yields a usable middle.
 pub fn targets() -> Vec<(f64, f64)> {
-    let xs = [0.5, 0.35, 0.65, 0.2, 0.8, 0.1, 0.9, 0.02, 0.98];
+    // Thirteen columns, not nine. The first sweep put only three inside the
+    // calibrated band (0.35, 0.50, 0.65) and so could say nothing about the
+    // structure *within* it — while the user's report was precisely that
+    // accuracy falls off well before the band's edge. Extra columns at 0.26,
+    // 0.42, 0.58 and 0.74 make that region resolvable instead of a guess.
+    let xs = [
+        0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74, 0.18, 0.82, 0.1, 0.9, 0.02, 0.98,
+    ];
     let ys = [0.5, 0.15, 0.85];
     let mut out = Vec::with_capacity(xs.len() * ys.len());
     for (i, &x) in xs.iter().enumerate() {
