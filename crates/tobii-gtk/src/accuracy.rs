@@ -65,6 +65,16 @@ pub struct Measurement {
     /// Samples that went into `reported`. Zero means the device never produced
     /// a valid gaze point here — which is itself the answer for that target.
     pub samples: usize,
+    /// Where the eyes actually were, tracker-space mm, midway between them.
+    ///
+    /// Recorded per target rather than assumed, because the quantity that
+    /// matters most here — how far the eye had to rotate to reach the dot —
+    /// depends entirely on it, and a profile read against a *guessed* head
+    /// position produces a confident and completely wrong story. This field
+    /// exists because that is exactly what happened: an eye position taken from
+    /// an unrelated capture made a symmetric, angle-driven falloff look like an
+    /// asymmetric seating problem.
+    pub eye_mm: Option<[f64; 3]>,
 }
 
 impl Measurement {
@@ -76,6 +86,26 @@ impl Measurement {
     /// How far this target sits from the horizontal centre, in screen widths.
     pub fn offset_x(&self) -> f64 {
         self.target.0 - 0.5
+    }
+
+    /// How far the eye had to rotate horizontally to reach this target, in
+    /// degrees, from the eye position actually recorded for it.
+    ///
+    /// Horizontal only: the display's tilt is about the horizontal axis, so it
+    /// does not enter this. `offset_x_mm` is where the display centre sits
+    /// relative to the tracker, so subtracting it puts the eye in screen-centre
+    /// coordinates. Approximate in that it uses the eye's tracker-space depth
+    /// rather than a true perpendicular to the tilted plane; over the few
+    /// degrees of tilt involved that is worth far less than the honesty of
+    /// using a measured head position at all.
+    pub fn gaze_angle_deg(&self, width_mm: f64, offset_x_mm: f64) -> Option<f64> {
+        let eye = self.eye_mm?;
+        if eye[2].abs() < 1.0 {
+            return None;
+        }
+        let target_mm = self.offset_x() * width_mm;
+        let eye_from_centre = eye[0] - offset_x_mm;
+        Some((target_mm - eye_from_centre).atan2(eye[2]).to_degrees())
     }
 }
 
@@ -94,6 +124,23 @@ pub fn aggregate(samples: &[(f64, f64)]) -> Option<(f64, f64)> {
         med(samples.iter().map(|s| s.0).collect()),
         med(samples.iter().map(|s| s.1).collect()),
     ))
+}
+
+/// Mean head position over one target's sampling window. Mean rather than
+/// median: a head drifts slowly and smoothly, so there are no outliers to
+/// reject, and averaging is the better estimator of where it actually sat.
+pub fn mean_eye(samples: &[[f64; 3]]) -> Option<[f64; 3]> {
+    if samples.is_empty() {
+        return None;
+    }
+    let n = samples.len() as f64;
+    let mut acc = [0.0f64; 3];
+    for s in samples {
+        for k in 0..3 {
+            acc[k] += s[k];
+        }
+    }
+    Some([acc[0] / n, acc[1] / n, acc[2] / n])
 }
 
 /// What the error profile points at.
@@ -321,28 +368,86 @@ pub fn calibrated_band(width_mm: f64, height_mm: f64, points: &[(f64, f64)]) -> 
 }
 
 /// Render the profile as a table a human can read and argue with.
-pub fn report(measurements: &[Measurement], band: (f64, f64), width_mm: f64) -> String {
+pub fn report(
+    measurements: &[Measurement],
+    band: (f64, f64),
+    width_mm: f64,
+    offset_x_mm: f64,
+) -> String {
     let mut s = String::new();
-    s.push_str("  target x   reported   error      error in mm   samples\n");
+    // The target's y is shown because the three rows per column are different
+    // heights, and collapsing them hid a real vertical spread the first time
+    // this printed. The gaze angle is shown because it, not the x coordinate,
+    // is what the falloff actually tracks.
+    s.push_str("  target      gaze     reported   error    error mm   samples\n");
+    s.push_str("   x    y     angle\n");
     let mut rows: Vec<&Measurement> = measurements.iter().collect();
-    rows.sort_by(|a, b| a.target.0.partial_cmp(&b.target.0).unwrap());
+    rows.sort_by(|a, b| {
+        a.target
+            .0
+            .partial_cmp(&b.target.0)
+            .unwrap()
+            .then(a.target.1.partial_cmp(&b.target.1).unwrap())
+    });
     for m in rows {
+        let angle = match m.gaze_angle_deg(width_mm, offset_x_mm) {
+            Some(a) => format!("{a:+6.1}"),
+            None => "     ?".to_string(),
+        };
         if m.samples == 0 {
             s.push_str(&format!(
-                "   {:5.2}      —          —          —             0   <-- no gaze data\n",
-                m.target.0
+                "  {:4.2} {:4.2}  {}      —        —          —         0   <-- no gaze data\n",
+                m.target.0, m.target.1, angle
             ));
             continue;
         }
         let inside = m.target.0 >= band.0 && m.target.0 <= band.1;
         s.push_str(&format!(
-            "   {:5.2}     {:6.3}    {:+.3}     {:+7.0}       {:5}{}\n",
+            "  {:4.2} {:4.2}  {}    {:6.3}   {:+.3}    {:+7.0}     {:5}{}\n",
             m.target.0,
+            m.target.1,
+            angle,
             m.reported.0,
             m.error_x(),
             m.error_x() * width_mm,
             m.samples,
-            if inside { "   (calibrated)" } else { "" }
+            if inside { "  (calibrated)" } else { "" }
+        ));
+    }
+    s
+}
+
+/// Mean absolute error and full-window capture rate, bucketed by how far the
+/// eye had to rotate. The falloff tracks angle, not screen position, so this is
+/// the summary that actually says something.
+pub fn by_angle(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -> String {
+    let mut s = String::new();
+    s.push_str("  eye rotation   mean error   full sample windows\n");
+    for (lo, hi) in [(0.0, 15.0), (15.0, 28.0), (28.0, 90.0)] {
+        let g: Vec<&Measurement> = measurements
+            .iter()
+            .filter(|m| {
+                m.gaze_angle_deg(width_mm, offset_x_mm)
+                    .is_some_and(|a| a.abs() >= lo && a.abs() < hi)
+            })
+            .collect();
+        if g.is_empty() {
+            continue;
+        }
+        let full = g
+            .iter()
+            .filter(|m| m.samples >= SAMPLE_TICKS as usize)
+            .count();
+        let usable: Vec<&&Measurement> = g.iter().filter(|m| m.samples > 0).collect();
+        let mean = if usable.is_empty() {
+            f64::NAN
+        } else {
+            usable.iter().map(|m| m.error_x().abs()).sum::<f64>() / usable.len() as f64
+        };
+        s.push_str(&format!(
+            "  {lo:5.0}-{hi:3.0} deg    {:6.0} mm    {full:2}/{:<2}\n",
+            mean * width_mm,
+            g.len()
         ));
     }
     s
@@ -366,6 +471,7 @@ pub fn launch(
     let setup = tobii_config::load().ok().flatten();
     let width_mm = setup.as_ref().map_or(0.0, |s| s.width_mm);
     let height_mm = setup.as_ref().map_or(0.0, |s| s.height_mm);
+    let offset_x_mm = setup.as_ref().map_or(0.0, |s| s.offset_x_mm);
     let band = calibrated_band(width_mm, height_mm, &crate::calibrate_flow::FULL_7);
 
     let win = gtk::ApplicationWindow::builder()
@@ -379,6 +485,7 @@ pub fn launch(
     let index = Rc::new(std::cell::Cell::new(0usize));
     let ticks = Rc::new(std::cell::Cell::new(0u32));
     let samples: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
+    let eyes: Rc<RefCell<Vec<[f64; 3]>>> = Rc::new(RefCell::new(Vec::new()));
     let results: Rc<RefCell<Vec<Measurement>>> = Rc::new(RefCell::new(Vec::new()));
 
     let area = gtk::DrawingArea::new();
@@ -409,10 +516,11 @@ pub fn launch(
     win.set_child(Some(&area));
 
     let tick = {
-        let (index, ticks, samples, results) = (
+        let (index, ticks, samples, eyes, results) = (
             index.clone(),
             ticks.clone(),
             samples.clone(),
+            eyes.clone(),
             results.clone(),
         );
         let (win, area, targets) = (win.clone(), area.clone(), targets.clone());
@@ -439,6 +547,26 @@ pub fn launch(
                             samples
                                 .borrow_mut()
                                 .push((g.gaze_point_2d[0], g.gaze_point_2d[1]));
+                            // Whichever eyes are valid, midway between them.
+                            // Captured alongside every gaze sample so the head
+                            // position belongs to *this* target rather than to
+                            // whatever the head was doing at some other time.
+                            let mut acc = [0.0f64; 3];
+                            let mut n = 0.0;
+                            for (valid, origin) in [
+                                (g.validity_l == 0, g.eye_origin_l_mm),
+                                (g.validity_r == 0, g.eye_origin_r_mm),
+                            ] {
+                                if valid {
+                                    for k in 0..3 {
+                                        acc[k] += origin[k];
+                                    }
+                                    n += 1.0;
+                                }
+                            }
+                            if n > 0.0 {
+                                eyes.borrow_mut().push([acc[0] / n, acc[1] / n, acc[2] / n]);
+                            }
                         }
                     }
                 }
@@ -447,16 +575,19 @@ pub fn launch(
             if t >= SETTLE_TICKS + SAMPLE_TICKS {
                 let taken = samples.borrow().len();
                 let reported = aggregate(&samples.borrow()).unwrap_or((0.0, 0.0));
+                let eye_mm = mean_eye(&eyes.borrow());
                 results.borrow_mut().push(Measurement {
                     target,
                     reported,
                     samples: taken,
+                    eye_mm,
                 });
                 samples.borrow_mut().clear();
+                eyes.borrow_mut().clear();
                 ticks.set(0);
                 index.set(i + 1);
                 if i + 1 >= targets.len() {
-                    finish(&results.borrow(), band, width_mm);
+                    finish(&results.borrow(), band, width_mm, offset_x_mm);
                     win.close();
                     return glib::ControlFlow::Break;
                 }
@@ -474,7 +605,7 @@ pub fn launch(
             if key == gtk::gdk::Key::Escape {
                 // Report whatever was gathered — a half-finished sweep of the
                 // middle is still worth more than nothing.
-                finish(&results.borrow(), band, width_mm);
+                finish(&results.borrow(), band, width_mm, offset_x_mm);
                 win.close();
                 return glib::Propagation::Stop;
             }
@@ -488,16 +619,33 @@ pub fn launch(
 }
 
 /// Write the CSV and print the profile + diagnosis.
-fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64) {
+fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64, offset_x_mm: f64) {
     if measurements.is_empty() {
         eprintln!("accuracy check: no targets completed");
         return;
     }
     let d = diagnose(measurements, band);
     println!("\n=== gaze accuracy ===");
-    print!("{}", report(measurements, band, width_mm));
+    print!("{}", report(measurements, band, width_mm, offset_x_mm));
+    println!();
+    print!("{}", by_angle(measurements, width_mm, offset_x_mm));
+
+    // Where the head actually was, so nobody has to infer it later.
+    let eyes: Vec<[f64; 3]> = measurements.iter().filter_map(|m| m.eye_mm).collect();
+    if let Some(e) = mean_eye(&eyes) {
+        println!(
+            "\nyour head, averaged over the run: {:.0} mm {} of screen centre, {:.0} mm back",
+            (e[0] - offset_x_mm).abs(),
+            if e[0] - offset_x_mm < 0.0 {
+                "left"
+            } else {
+                "right"
+            },
+            e[2]
+        );
+    }
     println!(
-        "\ncalibrated band: {:.2}..{:.2} of screen width",
+        "calibrated band: {:.2}..{:.2} of screen width",
         band.0, band.1
     );
     println!(
@@ -512,16 +660,25 @@ fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64) {
     println!("\nverdict: {:?}\n  {}", d.cause, d.detail);
 
     let path = tobii_config::config_path().with_file_name("accuracy.csv");
-    let mut csv = String::from("target_x,target_y,reported_x,reported_y,error_x,samples\n");
+    let mut csv = String::from(
+        "target_x,target_y,reported_x,reported_y,error_x,samples,eye_x_mm,eye_y_mm,eye_z_mm,gaze_angle_deg\n",
+    );
     for m in measurements {
+        let (ex, ey, ez) = match m.eye_mm {
+            Some(e) => (e[0].to_string(), e[1].to_string(), e[2].to_string()),
+            None => (String::new(), String::new(), String::new()),
+        };
         csv.push_str(&format!(
-            "{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{ex},{ey},{ez},{}\n",
             m.target.0,
             m.target.1,
             m.reported.0,
             m.reported.1,
             m.error_x(),
-            m.samples
+            m.samples,
+            m.gaze_angle_deg(width_mm, offset_x_mm)
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
         ));
     }
     match std::fs::write(&path, csv) {
@@ -539,6 +696,7 @@ mod tests {
             target: (tx, 0.5),
             reported: (tx + err, 0.5),
             samples: 30,
+            eye_mm: None,
         }
     }
 
@@ -627,6 +785,7 @@ mod tests {
                 target: (x, 0.5),
                 reported: (x + (x - 0.5) * 0.4, 0.5),
                 samples: 8, // device managed a fraction of the window
+                eye_mm: None,
             });
         }
         let d = diagnose(&ms, (0.30, 0.70));
@@ -660,6 +819,7 @@ mod tests {
                 target: (0.98, 0.5),
                 reported: (0.0, 0.0),
                 samples: 0,
+                eye_mm: None,
             },
         ];
         let d = diagnose(&ms, (0.30, 0.70));
@@ -680,6 +840,13 @@ mod tests {
     /// numbers actually show is the device running out of resolvable eye
     /// rotation: full sample windows for 93% of mid-screen targets against 42%
     /// at the edges.
+    ///
+    /// The head position was **not** recorded (this run predates that), and the
+    /// first reading of it borrowed an eye position from an unrelated capture,
+    /// which made a symmetric falloff look like an asymmetric seating problem.
+    /// The user reported sitting centred; at ~795 mm that puts both screen
+    /// edges at ±36° of eye rotation, and the |error| at ±35.8° comes out at
+    /// 167 mm and 176 mm — symmetric, as a physical limit should be.
     const REAL_SWEEP: &[(f64, f64, f64, usize)] = &[
         (0.50, 0.50, 0.4915, 30),
         (0.50, 0.15, 0.4885, 30),
@@ -717,6 +884,9 @@ mod tests {
                 target: (tx, ty),
                 reported: (rx, ty),
                 samples: n,
+                // This capture predates per-target eye recording — which is
+                // precisely why that recording now exists.
+                eye_mm: None,
             })
             .collect()
     }
