@@ -82,6 +82,17 @@ pub struct Measurement {
     /// an unrelated capture made a symmetric, angle-driven falloff look like an
     /// asymmetric seating problem.
     pub eye_mm: Option<[f64; 3]>,
+    /// The device's **per-eye** gaze points (columns `0x05` / `0x0b`), which it
+    /// reports alongside the fused one.
+    ///
+    /// Recorded because the fused point cannot distinguish "both eyes agree and
+    /// are wrong" from "one eye is dragging the average". Those need opposite
+    /// responses, and the measured error here is 2.3x worse looking left than
+    /// right — an asymmetry no screen-geometry cause can produce, since
+    /// curvature, plane width and plane depth all act symmetrically about the
+    /// screen centre. Two eyes are the only asymmetric thing in the system.
+    pub reported_l: Option<(f64, f64)>,
+    pub reported_r: Option<(f64, f64)>,
 }
 
 impl Measurement {
@@ -93,6 +104,16 @@ impl Measurement {
     /// How far this target sits from the horizontal centre, in screen widths.
     pub fn offset_x(&self) -> f64 {
         self.target.0 - 0.5
+    }
+
+    /// Signed horizontal error of one eye's own gaze point.
+    pub fn eye_error_x(&self, right: bool) -> Option<f64> {
+        let r = if right {
+            self.reported_r
+        } else {
+            self.reported_l
+        }?;
+        Some(r.0 - self.target.0)
     }
 
     /// How far the eye had to rotate horizontally to reach this target, in
@@ -460,6 +481,58 @@ pub fn by_angle(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -
     s
 }
 
+/// Mean absolute error of each eye's own gaze point against the fused one,
+/// split by which way the user had to look.
+///
+/// The question this answers: is the fused point wrong because both eyes are
+/// wrong, or because one eye is dragging the average? Only the second is
+/// actionable, and the fused reading alone cannot tell them apart.
+pub fn by_eye(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -> String {
+    let mut s = String::new();
+    s.push_str("  looking      fused    left eye   right eye\n");
+    for (lo, hi, label) in [
+        (-90.0, -8.0, "left   "),
+        (-8.0, 8.0, "centre "),
+        (8.0, 90.0, "right  "),
+    ] {
+        let g: Vec<&Measurement> = measurements
+            .iter()
+            .filter(|m| m.samples > 0)
+            .filter(|m| {
+                m.gaze_angle_deg(width_mm, offset_x_mm)
+                    .is_some_and(|a| a >= lo && a < hi)
+            })
+            .collect();
+        if g.is_empty() {
+            continue;
+        }
+        let mean = |v: Vec<f64>| -> String {
+            if v.is_empty() {
+                "    --".to_string()
+            } else {
+                format!("{:6.0}", v.iter().sum::<f64>() / v.len() as f64 * width_mm)
+            }
+        };
+        s.push_str(&format!(
+            "  {label}   {} mm  {} mm  {} mm\n",
+            mean(g.iter().map(|m| m.error_x().abs()).collect()),
+            mean(
+                g.iter()
+                    .filter_map(|m| m.eye_error_x(false))
+                    .map(f64::abs)
+                    .collect()
+            ),
+            mean(
+                g.iter()
+                    .filter_map(|m| m.eye_error_x(true))
+                    .map(f64::abs)
+                    .collect()
+            ),
+        ));
+    }
+    s
+}
+
 /// Run the measurement fullscreen: show each target in turn, record what the
 /// device reports, then write a CSV and print the profile and diagnosis.
 ///
@@ -493,6 +566,9 @@ pub fn launch(
     let ticks = Rc::new(std::cell::Cell::new(0u32));
     let samples: Rc<RefCell<Vec<(f64, f64)>>> = Rc::new(RefCell::new(Vec::new()));
     let eyes: Rc<RefCell<Vec<[f64; 3]>>> = Rc::new(RefCell::new(Vec::new()));
+    /// Left-eye and right-eye gaze samples for the target being measured.
+    type PerEyeSamples = Rc<RefCell<(Vec<(f64, f64)>, Vec<(f64, f64)>)>>;
+    let per_eye: PerEyeSamples = Rc::new(RefCell::new((Vec::new(), Vec::new())));
     let results: Rc<RefCell<Vec<Measurement>>> = Rc::new(RefCell::new(Vec::new()));
 
     let area = gtk::DrawingArea::new();
@@ -523,11 +599,12 @@ pub fn launch(
     win.set_child(Some(&area));
 
     let tick = {
-        let (index, ticks, samples, eyes, results) = (
+        let (index, ticks, samples, eyes, per_eye, results) = (
             index.clone(),
             ticks.clone(),
             samples.clone(),
             eyes.clone(),
+            per_eye.clone(),
             results.clone(),
         );
         let (win, area, targets) = (win.clone(), area.clone(), targets.clone());
@@ -574,6 +651,18 @@ pub fn launch(
                             if n > 0.0 {
                                 eyes.borrow_mut().push([acc[0] / n, acc[1] / n, acc[2] / n]);
                             }
+                            // Per-eye gaze, gated on that eye's own validity —
+                            // the device zeroes an eye's block when it loses it,
+                            // and a (0,0) would read as a huge leftward error.
+                            let mut pe = per_eye.borrow_mut();
+                            if g.validity_l == 0 && g.has(tobii_protocol::gaze::present::GAZE_2D_L)
+                            {
+                                pe.0.push((g.gaze_point_2d_l[0], g.gaze_point_2d_l[1]));
+                            }
+                            if g.validity_r == 0 && g.has(tobii_protocol::gaze::present::GAZE_2D_R)
+                            {
+                                pe.1.push((g.gaze_point_2d_r[0], g.gaze_point_2d_r[1]));
+                            }
                         }
                     }
                 }
@@ -583,14 +672,22 @@ pub fn launch(
                 let taken = samples.borrow().len();
                 let reported = aggregate(&samples.borrow()).unwrap_or((0.0, 0.0));
                 let eye_mm = mean_eye(&eyes.borrow());
+                let (rl, rr) = {
+                    let pe = per_eye.borrow();
+                    (aggregate(&pe.0), aggregate(&pe.1))
+                };
                 results.borrow_mut().push(Measurement {
                     target,
                     reported,
                     samples: taken,
                     eye_mm,
+                    reported_l: rl,
+                    reported_r: rr,
                 });
                 samples.borrow_mut().clear();
                 eyes.borrow_mut().clear();
+                per_eye.borrow_mut().0.clear();
+                per_eye.borrow_mut().1.clear();
                 ticks.set(0);
                 index.set(i + 1);
                 if i + 1 >= targets.len() {
@@ -636,6 +733,8 @@ fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64, offset_
     print!("{}", report(measurements, band, width_mm, offset_x_mm));
     println!();
     print!("{}", by_angle(measurements, width_mm, offset_x_mm));
+    println!();
+    print!("{}", by_eye(measurements, width_mm, offset_x_mm));
 
     // Where the head actually was, so nobody has to infer it later.
     let eyes: Vec<[f64; 3]> = measurements.iter().filter_map(|m| m.eye_mm).collect();
@@ -668,7 +767,7 @@ fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64, offset_
 
     let path = tobii_config::config_path().with_file_name("accuracy.csv");
     let mut csv = String::from(
-        "target_x,target_y,reported_x,reported_y,error_x,samples,eye_x_mm,eye_y_mm,eye_z_mm,gaze_angle_deg\n",
+        "target_x,target_y,reported_x,reported_y,error_x,samples,eye_x_mm,eye_y_mm,eye_z_mm,gaze_angle_deg,reported_l_x,reported_r_x\n",
     );
     for m in measurements {
         let (ex, ey, ez) = match m.eye_mm {
@@ -687,6 +786,12 @@ fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64, offset_
                 .map(|a| a.to_string())
                 .unwrap_or_default(),
         ));
+        csv.pop();
+        csv.push_str(&format!(
+            ",{},{}\n",
+            m.reported_l.map(|p| p.0.to_string()).unwrap_or_default(),
+            m.reported_r.map(|p| p.0.to_string()).unwrap_or_default(),
+        ));
     }
     match std::fs::write(&path, csv) {
         Ok(()) => println!("raw data: {}", path.display()),
@@ -704,6 +809,8 @@ mod tests {
             reported: (tx + err, 0.5),
             samples: 30,
             eye_mm: None,
+            reported_l: None,
+            reported_r: None,
         }
     }
 
@@ -793,6 +900,8 @@ mod tests {
                 reported: (x + (x - 0.5) * 0.4, 0.5),
                 samples: 8, // device managed a fraction of the window
                 eye_mm: None,
+                reported_l: None,
+                reported_r: None,
             });
         }
         let d = diagnose(&ms, (0.30, 0.70));
@@ -827,6 +936,8 @@ mod tests {
                 reported: (0.0, 0.0),
                 samples: 0,
                 eye_mm: None,
+                reported_l: None,
+                reported_r: None,
             },
         ];
         let d = diagnose(&ms, (0.30, 0.70));
@@ -894,6 +1005,8 @@ mod tests {
                 // This capture predates per-target eye recording — which is
                 // precisely why that recording now exists.
                 eye_mm: None,
+                reported_l: None,
+                reported_r: None,
             })
             .collect()
     }
