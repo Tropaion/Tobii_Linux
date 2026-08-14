@@ -533,6 +533,84 @@ pub fn by_eye(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -> 
     s
 }
 
+/// Score the alternative fusion (`gaze_fuse`) against the device's own, on the
+/// same targets, in the same run.
+///
+/// Replayed offline from the recorded per-eye points rather than applied live,
+/// so a rule that looks good on paper has to beat the device on this hardware
+/// before it is allowed anywhere near what the user sees. Every previous
+/// improvement on this problem was convincing and wrong.
+pub fn by_fusion(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -> String {
+    // Learn the per-eye bias from the centre targets, exactly as the live
+    // `Fuser` does, then apply it outward.
+    let centre: Vec<&Measurement> = measurements
+        .iter()
+        .filter(|m| m.samples > 0 && m.offset_x().abs() < 0.1)
+        .collect();
+    let bias = |right: bool| -> Option<f64> {
+        let v: Vec<f64> = centre
+            .iter()
+            .filter_map(|m| Some(m.eye_error_x(right)? - m.error_x()))
+            .collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let (Some(bl), Some(br)) = (bias(false), bias(true)) else {
+        return "  (not enough centre targets with both eyes to score a fusion)\n".into();
+    };
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "  learned straddle: left {:+.0} mm, right {:+.0} mm from the fused point\n",
+        bl * width_mm,
+        br * width_mm
+    ));
+    s.push_str("  looking      device    contralateral eye\n");
+    for (lo, hi, label) in [
+        (-90.0, -12.0, "left   "),
+        (-12.0, 12.0, "centre "),
+        (12.0, 90.0, "right  "),
+    ] {
+        let g: Vec<&Measurement> = measurements
+            .iter()
+            .filter(|m| m.samples > 0)
+            .filter(|m| {
+                m.gaze_angle_deg(width_mm, offset_x_mm)
+                    .is_some_and(|a| a >= lo && a < hi)
+            })
+            .collect();
+        let scored: Vec<(f64, f64)> = g
+            .iter()
+            .filter_map(|m| {
+                let a = m.gaze_angle_deg(width_mm, offset_x_mm)?;
+                // Contralateral: right eye when looking left, left when right.
+                let alt = if a < 0.0 {
+                    m.eye_error_x(true)? - br
+                } else {
+                    m.eye_error_x(false)? - bl
+                };
+                Some((m.error_x().abs(), alt.abs()))
+            })
+            .collect();
+        if scored.is_empty() {
+            continue;
+        }
+        let n = scored.len() as f64;
+        let dev = scored.iter().map(|p| p.0).sum::<f64>() / n * width_mm;
+        let alt = scored.iter().map(|p| p.1).sum::<f64>() / n * width_mm;
+        s.push_str(&format!(
+            "  {label}    {dev:5.0} mm    {alt:5.0} mm   {}\n",
+            if alt < dev * 0.9 {
+                "<-- better"
+            } else if alt > dev * 1.1 {
+                "<-- WORSE"
+            } else {
+                "same"
+            }
+        ));
+    }
+    s
+}
+
 /// Run the measurement fullscreen: show each target in turn, record what the
 /// device reports, then write a CSV and print the profile and diagnosis.
 ///
@@ -735,6 +813,8 @@ fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64, offset_
     print!("{}", by_angle(measurements, width_mm, offset_x_mm));
     println!();
     print!("{}", by_eye(measurements, width_mm, offset_x_mm));
+    println!();
+    print!("{}", by_fusion(measurements, width_mm, offset_x_mm));
 
     // Where the head actually was, so nobody has to infer it later.
     let eyes: Vec<[f64; 3]> = measurements.iter().filter_map(|m| m.eye_mm).collect();
