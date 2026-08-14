@@ -630,6 +630,7 @@ pub fn launch(
     let width_mm = setup.as_ref().map_or(0.0, |s| s.width_mm);
     let height_mm = setup.as_ref().map_or(0.0, |s| s.height_mm);
     let offset_x_mm = setup.as_ref().map_or(0.0, |s| s.offset_x_mm);
+    let eye_mode = state.lock().ok().and_then(|s| s.enabled_eye);
     let band = calibrated_band(width_mm, height_mm, &crate::calibrate_flow::FULL_7);
 
     let win = gtk::ApplicationWindow::builder()
@@ -769,7 +770,7 @@ pub fn launch(
                 ticks.set(0);
                 index.set(i + 1);
                 if i + 1 >= targets.len() {
-                    finish(&results.borrow(), band, width_mm, offset_x_mm);
+                    finish(&results.borrow(), band, width_mm, offset_x_mm, eye_mode);
                     win.close();
                     return glib::ControlFlow::Break;
                 }
@@ -787,7 +788,7 @@ pub fn launch(
             if key == gtk::gdk::Key::Escape {
                 // Report whatever was gathered — a half-finished sweep of the
                 // middle is still worth more than nothing.
-                finish(&results.borrow(), band, width_mm, offset_x_mm);
+                finish(&results.borrow(), band, width_mm, offset_x_mm, eye_mode);
                 win.close();
                 return glib::Propagation::Stop;
             }
@@ -801,13 +802,32 @@ pub fn launch(
 }
 
 /// Write the CSV and print the profile + diagnosis.
-fn finish(measurements: &[Measurement], band: (f64, f64), width_mm: f64, offset_x_mm: f64) {
+fn finish(
+    measurements: &[Measurement],
+    band: (f64, f64),
+    width_mm: f64,
+    offset_x_mm: f64,
+    eye_mode: Option<tobii_protocol::EnabledEye>,
+) {
     if measurements.is_empty() {
         eprintln!("accuracy check: no targets completed");
         return;
     }
     let d = diagnose(measurements, band);
     println!("\n=== gaze accuracy ===");
+    // Stated first, and loudly when it is not Both. A monocular run is not
+    // comparable to a binocular one: the per-eye gaze points straddle the
+    // target by ~110mm, so with one eye the device reports that eye's half of
+    // the straddle as a uniform offset across the whole screen. Comparing the
+    // two silently reads as "everything suddenly got six times worse".
+    match eye_mode {
+        Some(tobii_protocol::EnabledEye::Both) | None => {}
+        Some(e) => {
+            println!(
+                "!! the tracker is in {e:?}-eye-only mode. These numbers are NOT comparable\n                 !! to a both-eyes run, and a calibration made with both eyes leaves that\n                 !! eye's share of the straddle uncorrected across the whole screen.\n                 !! Set both eyes in the hub, or recalibrate in this mode.\n"
+            );
+        }
+    }
     print!("{}", report(measurements, band, width_mm, offset_x_mm));
     println!();
     print!("{}", by_angle(measurements, width_mm, offset_x_mm));
