@@ -533,82 +533,62 @@ pub fn by_eye(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -> 
     s
 }
 
-/// Score the alternative fusion (`gaze_fuse`) against the device's own, on the
-/// same targets, in the same run.
+/// Fit `reported = gain x true + offset` over the range the device tracks
+/// well, and report how much of the error is that single number.
 ///
-/// Replayed offline from the recorded per-eye points rather than applied live,
-/// so a rule that looks good on paper has to beat the device on this hardware
-/// before it is allowed anywhere near what the user sees. Every previous
-/// improvement on this problem was convincing and wrong.
-pub fn by_fusion(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -> String {
-    // Learn the per-eye bias from the centre targets, exactly as the live
-    // `Fuser` does, then apply it outward.
-    let centre: Vec<&Measurement> = measurements
+/// This is the statistic that survived. A scale error means the reported gaze
+/// spans more (or less) of the screen than the screen actually occupies, which
+/// is what a display plane at the wrong depth or the wrong width produces —
+/// and unlike a runtime correction, that is a config number the device is told
+/// once. Fitted only inside `USABLE_GAZE_DEG`, since beyond it the device is
+/// losing samples and its output is not a mapping of anything.
+pub fn by_scale(measurements: &[Measurement], width_mm: f64, offset_x_mm: f64) -> String {
+    let g: Vec<(f64, f64)> = measurements
         .iter()
-        .filter(|m| m.samples > 0 && m.offset_x().abs() < 0.1)
+        .filter(|m| m.samples >= SAMPLE_TICKS as usize)
+        .filter(|m| {
+            m.gaze_angle_deg(width_mm, offset_x_mm)
+                .is_some_and(|a| a.abs() < tobii_config::USABLE_GAZE_DEG)
+        })
+        .map(|m| {
+            (
+                m.offset_x() * width_mm,
+                m.reported.0.mul_add(width_mm, -0.5 * width_mm),
+            )
+        })
         .collect();
-    let bias = |right: bool| -> Option<f64> {
-        let v: Vec<f64> = centre
-            .iter()
-            .filter_map(|m| Some(m.eye_error_x(right)? - m.error_x()))
-            .collect();
-        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
-    };
-    let (Some(bl), Some(br)) = (bias(false), bias(true)) else {
-        return "  (not enough centre targets with both eyes to score a fusion)\n".into();
-    };
-
-    let mut s = String::new();
-    s.push_str(&format!(
-        "  learned straddle: left {:+.0} mm, right {:+.0} mm from the fused point\n",
-        bl * width_mm,
-        br * width_mm
-    ));
-    s.push_str("  looking      device    contralateral eye\n");
-    for (lo, hi, label) in [
-        (-90.0, -12.0, "left   "),
-        (-12.0, 12.0, "centre "),
-        (12.0, 90.0, "right  "),
-    ] {
-        let g: Vec<&Measurement> = measurements
-            .iter()
-            .filter(|m| m.samples > 0)
-            .filter(|m| {
-                m.gaze_angle_deg(width_mm, offset_x_mm)
-                    .is_some_and(|a| a >= lo && a < hi)
-            })
-            .collect();
-        let scored: Vec<(f64, f64)> = g
-            .iter()
-            .filter_map(|m| {
-                let a = m.gaze_angle_deg(width_mm, offset_x_mm)?;
-                // Contralateral: right eye when looking left, left when right.
-                let alt = if a < 0.0 {
-                    m.eye_error_x(true)? - br
-                } else {
-                    m.eye_error_x(false)? - bl
-                };
-                Some((m.error_x().abs(), alt.abs()))
-            })
-            .collect();
-        if scored.is_empty() {
-            continue;
-        }
-        let n = scored.len() as f64;
-        let dev = scored.iter().map(|p| p.0).sum::<f64>() / n * width_mm;
-        let alt = scored.iter().map(|p| p.1).sum::<f64>() / n * width_mm;
-        s.push_str(&format!(
-            "  {label}    {dev:5.0} mm    {alt:5.0} mm   {}\n",
-            if alt < dev * 0.9 {
-                "<-- better"
-            } else if alt > dev * 1.1 {
-                "<-- WORSE"
-            } else {
-                "same"
-            }
-        ));
+    if g.len() < 6 {
+        return "  (too few well-sampled targets inside the working range to fit a scale)\n".into();
     }
-    s
+    let n = g.len() as f64;
+    let (mx, my) = (
+        g.iter().map(|p| p.0).sum::<f64>() / n,
+        g.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    let var = g.iter().map(|p| (p.0 - mx).powi(2)).sum::<f64>();
+    if var <= f64::EPSILON {
+        return "  (targets do not span enough width to fit a scale)\n".into();
+    }
+    let gain = g.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / var;
+    let off = my - gain * mx;
+
+    let raw = g.iter().map(|p| (p.1 - p.0).abs()).sum::<f64>() / n;
+    let residual = g
+        .iter()
+        .map(|p| (p.1 - (gain * p.0 + off)).abs())
+        .sum::<f64>()
+        / n;
+    let share = if raw > 0.0 {
+        100.0 * (1.0 - residual / raw)
+    } else {
+        0.0
+    };
+    format!(
+        "  reported gaze is scaled {:+.1}% and shifted {:+.0} mm\n           inside the working range that accounts for {share:.0}% of the error \
+         ({raw:.0} mm -> {residual:.0} mm without it)\n",
+        (gain - 1.0) * 100.0,
+        off,
+    )
 }
 
 /// Run the measurement fullscreen: show each target in turn, record what the
@@ -834,7 +814,7 @@ fn finish(
     println!();
     print!("{}", by_eye(measurements, width_mm, offset_x_mm));
     println!();
-    print!("{}", by_fusion(measurements, width_mm, offset_x_mm));
+    print!("{}", by_scale(measurements, width_mm, offset_x_mm));
 
     // Where the head actually was, so nobody has to infer it later.
     let eyes: Vec<[f64; 3]> = measurements.iter().filter_map(|m| m.eye_mm).collect();
