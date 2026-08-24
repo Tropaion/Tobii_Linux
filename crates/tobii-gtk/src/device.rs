@@ -198,7 +198,10 @@ pub fn device_tick<T: Transport>(
                 // nothing to improve on (e.g. a true first-ever calibration) —
                 // proceed as a plain fresh session in that case, exactly as
                 // before this change.
-                let previous_blob = conn.retrieve_calibration().ok().filter(|b| !b.0.is_empty());
+                let previous_blob = conn
+                    .retrieve_calibration()
+                    .ok()
+                    .filter(|b| tobii_usb::is_plausible_calibration(&b.0));
 
                 // Pessimistic: a request fails on a wall-clock deadline, which
                 // is NOT proof the device ignored it — it may have entered the
@@ -210,11 +213,21 @@ pub fn device_tick<T: Transport>(
                 let r = conn
                     .start_calibration()
                     .and_then(|()| conn.clear_calibration())
-                    .and_then(|()| match &previous_blob {
-                        Some(blob) => conn.apply_calibration(&blob.0),
-                        None => Ok(()),
-                    })
                     .map_err(|e| e.to_string());
+
+                // Seeding from the previous calibration is an optimisation, not
+                // a precondition: failing to seed just makes this a from-scratch
+                // session, which is a perfectly good calibration. Keeping it in
+                // the chain above made an unusable stored blob abort the whole
+                // flow — every attempt failing instantly with "can't detect your
+                // eyes", which is not remotely what went wrong.
+                if r.is_ok() {
+                    if let Some(blob) = &previous_blob {
+                        if let Err(e) = conn.apply_calibration(&blob.0) {
+                            eprintln!("note: starting from scratch, not seeding ({e})");
+                        }
+                    }
+                }
                 match r {
                     // Only now is the session really open for point collection.
                     Ok(()) => state.lock().unwrap().calibration.on_started(),
@@ -704,6 +717,40 @@ mod tests {
         let s = state.lock().unwrap();
         assert!(s.calibration.started, "start+clear+reapply all acked");
         assert!(s.cal_session_open);
+    }
+
+    #[test]
+    fn an_unusable_stored_calibration_does_not_abort_the_session() {
+        // The blob saved before the calibration ops were corrected is a ~1.5KB
+        // stub that `apply` now refuses. Seeding from it is an optimisation, so
+        // its absence must leave a perfectly good from-scratch session — not
+        // fail instantly with "can't detect your eyes", which is what shipping
+        // this in the start/clear chain did.
+        let mut conn = connected(vec![
+            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[0x00, 0x00, 0xDE, 0xAD]),
+            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 8, 0x424, &[]),
+        ]);
+        let state = Mutex::new(DeviceState::default());
+        let (tx, rx) = channel::<DeviceCommand>();
+        tx.send(DeviceCommand::CalBegin {
+            eye: EnabledEye::Both,
+            token: 1,
+        })
+        .unwrap();
+        device_tick(&mut conn, &state, &rx);
+        let s = state.lock().unwrap();
+        assert!(s.calibration.started, "session must open anyway");
+        assert!(
+            s.calibration.finished.is_none(),
+            "must not have failed: {:?}",
+            s.calibration.finished
+        );
+        assert!(
+            !sent_op(&conn, 0x456),
+            "a stub blob must not even be offered"
+        );
     }
 
     #[test]

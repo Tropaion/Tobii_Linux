@@ -46,6 +46,16 @@ const CAL_POINT_TIMEOUT: Duration = Duration::from_secs(30);
 /// were the response's status word plus a fragment, not a calibration.
 const MIN_PLAUSIBLE_BLOB: usize = 4096;
 
+/// Whether a stored blob is big enough to be a real calibration.
+///
+/// Exposed so callers can decide *not* to offer one, rather than discovering it
+/// through an error. Seeding a new session from a previous calibration is an
+/// optimisation; treating "no usable previous calibration" as a failure turns a
+/// perfectly good from-scratch calibration into an abort.
+pub fn is_plausible_calibration(blob: &[u8]) -> bool {
+    blob.len() >= MIN_PLAUSIBLE_BLOB
+}
+
 /// A live connection to the eye tracker. Generic over [`Transport`] so the
 /// driver logic is testable without hardware.
 pub struct Connection<T: Transport> {

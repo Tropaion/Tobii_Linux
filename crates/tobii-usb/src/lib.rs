@@ -7,5 +7,5 @@
 mod connection;
 mod transport;
 
-pub use connection::Connection;
+pub use connection::{is_plausible_calibration, Connection};
 pub use transport::{Transport, UsbError, UsbTransport};

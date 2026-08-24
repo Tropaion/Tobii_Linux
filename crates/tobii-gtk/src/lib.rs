@@ -45,9 +45,14 @@ window { background-color: #15181c; color: #e6e8ea; }
 .cal-fail-tips { font-size: 14px; color: #9aa4ad; }
 .cal-fail-detail { font-size: 12px; color: #6b7178; font-style: italic; }
 .cal-success-heading { font-size: 32px; font-weight: bold; }
+/* No min-height and no label padding here on purpose. Both were fighting the
+   label's own natural height, and the loser was the text: with `min-height`
+   pinning the content box and the label's padding eating into it, tall glyphs
+   were clipped along their tops -- the T of \"Try again\", the D of \"Done\".
+   Vertical padding alone sizes the button, and a naturally-sized label cannot
+   be cut off. */
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
-         border: none; border-radius: 8px; padding: 10px 18px; min-height: 24px; }
-button label { padding: 2px 0; }
+         border: none; border-radius: 8px; padding: 10px 18px; }
 button:hover { background-color: #26b6b8; }
 button:disabled { background-color: #2a2f36; color: #6b7178; }
 button:checked { background-color: #14696b; }
