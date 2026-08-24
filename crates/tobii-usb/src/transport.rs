@@ -13,6 +13,8 @@ pub enum UsbError {
     DeviceBusy,
     /// A libusb operation failed.
     Usb(rusb::Error),
+    /// A calibration blob too small to be one — see `MIN_PLAUSIBLE_BLOB`.
+    ImplausibleCalibration { len: usize },
     /// A bulk write transferred fewer bytes than requested.
     ShortWrite { wrote: usize, expected: usize },
     /// The protocol handshake did not complete.
@@ -41,6 +43,12 @@ impl std::fmt::Display for UsbError {
             UsbError::Usb(e) => write!(f, "libusb error: {e}"),
             UsbError::ShortWrite { wrote, expected } => {
                 write!(f, "short bulk write: {wrote}/{expected} bytes")
+            }
+            UsbError::ImplausibleCalibration { len } => {
+                write!(
+                    f,
+                    "stored calibration is only {len} bytes — too small to be one; recalibrate"
+                )
             }
             UsbError::Handshake => write!(f, "handshake failed"),
             UsbError::NoResponse { op } => write!(f, "no device response for op {op:#x}"),
@@ -73,6 +81,43 @@ const PID: u16 = 0x0313;
 const IFACE: u8 = 0;
 const EP_OUT: u8 = 0x05;
 const EP_IN: u8 = 0x83;
+/// Split an outbound frame into transfers the device will accept.
+///
+/// A frame longer than [`CHUNK`] must go out as several bulk transfers, each
+/// carrying its own 8-byte envelope. This matters because the ET5's calibration
+/// blob is on the order of hundreds of kilobytes, not the few this code once
+/// assumed — sent whole, the apply simply fails.
+///
+/// The first transfer keeps the frame's own header, but its envelope length is
+/// rewritten to describe only the bytes in *this* transfer; continuations are a
+/// bare envelope plus payload. The length field is little-endian at bytes 4..8,
+/// matching `build_out_frame`. Returns borrowed slices where it can, so the
+/// common single-transfer case copies nothing.
+fn chunk_frame(data: &[u8]) -> Vec<std::borrow::Cow<'_, [u8]>> {
+    use std::borrow::Cow;
+    if data.len() <= CHUNK {
+        return vec![Cow::Borrowed(data)];
+    }
+    let mut first = data[..CHUNK].to_vec();
+    first[4..8].copy_from_slice(&(CONT_DATA as u32).to_le_bytes());
+    let mut out = vec![Cow::Owned(first)];
+    for part in data[CHUNK..].chunks(CONT_DATA) {
+        let mut cont = Vec::with_capacity(ENVELOPE + part.len());
+        cont.extend_from_slice(&0u32.to_le_bytes());
+        cont.extend_from_slice(&(part.len() as u32).to_le_bytes());
+        cont.extend_from_slice(part);
+        out.push(Cow::Owned(cont));
+    }
+    out
+}
+
+/// Largest single bulk OUT the device accepts.
+const CHUNK: usize = 8192;
+/// The per-transfer envelope: four zero bytes then a little-endian length.
+const ENVELOPE: usize = 8;
+/// Payload a continuation transfer can carry.
+const CONT_DATA: usize = CHUNK - ENVELOPE;
+
 const SESSION_OPEN: u8 = 0x41;
 const SESSION_CLOSE: u8 = 0x42;
 
@@ -155,6 +200,22 @@ fn classify_open_failure(e: rusb::Error) -> UsbError {
 
 impl Transport for UsbTransport {
     fn send(&mut self, data: &[u8]) -> Result<(), UsbError> {
+        for part in chunk_frame(data) {
+            self.write_all(&part)?;
+        }
+        Ok(())
+    }
+    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Option<usize> {
+        match self.handle.read_bulk(EP_IN, buf, timeout) {
+            Ok(n) if n > 0 => Some(n),
+            // Timeout (expected for polling) or zero-length: nothing this call.
+            _ => None,
+        }
+    }
+}
+
+impl UsbTransport {
+    fn write_all(&mut self, data: &[u8]) -> Result<(), UsbError> {
         let wrote = self
             .handle
             .write_bulk(EP_OUT, data, Duration::from_millis(1000))?;
@@ -165,14 +226,6 @@ impl Transport for UsbTransport {
             });
         }
         Ok(())
-    }
-
-    fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Option<usize> {
-        match self.handle.read_bulk(EP_IN, buf, timeout) {
-            Ok(n) if n > 0 => Some(n),
-            // Timeout (expected for polling) or zero-length: nothing this call.
-            _ => None,
-        }
     }
 }
 
@@ -255,5 +308,49 @@ mod tests {
     fn the_busy_error_names_the_gui_as_the_likely_holder() {
         let msg = UsbError::DeviceBusy.to_string();
         assert!(msg.contains("tobii-gtk"), "{msg}");
+    }
+
+    #[test]
+    fn a_frame_that_fits_is_sent_whole_and_uncopied() {
+        let f = vec![7u8; CHUNK];
+        let parts = chunk_frame(&f);
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn every_transfer_declares_its_own_length_and_fits() {
+        // A calibration-sized frame: hundreds of KB, the case that motivated this.
+        let f: Vec<u8> = (0..414_844u32).map(|i| i as u8).collect();
+        let parts = chunk_frame(&f);
+        assert!(parts.len() > 50, "{} transfers", parts.len());
+        for (i, p) in parts.iter().enumerate() {
+            assert!(p.len() <= CHUNK, "transfer {i} is {} bytes", p.len());
+            let declared = u32::from_le_bytes(p[4..8].try_into().unwrap()) as usize;
+            assert_eq!(
+                declared,
+                p.len() - ENVELOPE,
+                "transfer {i} mis-declares itself"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_preserves_every_byte_after_the_first_envelope() {
+        let f: Vec<u8> = (0..30_000u32).map(|i| (i * 7) as u8).collect();
+        let parts = chunk_frame(&f);
+        let mut rebuilt = parts[0][ENVELOPE..].to_vec();
+        for p in &parts[1..] {
+            rebuilt.extend_from_slice(&p[ENVELOPE..]);
+        }
+        assert_eq!(rebuilt, f[ENVELOPE..], "a byte was lost or duplicated");
+    }
+
+    #[test]
+    fn a_frame_exactly_one_byte_over_the_limit_still_splits_cleanly() {
+        let f = vec![3u8; CHUNK + 1];
+        let parts = chunk_frame(&f);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].len(), ENVELOPE + 1);
     }
 }

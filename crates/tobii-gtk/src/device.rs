@@ -223,7 +223,7 @@ pub fn device_tick<T: Transport>(
             }
             DeviceCommand::CalCollect { x, y } => {
                 let r = conn
-                    .add_calibration_point(x, y, 0)
+                    .add_calibration_point(x, y, tobii_protocol::calibration::CAL_EYE_BOTH)
                     .map_err(|e| e.to_string());
                 state.lock().unwrap().calibration.on_collect(r);
             }
@@ -619,13 +619,25 @@ mod tests {
 
     #[test]
     fn tick_collects_a_calibration_point() {
-        let mut conn = connected(vec![inbound(TTP_MAGIC_RSP, 5, 0x408, &[])]);
+        // 0x406 (CALIBRATE_POINT_ADD2D), not 0x408 — the device acks points
+        // sent to 0x408 and discards them, so this responding at all is the
+        // whole assertion.
+        let mut conn = connected(vec![inbound(TTP_MAGIC_RSP, 5, 0x406, &[])]);
         let state = Mutex::new(DeviceState::default());
         let (tx, rx) = channel::<DeviceCommand>();
         tx.send(DeviceCommand::CalCollect { x: 0.5, y: 0.5 })
             .unwrap();
         device_tick(&mut conn, &state, &rx);
         assert_eq!(state.lock().unwrap().calibration.collected, 1);
+    }
+
+    /// A retrieve response of plausible size: 2 status bytes plus 8 KB of body.
+    /// Also large enough that the frame crosses the transport's chunk boundary
+    /// on the way back out, exercising the split send.
+    fn big_blob() -> Vec<u8> {
+        let mut v = vec![0x00, 0x00];
+        v.extend((0..8192u32).map(|i| i as u8));
+        v
     }
 
     /// Was a request frame for `op` ever sent? (op lives at bytes 20..24.)
@@ -673,7 +685,9 @@ mod tests {
         // instead of behaving like a from-scratch one.
         let mut conn = connected(vec![
             inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
-            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[0xde, 0xad, 0xbe, 0xef]),
+            // Two status bytes then a blob big enough to be believable: the
+            // apply path now refuses anything too small to be a calibration.
+            inbound(TTP_MAGIC_RSP, 6, 0x44c, &big_blob()),
             inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
             inbound(TTP_MAGIC_RSP, 8, 0x424, &[]),
             inbound(TTP_MAGIC_RSP, 9, 0x456, &[]),

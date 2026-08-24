@@ -14,6 +14,15 @@ pub struct CalibrationBlob(pub Vec<u8>);
 /// `cal_add_point` payload: `00 00` + Q42(x) + Q42(y) + u32(eye).
 /// `x`/`y` are normalized display coords in `[0,1]`; `eye` is 0=both/1=L/2=R.
 /// Note: two bare Q42 fields — NOT a point2d prolog.
+/// Eye mask for [`crate::frame::OP_CAL_ADD_POINT`]: 1 = left, 2 = right,
+/// 3 = both — the same encoding as `EnabledEye::to_wire`.
+///
+/// Note there is no "0 means both". Passing 0, as this code did until
+/// 2026-08-15, selects no eye at all: the device acks the point and drops it.
+pub const CAL_EYE_LEFT: u32 = 1;
+pub const CAL_EYE_RIGHT: u32 = 2;
+pub const CAL_EYE_BOTH: u32 = 3;
+
 pub fn cal_add_point_payload(x: f64, y: f64, eye: u32) -> Vec<u8> {
     let mut p = Writer::new();
     p.push_u8(0);

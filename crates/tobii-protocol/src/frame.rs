@@ -51,9 +51,22 @@ pub const OP_SET_ENABLED_EYE: u32 = 0xc58;
 pub const OP_CAL_START: u32 = 0x3f2;
 pub const OP_CAL_STOP: u32 = 0x3fc;
 pub const OP_CAL_CLEAR: u32 = 0x424;
-pub const OP_CAL_ADD_POINT: u32 = 0x408;
+/// `CALIBRATE_POINT_ADD2D`. **Not** `0x408` (`CALIBRATE_POINT_ADD_EYE`), which
+/// this used until 2026-08-15: the device acknowledges points sent to `0x408`
+/// and then discards them, so a whole calibration ran clean and changed
+/// nothing. Payload shape is identical between the two, which is why it went
+/// unnoticed for so long. Cross-checked against `ChrisVeigl/tobiifree`, who
+/// found it independently on macOS and measured 0.69 deg afterwards against
+/// the vendor stack's 0.70 deg on the same device.
+pub const OP_CAL_ADD_POINT: u32 = 0x406;
 pub const OP_CAL_DISCARD_POINT: u32 = 0x438; // redo a point
-pub const OP_CAL_COMPUTE: u32 = 0x42f; // compute AND apply
+/// `CALIBRATE_POINTS_APPLY` — compute the model from the collected points and
+/// apply it. **Not** `0x42f`, which is `CALIBRATE_EYE_APPLY`, a different
+/// operation that leaves the model untouched.
+///
+/// The tell is timing: a real computation takes well over a second, while
+/// `0x42f` returns in ~230 ms having done nothing. See [`OP_CAL_ADD_POINT`].
+pub const OP_CAL_COMPUTE: u32 = 0x42e;
 pub const OP_CAL_RETRIEVE: u32 = 0x44c;
 pub const OP_CAL_APPLY: u32 = 0x456;
 

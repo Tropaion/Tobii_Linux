@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         (Some("display"), Some("set")) => display_set(),
         (Some("calibrate"), _) => calibrate(args.iter().any(|a| a == "--apply")),
         (Some("cal-probe"), _) => cal_probe(),
+        (Some("cal-blob"), _) => cal_blob(),
         (Some("enabled-eye"), arg) => enabled_eye_cmd(arg),
         _ => {
             eprintln!(
@@ -55,6 +56,7 @@ fn main() -> ExitCode {
                  tobii display set\n  \
                  tobii calibrate [--apply]\n  \
                  tobii cal-probe\n  \
+                 tobii cal-blob\n  \
                  tobii enabled-eye [both|left|right]"
             );
             return ExitCode::from(2);
@@ -154,6 +156,63 @@ fn cal_probe() -> CmdResult {
         Ok(()) => println!("  calibration_stop  (0x3fc): ACK"),
         Err(e) => println!("  calibration_stop  (0x3fc): FAILED ({e})"),
     }
+    Ok(())
+}
+
+/// Diagnose the calibration-blob round trip: retrieve it, then apply it both
+/// with and without the response's 2-byte status prefix, printing what the
+/// device answers each time.
+///
+/// Every TTP response payload starts with a 2-byte prefix that every other
+/// decoder here skips. `retrieve_calibration` does not, and `apply_calibration`
+/// prepends its own — so a re-applied blob goes out as `[00 00][00 00][data]`,
+/// shifted by two bytes. Nothing checks the reply, so a rejection would look
+/// exactly like success. This prints the reply so it cannot.
+///
+/// Non-destructive by construction: whichever form the device prefers is
+/// applied LAST, so the session ends in the better of the two states.
+fn cal_blob() -> CmdResult {
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+
+    let blob = conn.retrieve_calibration()?;
+    let raw = &blob.0;
+    println!("retrieved {} bytes", raw.len());
+    println!("  first 16: {}", hex(&raw[..raw.len().min(16)]));
+    if raw.len() >= 2 && raw[0] == 0 && raw[1] == 0 {
+        println!("  starts with the 2-byte status prefix every other decoder skips");
+    }
+    let stripped: Vec<u8> = if raw.len() > 2 {
+        raw[2..].to_vec()
+    } else {
+        raw.clone()
+    };
+
+    let try_apply = |label: &str, b: &[u8], conn: &mut Connection<UsbTransport>| match conn.request(
+        tobii_protocol::frame::OP_CAL_APPLY,
+        &tobii_protocol::calibration::cal_apply_payload(b),
+    ) {
+        Ok(Some(reply)) => println!(
+            "  {label:9} ({:5} bytes): reply {} bytes, status {}",
+            b.len(),
+            reply.len(),
+            if reply.len() >= 2 {
+                hex(&reply[..2])
+            } else {
+                "(none)".into()
+            }
+        ),
+        Ok(None) => println!("  {label:9} ({:5} bytes): NO REPLY", b.len()),
+        Err(e) => println!("  {label:9} ({:5} bytes): error {e}", b.len()),
+    };
+    println!("\napplying both forms (the stripped one last, so it wins):");
+    try_apply("as-is", raw, &mut conn);
+    try_apply("stripped", &stripped, &mut conn);
+    println!(
+        "\nA differing status is the answer. Identical statuses mean the device\n\
+         tolerates both, and the prefix is cosmetic rather than corrupting."
+    );
     Ok(())
 }
 
@@ -929,7 +988,7 @@ fn calibrate(apply_saved: bool) -> CmdResult {
          protocol only, not gaze accuracy."
     );
     for (i, &(x, y)) in CAL_POINTS.iter().enumerate() {
-        conn.add_calibration_point(x, y, 0)?;
+        conn.add_calibration_point(x, y, tobii_protocol::calibration::CAL_EYE_BOTH)?;
         println!(
             "  point {}/{} at ({x:.2}, {y:.2}) sampled",
             i + 1,

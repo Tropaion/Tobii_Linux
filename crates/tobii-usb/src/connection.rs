@@ -41,6 +41,10 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// while sampling; the fixation dwell is enforced host-side), so this ceiling is
 /// never reached in practice; it only guards a pathological stall.
 const CAL_POINT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Smallest blob worth sending back to the device. Purely a smoke test: the one
+/// ET5 measured produced ~414 KB, and the ~1.5 KB stubs this code used to store
+/// were the response's status word plus a fragment, not a calibration.
+const MIN_PLAUSIBLE_BLOB: usize = 4096;
 
 /// A live connection to the eye tracker. Generic over [`Transport`] so the
 /// driver logic is testable without hardware.
@@ -164,7 +168,9 @@ impl<T: Transport> Connection<T> {
     }
 
     /// Sample one calibration stimulus point. `x`/`y` normalized `[0,1]`;
-    /// `eye` 0=both/1=L/2=R. Assumes calibration runs in the already-open realm.
+    /// `eye` is a mask — 1=L, 2=R, 3=both (`calibration::CAL_EYE_*`). There is
+    /// no zero-means-both: 0 selects nothing and the point is silently dropped.
+    /// Assumes calibration runs in the already-open realm.
     pub fn add_calibration_point(&mut self, x: f64, y: f64, eye: u32) -> Result<(), UsbError> {
         self.request_until(
             OP_CAL_ADD_POINT,
@@ -204,11 +210,28 @@ impl<T: Transport> Connection<T> {
     /// Retrieve the opaque calibration blob (the verbatim response payload).
     pub fn retrieve_calibration(&mut self) -> Result<CalibrationBlob, UsbError> {
         let payload = self.expect_response(OP_CAL_RETRIEVE, &cal_retrieve_payload())?;
-        Ok(CalibrationBlob(payload))
+        // Drop the 2-byte status prefix every TTP response payload carries and
+        // every other decoder here already skips. `apply_calibration` prepends
+        // its own, so keeping it sent `[00 00][00 00][blob]` — the blob shifted
+        // two bytes, with nothing checking the reply to notice.
+        let blob = if payload.len() > 2 {
+            payload[2..].to_vec()
+        } else {
+            payload
+        };
+        Ok(CalibrationBlob(blob))
     }
 
     /// Re-apply a previously saved calibration blob.
+    ///
+    /// Rejects a blob too small to be a real calibration rather than sending
+    /// it. This device's is on the order of hundreds of kilobytes; anything
+    /// tiny is a leftover from before the calibration ops were corrected, when
+    /// `retrieve` returned a stub that no amount of applying would help.
     pub fn apply_calibration(&mut self, blob: &[u8]) -> Result<(), UsbError> {
+        if blob.len() < MIN_PLAUSIBLE_BLOB {
+            return Err(UsbError::ImplausibleCalibration { len: blob.len() });
+        }
         self.expect_response(OP_CAL_APPLY, &cal_apply_payload(blob))?;
         Ok(())
     }
@@ -663,7 +686,7 @@ mod tests {
 
     #[test]
     fn add_calibration_point_gets_ack() {
-        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x408, &[])]);
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x406, &[])]);
         assert!(conn.add_calibration_point(0.25, 0.75, 0).is_ok());
     }
 
@@ -742,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_calibration_returns_blob_verbatim() {
+    fn retrieve_calibration_returns_the_body_without_the_status_prefix() {
         let mut conn = connected_with(vec![inbound(
             TTP_MAGIC_RSP,
             5,
@@ -750,7 +773,7 @@ mod tests {
             &[0xDE, 0xAD, 0xBE, 0xEF],
         )]);
         let blob = conn.retrieve_calibration().expect("blob");
-        assert_eq!(blob.0, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(blob.0, vec![0xBE, 0xEF]);
     }
 
     #[test]
@@ -760,7 +783,7 @@ mod tests {
         conn.set_request_timeout(Duration::from_millis(150));
         assert!(matches!(
             conn.compute_and_apply_calibration(),
-            Err(UsbError::NoResponse { op }) if op == 0x42f
+            Err(UsbError::NoResponse { op }) if op == 0x42e
         ));
     }
 
@@ -788,11 +811,42 @@ mod tests {
 
     #[test]
     fn apply_calibration_sends_prefixed_blob_and_acks() {
+        let blob: Vec<u8> = (0..MIN_PLAUSIBLE_BLOB as u32).map(|i| i as u8).collect();
         let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x456, &[])]);
-        assert!(conn.apply_calibration(&[0xDE, 0xAD]).is_ok());
-        // Outbound payload (after envelope+header) must be exactly `00 00` + blob.
+        assert!(conn.apply_calibration(&blob).is_ok());
+        // Outbound payload (after envelope+header) is exactly `00 00` + blob.
+        // The mock transport does no chunking, so the whole frame is one entry.
         let sent = conn.transport().sent.last().expect("a sent frame");
-        assert_eq!(&sent[32..], &[0x00, 0x00, 0xDE, 0xAD]);
+        assert_eq!(&sent[32..], &[&[0x00, 0x00][..], &blob[..]].concat()[..]);
+    }
+
+    #[test]
+    fn a_retrieved_blob_loses_the_status_prefix_it_arrived_with() {
+        // Every response payload starts with two status bytes. Keeping them
+        // meant `apply` re-sent `[00 00][00 00][blob]`, shifted by two.
+        let mut conn = connected_with(vec![inbound(
+            TTP_MAGIC_RSP,
+            5,
+            0x44c,
+            &[0x00, 0x00, 0xDE, 0xAD],
+        )]);
+        assert_eq!(
+            conn.retrieve_calibration().expect("blob").0,
+            vec![0xDE, 0xAD]
+        );
+    }
+
+    #[test]
+    fn a_blob_too_small_to_be_a_calibration_is_refused_not_sent() {
+        // The stubs stored before the calibration ops were corrected are ~1.5KB
+        // and are not calibrations; sending one back is worse than doing nothing.
+        let mut conn = connected_with(vec![inbound(TTP_MAGIC_RSP, 5, 0x456, &[])]);
+        let before = conn.transport().sent.len();
+        assert!(matches!(
+            conn.apply_calibration(&[0u8; 1478]),
+            Err(UsbError::ImplausibleCalibration { len: 1478 })
+        ));
+        assert_eq!(conn.transport().sent.len(), before, "nothing was sent");
     }
 
     #[test]
