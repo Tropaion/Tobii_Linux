@@ -111,6 +111,12 @@ fn chunk_frame(data: &[u8]) -> Vec<std::borrow::Cow<'_, [u8]>> {
     out
 }
 
+/// How long one bulk OUT may take. A calibration blob goes out as ~40 back-to-back
+/// transfers and the device does not drain them instantly; the reference
+/// implementation allows 2 s per transfer and a 1 s limit was seen to time out
+/// mid-blob on real hardware.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
+
 /// Largest single bulk OUT the device accepts.
 const CHUNK: usize = 8192;
 /// The per-transfer envelope: four zero bytes then a little-endian length.
@@ -200,8 +206,23 @@ fn classify_open_failure(e: rusb::Error) -> UsbError {
 
 impl Transport for UsbTransport {
     fn send(&mut self, data: &[u8]) -> Result<(), UsbError> {
-        for part in chunk_frame(data) {
-            self.write_all(&part)?;
+        let parts = chunk_frame(data);
+        let total = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            self.write_all(part).inspect_err(|_| {
+                // Say where it stopped. A frame abandoned part-way leaves the
+                // device's TTP reassembly holding an incomplete frame, so the
+                // next request can fail for reasons that have nothing to do
+                // with it — worth knowing that is what happened.
+                if total > 1 {
+                    eprintln!(
+                        "usb: frame of {} bytes failed on transfer {}/{total}; \
+                         the device may hold a partial frame",
+                        data.len(),
+                        i + 1
+                    );
+                }
+            })?;
         }
         Ok(())
     }
@@ -216,9 +237,7 @@ impl Transport for UsbTransport {
 
 impl UsbTransport {
     fn write_all(&mut self, data: &[u8]) -> Result<(), UsbError> {
-        let wrote = self
-            .handle
-            .write_bulk(EP_OUT, data, Duration::from_millis(1000))?;
+        let wrote = self.handle.write_bulk(EP_OUT, data, WRITE_TIMEOUT)?;
         if wrote != data.len() {
             return Err(UsbError::ShortWrite {
                 wrote,

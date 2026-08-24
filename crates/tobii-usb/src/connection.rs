@@ -45,6 +45,9 @@ const CAL_POINT_TIMEOUT: Duration = Duration::from_secs(30);
 /// ET5 measured produced ~414 KB, and the ~1.5 KB stubs this code used to store
 /// were the response's status word plus a fragment, not a calibration.
 const MIN_PLAUSIBLE_BLOB: usize = 4096;
+/// Window for `cal_apply`, which transfers the whole model. The reference
+/// implementation allows 60 s for the comparable operation.
+const CAL_APPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Whether a stored blob is big enough to be a real calibration.
 ///
@@ -245,7 +248,11 @@ impl<T: Transport> Connection<T> {
         if blob.len() < MIN_PLAUSIBLE_BLOB {
             return Err(UsbError::ImplausibleCalibration { len: blob.len() });
         }
-        self.expect_response(OP_CAL_APPLY, &cal_apply_payload(blob))?;
+        // Its own window: this pushes a few hundred KB across ~40 transfers and
+        // then waits for the device to ingest a whole calibration model. The
+        // 10 s default is a request timeout, sized for one small round trip.
+        self.request_until(OP_CAL_APPLY, &cal_apply_payload(blob), CAL_APPLY_TIMEOUT)?
+            .ok_or(UsbError::NoResponse { op: OP_CAL_APPLY })?;
         Ok(())
     }
 
