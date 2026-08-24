@@ -44,9 +44,9 @@ Master table of every known TTP op code. Op constants live in
 | `0x3f2` | 1010 | cal_start | host→dev | `00 00` | ack | **[CONFIRMED]** live | `frame.rs`, `calibration.rs`; memory `et5-calibration-protocol` |
 | `0x3fc` | 1020 | cal_stop | host→dev | `00 00` | ack | **[CONFIRMED]** live | same |
 | `0x424` | 1060 | cal_clear | host→dev | `00 00` (destructive) | ack | **[CODE-VERIFIED]** | `frame.rs` `OP_CAL_CLEAR` |
-| `0x406` | 1030 | cal_add_point (`CALIBRATE_POINT_ADD2D`) | host→dev | `00 00` + Q42(x) + Q42(y) + u32(eye **mask**: 1=L, 2=R, 3=both) | ack | **[HYPOTHESIS]** | `calibration.rs::cal_add_point_payload` |
+| `0x406` | 1030 | cal_add_point (`CALIBRATE_POINT_ADD2D`) | host→dev | `00 00` + Q42(x) + Q42(y) + u32(eye **mask**: 1=L, 2=R, 3=both) | ack | **[CONFIRMED]** live | `calibration.rs::cal_add_point_payload` |
 | `0x408` | 1032 | ~~cal_add_point~~ `CALIBRATE_POINT_ADD_EYE` — **do not use**: acks and discards | host→dev | as above | ack | **[HYPOTHESIS]** | shipped here in error until 2026-08-15 |
-| `0x42e` | 1070 | cal_compute (`CALIBRATE_POINTS_APPLY`) — compute **and** apply | host→dev | `00 00` | ack | **[HYPOTHESIS]** | `frame.rs` `OP_CAL_COMPUTE` |
+| `0x42e` | 1070 | cal_compute (`CALIBRATE_POINTS_APPLY`) — compute **and** apply | host→dev | `00 00` | ack | **[CONFIRMED]** live | `frame.rs` `OP_CAL_COMPUTE` |
 | `0x42f` | 1071 | ~~cal_compute~~ `CALIBRATE_EYE_APPLY` — **do not use**: leaves the model unchanged | host→dev | `00 00` | ack | **[HYPOTHESIS]** | shipped here in error until 2026-08-15 |
 | `0x44c` | 1100 | cal_retrieve | host→dev | `00 00` | opaque blob | **[CONFIRMED]** | `connection.rs`, real blob testdata |
 | `0x456` | 1110 | cal_apply | host→dev | `00 00` + raw blob | ack | **[CODE-VERIFIED]** | `calibration.rs::cal_apply_payload` |

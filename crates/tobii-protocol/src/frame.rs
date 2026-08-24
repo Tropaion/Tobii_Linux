@@ -59,10 +59,10 @@ pub const OP_CAL_CLEAR: u32 = 0x424;
 /// found it independently on macOS and measured 0.69 deg afterwards against
 /// the vendor stack's 0.70 deg on the same device.
 ///
-/// **[HYPOTHESIS]** on *this* hardware: strong, but the confirming measurement
-/// has not been taken here. `finish_calibration` logs the compute duration and
-/// the blob's size and digest — one real run settles it. Over a second with a
-/// changed blob confirms; ~230 ms with an identical blob refutes.
+/// **[CONFIRMED]** live 2026-08-24 on an ET5. `finish_calibration` logs the
+/// compute duration and blob size for exactly this purpose, and the run that
+/// settled it read: compute **1.115 s**, blob **324,437 bytes**, size changed —
+/// against the ~230 ms and unchanging 1,480-byte stub the old ops produced.
 pub const OP_CAL_ADD_POINT: u32 = 0x406;
 pub const OP_CAL_DISCARD_POINT: u32 = 0x438; // redo a point
 /// `CALIBRATE_POINTS_APPLY` — compute the model from the collected points and
@@ -70,8 +70,8 @@ pub const OP_CAL_DISCARD_POINT: u32 = 0x438; // redo a point
 /// operation that leaves the model untouched.
 ///
 /// The tell is timing: a real computation takes well over a second, while
-/// `0x42f` returns in ~230 ms having done nothing. See [`OP_CAL_ADD_POINT`],
-/// including why this is **[HYPOTHESIS]** here and not yet [CONFIRMED].
+/// `0x42f` returns in ~230 ms having done nothing. Measured here at 1.115 s —
+/// see [`OP_CAL_ADD_POINT`].
 pub const OP_CAL_COMPUTE: u32 = 0x42e;
 pub const OP_CAL_RETRIEVE: u32 = 0x44c;
 pub const OP_CAL_APPLY: u32 = 0x456;
