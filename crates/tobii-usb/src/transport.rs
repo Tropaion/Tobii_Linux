@@ -117,6 +117,9 @@ fn chunk_frame(data: &[u8]) -> Vec<std::borrow::Cow<'_, [u8]>> {
 /// mid-blob on real hardware.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
 
+/// Ceiling on bytes buffered by `soak_incoming` during one send.
+const SOAK_CAP: usize = 1 << 20;
+
 /// Largest single bulk OUT the device accepts.
 const CHUNK: usize = 8192;
 /// The per-transfer envelope: four zero bytes then a little-endian length.
@@ -130,6 +133,18 @@ const SESSION_CLOSE: u8 = 0x42;
 /// libusb-backed [`Transport`] for the Tobii ET5.
 pub struct UsbTransport {
     handle: rusb::DeviceHandle<GlobalContext>,
+    /// Bytes read off the IN endpoint while a multi-transfer frame was going
+    /// out, handed to the next [`Transport::recv`] before anything new.
+    ///
+    /// Sending is synchronous here, so nothing drains IN for the duration —
+    /// and gaze notifications keep arriving at ~33 Hz throughout. Pushing a
+    /// 324 KB calibration without reading backs the device's IN buffer up and
+    /// it stops accepting OUT: observed failing on transfer 4 of 40. The
+    /// reference implementation avoids this by running its receive pump
+    /// concurrently with sends. Buffering rather than discarding matters
+    /// because the parser upstream reassembles a byte *stream*; a hole in it
+    /// would desync framing far more thoroughly than the stall did.
+    pending: Vec<u8>,
 }
 
 impl UsbTransport {
@@ -160,7 +175,10 @@ impl UsbTransport {
             Duration::from_millis(1000),
         )?;
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            pending: Vec::new(),
+        })
     }
 }
 
@@ -209,6 +227,10 @@ impl Transport for UsbTransport {
         let parts = chunk_frame(data);
         let total = parts.len();
         for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                // Keep the device's IN side moving between transfers.
+                self.soak_incoming();
+            }
             self.write_all(part).inspect_err(|_| {
                 // Say where it stopped. A frame abandoned part-way leaves the
                 // device's TTP reassembly holding an incomplete frame, so the
@@ -227,6 +249,13 @@ impl Transport for UsbTransport {
         Ok(())
     }
     fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Option<usize> {
+        // Anything soaked up during a large send comes first, in order.
+        if !self.pending.is_empty() {
+            let n = buf.len().min(self.pending.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            return Some(n);
+        }
         match self.handle.read_bulk(EP_IN, buf, timeout) {
             Ok(n) if n > 0 => Some(n),
             // Timeout (expected for polling) or zero-length: nothing this call.
@@ -236,6 +265,32 @@ impl Transport for UsbTransport {
 }
 
 impl UsbTransport {
+    /// Take whatever the device has queued on IN, without waiting for more.
+    ///
+    /// Bounded: past [`SOAK_CAP`] we stop buffering and let the reads fall on
+    /// the floor, because a send long enough to overflow this has bigger
+    /// problems than the frames it is dropping, and growing without limit
+    /// would be worse than either.
+    fn soak_incoming(&mut self) {
+        if self.pending.len() >= SOAK_CAP {
+            return;
+        }
+        let mut scratch = [0u8; 16384];
+        // A 0 timeout means *wait forever* in libusb, not "poll" — hence 1ms.
+        while let Ok(n) = self
+            .handle
+            .read_bulk(EP_IN, &mut scratch, Duration::from_millis(1))
+        {
+            if n == 0 {
+                break;
+            }
+            self.pending.extend_from_slice(&scratch[..n]);
+            if self.pending.len() >= SOAK_CAP {
+                break;
+            }
+        }
+    }
+
     fn write_all(&mut self, data: &[u8]) -> Result<(), UsbError> {
         let wrote = self.handle.write_bulk(EP_OUT, data, WRITE_TIMEOUT)?;
         if wrote != data.len() {
