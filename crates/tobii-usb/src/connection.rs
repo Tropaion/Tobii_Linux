@@ -224,7 +224,10 @@ impl<T: Transport> Connection<T> {
         // every other decoder here already skips. `apply_calibration` prepends
         // its own, so keeping it sent `[00 00][00 00][blob]` — the blob shifted
         // two bytes, with nothing checking the reply to notice.
-        let blob = if payload.len() > 2 {
+        // `>= 2`, not `> 2`: a status-only response is an empty blob, not a
+        // two-byte one. The caller's plausibility check would catch it either
+        // way, but "0 bytes" is the truthful answer.
+        let blob = if payload.len() >= 2 {
             payload[2..].to_vec()
         } else {
             payload

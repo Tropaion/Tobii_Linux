@@ -419,13 +419,40 @@ fn finish_calibration<T: Transport>(
     conn: &mut Connection<T>,
     mode: &str,
 ) -> (Result<(), String>, bool) {
+    // Timed, because the duration is the one cheap tell that the commit op is
+    // the right one. `0x42e` computes a model and takes well over a second;
+    // `0x42f`, which this used to send, returns in ~230 ms having changed
+    // nothing. Logging it means the next real calibration settles that on this
+    // hardware instead of resting on a second-hand claim — see
+    // `frame::OP_CAL_COMPUTE`.
+    let started = Instant::now();
     let compute = conn
         .compute_and_apply_calibration()
         .map_err(|e| e.to_string());
+    let compute_took = started.elapsed();
     // Stop unconditionally, even when compute failed.
     let stop_acked = conn.stop_calibration().is_ok();
     let outcome = compute.and_then(|()| {
         let blob = conn.retrieve_calibration().map_err(|e| e.to_string())?;
+        let previous = tobii_config::load_calibration()
+            .ok()
+            .flatten()
+            .map(|(b, _)| b.len());
+        eprintln!(
+            "calibration: compute {:?}, blob {} bytes{}{}",
+            compute_took,
+            blob.0.len(),
+            match previous {
+                Some(n) if n == blob.0.len() => " (SAME SIZE as the stored one)",
+                Some(_) => " (size changed)",
+                None => "",
+            },
+            if compute_took < Duration::from_millis(500) {
+                " -- suspiciously fast for a real computation"
+            } else {
+                ""
+            }
+        );
         if blob.0.is_empty() {
             // Persisting an empty blob would re-apply nothing on every connect
             // and silently mask that the calibration was never stored.

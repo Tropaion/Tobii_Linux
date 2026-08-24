@@ -21,7 +21,7 @@ pub const OP_HELLO: u32 = 0x3e8;
 pub const OP_SUBSCRIBE: u32 = 0x4c4;
 /// Stop a stream started with [`OP_SUBSCRIBE`]. Every mapped request/companion
 /// pair in this catalog sits exactly +10 apart (`0x596`/`0x5a0`, `0x3f2`/`0x3fc`,
-/// `0x424`/`0x42e`, `0x44c`/`0x456`, `0x76c`/`0x776`, `0xc58`/`0xc62`), and
+/// `0x44c`/`0x456`, `0x76c`/`0x776`, `0xc58`/`0xc62`), and
 /// `0x4c4 + 10 = 0x4ce`, which is also what `njmill/tobii-linux` sends to stop a
 /// stream. **[UNCONFIRMED]** — the pattern and the third-party use agree, but we
 /// have not watched a stream actually fall silent after sending it.
@@ -58,6 +58,11 @@ pub const OP_CAL_CLEAR: u32 = 0x424;
 /// unnoticed for so long. Cross-checked against `ChrisVeigl/tobiifree`, who
 /// found it independently on macOS and measured 0.69 deg afterwards against
 /// the vendor stack's 0.70 deg on the same device.
+///
+/// **[HYPOTHESIS]** on *this* hardware: strong, but the confirming measurement
+/// has not been taken here. `finish_calibration` logs the compute duration and
+/// the blob's size and digest — one real run settles it. Over a second with a
+/// changed blob confirms; ~230 ms with an identical blob refutes.
 pub const OP_CAL_ADD_POINT: u32 = 0x406;
 pub const OP_CAL_DISCARD_POINT: u32 = 0x438; // redo a point
 /// `CALIBRATE_POINTS_APPLY` — compute the model from the collected points and
@@ -65,7 +70,8 @@ pub const OP_CAL_DISCARD_POINT: u32 = 0x438; // redo a point
 /// operation that leaves the model untouched.
 ///
 /// The tell is timing: a real computation takes well over a second, while
-/// `0x42f` returns in ~230 ms having done nothing. See [`OP_CAL_ADD_POINT`].
+/// `0x42f` returns in ~230 ms having done nothing. See [`OP_CAL_ADD_POINT`],
+/// including why this is **[HYPOTHESIS]** here and not yet [CONFIRMED].
 pub const OP_CAL_COMPUTE: u32 = 0x42e;
 pub const OP_CAL_RETRIEVE: u32 = 0x44c;
 pub const OP_CAL_APPLY: u32 = 0x456;

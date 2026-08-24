@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::ExitCode;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tobii_config::DisplaySetup;
 use tobii_headpose::{opentrack, pose_from_sample, PoseFilter};
@@ -984,9 +984,19 @@ fn calibrate(apply_saved: bool) -> CmdResult {
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
     eprintln!(
-        "NOTE: headless calibration — no stimulus is drawn, so this validates the \
-         protocol only, not gaze accuracy."
+        "Protocol exercise only. No stimulus is drawn, so the points below are \
+         positions nobody looked at — the result cannot be a usable calibration \
+         and is deliberately NOT saved. Use `tobii-gtk` for a real one."
     );
+
+    // start + clear before any point, stop after the compute. Without the
+    // session the device acknowledges every point and discards it, and the
+    // whole run reports success having changed nothing — which is exactly how
+    // this driver shipped a calibration that never calibrated.
+    conn.start_calibration()?;
+    conn.clear_calibration()?;
+    let before = conn.retrieve_calibration().map(|b| b.0.len()).unwrap_or(0);
+
     for (i, &(x, y)) in CAL_POINTS.iter().enumerate() {
         conn.add_calibration_point(x, y, tobii_protocol::calibration::CAL_EYE_BOTH)?;
         println!(
@@ -995,20 +1005,33 @@ fn calibrate(apply_saved: bool) -> CmdResult {
             CAL_POINTS.len()
         );
     }
-    conn.compute_and_apply_calibration()?;
+
+    // Time it: a real computation takes well over a second. Around 230 ms is
+    // the signature of an op that accepted the request and did nothing.
+    let t0 = Instant::now();
+    let computed = conn.compute_and_apply_calibration();
+    let elapsed = t0.elapsed();
+    let stopped = conn.stop_calibration();
+    computed?;
+    println!("  compute took {:?}", elapsed);
+    if elapsed < Duration::from_millis(500) {
+        println!("  ^ suspiciously fast — a real computation takes over a second");
+    }
+    if let Err(e) = stopped {
+        eprintln!("warning: calibration session may still be open ({e})");
+    }
+
     let blob = conn.retrieve_calibration()?;
-    let meta = tobii_config::CalMeta {
-        monitor_id: tobii_config::pick_monitor(&tobii_config::detect_monitors())
-            .and_then(|m| m.id.clone()),
-        created_utc: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
-        mode: "cli".to_string(),
-        display_fingerprint: tobii_config::load()?.map(|s| s.fingerprint()).unwrap_or(0),
-    };
-    tobii_config::save_calibration(&blob.0, &meta)?;
     println!(
-        "calibration computed + applied; saved {} bytes.",
-        blob.0.len()
+        "  blob {} bytes (was {before}) — {}",
+        blob.0.len(),
+        if blob.0.len() == before {
+            "UNCHANGED, so nothing was computed"
+        } else {
+            "changed"
+        }
     );
+    println!("nothing saved; this exercises the protocol, not your eyes.");
     Ok(())
 }
 

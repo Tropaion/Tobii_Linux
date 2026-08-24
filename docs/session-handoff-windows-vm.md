@@ -156,8 +156,9 @@ files make it trivial.
   session close). The driver must re-apply the saved area on every connect or
   the device reports no eyes at all (`validity = 4`).
 - **Calibration ops**: start `0x3f2`, stop `0x3fc`, clear `0x424` (destructive),
-  add_point `0x408` (`00 00` + Q42 x + Q42 y + u32 eye, eye 0 = both), compute+
-  apply `0x42f`, retrieve `0x44c`, apply `0x456`, discard_point `0x438`,
+  add_point `0x406` (`00 00` + Q42 x + Q42 y + u32 eye **mask**, 1=L 2=R 3=both;
+  NOT `0x408`, and NOT eye 0 — see the correction in [[Op-Catalog]]), compute+
+  apply `0x42e` (NOT `0x42f`), retrieve `0x44c`, apply `0x456`, discard_point `0x438`,
   stimulus_points_get `0x460`. Order: `start → clear → points → compute → stop
   → retrieve`; compute comes **before** stop.
 - **`add_calibration_point` acks almost immediately** — it does *not* block

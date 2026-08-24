@@ -45,10 +45,18 @@ The hardware-captured **BOTH** GET response is:
 `commands.rs::enabled_eye_payload_and_parse_match_device`,
 `connection.rs::get_enabled_eye_parses_device_response`.
 
-> **Enum landmine:** this property's wire enum (`1=L,2=R,3=B`) is a *different*
-> numbering from the `cal_add_point` (`0x408`) eye argument
-> (`0=both,1=L,2=R`, see [[Calibration]]). Same integer ≠ same eye across
-> contexts. Never share a constant between the two.
+> **This used to warn of an enum landmine. There isn't one — that warning was
+> the bug.** `cal_add_point` is `0x406`, not `0x408`, and its eye argument uses
+> **the same** encoding as this property: `1=L, 2=R, 3=both`, as a mask. There is
+> no `0=both`; passing 0 selects no eye, and the device acks the point and
+> discards it. Sharing a constant between the two is correct, and
+> `calibration::CAL_EYE_*` exists for that. See [[Calibration]] and the
+> correction note at the top of [[Op-Catalog]].
+>
+> This also reopens a question: `et5-calibration-protocol` concluded that a
+> standard calibration cannot honour the eye selection because per-eye needed
+> `0x42e`. That premise is gone — `0x42e` is the ordinary compute — so whether a
+> standard calibration applies the eye selection is **unknown again**.
 
 ## Semantics: persists, but takes effect only on (re)calibration
 

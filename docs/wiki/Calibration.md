@@ -1,5 +1,19 @@
 # Calibration (follow-the-dot)
 
+> **Corrected 2026-08-15 — calibration ops.** `0x408` and `0x42f` were wrong and
+> are kept in the table below, renamed, so nobody re-picks them. `0x408` is
+> `CALIBRATE_POINT_ADD_EYE` and `0x42f` is `CALIBRATE_EYE_APPLY`: the device acks
+> points sent to `0x408` with eye `0` and then discards them, and `0x42f` leaves
+> the model untouched — so a whole calibration ran clean and changed nothing, for
+> months. The eye argument is a **mask** (1=L, 2=R, 3=both); there is no
+> zero-means-both. Found via `ChrisVeigl/tobiifree` commit `623c696`, corroborated
+> here by a stored blob that was byte-identical across a full recalibration.
+>
+> The old `[CONFIRMED]` on `0x408` cited our own source file, which is circular and
+> against this project's own rule that `[CONFIRMED]` needs a capture or a hardware
+> round-trip. The replacements are **[HYPOTHESIS]** until a run on this hardware
+> shows a compute over one second and a blob that changes.
+
 Per-user gaze calibration improves accuracy by sampling where the user looks at
 known on-screen stimulus dots and computing a personal model. Source of truth:
 `crates/tobii-protocol/src/calibration.rs` (payload builders),
@@ -14,9 +28,9 @@ start (0x3f2)                          enter calibration mode
   → clear (0x424)                      discard any collected/active data (destructive)
   → for each stimulus point:
         (host draws + animates the dot, waits for fixation)
-        add_point (0x408, x, y, eye)   sample this point
+        add_point (0x406, x, y, eyemask) sample this point
         [on a bad point: discard_point (0x438, x, y), then re-add]
-  → compute (0x42f)                    compute AND apply the new calibration
+  → compute (0x42e)                    compute AND apply the new calibration
   → stop (0x3fc)                       leave calibration mode
   → retrieve (0x44c)                   read back the opaque blob to persist
 ```
@@ -34,8 +48,8 @@ standalone and the device keeps streaming afterward).
 | `0x3f2` start | `cal_session_payload` | `00 00` (no eye arg — see below) |
 | `0x3fc` stop | `cal_session_payload` | `00 00` |
 | `0x424` clear | `cal_session_payload` | `00 00` |
-| `0x408` add_point | `cal_add_point_payload(x, y, eye)` | `00 00` + Q42(x) + Q42(y) + u32(eye) |
-| `0x42f` compute | `cal_compute_payload` | `00 00` |
+| `0x406` add_point | `cal_add_point_payload(x, y, eye)` | `00 00` + Q42(x) + Q42(y) + u32(eye **mask**: 1=L, 2=R, 3=both) |
+| `0x42e` compute | `cal_compute_payload` | `00 00` |
 | `0x44c` retrieve | `cal_retrieve_payload` | `00 00` → response is the blob |
 | `0x456` apply | `cal_apply_payload(blob)` | `00 00` + raw blob bytes (no TLV header) |
 | `0x438` discard_point | `cal_discard_point_payload(x, y)` | `00 00` + Q42(x) + Q42(y) — no eye arg |

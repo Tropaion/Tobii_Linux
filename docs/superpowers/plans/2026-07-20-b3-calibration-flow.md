@@ -1,5 +1,13 @@
 # B3 — Follow-the-dot Calibration Flow Implementation Plan
 
+> ⚠️ **Superseded 2026-08-15 — the calibration op codes in this document are wrong.**
+> `0x408` is `CALIBRATE_POINT_ADD_EYE` (acks points and discards them) and `0x42f`
+> is `CALIBRATE_EYE_APPLY` (leaves the model unchanged). Correct: **`0x406`**
+> add_point and **`0x42e`** compute+apply, with the eye argument a **mask**
+> (1=L, 2=R, 3=both) — there is no `0=both`. This is a historical record; see
+> `docs/wiki/Op-Catalog.md` for current truth.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a guided follow-the-dot gaze calibration to the GTK4 app, saved and re-applied on every connect, unblocking the hub's "Improve my calibration" button.

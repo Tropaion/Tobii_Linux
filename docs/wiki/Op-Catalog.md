@@ -1,5 +1,19 @@
 # Op Catalog
 
+> **Corrected 2026-08-15 — calibration ops.** `0x408` and `0x42f` were wrong and
+> are kept in the table below, renamed, so nobody re-picks them. `0x408` is
+> `CALIBRATE_POINT_ADD_EYE` and `0x42f` is `CALIBRATE_EYE_APPLY`: the device acks
+> points sent to `0x408` with eye `0` and then discards them, and `0x42f` leaves
+> the model untouched — so a whole calibration ran clean and changed nothing, for
+> months. The eye argument is a **mask** (1=L, 2=R, 3=both); there is no
+> zero-means-both. Found via `ChrisVeigl/tobiifree` commit `623c696`, corroborated
+> here by a stored blob that was byte-identical across a full recalibration.
+>
+> The old `[CONFIRMED]` on `0x408` cited our own source file, which is circular and
+> against this project's own rule that `[CONFIRMED]` needs a capture or a hardware
+> round-trip. The replacements are **[HYPOTHESIS]** until a run on this hardware
+> shows a compute over one second and a blob that changes.
+
 Master table of every known TTP op code. Op constants live in
 `crates/tobii-protocol/src/frame.rs`; the name table is
 `crates/tobii-recap/src/opnames.rs`. Payloads all begin with the universal
@@ -30,12 +44,14 @@ Master table of every known TTP op code. Op constants live in
 | `0x3f2` | 1010 | cal_start | host→dev | `00 00` | ack | **[CONFIRMED]** live | `frame.rs`, `calibration.rs`; memory `et5-calibration-protocol` |
 | `0x3fc` | 1020 | cal_stop | host→dev | `00 00` | ack | **[CONFIRMED]** live | same |
 | `0x424` | 1060 | cal_clear | host→dev | `00 00` (destructive) | ack | **[CODE-VERIFIED]** | `frame.rs` `OP_CAL_CLEAR` |
-| `0x408` | 1032 | cal_add_point | host→dev | `00 00` + Q42(x) + Q42(y) + u32(eye) | ack | **[CONFIRMED]** | `calibration.rs::cal_add_point_payload` |
-| `0x42f` | 1071 | cal_compute (compute **and** apply) | host→dev | `00 00` | ack | **[CODE-VERIFIED]** | `frame.rs` `OP_CAL_COMPUTE` |
+| `0x406` | 1030 | cal_add_point (`CALIBRATE_POINT_ADD2D`) | host→dev | `00 00` + Q42(x) + Q42(y) + u32(eye **mask**: 1=L, 2=R, 3=both) | ack | **[HYPOTHESIS]** | `calibration.rs::cal_add_point_payload` |
+| `0x408` | 1032 | ~~cal_add_point~~ `CALIBRATE_POINT_ADD_EYE` — **do not use**: acks and discards | host→dev | as above | ack | **[HYPOTHESIS]** | shipped here in error until 2026-08-15 |
+| `0x42e` | 1070 | cal_compute (`CALIBRATE_POINTS_APPLY`) — compute **and** apply | host→dev | `00 00` | ack | **[HYPOTHESIS]** | `frame.rs` `OP_CAL_COMPUTE` |
+| `0x42f` | 1071 | ~~cal_compute~~ `CALIBRATE_EYE_APPLY` — **do not use**: leaves the model unchanged | host→dev | `00 00` | ack | **[HYPOTHESIS]** | shipped here in error until 2026-08-15 |
 | `0x44c` | 1100 | cal_retrieve | host→dev | `00 00` | opaque blob | **[CONFIRMED]** | `connection.rs`, real blob testdata |
 | `0x456` | 1110 | cal_apply | host→dev | `00 00` + raw blob | ack | **[CODE-VERIFIED]** | `calibration.rs::cal_apply_payload` |
 | `0x438` | 1080 | cal_discard_point (discard_data_2d) | host→dev | `00 00` + Q42(x) + Q42(y) | ack | **[CODE-VERIFIED]** | memory `et5-calibration-protocol` (not in `frame.rs` consts) |
-| `0x42e` | 1070 | cal_compute_and_apply_per_eye | host→dev | per-eye path; returns collected_eyes | — | **[HYPOTHESIS]** | memory `et5-calibration-protocol` (inferred, unverified) |
+
 | `0x460` | 1120 | cal_stimulus_points_get | host→dev | quality: per-point L/R precision+bias | — | **[CODE-VERIFIED]** | memory `et5-calibration-protocol` |
 
 ## Enabled eye ("Select eyes to detect", platmod property)
