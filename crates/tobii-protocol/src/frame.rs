@@ -73,6 +73,23 @@ pub const OP_CAL_DISCARD_POINT: u32 = 0x438; // redo a point
 /// `0x42f` returns in ~230 ms having done nothing. Measured here at 1.115 s —
 /// see [`OP_CAL_ADD_POINT`].
 pub const OP_CAL_COMPUTE: u32 = 0x42e;
+/// Read back the points of the calibration currently on the device, with
+/// per-point data alongside each.
+///
+/// **[CONFIRMED]** live 2026-08-24: answers with 713 bytes after a calibration,
+/// and with an empty list inside a freshly started session — so it reports what
+/// was collected, it does not supply what to present. `docs/` called it
+/// `stimulus_points_get`, which is misleading enough to have stopped anyone
+/// asking it.
+///
+/// Layout: an outer container, the object id `0x3390`, then one 7-element
+/// record per point. Each record opens with a 3-element `0x1f42` struct whose
+/// first two values are the point's normalized x and y, and is followed by two
+/// `(type-1 = 2, fixed, fixed)` triples of small magnitudes (0.006..0.13). Those
+/// trailing pairs are plausibly a per-eye residual or offset — **[HYPOTHESIS]**,
+/// their meaning has not been established, and they do not obviously track the
+/// error measured by `tobii-gtk --accuracy`.
+pub const OP_CAL_STIMULUS_POINTS: u32 = 0x460;
 pub const OP_CAL_RETRIEVE: u32 = 0x44c;
 pub const OP_CAL_APPLY: u32 = 0x456;
 

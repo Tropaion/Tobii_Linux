@@ -38,6 +38,7 @@ fn main() -> ExitCode {
         (Some("calibrate"), _) => calibrate(args.iter().any(|a| a == "--apply")),
         (Some("cal-probe"), _) => cal_probe(),
         (Some("cal-blob"), _) => cal_blob(),
+        (Some("cal-points"), _) => cal_points(),
         (Some("enabled-eye"), arg) => enabled_eye_cmd(arg),
         _ => {
             eprintln!(
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
                  tobii calibrate [--apply]\n  \
                  tobii cal-probe\n  \
                  tobii cal-blob\n  \
+                 tobii cal-points\n  \
                  tobii enabled-eye [both|left|right]"
             );
             return ExitCode::from(2);
@@ -157,6 +159,80 @@ fn cal_probe() -> CmdResult {
         Err(e) => println!("  calibration_stop  (0x3fc): FAILED ({e})"),
     }
     Ok(())
+}
+
+/// Ask the device for the calibration stimulus points (op `0x460`).
+///
+/// If it answers, the point set is the device's own and settles whether our
+/// hardcoded layout matches the original — no decompiling required. Tries both
+/// outside and inside a calibration session, since a query like this may only be
+/// meaningful once one is open.
+fn cal_points() -> CmdResult {
+    use tobii_protocol::frame::{OP_CAL_START, OP_CAL_STIMULUS_POINTS, OP_CAL_STOP};
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+    conn.set_request_timeout(Duration::from_secs(3));
+
+    let mut ask = |label: &str, conn: &mut Connection<UsbTransport>| match conn
+        .request(OP_CAL_STIMULUS_POINTS, &[0x00, 0x00])
+    {
+        Ok(Some(p)) => {
+            println!("  {label:16} ANSWERED, {} bytes", p.len());
+            println!("    hex: {}", hex(&p));
+            decode_points(&p);
+            true
+        }
+        Ok(None) => {
+            println!("  {label:16} no response");
+            false
+        }
+        Err(e) => {
+            println!("  {label:16} error: {e}");
+            false
+        }
+    };
+
+    println!("asking the device for its calibration points (op 0x460):");
+    let outside = ask("outside session", &mut conn);
+    // A calibration session is not destructive by itself: start then stop, with
+    // no clear and no compute, leaves the existing calibration alone.
+    let inside = match conn.start_calibration() {
+        Ok(()) => {
+            let got = ask("inside session", &mut conn);
+            if let Err(e) = conn.stop_calibration() {
+                eprintln!("warning: failed to leave the calibration session ({e})");
+            }
+            got
+        }
+        Err(e) => {
+            println!("  (could not open a session to ask inside it: {e})");
+            false
+        }
+    };
+    if !outside && !inside {
+        println!("\nNo answer either way. 0x460 is likely not this op, or not a query.");
+    }
+    Ok(())
+}
+
+/// Try to read a stimulus-point list out of a reply: pairs of Q42 values in
+/// `[0,1]` are what a normalized point set looks like on this wire.
+fn decode_points(payload: &[u8]) {
+    let mut r = tobii_protocol::tlv::Reader::new(payload);
+    r.skip(2);
+    let mut pts = Vec::new();
+    while let Ok(p) = r.read_point2d() {
+        pts.push(p);
+    }
+    if pts.is_empty() {
+        println!("    (no point2d values decoded — the layout is something else)");
+        return;
+    }
+    println!("    {} point(s):", pts.len());
+    for (i, p) in pts.iter().enumerate() {
+        println!("      {i}: ({:.4}, {:.4})", p[0], p[1]);
+    }
 }
 
 /// Diagnose the calibration-blob round trip: retrieve it, then apply it both
