@@ -168,13 +168,13 @@ fn cal_probe() -> CmdResult {
 /// outside and inside a calibration session, since a query like this may only be
 /// meaningful once one is open.
 fn cal_points() -> CmdResult {
-    use tobii_protocol::frame::{OP_CAL_START, OP_CAL_STIMULUS_POINTS, OP_CAL_STOP};
+    use tobii_protocol::frame::OP_CAL_STIMULUS_POINTS;
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
     reapply_display_area(&mut conn);
     conn.set_request_timeout(Duration::from_secs(3));
 
-    let mut ask = |label: &str, conn: &mut Connection<UsbTransport>| match conn
+    let ask = |label: &str, conn: &mut Connection<UsbTransport>| match conn
         .request(OP_CAL_STIMULUS_POINTS, &[0x00, 0x00])
     {
         Ok(Some(p)) => {
