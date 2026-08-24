@@ -136,9 +136,25 @@ pub enum DeviceCommand {
     /// `token` identifies this session; it is echoed into `CalPhase::token` so
     /// the UI can tell a fresh phase from the previous session's leftovers.
     CalBegin {
-        eye: EnabledEye,
+        /// Whether to seed from the calibration already on the device.
+        ///
+        /// The original gates both the retrieve and the re-apply on
+        /// `ShouldImproveCalibration` — true only for an explicit
+        /// "improve" recalibration. Every other entry (new profile, guest,
+        /// forced) starts clean. Seeding unconditionally, as this did, hands a
+        /// user who is recalibrating *because the old model is bad* that same
+        /// bad model as the starting point.
+        improve: bool,
         token: u64,
     },
+    /// Compute and apply the model from the points collected so far, without
+    /// ending the session.
+    ///
+    /// The original does this after **every** group — once for the centre
+    /// point, once for each row of three — so the outer points are collected
+    /// against a tracker that already has a partial model applied, rather than
+    /// against the factory one. Only the last compute is followed by a stop.
+    CalComputeGroup,
     /// Sample one stimulus point (both eyes).
     CalCollect {
         x: f64,
@@ -184,9 +200,14 @@ pub fn device_tick<T: Transport>(
                 let _ = tobii_config::save_enabled_eye(e);
                 state.lock().unwrap().enabled_eye = Some(e);
             }
-            DeviceCommand::CalBegin { eye, token } => {
+            DeviceCommand::CalBegin { improve, token } => {
                 state.lock().unwrap().calibration = CalPhase::begin(token);
-                let _ = conn.set_enabled_eye(eye); // best-effort select-eyes experiment
+                // Deliberately does NOT touch enabled_eye. The original never
+                // does during calibration: `CalibrationStart` is hardcoded to
+                // both eyes and the configured selection is used only to pick
+                // which eye's gaze drives dot focus, host-side. Writing it here
+                // mutated persistent device state as a side effect of opening
+                // a calibration.
 
                 // Retrieve whatever calibration is currently active on the
                 // device BEFORE clearing it, so a successful start+clear below
@@ -198,9 +219,9 @@ pub fn device_tick<T: Transport>(
                 // nothing to improve on (e.g. a true first-ever calibration) —
                 // proceed as a plain fresh session in that case, exactly as
                 // before this change.
-                let previous_blob = conn
-                    .retrieve_calibration()
-                    .ok()
+                let previous_blob = improve
+                    .then(|| conn.retrieve_calibration().ok())
+                    .flatten()
                     .filter(|b| tobii_usb::is_plausible_calibration(&b.0));
 
                 // Pessimistic: a request fails on a wall-clock deadline, which
@@ -243,6 +264,18 @@ pub fn device_tick<T: Transport>(
             DeviceCommand::CalDiscard { x, y } => {
                 if let Err(e) = conn.discard_calibration_point(x, y) {
                     eprintln!("warning: could not discard calibration point ({e})");
+                }
+            }
+            DeviceCommand::CalComputeGroup => {
+                // A failure here is fatal to the session: the model is now in
+                // an unknown state and collecting more points onto it would
+                // produce a calibration nobody can reason about.
+                if let Err(e) = conn.compute_and_apply_calibration() {
+                    state
+                        .lock()
+                        .unwrap()
+                        .calibration
+                        .on_finish(Err(e.to_string()));
                 }
             }
             DeviceCommand::CalFinish { mode } => {
@@ -690,18 +723,18 @@ mod tests {
 
     #[test]
     fn cal_begin_echoes_the_token_and_marks_the_session_open() {
-        // Post-handshake seqs run 5, 6, 7, 8: set_enabled_eye, retrieve
-        // (empty -> no previous blob, so no reapply follows), start, clear.
+        // Post-handshake seqs run 5, 6, 7: retrieve (empty -> no previous
+        // blob, so no reapply follows), start, clear. No set_enabled_eye —
+        // the original never touches it during a calibration.
         let mut conn = connected(vec![
-            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
-            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[]),
-            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
-            inbound(TTP_MAGIC_RSP, 8, 0x424, &[]),
+            inbound(TTP_MAGIC_RSP, 5, 0x44c, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x424, &[]),
         ]);
         let state = Mutex::new(DeviceState::default());
         let (tx, rx) = channel::<DeviceCommand>();
         tx.send(DeviceCommand::CalBegin {
-            eye: EnabledEye::Both,
+            improve: true,
             token: 99,
         })
         .unwrap();
@@ -724,18 +757,17 @@ mod tests {
         // is what makes "Improve calibration" build on the old calibration
         // instead of behaving like a from-scratch one.
         let mut conn = connected(vec![
-            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
             // Two status bytes then a blob big enough to be believable: the
             // apply path now refuses anything too small to be a calibration.
-            inbound(TTP_MAGIC_RSP, 6, 0x44c, &big_blob()),
-            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
-            inbound(TTP_MAGIC_RSP, 8, 0x424, &[]),
-            inbound(TTP_MAGIC_RSP, 9, 0x456, &[]),
+            inbound(TTP_MAGIC_RSP, 5, 0x44c, &big_blob()),
+            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x424, &[]),
+            inbound(TTP_MAGIC_RSP, 8, 0x456, &[]),
         ]);
         let state = Mutex::new(DeviceState::default());
         let (tx, rx) = channel::<DeviceCommand>();
         tx.send(DeviceCommand::CalBegin {
-            eye: EnabledEye::Both,
+            improve: true,
             token: 1,
         })
         .unwrap();
@@ -754,15 +786,14 @@ mod tests {
         // fail instantly with "can't detect your eyes", which is what shipping
         // this in the start/clear chain did.
         let mut conn = connected(vec![
-            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
-            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[0x00, 0x00, 0xDE, 0xAD]),
-            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
-            inbound(TTP_MAGIC_RSP, 8, 0x424, &[]),
+            inbound(TTP_MAGIC_RSP, 5, 0x44c, &[0x00, 0x00, 0xDE, 0xAD]),
+            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 7, 0x424, &[]),
         ]);
         let state = Mutex::new(DeviceState::default());
         let (tx, rx) = channel::<DeviceCommand>();
         tx.send(DeviceCommand::CalBegin {
-            eye: EnabledEye::Both,
+            improve: true,
             token: 1,
         })
         .unwrap();
@@ -785,15 +816,14 @@ mod tests {
         // start (seq 7) acks, clear (seq 8) gets no response: the realm IS open
         // and a later abort must still stop it, even though `active` is false.
         let mut conn = connected(vec![
-            inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]),
-            inbound(TTP_MAGIC_RSP, 6, 0x44c, &[]),
-            inbound(TTP_MAGIC_RSP, 7, 0x3f2, &[]),
+            inbound(TTP_MAGIC_RSP, 5, 0x44c, &[]),
+            inbound(TTP_MAGIC_RSP, 6, 0x3f2, &[]),
         ]);
         conn.set_request_timeout(Duration::from_millis(10));
         let state = Mutex::new(DeviceState::default());
         let (tx, rx) = channel::<DeviceCommand>();
         tx.send(DeviceCommand::CalBegin {
-            eye: EnabledEye::Both,
+            improve: true,
             token: 5,
         })
         .unwrap();
@@ -806,6 +836,12 @@ mod tests {
         }
         // ...and the abort therefore actually stops it (the pre-fix `active`
         // guard skipped exactly this case).
+        //
+        // NOTE: the abort's restore path calls `tobii_config::load_calibration`,
+        // which reads the real user config directory — so whether an apply is
+        // even attempted here depends on the machine this runs on. The
+        // assertions below deliberately do not depend on that, but the coupling
+        // is real and this test would be better with a config seam.
         tx.send(DeviceCommand::CalAbort).unwrap();
         device_tick(&mut conn, &state, &rx);
         assert!(sent_op(&conn, 0x3fc), "CAL_STOP was sent");

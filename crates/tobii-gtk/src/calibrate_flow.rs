@@ -23,7 +23,6 @@ use crate::{
     screen_height, widget,
 };
 use tobii_protocol::gaze::present;
-use tobii_protocol::EnabledEye;
 
 /// The 7-point calibration layout (normalized, top-left origin), verified
 /// byte-for-byte against the decompiled real Windows software's
@@ -71,12 +70,11 @@ impl CalMode {
 /// the real product shows these 7 points in three groups (center alone;
 /// indices 1-3 together; indices 4-6 together — see `CalibrationStateManager`)
 /// and recomputes the hit-zone radius fresh per group, from only that
-/// group's own points. Our UI shows one point at a time rather than the
-/// original's simultaneous groups, but the *tolerance* for each point should
-/// still match whichever group it conceptually belongs to — using the
-/// spacing of all 7 points at once (as this code did before) gives roughly
-/// half the correct radius for the corner points in the last group, making
-/// them very hard to hold focus on.
+/// group's own points. We show the group simultaneously too, and let gaze pick
+/// which member is being looked at, so the tolerance must be the group's own:
+/// using the spacing of all 7 points at once (as this code did before) gives
+/// roughly half the correct radius for the corner points in the last group,
+/// making them very hard to hold focus on.
 fn group_zone_radii(points: &[(f64, f64); 7], aspect: f64) -> [f64; 7] {
     let center = focus::zone_radius(&points[0..1], aspect); // fewer than 2 points -> f64::MAX, i.e. "always in zone", matching the original's "whole screen" radius for the lone center point
     let group_b = focus::zone_radius(&points[1..4], aspect);
@@ -137,11 +135,11 @@ const EXPLODE_DURATION_TICKS: u32 = 24;
 // will not dequeue the abort for the remaining difference — the window in which
 // a queued CalBegin/CalFinish can still land on a session the UI has abandoned.
 //
-// `CalBegin` runs set_enabled_eye + retrieve_calibration + start + clear +
-// (conditionally) apply_calibration — up to five requests, each bounded by
-// `tobii-usb` DEFAULT_REQUEST_TIMEOUT (10 s). (Grew from three to five when
-// "Improve calibration" seeding was added — this budget must stay in step
-// with whatever `CalBegin`'s handler in `device.rs` actually does.)
+// `CalBegin` runs start + clear, and for an "improve" run also
+// retrieve_calibration + apply_calibration — up to four requests. The apply
+// carries a few hundred KB and has its own 60 s window (`CAL_APPLY_TIMEOUT`),
+// so this budget must stay in step with what `CalBegin`'s handler in
+// `device.rs` actually does.
 const START_TIMEOUT_TICKS: u32 = 2000; // ~66 s waiting for the device to ack CalBegin
 
 // One point is bounded by `tobii-usb` CAL_POINT_TIMEOUT (30 s) — keep this
@@ -462,9 +460,9 @@ fn done_phase(res: Result<(), String>) -> Phase {
 /// `Phase::Starting` transition. Does not touch `phase` itself, so it is
 /// safe to call whether or not the caller already holds `phase`'s RefCell
 /// borrow (see the two call sites).
-fn begin_calibration_phase(cmd_tx: &Sender<DeviceCommand>, eye: EnabledEye) -> Phase {
+fn begin_calibration_phase(cmd_tx: &Sender<DeviceCommand>, improve: bool) -> Phase {
     let token = next_cal_token();
-    let _ = cmd_tx.send(DeviceCommand::CalBegin { eye, token });
+    let _ = cmd_tx.send(DeviceCommand::CalBegin { improve, token });
     Phase::Starting {
         mode: CalMode::Full,
         token,
@@ -474,18 +472,17 @@ fn begin_calibration_phase(cmd_tx: &Sender<DeviceCommand>, eye: EnabledEye) -> P
 
 /// Open the fullscreen follow-the-dot calibration flow, returning the window so
 /// the caller can react to it closing (the hub re-enables its button).
+/// `improve` refines the calibration already on the device instead of starting
+/// clean — the hub's "Improve calibration" entry. The original gates its own
+/// seeding on exactly this distinction (`ShouldImproveCalibration`), because a
+/// user recalibrating *because the model is bad* should not be handed that model
+/// back as a starting point.
 pub fn launch(
     app: &Application,
     state: Arc<Mutex<DeviceState>>,
     cmd_tx: Sender<DeviceCommand>,
+    improve: bool,
 ) -> gtk::ApplicationWindow {
-    // Eye to calibrate: the device's current selection, defaulting to Both.
-    let eye = state
-        .lock()
-        .unwrap()
-        .enabled_eye
-        .unwrap_or(EnabledEye::Both);
-
     // If the physical screen is large enough that gaze estimation near the
     // literal edge isn't reliable pre-calibration, confine every calibration
     // point to a centered sub-rectangle instead of the raw full-screen
@@ -684,7 +681,7 @@ pub fn launch(
             if !in_eye_preview {
                 return;
             }
-            *phase.borrow_mut() = begin_calibration_phase(&cmd_tx, eye);
+            *phase.borrow_mut() = begin_calibration_phase(&cmd_tx, improve);
         })
     };
     {
@@ -711,7 +708,7 @@ pub fn launch(
             if !in_done {
                 return;
             }
-            *phase.borrow_mut() = begin_calibration_phase(&cmd_tx, eye);
+            *phase.borrow_mut() = begin_calibration_phase(&cmd_tx, improve);
         });
     }
     // Every exit routes through `win.close()` so the single close handler below
@@ -798,7 +795,7 @@ pub fn launch(
                     // `phase`, so it's safe here; the transition it returns is
                     // applied via `next` (assigned to `*ph` once the match
                     // returns), same as every other arm.
-                    next = Some(begin_calibration_phase(&tick_cmd, eye));
+                    next = Some(begin_calibration_phase(&tick_cmd, improve));
                 } else {
                     next = Some(Phase::EyePreview {
                         ticks: ticks + 1,
@@ -958,6 +955,12 @@ pub fn launch(
                             });
                             next = Some(Phase::Computing { token, ticks: 0 });
                         } else if group_done {
+                            // Fit and apply what this group gathered before
+                            // showing the next one, as the original does. The
+                            // device thread runs commands in order, so the next
+                            // group's first capture queues behind this compute
+                            // rather than racing it.
+                            let _ = tick_cmd.send(DeviceCommand::CalComputeGroup);
                             next = Some(Phase::Collecting {
                                 token,
                                 mode,

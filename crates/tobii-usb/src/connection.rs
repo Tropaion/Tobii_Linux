@@ -251,7 +251,15 @@ impl<T: Transport> Connection<T> {
         // Its own window: this pushes a few hundred KB across ~40 transfers and
         // then waits for the device to ingest a whole calibration model. The
         // 10 s default is a request timeout, sized for one small round trip.
-        self.request_until(OP_CAL_APPLY, &cal_apply_payload(blob), CAL_APPLY_TIMEOUT)?
+        //
+        // A caller that has *lowered* the timeout below the default meant it —
+        // probes and tests want to fail fast — so only widen from the default.
+        let window = if self.request_timeout < DEFAULT_REQUEST_TIMEOUT {
+            self.request_timeout
+        } else {
+            CAL_APPLY_TIMEOUT
+        };
+        self.request_until(OP_CAL_APPLY, &cal_apply_payload(blob), window)?
             .ok_or(UsbError::NoResponse { op: OP_CAL_APPLY })?;
         Ok(())
     }

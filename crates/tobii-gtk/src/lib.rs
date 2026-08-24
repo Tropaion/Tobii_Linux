@@ -393,7 +393,8 @@ fn build_ui(app: &Application) {
             // One flow at a time: a second window would drive the same device
             // session and corrupt the first's point accounting.
             btn.set_sensitive(false);
-            let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone());
+            // The hub's entry is "Improve calibration": refine what is there.
+            let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone(), true);
             let btn = btn.clone();
             win.connect_close_request(move |_| {
                 btn.set_sensitive(true);
@@ -459,7 +460,9 @@ fn build_ui(app: &Application) {
             // applies (and would otherwise reappear stale once this closes).
             banner.set_visible(false);
             btn.set_sensitive(false);
-            let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone());
+            // The banner fires when the existing calibration is no longer
+            // trusted, so seeding from it would be self-defeating.
+            let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone(), false);
             let btn = btn.clone();
             win.connect_close_request(move |_| {
                 btn.set_sensitive(true);
@@ -550,7 +553,9 @@ fn build_ui(app: &Application) {
                         {
                             let state = state.clone();
                             let cmd_tx = tick_cmd_tx.clone();
-                            move |app| calibrate_flow::launch(app, state.clone(), cmd_tx.clone())
+                            move |app| {
+                                calibrate_flow::launch(app, state.clone(), cmd_tx.clone(), false)
+                            }
                         },
                     ),
                     tobii_config::CalAction::RecommendCalibration(reason) => {
