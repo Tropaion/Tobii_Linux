@@ -13,11 +13,13 @@
 //!   shipped, and reverted in `8b21938` — accurate at the centre, centimetres
 //!   out at the sides, the signature of double-counting something the
 //!   calibration had already absorbed.
-//! - **Calibration coverage** looked compelling too: `capped_area` confines the
-//!   stimulus points to 600 mm, so on a 1193 mm panel every point lands between
-//!   x = 0.30 and x = 0.70. But `calibration_area` is a port of the original's
-//!   own `CalibrationAreaCalculator`, so the original confines them identically.
-//!   Something both sides do cannot explain a difference between them.
+//! - **Calibration coverage** was dismissed here on the grounds that
+//!   `calibration_area` ports the original's own `CalibrationAreaCalculator`,
+//!   so both sides confine the points identically. That reasoning answered the
+//!   wrong question — "why are we worse than the original" rather than "why is
+//!   the edge bad" — and it is now the standing explanation: with a calibration
+//!   that actually works, error per unit offset is ~0 inside the calibrated
+//!   band and eleven to thirteen times that outside it.
 //! - **Plane depth** (`offset_z_mm`) has never been measured on any setup here,
 //!   and a depth error produces this shape too.
 //!
@@ -223,7 +225,7 @@ const GAIN_RATIO: f64 = 1.8;
 /// Read an error profile and name the most likely cause.
 ///
 /// `calibrated_band` is the `(min_x, max_x)` the calibration points actually
-/// covered — from `calibration_area::capped_area` composed with the point set,
+/// covered — from `calibration_area::capped_area_at` composed with the point set,
 /// NOT the full screen. Targets outside it are the extrapolated ones.
 pub fn diagnose(measurements: &[Measurement], calibrated_band: (f64, f64)) -> Diagnosis {
     let dead_targets = measurements.iter().filter(|m| m.samples == 0).count();
@@ -379,9 +381,19 @@ pub fn diagnose(measurements: &[Measurement], calibrated_band: (f64, f64)) -> Di
 }
 
 /// The horizontal band the calibration points actually covered, given the
-/// screen size and the point set's own x values.
-pub fn calibrated_band(width_mm: f64, height_mm: f64, points: &[(f64, f64)]) -> (f64, f64) {
-    let area = crate::calibration_area::capped_area(width_mm, height_mm);
+/// screen size, the viewing distance and the point set's own x values.
+///
+/// Takes the distance because the area is sized from it — reporting the fixed
+/// 600mm band while the flow calibrated a wider one would label targets
+/// "(calibrated)" that never were, which is exactly the annotation this report
+/// exists to get right.
+pub fn calibrated_band(
+    width_mm: f64,
+    height_mm: f64,
+    distance_mm: Option<f64>,
+    points: &[(f64, f64)],
+) -> (f64, f64) {
+    let area = crate::calibration_area::capped_area_at(width_mm, height_mm, distance_mm);
     let xs: Vec<f64> = points
         .iter()
         .map(|&p| crate::calibration_area::remap_point(p, area).0)
@@ -611,7 +623,16 @@ pub fn launch(
     let height_mm = setup.as_ref().map_or(0.0, |s| s.height_mm);
     let offset_x_mm = setup.as_ref().map_or(0.0, |s| s.offset_x_mm);
     let eye_mode = state.lock().ok().and_then(|s| s.enabled_eye);
-    let band = calibrated_band(width_mm, height_mm, &crate::calibrate_flow::FULL_7);
+    let band = calibrated_band(
+        width_mm,
+        height_mm,
+        state
+            .lock()
+            .ok()
+            .and_then(|s| s.eye_view.and_then(|v| v.distance_mm))
+            .map(f64::from),
+        &crate::calibrate_flow::FULL_7,
+    );
 
     let win = gtk::ApplicationWindow::builder()
         .application(app)
@@ -1093,7 +1114,7 @@ mod tests {
 
     #[test]
     fn the_real_sweep_reads_as_the_device_running_out_of_angle() {
-        let band = calibrated_band(1193.0, 336.0, &crate::calibrate_flow::FULL_7);
+        let band = calibrated_band(1193.0, 336.0, None, &crate::calibrate_flow::FULL_7);
         let d = diagnose(&real_sweep(), band);
         assert_eq!(
             d.cause,
@@ -1125,12 +1146,12 @@ mod tests {
         // The user's 1193x336 panel: capping confines calibration to 600mm,
         // and FULL_7's own 0.1..0.9 inset narrows it further.
         let pts = crate::calibrate_flow::FULL_7;
-        let (lo, hi) = calibrated_band(1193.0, 336.0, &pts);
+        let (lo, hi) = calibrated_band(1193.0, 336.0, None, &pts);
         assert!((lo - 0.299).abs() < 0.005, "lo {lo}");
         assert!((hi - 0.701).abs() < 0.005, "hi {hi}");
 
         // A small screen is not capped, so the band is the point set's own span.
-        let (lo, hi) = calibrated_band(500.0, 300.0, &pts);
+        let (lo, hi) = calibrated_band(500.0, 300.0, None, &pts);
         assert!(
             (lo - 0.1).abs() < 1e-9 && (hi - 0.9).abs() < 1e-9,
             "{lo} {hi}"

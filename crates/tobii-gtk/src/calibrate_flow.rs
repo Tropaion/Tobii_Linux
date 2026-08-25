@@ -493,10 +493,21 @@ pub fn launch(
     // matching this flow's existing behavior before this fix — calibration
     // is only ever reachable after display setup has already succeeded, so
     // this should always find a saved setup in practice.
+    // Sized from the user's measured distance so the outermost stimulus lands
+    // on the gaze angle this device still resolves, rather than on a fixed
+    // 600mm — see `calibration_area::capped_area_at`. The eye preview has just
+    // been showing live eye data, so a distance is normally to hand; without
+    // one that helper falls back to Tobii's fixed area rather than guessing a
+    // number the answer scales directly with.
+    let distance_mm = state
+        .lock()
+        .ok()
+        .and_then(|s| s.eye_view.and_then(|v| v.distance_mm))
+        .map(f64::from);
     let cal_area = tobii_config::load()
         .ok()
         .flatten()
-        .and_then(|s| calibration_area::capped_area(s.width_mm, s.height_mm));
+        .and_then(|s| calibration_area::capped_area_at(s.width_mm, s.height_mm, distance_mm));
     let raw_points = CalMode::Full.points();
     let cal_points: [(f64, f64); 7] =
         std::array::from_fn(|i| calibration_area::remap_point(raw_points[i], cal_area));
