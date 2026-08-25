@@ -45,12 +45,13 @@ window { background-color: #15181c; color: #e6e8ea; }
 .cal-fail-tips { font-size: 14px; color: #9aa4ad; }
 .cal-fail-detail { font-size: 12px; color: #6b7178; font-style: italic; }
 .cal-success-heading { font-size: 32px; font-weight: bold; }
-/* No min-height and no label padding here on purpose. Both were fighting the
-   label's own natural height, and the loser was the text: with `min-height`
-   pinning the content box and the label's padding eating into it, tall glyphs
-   were clipped along their tops -- the T of \"Try again\", the D of \"Done\".
-   Vertical padding alone sizes the button, and a naturally-sized label cannot
-   be cut off. */
+/* No min-height and no label padding. A previous revision claimed those two
+   were clipping the tops of tall glyphs; that claim is DISPROVEN — GTK4 pushes
+   no clip anywhere in the Button->Label path (only overflow:hidden does, and
+   nothing here sets it), and a minimal program using this stylesheet verbatim
+   would not clip at any scale or renderer. Their absence is now merely a
+   simplification, not a fix, and the reported clipping remains unexplained.
+   Do not cite this rule as its cause. */
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
          border: none; border-radius: 8px; padding: 10px 18px; }
 button:hover { background-color: #26b6b8; }
