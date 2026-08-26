@@ -559,7 +559,17 @@ fn camera(args: &[String]) -> CmdResult {
     let mut saved = 0u32;
     let deadline = Instant::now() + Duration::from_secs(20);
     while saved < count && Instant::now() < deadline {
+        let mut eyes_seen = false;
         for (op, payload) in conn.read_notifications() {
+            // Track whether the device is actually seeing eyes while these
+            // frames are captured. Without it a dark frame is ambiguous: nobody
+            // in view, or illuminators off. Head-pose work needs to tell those
+            // apart before blaming a model for finding no face.
+            if op == tobii_protocol::frame::OP_GAZE_NOTIFY {
+                if let Some(g) = tobii_protocol::GazeSample::decode(&payload) {
+                    eyes_seen |= g.validity_l == 0 || g.validity_r == 0;
+                }
+            }
             if op != id as u32 {
                 continue;
             }
@@ -577,13 +587,25 @@ fn camera(args: &[String]) -> CmdResult {
                 .create_new(true)
                 .open(&path)?;
             file.write_all(&out)?;
+            let peak = f.pixels.iter().copied().max().unwrap_or(0);
             println!(
-                "{}  ({}x{}, {}-bit, mean brightness {mean})",
+                "{}  ({}x{}, {}-bit, mean {mean}, peak {peak}, eyes {})",
                 path.display(),
                 f.width,
                 f.height,
-                f.bit_depth
+                f.bit_depth,
+                if eyes_seen {
+                    "DETECTED"
+                } else {
+                    "not detected"
+                }
             );
+            if !eyes_seen && peak < 64 {
+                println!(
+                    "    ^ dark frame with no eyes detected — nobody in view, so this \
+                     says nothing about whether a face is legible to a model."
+                );
+            }
             saved += 1;
             if saved >= count {
                 break;
