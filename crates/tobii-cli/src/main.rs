@@ -1064,8 +1064,10 @@ enum ModelChoice {
     Auto,
     /// Never load a model, even if one is installed.
     Off,
-    /// Load this exact file.
-    Path(std::path::PathBuf),
+    /// Load this exact file. Only read by the `onnx` build; the lean build
+    /// still parses the flag so that a script passing it does not fail, it just
+    /// has nothing to load it with.
+    Path(#[cfg_attr(not(feature = "onnx"), allow(dead_code))] std::path::PathBuf),
 }
 
 fn model_choice(args: &[String]) -> ModelChoice {
