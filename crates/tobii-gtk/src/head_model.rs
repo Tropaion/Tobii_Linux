@@ -53,6 +53,57 @@ pub fn progress_line(so_far: u64, total: u64) -> String {
     )
 }
 
+/// Undo hard line wrapping so a widget can wrap the text to its own width.
+///
+/// [`model_store::TERMS`] is wrapped at ~76 columns because its other consumer
+/// is a terminal. Handing that to a wrapping `Label` wraps it *twice* — every
+/// hard newline becomes a short line, and the paragraph comes out ragged. So
+/// each paragraph is joined back into one logical line here and the widget is
+/// left to do the wrapping.
+///
+/// Blank lines separate paragraphs and are kept. A line that starts with
+/// whitespace is deliberately *not* joined: that is how the terms set their
+/// licence URL apart, and a URL folded into a paragraph is much worse to read.
+pub fn reflow(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut open = false; // a paragraph is being accumulated
+    for line in text.lines() {
+        let indented = line.starts_with(char::is_whitespace);
+        if line.trim().is_empty() {
+            out.push_str("\n\n");
+            open = false;
+        } else if indented {
+            if open {
+                out.push('\n');
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+            open = false;
+        } else {
+            if open {
+                out.push(' ');
+            }
+            out.push_str(line.trim());
+            open = true;
+        }
+    }
+    // Collapse the runs of blank lines the loop above can leave at a boundary.
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    out.trim().to_string()
+}
+
+/// What the download is about to do, in the user's terms rather than ours.
+pub fn download_summary(src: &ModelSource) -> String {
+    format!(
+        "{} — {:.1} MB, from {}",
+        src.file,
+        src.bytes as f64 / 1e6,
+        src.url
+    )
+}
+
 /// Build the control: a status line plus, when there is something to fetch, a
 /// button that shows the terms and downloads on explicit agreement.
 pub fn control() -> gtk::Box {
@@ -80,72 +131,144 @@ pub fn control() -> gtk::Box {
     let status_for_click = status.clone();
     let refresh_for_click = refresh.clone();
     button.connect_clicked(move |btn| {
-        let dlg = gtk::AlertDialog::builder()
-            .modal(true)
-            .message("Download the head-pose model?")
-            .detail(format!(
-                "{}\n\nAbout to download {} ({:.1} MB) from {}",
-                model_store::TERMS,
-                SRC.file,
-                SRC.bytes as f64 / 1e6,
-                SRC.url
-            ))
-            .buttons(["Cancel", "I agree — download"])
-            // Both the Escape key and the default action must mean "no": the
-            // safe answer to a licence prompt is the one that fetches nothing.
-            .cancel_button(0)
-            .default_button(0)
-            .build();
-        let btn = btn.clone();
         let status = status_for_click.clone();
         let refresh = refresh_for_click.clone();
-        // The hub window is built after this control, so the dialog's parent is
-        // taken from the button's own root at click time rather than captured.
+        let btn = btn.clone();
+        // The hub window is built after this control, so the parent is taken
+        // from the button's own root at click time rather than captured.
         let parent = btn.root().and_downcast::<gtk::Window>();
-        dlg.choose(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
-            if res.unwrap_or(0) != 1 {
-                return;
-            }
-            btn.set_sensitive(false);
-            status.set_text(&progress_line(0, SRC.bytes));
-            // Off the UI thread: 13 MB over an unknown link must not freeze the
-            // hub. The worker touches no widgets — it only sends its result.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(model_store::fetch(SRC));
-            });
-            glib::timeout_add_local(Duration::from_millis(150), move || {
-                match rx.try_recv() {
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        // The fetcher is a child process (curl/wget), so the
-                        // only progress signal available is the part-file
-                        // growing on disk.
-                        let so_far = std::fs::metadata(model_store::download_path(SRC))
-                            .map(|m| m.len())
-                            .unwrap_or(0);
-                        status.set_text(&progress_line(so_far, SRC.bytes));
-                        glib::ControlFlow::Continue
-                    }
-                    Ok(Ok(_)) => {
-                        btn.set_sensitive(true);
-                        refresh();
-                        glib::ControlFlow::Break
-                    }
-                    Ok(Err(e)) => {
-                        btn.set_sensitive(true);
-                        status.set_text(&format!("Download failed: {e}"));
-                        glib::ControlFlow::Break
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        btn.set_sensitive(true);
-                        status.set_text("Download failed: the download stopped unexpectedly.");
-                        glib::ControlFlow::Break
-                    }
-                }
-            });
+        terms_dialog(parent.as_ref(), move || {
+            start_download(&btn, &status, refresh.clone())
         });
     });
     b
+}
+
+/// A modal window showing the licence terms, with an explicit agree/cancel.
+///
+/// Deliberately a real window rather than a `gtk::AlertDialog`: the terms run to
+/// several paragraphs, and `AlertDialog`'s detail text neither scrolls nor gives
+/// any control over how it is laid out — it grows the dialog until it is taller
+/// than the screen. `on_agree` runs only for the agree button.
+fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F) {
+    let heading = Label::new(Some("Download the head-pose model?"));
+    heading.add_css_class("cal-fail-heading");
+    heading.set_halign(Align::Start);
+    heading.set_wrap(true);
+    heading.set_xalign(0.0);
+
+    let terms = Label::new(Some(&reflow(model_store::TERMS)));
+    terms.set_wrap(true);
+    terms.set_xalign(0.0);
+    terms.set_halign(Align::Start);
+    // Without this a wrapping label reports its *unwrapped* width as natural,
+    // and the window opens as wide as the longest paragraph.
+    terms.set_max_width_chars(64);
+    terms.set_selectable(true);
+
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_child(Some(&terms));
+    scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scroller.set_vexpand(true);
+    scroller.set_min_content_height(320);
+
+    let what = Label::new(Some(&download_summary(SRC)));
+    what.add_css_class("section-desc");
+    what.set_wrap(true);
+    what.set_wrap_mode(gtk::pango::WrapMode::WordChar); // the URL has no spaces
+    what.set_xalign(0.0);
+    what.set_halign(Align::Start);
+    what.set_max_width_chars(64);
+
+    let cancel = Button::with_label("Cancel");
+    let agree = Button::with_label("I agree — download");
+    let buttons = gtk::Box::new(Orientation::Horizontal, 12);
+    buttons.set_halign(Align::End);
+    buttons.append(&cancel);
+    buttons.append(&agree);
+
+    let content = gtk::Box::new(Orientation::Vertical, 14);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content.append(&heading);
+    content.append(&scroller);
+    content.append(&what);
+    content.append(&buttons);
+
+    let win = gtk::Window::builder()
+        .title("Head-pose model")
+        .modal(true)
+        .default_width(620)
+        .default_height(560)
+        .child(&content)
+        .build();
+    if let Some(p) = parent {
+        win.set_transient_for(Some(p));
+    }
+
+    let w = win.clone();
+    cancel.connect_clicked(move |_| w.close());
+    let w = win.clone();
+    agree.connect_clicked(move |_| {
+        w.close();
+        on_agree();
+    });
+    // Escape is a "no", like every other refusal path here.
+    let keys = gtk::EventControllerKey::new();
+    let w = win.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            w.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    win.add_controller(keys);
+    win.present();
+}
+
+/// Fetch on a worker thread, reporting progress from the part-file's size.
+fn start_download<F: Fn() + Clone + 'static>(btn: &Button, status: &Label, refresh: F) {
+    btn.set_sensitive(false);
+    btn.set_visible(true);
+    status.set_text(&progress_line(0, SRC.bytes));
+    // Off the UI thread: 13 MB over an unknown link must not freeze the hub.
+    // The worker touches no widgets — it only sends its result.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(model_store::fetch(SRC));
+    });
+    let btn = btn.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            // The fetcher is a child process (curl/wget), so the only progress
+            // signal available is the part-file growing on disk.
+            let so_far = std::fs::metadata(model_store::download_path(SRC))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            status.set_text(&progress_line(so_far, SRC.bytes));
+            glib::ControlFlow::Continue
+        }
+        Ok(Ok(_)) => {
+            btn.set_sensitive(true);
+            refresh();
+            glib::ControlFlow::Break
+        }
+        Ok(Err(e)) => {
+            btn.set_sensitive(true);
+            status.set_text(&format!("Download failed: {e}"));
+            glib::ControlFlow::Break
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            btn.set_sensitive(true);
+            status.set_text("Download failed: the download stopped unexpectedly.");
+            glib::ControlFlow::Break
+        }
+    });
 }
 
 #[cfg(test)]
@@ -183,5 +306,48 @@ mod tests {
             progress_line(6_000_000, 12_919_981),
             "Downloading… 6.0 of 12.9 MB"
         );
+    }
+
+    #[test]
+    fn reflow_joins_a_hard_wrapped_paragraph_into_one_line() {
+        let got = reflow("one two\nthree four\n\nsecond para\ncontinues");
+        assert_eq!(got, "one two three four\n\nsecond para continues");
+    }
+
+    #[test]
+    fn reflow_leaves_an_indented_line_alone() {
+        // This is how the terms set their licence URL apart; folding a URL into
+        // a paragraph makes it much harder to read and to copy.
+        let got = reflow("text before\n  https://example.invalid/license.md\ntext after");
+        assert!(
+            got.contains("\n  https://example.invalid/license.md\n"),
+            "the indented URL must keep its own line: {got:?}"
+        );
+    }
+
+    /// The bug this function exists for: the real terms, rendered by a wrapping
+    /// widget, came out ragged because they were already wrapped at 76 columns.
+    #[test]
+    fn the_real_terms_contain_no_short_hard_wrapped_lines_after_reflow() {
+        let got = reflow(model_store::TERMS);
+        for line in got.lines() {
+            let l = line.trim();
+            if l.is_empty() || line.starts_with(char::is_whitespace) {
+                continue;
+            }
+            assert!(
+                l.len() > 76,
+                "a paragraph should be one long logical line, got {} chars: {l:?}",
+                l.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_download_summary_names_the_file_the_size_and_the_source() {
+        let s = download_summary(SRC);
+        assert!(s.contains(SRC.file), "{s}");
+        assert!(s.contains("12.9 MB"), "{s}");
+        assert!(s.contains("opentrack"), "{s}");
     }
 }
