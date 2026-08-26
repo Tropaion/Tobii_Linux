@@ -13,4 +13,10 @@ path = "src/main.rs"
 tobii-usb = { path = "../tobii-usb" }
 tobii-protocol = { path = "../tobii-protocol" }
 tobii-config = { path = "../tobii-config" }
-tobii-headpose = { path = "../tobii-headpose" }
+tobii-headpose = { path = "../tobii-headpose", default-features = false }
+
+[features]
+# Mirrors `tobii-headpose`'s. With this off, `tobii headpose` is the 5-DOF
+# eye-origin path exactly as it was, and the neural model is not compiled in.
+default = ["onnx"]
+onnx = ["tobii-headpose/onnx"]

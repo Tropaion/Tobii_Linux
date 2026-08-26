@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tobii_config::DisplaySetup;
 use tobii_headpose::{opentrack, pose_from_sample, PoseFilter};
-use tobii_protocol::frame::OP_GET_DISPLAY_AREA;
+use tobii_protocol::frame::{OP_GAZE_NOTIFY, OP_GET_DISPLAY_AREA};
 use tobii_protocol::gaze::present;
 use tobii_protocol::{DisplayCorners, EnabledEye};
 use tobii_usb::{Connection, UsbTransport};
@@ -48,7 +48,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage:\n  \
                  tobii stream [--json] [--eyes]\n  \
-                 tobii headpose [--udp ADDR] [--rate HZ]\n  \
+                 tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE] [--check]\n  \
                  tobii headpose --model-status\n  \
                  tobii headpose --fetch-model [--agree]\n  \
                  tobii headpose --install-model <FILE>\n  \
@@ -1058,6 +1058,171 @@ fn parse_rate(raw: &str) -> Result<f64, Box<dyn std::error::Error>> {
 /// Pitch is always zero — it cannot be recovered from two eye positions. See
 /// the `tobii-headpose` crate docs for the geometry and the (still unvalidated)
 /// sign conventions.
+/// Which head-pose model to run, from `--model`.
+enum ModelChoice {
+    /// Use the installed model if there is one; otherwise the geometric path.
+    Auto,
+    /// Never load a model, even if one is installed.
+    Off,
+    /// Load this exact file.
+    Path(std::path::PathBuf),
+}
+
+fn model_choice(args: &[String]) -> ModelChoice {
+    match flag_value(args, "--model") {
+        None | Some("auto") => ModelChoice::Auto,
+        Some("off") | Some("none") => ModelChoice::Off,
+        Some(p) => ModelChoice::Path(p.into()),
+    }
+}
+
+#[cfg(feature = "onnx")]
+type Model = tobii_headpose::onnx::OnnxPose;
+#[cfg(not(feature = "onnx"))]
+type Model = std::convert::Infallible;
+
+/// Load the neural backend, reporting what happened on stderr. A missing model
+/// is not an error — it is the ordinary state of a fresh install.
+#[cfg(feature = "onnx")]
+fn open_model(choice: &ModelChoice) -> Option<Model> {
+    use tobii_headpose::model::{ModelConfig, ModelKind};
+    use tobii_headpose::model_store;
+    use tobii_headpose::onnx::OnnxPose;
+    let loaded = match choice {
+        ModelChoice::Off => return None,
+        ModelChoice::Auto => {
+            if model_store::installed(&model_store::HEAD_POSE).is_none() {
+                eprintln!(
+                    "no head-pose model installed — reporting 5 DOF (no pitch). \
+                     Run `tobii headpose --fetch-model` to add it."
+                );
+                return None;
+            }
+            OnnxPose::from_store()
+        }
+        ModelChoice::Path(p) => OnnxPose::load(&ModelConfig {
+            kind: ModelKind::OpentrackOnnx,
+            model_path: p.clone(),
+        }),
+    };
+    match loaded {
+        Ok(m) => {
+            eprintln!("head-pose model loaded — reporting 6 DOF");
+            Some(m)
+        }
+        Err(e) => {
+            eprintln!("could not load the head-pose model ({e}); reporting 5 DOF");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "onnx"))]
+fn open_model(_choice: &ModelChoice) -> Option<Model> {
+    None
+}
+
+/// The device's wide-angle NIR camera stream, which the model runs on.
+const CAMERA_STREAM: u16 = 0x501;
+
+#[cfg(feature = "onnx")]
+type ModelPose = tobii_headpose::onnx::ModelPose;
+#[cfg(not(feature = "onnx"))]
+type ModelPose = std::convert::Infallible;
+
+/// Decode a camera notification and run the model on it, keeping the result if
+/// the model was confident.
+#[cfg(feature = "onnx")]
+fn run_model(model: &mut Option<Model>, payload: &[u8], out: &mut Option<(ModelPose, Instant)>) {
+    let Some(m) = model.as_mut() else { return };
+    let Some(frame) = tobii_protocol::camera::decode_camera_frame(payload) else {
+        return;
+    };
+    if let Some(pose) = m.estimate_detailed(&frame) {
+        *out = Some((pose, Instant::now()));
+    }
+}
+
+#[cfg(not(feature = "onnx"))]
+fn run_model(_m: &mut Option<Model>, _payload: &[u8], _out: &mut Option<(ModelPose, Instant)>) {}
+
+/// Position from the eyes, rotation from the model. See
+/// `tobii_headpose::onnx::fuse` for why that split.
+#[cfg(feature = "onnx")]
+fn fuse_pose(
+    eyes: Option<tobii_headpose::HeadPose>,
+    model: Option<&ModelPose>,
+) -> Option<tobii_headpose::HeadPose> {
+    tobii_headpose::onnx::fuse(eyes, model, tobii_headpose::onnx::RotationSource::Model)
+}
+
+#[cfg(not(feature = "onnx"))]
+fn fuse_pose(
+    eyes: Option<tobii_headpose::HeadPose>,
+    _model: Option<&ModelPose>,
+) -> Option<tobii_headpose::HeadPose> {
+    eyes
+}
+
+/// `--check`: the model's rotation beside the geometry's.
+///
+/// This is the whole sign experiment. Turn your head one axis at a time; the two
+/// yaw numbers must move together, and so must the two roll numbers. If a pair
+/// moves in opposite directions, that sign is inverted in
+/// `tobii_headpose::onnx::Signs` — which is the only place it is decided.
+///
+/// Pitch has no geometric counterpart to check against; what it needs instead is
+/// a zero. Sit square-on to the screen: whatever pitch reads then is the offset
+/// to cancel with `Signs::pitch_offset_deg`.
+#[cfg(feature = "onnx")]
+fn print_check_line(
+    eyes: Option<tobii_headpose::HeadPose>,
+    model: Option<&ModelPose>,
+    rates: &str,
+) {
+    match (eyes, model) {
+        (Some(e), Some(m)) => eprintln!(
+            "model yaw={:>7.2}° pitch={:>7.2}° roll={:>7.2}° sigma={:.3} head=({:>5.1},{:>5.1})px\n\
+             eyes  yaw={:>7.2}°   pitch=  n/a   roll={:>7.2}°   z={:.0}mm   {rates}",
+            m.yaw_deg,
+            m.pitch_deg,
+            m.roll_deg,
+            m.sigma,
+            m.centre_px[0],
+            m.centre_px[1],
+            e.yaw_deg,
+            e.roll_deg,
+            e.z_mm,
+        ),
+        (Some(e), None) => eprintln!(
+            "model  (no confident pose this second)\n\
+             eyes  yaw={:>7.2}°   pitch=  n/a   roll={:>7.2}°   z={:.0}mm   {rates}",
+            e.yaw_deg, e.roll_deg, e.z_mm
+        ),
+        (None, Some(m)) => eprintln!(
+            "model yaw={:>7.2}° pitch={:>7.2}° roll={:>7.2}° sigma={:.3}\n\
+             eyes   (both eyes must be in the trackbox)   {rates}",
+            m.yaw_deg, m.pitch_deg, m.roll_deg, m.sigma
+        ),
+        (None, None) => eprintln!("no pose from either source   {rates}"),
+    }
+}
+
+#[cfg(not(feature = "onnx"))]
+fn print_check_line(
+    eyes: Option<tobii_headpose::HeadPose>,
+    _model: Option<&ModelPose>,
+    rates: &str,
+) {
+    match eyes {
+        Some(e) => eprintln!(
+            "eyes  yaw={:>7.2}°   pitch=  n/a   roll={:>7.2}°   z={:.0}mm   {rates}",
+            e.yaw_deg, e.roll_deg, e.z_mm
+        ),
+        None => eprintln!("no pose   {rates}"),
+    }
+}
+
 fn headpose(args: &[String]) -> CmdResult {
     let addr = parse_udp_addr(flag_value(args, "--udp").unwrap_or(DEFAULT_UDP_ADDR))?;
     let rate_hz = match flag_value(args, "--rate") {
@@ -1065,20 +1230,38 @@ fn headpose(args: &[String]) -> CmdResult {
         None => DEFAULT_RATE_HZ,
     };
     let send_interval = Duration::from_secs_f64(1.0 / rate_hz);
+    // `--check` prints the model's rotation beside the geometry's instead of the
+    // normal status line. It is the experiment that settles the sign
+    // conventions: turn your head one axis at a time and the two must move
+    // TOGETHER. If one is inverted, that sign is wrong.
+    let check = args.iter().any(|a| a == "--check");
 
     // Bind an ephemeral local port; opentrack only ever receives from us.
     let socket = UdpSocket::bind("0.0.0.0:0")?;
+
+    let mut model = open_model(&model_choice(args));
 
     eprintln!("opening Tobii ET5...");
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
     reapply_display_area(&mut conn);
 
+    // The camera stream is only worth its bandwidth when something consumes it.
+    if model.is_some() {
+        conn.set_request_timeout(Duration::from_millis(500));
+        if !conn.subscribe_stream(CAMERA_STREAM)? {
+            eprintln!("the device refused the camera subscription; falling back to 5 DOF");
+            model = None;
+        }
+    }
+
     eprintln!("sending head pose to {addr} at {rate_hz:.0} Hz (Ctrl-C to stop)");
-    eprintln!(
-        "note: pitch is always 0 — it is not derivable from two eye positions, \
-         and the device's own head-pose stream is not mapped yet."
-    );
+    if model.is_none() {
+        eprintln!(
+            "note: pitch is always 0 — two eye positions cannot express it. \
+             `tobii headpose --fetch-model` adds the model that can."
+        );
+    }
 
     let mut filter = PoseFilter::default();
     let now = Instant::now();
@@ -1086,58 +1269,96 @@ fn headpose(args: &[String]) -> CmdResult {
     let mut last_tracked: Option<Instant> = None;
     let mut samples_since_status = 0u32;
     let mut sends_since_status = 0u32;
+    let mut frames_since_status = 0u32;
+    // The model's pose is held between camera frames: the camera runs at ~33 Hz
+    // and gaze at ~33 Hz, but they are not in lockstep, and dropping pitch to
+    // zero on every gaze sample that arrived without a matching image would
+    // shake the head in game. Held for at most `TRACKING_LOSS_RESET`.
+    let mut last_model: Option<(ModelPose, Instant)> = None;
 
     loop {
-        // Drain every sample the device offers and feed them all to the filter;
-        // `--rate` throttles what goes on the wire, not what we smooth over.
-        if let Some(sample) = conn.next_gaze() {
-            samples_since_status += 1;
-            match pose_from_sample(&sample) {
-                Some(raw) => {
-                    last_tracked = Some(Instant::now());
-                    let pose = filter.update(raw);
-                    if last_send.elapsed() >= send_interval {
-                        socket.send_to(&opentrack::to_opentrack_datagram(&pose), addr)?;
-                        last_send = Instant::now();
-                        sends_since_status += 1;
+        let notes = conn.read_notifications();
+        for (op, payload) in notes.iter() {
+            match *op {
+                OP_GAZE_NOTIFY => {
+                    let Some(sample) = tobii_protocol::gaze::GazeSample::decode(payload) else {
+                        continue;
+                    };
+                    samples_since_status += 1;
+                    let eyes = pose_from_sample(&sample);
+                    let fresh = last_model
+                        .as_ref()
+                        .filter(|(_, at)| at.elapsed() < TRACKING_LOSS_RESET)
+                        .map(|(m, _)| m);
+                    let fused = fuse_pose(eyes, fresh);
+                    match fused {
+                        Some(raw) => {
+                            last_tracked = Some(Instant::now());
+                            let pose = filter.update(raw);
+                            if last_send.elapsed() >= send_interval {
+                                socket.send_to(&opentrack::to_opentrack_datagram(&pose), addr)?;
+                                last_send = Instant::now();
+                                sends_since_status += 1;
+                            }
+                        }
+                        None => {
+                            // Tracking lost. Stop sending rather than emitting a
+                            // synthetic pose: opentrack simply holds its last
+                            // value, which is far less jarring in game than a
+                            // snap to zero.
+                            let lost_for = last_tracked.map(|t| t.elapsed());
+                            if lost_for.is_none_or(|d| d >= TRACKING_LOSS_RESET) {
+                                filter.reset();
+                                last_tracked = None;
+                            }
+                        }
                     }
                 }
-                None => {
-                    // Tracking lost. Stop sending rather than emitting a
-                    // synthetic pose: opentrack simply holds its last value,
-                    // which is far less jarring in game than a snap to zero.
-                    let lost_for = last_tracked.map(|t| t.elapsed());
-                    if lost_for.is_none_or(|d| d >= TRACKING_LOSS_RESET) {
-                        filter.reset();
-                        last_tracked = None;
-                    }
+                op if op == u32::from(CAMERA_STREAM) => {
+                    frames_since_status += 1;
+                    run_model(&mut model, payload, &mut last_model);
                 }
+                _ => {}
             }
         }
 
         if last_status.elapsed() >= STATUS_INTERVAL {
             let elapsed = last_status.elapsed().as_secs_f64();
-            match (last_tracked.is_some(), filter.current()) {
-                (true, Some(p)) => eprintln!(
-                    "pos=({:>7.1}, {:>7.1}, {:>7.1})mm  yaw={:>6.1}°  roll={:>6.1}°  \
-                     pitch=n/a   {:.0} samples/s, {:.0} sent/s",
-                    p.x_mm,
-                    p.y_mm,
-                    p.z_mm,
-                    p.yaw_deg,
-                    p.roll_deg,
-                    f64::from(samples_since_status) / elapsed,
-                    f64::from(sends_since_status) / elapsed,
-                ),
-                _ => eprintln!(
-                    "NO HEAD DETECTED — both eyes must be in the trackbox  \
-                     ({:.0} samples/s, not sending)",
-                    f64::from(samples_since_status) / elapsed
-                ),
+            let rates = format!(
+                "{:.0} samples/s, {:.0} frames/s, {:.0} sent/s",
+                f64::from(samples_since_status) / elapsed,
+                f64::from(frames_since_status) / elapsed,
+                f64::from(sends_since_status) / elapsed,
+            );
+            if check {
+                print_check_line(
+                    filter.current(),
+                    last_model.as_ref().map(|(m, _)| m),
+                    &rates,
+                );
+            } else {
+                match (last_tracked.is_some(), filter.current()) {
+                    (true, Some(p)) => {
+                        let pitch = match last_model {
+                            Some(_) => format!("{:>6.1}°", p.pitch_deg),
+                            None => "   n/a".to_string(),
+                        };
+                        eprintln!(
+                            "pos=({:>7.1}, {:>7.1}, {:>7.1})mm  yaw={:>6.1}°  pitch={pitch}  \
+                             roll={:>6.1}°   {rates}",
+                            p.x_mm, p.y_mm, p.z_mm, p.yaw_deg, p.roll_deg,
+                        )
+                    }
+                    _ => eprintln!(
+                        "NO HEAD DETECTED — both eyes must be in the trackbox  ({rates}, \
+                         not sending)"
+                    ),
+                }
             }
             last_status = Instant::now();
             samples_since_status = 0;
             sends_since_status = 0;
+            frames_since_status = 0;
         }
     }
 }
