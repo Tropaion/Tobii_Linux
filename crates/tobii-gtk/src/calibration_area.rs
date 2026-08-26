@@ -82,7 +82,22 @@ pub const OUTERMOST_POINT_FRACTION: f64 = 0.4;
 /// An earlier attempt at this was reverted for measuring no effect. That
 /// measurement was worthless — it was taken while `OP_CAL_COMPUTE` was the wrong
 /// op and *no* calibration had any effect at all, so nothing could have shown
-/// one. This is the first time the experiment can even run.
+/// one.
+///
+/// **[CONFIRMED]** live 2026-08-26, measured against the 600 mm cap on the same
+/// 13-column sweep, paired by target position:
+///
+/// ```text
+///   every target                 41.8 mm -> 28.1 mm   (33% better)
+///   within the device's ~28 deg  23.4 mm -> 12.1 mm   (48% better)
+/// ```
+///
+/// The gains are where the theory said they would be — x = 0.10, 0.18, 0.74,
+/// 0.82 improved by 60, 46, 23 and 12 mm. The cost is a small regression just
+/// inside the old band (x = 0.34 by 12 mm), where the fit now spends error it
+/// used to concentrate outside. Screen centre is unchanged. 12 mm at 813 mm is
+/// 0.85 deg across most of a 1193 mm panel, against 0.70 deg for the vendor's
+/// own stack on this hardware.
 ///
 /// On a supported screen this changes nothing: at any distance in the ET5's
 /// range the angular cap exceeds 600 mm, and the area was already the whole
