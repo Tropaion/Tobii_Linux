@@ -525,11 +525,13 @@ pub fn euler_deg(q: [f64; 4]) -> (f64, f64, f64) {
     let m00 = 1.0 - 2.0 * (y * y + z * z);
     let m10 = 2.0 * (x * y + z * w);
     let m20 = 2.0 * (x * z - y * w);
-    let m11 = 1.0 - 2.0 * (x * x + z * z);
-    let m21 = 2.0 * (y * z - x * w);
+    // opentrack names these by column: `my(1)` and `mz(1)` are row 1 of columns
+    // 1 and 2. Its roll is `-atan2(-mz1, my1)`, which is `atan2(mz1, my1)`.
+    let my1 = 1.0 - 2.0 * (x * x + z * z);
+    let mz1 = 2.0 * (y * z - x * w);
     let yaw = m20.atan2(m00);
     let pitch = m10.atan2((m20 * m20 + m00 * m00).sqrt());
-    let roll = m21.atan2(m11);
+    let roll = mz1.atan2(my1);
     (yaw.to_degrees(), pitch.to_degrees(), roll.to_degrees())
 }
 
