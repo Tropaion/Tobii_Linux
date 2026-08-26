@@ -50,9 +50,9 @@ window { background-color: #15181c; color: #e6e8ea; }
    were clipping the tops of tall glyphs; that claim is DISPROVEN — GTK4 pushes
    no clip anywhere in the Button->Label path (only overflow:hidden does, and
    nothing here sets it), and a minimal program using this stylesheet verbatim
-   would not clip at any scale or renderer. Their absence is now merely a
-   simplification, not a fix, and the reported clipping remains unexplained.
-   Do not cite this rule as its cause. */
+   renders cleanly at every renderer tested. Their absence is a simplification,
+   not a fix. The clipping is a rendering-stack problem, not a CSS one: see the
+   GSK_RENDERER note in `run`. Do not cite this rule as its cause. */
 button { background-image: none; background-color: #1f9ea0; color: #ffffff;
          border: none; border-radius: 8px; padding: 10px 18px; }
 button:hover { background-color: #26b6b8; }
@@ -68,11 +68,19 @@ button.help-btn:hover { background-color: #3a424b; color: #e6e8ea; }
 
 /// Run the GTK application.
 pub fn run() -> glib::ExitCode {
-    // GTK4's Vulkan renderer makes Mesa/radv print a noisy "not a conformant
-    // Vulkan implementation" warning; default to the GL renderer (overridable).
-    if std::env::var_os("GSK_RENDERER").is_none() {
-        std::env::set_var("GSK_RENDERER", "gl");
-    }
+    // No GSK_RENDERER override. A previous revision forced "gl" here, purely to
+    // silence a cosmetic Mesa/radv "not a conformant Vulkan implementation"
+    // warning — and that pinned the app to one specific renderer on a machine
+    // where the tops of tall glyphs are visibly shaved off (reported repeatedly;
+    // this display runs at fractional scale 1.15, which is where glyph-atlas
+    // rounding bugs live). Silencing a warning is not worth overriding the
+    // toolkit's own choice of renderer. The warning may come back; the text
+    // matters more.
+    //
+    // NOT yet proven to be the cause: a minimal program using this stylesheet
+    // renders cleanly under "gl" here, so if the clipping survives this change,
+    // the renderer was innocent. `GSK_RENDERER=gl|ngl|vulkan|cairo` still works
+    // as an override for whoever tests it next.
     let mut builder = Application::builder().application_id(APP_ID);
     if accuracy_mode() {
         // GApplication is single-instance by default: with the hub already
