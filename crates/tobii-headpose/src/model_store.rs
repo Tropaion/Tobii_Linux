@@ -239,6 +239,23 @@ pub fn download_to(src: &ModelSource, dest: &Path) -> Result<(), StoreError> {
     Err(StoreError::Fetch(last))
 }
 
+/// The [`ModelConfig`] for an installed, verified model, or `None`.
+///
+/// The one place a front end should ask "can I run the neural path?", so that
+/// the CLI and the GUI cannot drift on what counts as installed. A file that is
+/// present but has the wrong digest reads as `None`: a model whose behaviour was
+/// never characterised is worse than no model, because its output looks
+/// plausible.
+pub fn installed(src: &ModelSource) -> Option<crate::model::ModelConfig> {
+    match status(src) {
+        Status::Ready => Some(crate::model::ModelConfig {
+            kind: crate::model::ModelKind::OpentrackOnnx,
+            model_path: path_of(src),
+        }),
+        _ => None,
+    }
+}
+
 /// Where [`fetch`] writes while the download is in flight.
 ///
 /// Public so a GUI can size its progress against [`ModelSource::bytes`] by

@@ -52,6 +52,10 @@
 pub mod filter;
 pub mod model;
 pub mod model_store;
+/// The neural 6DOF backend. Behind a feature because it is the only thing in
+/// this crate that costs a dependency tree — see the crate's `Cargo.toml`.
+#[cfg(feature = "onnx")]
+pub mod onnx;
 pub mod opentrack;
 pub mod preprocess;
 pub mod sha256;

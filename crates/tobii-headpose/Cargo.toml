@@ -8,3 +8,16 @@ description = "Derives a 6DOF head pose from ET5 eye origins and encodes it for 
 [dependencies]
 tobii-protocol = { path = "../tobii-protocol" }
 tobii-config = { path = "../tobii-config" }
+tract-onnx = { version = "0.23", optional = true }
+
+[features]
+# The neural 6DOF backend. Off means the crate is exactly what it was: the
+# 5-DOF eye-origin geometry, with no pitch and no new dependencies.
+#
+# On by default so a normal `cargo build` produces a driver that can do head
+# tracking the moment the user fetches the model. The cost is real and is the
+# reason this is a switch at all: `tract-onnx` brings 107 crates the workspace
+# did not have (84 -> 191). Build the lean 5-DOF driver with
+# `--no-default-features`.
+default = ["onnx"]
+onnx = ["dep:tract-onnx"]
