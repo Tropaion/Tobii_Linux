@@ -5,7 +5,7 @@
 //!
 //! * **Geometric** — [`crate::pose_from_sample`], from the two eye origins. No
 //!   model, always available, but 5-DOF only (no pitch).
-//! * **Neural** — a [`PoseModel`] run on the NIR camera frames
+//! * **Neural** — a [`PoseModel`] run on the NIR camera frame
 //!   ([`tobii_protocol::CameraFrame`]). Full 6-DOF. This is how Tobii's own
 //!   software does it (a host-side OpenVINO model on the camera images).
 //!
@@ -64,15 +64,16 @@ pub struct ModelConfig {
 
 /// A loaded head-pose model: NIR frames in, 6-DOF pose out.
 ///
-/// `right` is the second camera stream when available. Whether it is a genuinely
-/// different view is **[UNCONFIRMED]**: `camera.rs` asserts a stereo pair, but a
-/// measurement found `0x50e` byte-identical to `0x501` — on an empty scene,
-/// which is not conclusive. `tobii camera both` settles it with a face in view,
-/// and if they are the same image this parameter should go. Returns `None` when the model can't produce a pose this frame (no face
+/// There is deliberately **no second frame parameter**. The two image streams
+/// carry the same image: 199 timestamp-matched pairs came back 199 byte-identical
+/// with a face in view (2026-08-26, `tobii camera both`). Monocular is the only
+/// option this hardware offers, so depth must come from the eye origins the gaze
+/// frame already reports in millimetres — which is better than the fixed 200 mm
+/// head a webcam tracker has to assume. Returns `None` when the model can't produce a pose this frame (no face
 /// found, low confidence, inference error) — the caller should hold the previous
 /// pose rather than snap to zero.
 pub trait PoseModel {
-    fn estimate(&mut self, left: &CameraFrame, right: Option<&CameraFrame>) -> Option<HeadPose>;
+    fn estimate(&mut self, frame: &CameraFrame) -> Option<HeadPose>;
     fn kind(&self) -> ModelKind;
 }
 
@@ -87,7 +88,7 @@ mod tests {
         pose: HeadPose,
     }
     impl PoseModel for MockModel {
-        fn estimate(&mut self, _l: &CameraFrame, _r: Option<&CameraFrame>) -> Option<HeadPose> {
+        fn estimate(&mut self, _frame: &CameraFrame) -> Option<HeadPose> {
             Some(self.pose)
         }
         fn kind(&self) -> ModelKind {
@@ -112,7 +113,7 @@ mod tests {
             ..Default::default()
         };
         let mut m: Box<dyn PoseModel> = Box::new(MockModel { pose: want });
-        let got = m.estimate(&frame(), None).unwrap();
+        let got = m.estimate(&frame()).unwrap();
         assert_eq!(got.pitch_deg, 12.0);
         assert_eq!(m.kind(), ModelKind::OpentrackOnnx);
     }

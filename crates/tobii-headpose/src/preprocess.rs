@@ -1,3 +1,22 @@
+//! # What an ET5 frame actually looks like
+//!
+//! **[CONFIRMED]** 2026-08-26, 280x280 8-bit, face at ~70 cm, eyes detected:
+//! raw pixel values span roughly **8..42 of 255** — 98% of the frame sits in the
+//! darkest eighth, and a capture of an *empty* scene looks nearly identical
+//! (peak 30, a smooth radial illuminator vignette). Brightness alone therefore
+//! cannot tell "face" from "empty room", which is why `face_bbox` claims a face
+//! either way and must never be the gate for whether a pose is emitted.
+//!
+//! But the structure is there. A plain percentile stretch of 8..42 onto 0..255
+//! yields an ordinary, legible greyscale face: brows, eye corners, nose, mouth,
+//! jawline, ears. The input is dim, not information-poor, and the contrast work
+//! here is what makes it usable rather than a nicety.
+//!
+//! Two properties any model must cope with, both visible in that capture: the
+//! illuminators light the face **from below**, and they put two **blown-out
+//! corneal glints** (value 255) exactly where a model trained on photographs
+//! expects dark pupils.
+//!
 //! Shared image preprocessing for the neural head-pose backends: equalise the
 //! wide-angle NIR frame, locate the face in it, crop it, resize to the model's
 //! input size, and normalize to a float tensor.
