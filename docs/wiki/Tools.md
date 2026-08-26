@@ -13,7 +13,7 @@ display area first (the device wipes it on reboot; see [[Display-Area]]).
 | Subcommand | Purpose |
 |-----------|---------|
 | `tobii stream [--json] [--eyes]` | Connect and print decoded gaze samples (timestamp, `gaze_point_2d`, validities). `--eyes` also prints trackbox + eye-origin geometry; `--json` emits one JSON object per frame. |
-| `tobii headpose [--udp ADDR] [--rate HZ]` | Derive a 5-DOF head pose from the two eye origins and stream it to opentrack over UDP (default `127.0.0.1:4242`, 60 Hz). **Pitch is always 0.** See [[Head-Pose]]. |
+| `tobii headpose [--udp ADDR] [--rate HZ] [--model auto\|off\|FILE] [--check]` | Stream head pose to opentrack over UDP (default `127.0.0.1:4242`, 60 Hz). With a model installed this is **6 DOF** — position from the eye origins, rotation from the neural model; without one it is the 5-DOF geometry and **pitch is 0**. `--check` prints the model's yaw/roll beside the geometry's, which is the experiment that settles the sign conventions. See [[Head-Pose]]. |
 | `tobii headpose --model-status` | Report which head-pose models are installed in `~/.config/tobii-linux/models` and whether their sha256 matches the pinned one. |
 | `tobii headpose --fetch-model [--agree]` | Show the model's licence terms, ask for explicit consent, then download + verify + install it. `--agree` answers the prompt (for scripts); nothing is fetched without one or the other. Same flow as the GUI's **Head tracking** section. |
 | `tobii headpose --install-model <FILE>` | Install a model you already have. Refused unless its sha256 is the pinned one — a different file is worse than none, because its output looks plausible. |

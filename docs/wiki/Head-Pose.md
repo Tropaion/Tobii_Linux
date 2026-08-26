@@ -98,6 +98,91 @@ each sign is decided.
 The 5-DOF eye-origin fallback remains useful as a no-model, always-available
 baseline (position + yaw + roll); the neural path adds the pitch it cannot give.
 
+## What we ship: the neural 6-DOF path
+
+`crates/tobii-headpose/src/onnx.rs` runs opentrack's `head-pose-0.5-small.onnx`
+on `tract` (pure Rust — no runtime to download, no system library). **12.4
+ms/frame single-threaded** against a 33 Hz camera, plus ~50 ms once to optimise
+the graph. Enabled with the crate's `onnx` feature, which is on by default;
+`--no-default-features` gives the lean 5-DOF build.
+
+```text
+CameraFrame 280x280 u8
+  -> Roi (sub-pixel, square)      seeded from the corneal glints
+  -> sample_patch  129x129 u8     bilinear, replicate border
+  -> normalize     129x129 f32    opentrack's adaptive brightness gain
+  -> tract                        pos_size, quat, box, *_scales
+  -> next_roi = box               the ROI for the NEXT frame
+  -> image->world, perspective correction, Euler
+```
+
+### Three parts that look optional and are not
+
+Each was measured on a real ET5 frame, not reasoned about.
+
+| part | what happens without it |
+|---|---|
+| **box-feedback loop** (the model's `box` becomes the next ROI) | Pitch is confounded with crop *scale*: a 0.70–1.50x zoom sweep moves pitch **19.6°** while yaw moves under 2°. A one-shot crop from `preprocess()` is **8° off in pitch — and passes the confidence gate while being so.** |
+| **sub-pixel ROI** (`Roi { cx: f32, cy: f32, side: f32 }`, bilinear, replicate border) | The crate's integer `BBox` + nearest-neighbour `crop_resize` injects **4.06° peak-to-peak pitch jitter on a frozen image**, purely from ROI quantisation, against 0.30° for bilinear. |
+| **updating the ROI on rejected frames** | From a whole-frame start, sigma runs 0.50 → 0.94 → 0.80 → 0.88 → 0.75 → 0.51 → 0.20 before locking at 0.08. Gating the ROI update on sigma freezes it there and re-acquisition can never happen. Sigma decides whether a pose is *emitted*, never whether the ROI *moves*. |
+
+### The contract [CONFIRMED]
+
+Input `x [1,1,129,129]` f32. Outputs `pos_size[1,3]`, `quat[1,4]`, `box[1,4]`,
+`pos_size_scales[1,3]`, `rotaxis_scales_tril[1,3,3]`, resolved **by name** at
+load (labels survive tract's optimiser; outlet ids do not).
+
+- Normalisation is opentrack's `normalize_brightness`: put the patch's 90th
+  percentile at mid-scale, `alpha = 0.45 / max(5, q)` for `q < 127` else
+  `1/255`, then `p * alpha - 0.5`. It works on ET5 NIR despite the corneal
+  glints saturating. `Normalize::SignedUnit` is the trap — it gives yaw −75°
+  and sigma 0.81, i.e. garbage.
+- `pos_size` and `box` are normalised to the **patch half-extent**, not `[0,1]`
+  and not the 129 grid. `+py` is down. `box` is corner form.
+- `quat` is `(x, y, z, w)` — **real part last.** Reading it w-first gives a
+  plausible-looking upside-down head, which is why there is a test pinning
+  exactly that mistake.
+- `rotaxis_scales_tril` is always exactly `sigma * I`, by construction: the
+  training head predicts one scalar and writes literal zeros off the diagonal.
+
+### Confidence gate
+
+`sigma = rotaxis_scales_tril[0][0]`, reject at `>= 0.15`:
+
+| input | sigma |
+|---|---|
+| real face, well cropped | 0.066 – 0.075 |
+| real face, worst perturbation tried | 0.135 |
+| real face, eyes occluded | 0.173 |
+| best garbage of any kind | 0.423 |
+| real empty-room capture | 0.90 – 1.06 |
+
+Nothing was ever observed between 0.18 and 0.42 — a 5.4x empty band, so the
+threshold is not delicate. What it does **not** catch is a badly *scaled* crop
+(0.093 passes, carrying 8° of pitch error), which is what the feedback loop is
+for.
+
+### Fusion
+
+Position from the **eye origins** — a hardware measurement in real millimetres,
+and the one advantage this device has over a webcam, which must assume a fixed
+head size. Rotation from the **model**, all three angles together so the
+rotation stays self-consistent. `tobii_headpose::onnx::fuse`.
+
+### What is still unverified, and how to settle it
+
+Everything about the model's *numerics* is measured. What is not is how its
+rotation sits against the physical world — and a mirrored pose looks perfectly
+plausible, which makes it the hardest class of error to spot from a number. All
+of it is collected in `onnx::Signs` so a fix is a constant, not a rewrite:
+
+| unknown | how to settle it |
+|---|---|
+| yaw sign, roll sign | `tobii headpose --check` prints the model's yaw and roll beside `pose_from_eyes`'s. Turn your head one axis at a time: they must move **together**. If a pair anti-correlates, flip that sign. |
+| absolute pitch zero | Sit square-on to the screen with `--check` running. Whatever pitch reads is the offset — cancel it with `Signs::pitch_offset_deg`. Two constants are folded in here that cannot be separated from one frame: the training set's own convention, and the ET5's physical camera tilt (its mounting rotation is **−20.00°**, measured by the gaze pipeline). |
+| `DEFAULT_FOCAL_PX = 355` | The perspective correction is worth 12–16° of pitch, and omitting it makes pitch a function of where the head sits in frame (~28° swing). `focal_from_eye_origins` computes the real value from the glint separation and the metric eye origins — both already on the wire. Cross-check: report pitch with the head high and low in frame; with the right `f` they agree. |
+| whether the 0.15 gate generalises | It was calibrated on one face. Log sigma over 30 s with glasses, one eye occluded, gaze far off-axis, and a reflective object behind the head; check the 0.18–0.42 band is still empty. |
+
 ## Getting the neural model
 
 The weights are **not in this repository and are never fetched automatically.**

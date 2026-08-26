@@ -19,14 +19,21 @@ nothing. **[CONFIRMED]** — live probe 2026-07-22/23.
 | Stream | Payload size | Rate | What it is | Confidence |
 |--------|-------------|------|------------|-----------|
 | `0x500` | ~1692 B | ~33 Hz | **gaze** — 39 XDS columns (eye positions, gaze directions, pupils, validity, timestamps, flags). See [[Gaze-Stream]] | **[CONFIRMED]** |
-| `0x501` | 78550 B | ~33 Hz | **NIR camera image** — 280×280, 8-bit grayscale, full-face wide-angle (one of a stereo pair) | **[CONFIRMED]** |
-| `0x50e` | 78577 B | ~33 Hz | **NIR camera image** — the second (stereo) camera, same format | **[CONFIRMED]** |
+| `0x501` | 78550 B | ~33 Hz | **NIR camera image** — 280×280, 8-bit grayscale, full-face wide-angle | **[CONFIRMED]** |
+| `0x50e` | 78577 B | ~33 Hz | **NIR camera image** — the SAME image as `0x501`, not a second view | **[CONFIRMED]** |
 | `0x504` | 69 B (2 cols) | once | state-change **event** — fires exactly once on subscribe, not again; XDS row with a timestamp + one small value. Likely user-presence / tracking-state change | one-shot **[CONFIRMED]**; meaning **[HYPOTHESIS]** |
 | `0x502`, `0x503`, `0x505`–`0x50d`, `0x50f`–`0x520` | — | — | ACK the subscribe but produced no data in a 5 s window | ACK **[CONFIRMED]**; purpose unknown |
 
-The two ~78 KB streams are the ET5's **two near-infrared cameras** — a stereo
-pair imaging the whole face wide-angle (the tracker sits below the monitor, so
-the face appears low in frame). Decoded live 2026-07-23: same XDS/TLV framing as
+The two ~78 KB streams carry the **same** near-infrared image of the whole face,
+wide-angle (the tracker sits below the monitor and looks up, so the face appears
+low in frame with empty wall above it).
+
+**They are NOT a stereo pair.** That was the reading here until it was measured:
+`tobii camera both` captured 199 timestamp-matched pairs with a face in view and
+**199 of them were byte-identical**. Whatever the second stream is for, it is not
+a second viewpoint, and there is no stereo depth to be had from this device — which
+is why the head-pose model is monocular and takes its depth from the gaze frame's
+metric eye origins instead (see [[Head-Pose]]). Decoded live 2026-07-23: same XDS/TLV framing as
 gaze, with columns `[timestamp(s64), bit_depth=8, width=280, height=280,
 image-blob]`; the `0x05` blob is a 4-byte prefix (`00 01 ..`) followed by
 `280×280 = 78400` 8-bit pixels. See `tobii-protocol/src/camera.rs`

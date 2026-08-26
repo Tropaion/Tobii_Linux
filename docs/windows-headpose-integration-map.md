@@ -1,3 +1,13 @@
+> **Partly superseded (2026-08-26).** This document predates the working ONNX
+> backend and still quotes the two-frame `estimate(left, right)` trait signature.
+> The second frame is gone: the two camera streams carry the *same* image (199/199
+> byte-identical pairs), so `PoseModel::estimate` takes one `CameraFrame`. The
+> `model.vino` questions below are also closed — those files are AES-encrypted
+> (`docs/windows-headpose-findings.md`), so that path is shut, not merely
+> unshippable. What ships instead is `crates/tobii-headpose/src/onnx.rs` running
+> opentrack's model; see [[Head-Pose]]. The framing and the CLI plumbing notes
+> here are still accurate.
+
 <!-- Auto-generated 2026-07-23 by a multi-agent recon workflow, then reviewed. DRAFT: many I/O facts are pending an elevated read of the ACL-locked model files. -->
 
 # Tobii ET5 head-pose — Windows→Linux integration map (DRAFT, pending elevated model read)
