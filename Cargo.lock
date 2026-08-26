@@ -701,6 +701,7 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "tobii-config",
+ "tobii-headpose",
  "tobii-protocol",
  "tobii-usb",
 ]
@@ -709,6 +710,7 @@ dependencies = [
 name = "tobii-headpose"
 version = "0.1.0"
 dependencies = [
+ "tobii-config",
  "tobii-protocol",
 ]
 

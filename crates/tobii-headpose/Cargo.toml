@@ -7,3 +7,4 @@ description = "Derives a 6DOF head pose from ET5 eye origins and encodes it for 
 
 [dependencies]
 tobii-protocol = { path = "../tobii-protocol" }
+tobii-config = { path = "../tobii-config" }

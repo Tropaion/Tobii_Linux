@@ -14,9 +14,19 @@ display area first (the device wipes it on reboot; see [[Display-Area]]).
 |-----------|---------|
 | `tobii stream [--json] [--eyes]` | Connect and print decoded gaze samples (timestamp, `gaze_point_2d`, validities). `--eyes` also prints trackbox + eye-origin geometry; `--json` emits one JSON object per frame. |
 | `tobii headpose [--udp ADDR] [--rate HZ]` | Derive a 5-DOF head pose from the two eye origins and stream it to opentrack over UDP (default `127.0.0.1:4242`, 60 Hz). **Pitch is always 0.** See [[Head-Pose]]. |
+| `tobii headpose --model-status` | Report which head-pose models are installed in `~/.config/tobii-linux/models` and whether their sha256 matches the pinned one. |
+| `tobii headpose --fetch-model [--agree]` | Show the model's licence terms, ask for explicit consent, then download + verify + install it. `--agree` answers the prompt (for scripts); nothing is fetched without one or the other. Same flow as the GUI's **Head tracking** section. |
+| `tobii headpose --install-model <FILE>` | Install a model you already have. Refused unless its sha256 is the pinned one — a different file is worse than none, because its output looks plausible. |
 | `tobii columns` | Diagnostic: stream the FULL column inventory of each gaze frame (~2 Hz), including columns `stream`/`headpose` discard. Move your head one axis at a time to see which columns track motion. Flags unmapped columns. Needs a valid display area. |
 | `tobii probe-streams [START] [END]` | Hunt for undiscovered streams: baseline gaze-only notify ops, subscribe across `START..=END` (default `0x501..=0x520`), report which notify ops newly appear. See [[Streams]]. |
 | `tobii probe-stream <ID_hex> [SECS]` | Deep-dive on ONE stream: subscribe, read `SECS` (default 5), report rate, payload size range, whether the payload changes frame-to-frame (live vs static), and a hex preview. |
+| `tobii streams` | Ask the device for its OWN stream catalog (`0x4b0`) and print every stream id it advertises, with names. See [[Streams]]. |
+| `tobii log [SECS]` | Subscribe to the device's ASCII log stream (`0x1772`) and print it for `SECS` (default 30). The firmware's own view of what it is doing. |
+| `tobii dump-stream <ID_hex> [COUNT]` | Dump `COUNT` (default 3) raw payloads of one stream to files in a fresh private directory. |
+| `tobii camera [ID] [COUNT]` | Capture camera frames from one image stream (default `0x501`) and write them as PGM. |
+| `tobii camera both [SECS]` | Capture `0x501` and `0x50e` together for `SECS` (default 6), pair them by timestamp, and report whether the two cameras differ. On this ET5 they are byte-identical — **there is no stereo pair**. |
+| `tobii cal-blob` | Retrieve the stored calibration (`0x44c`) and report its size, the 2-byte status prefix, and a preview — the quickest way to tell a real blob from a stub. See [[Calibration]]. |
+| `tobii cal-points` | Ask the device for its own stimulus point set (`0x460`) and decode the reply. |
 | `tobii setup` | Interactive display-geometry wizard: detect the monitor, prompt for width/height/tilt/offsets/curvature, compute corners, save config, and apply to the device. |
 | `tobii display get` | Read the device's current display area (`0x596`), print the three corners and the derived setup. |
 | `tobii display set` | Apply the saved config's corners to the device (`0x5a0`). |

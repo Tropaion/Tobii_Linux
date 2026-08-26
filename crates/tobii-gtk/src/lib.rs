@@ -12,6 +12,7 @@ pub mod device;
 pub mod eye_preview;
 pub mod eyeview;
 pub mod focus;
+pub mod head_model;
 pub mod overlay;
 pub mod particles;
 pub mod screen_pick;
@@ -412,6 +413,13 @@ fn build_ui(app: &Application) {
         "If the light conditions change or if you experience less tracker precision, you might \
          benefit from improving your calibration.",
         &b_cal,
+    ));
+    right.append(&section(
+        "Head tracking",
+        "Reports where your head is, for games and applications that accept head \
+         tracking. Position works with no extra download; the up-and-down angle \
+         needs a model from the opentrack project, which you must fetch yourself.",
+        &head_model::control(),
     ));
     right.append(&section(
         "Preview my gaze",

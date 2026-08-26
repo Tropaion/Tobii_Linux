@@ -56,14 +56,20 @@ mechanism is a neural net, not a geometric derivation.
 ### Replicating it
 
 Feasible: subscribe to `0x501`/`0x50e` → run a head-pose model (Rust
-`openvino` / `ort` / `tract`) → 6 DOF. Open questions being worked:
-- **Camera-image format** — decode `0x501`/`0x50e` (`tobii dump-stream 0x501`).
-  Face image vs eye crops decides which models can consume it.
-- **Model source** — Tobii's `model.vino.*` is proprietary and **cannot be
-  shipped in this GPL repo**; code would load a user-supplied model extracted
-  from their own install (`bdtsdata/NN/`). Clean alternative: opentrack's free
-  `head-pose-0.4-big-int8.onnx`, if the NIR images are face-like enough (a
-  grayscale/NIR domain gap may need fine-tuning).
+`openvino` / `ort` / `tract`) → 6 DOF. Both former open questions are now
+settled by measurement:
+- **Camera-image format** — **[CONFIRMED]** `0x501` and `0x50e` are the *same*
+  wide face image, not eye crops and not a stereo pair: over a 199-frame capture
+  every timestamp-matched pair was byte-identical (`tobii camera both`). The raw
+  pixels sit in a narrow 8..42-of-255 band lit from below, with blown-out
+  corneal glints at 255, but the face is plainly legible after a percentile
+  stretch — face-like enough for a face model (see
+  `crates/tobii-headpose/src/preprocess.rs`, which equalises before inference).
+- **Model source** — **settled**: Tobii's `model.vino.*` is AES-encrypted as
+  well as proprietary (`docs/windows-headpose-findings.md`), so that path is
+  closed, not merely unshippable. We use opentrack's `head-pose-0.5-small.onnx`,
+  fetched by the user rather than bundled — see *Getting the neural model*
+  below.
 
 ## What we ship: a 5-DOF eye-origin fallback
 
@@ -91,3 +97,46 @@ each sign is decided.
 
 The 5-DOF eye-origin fallback remains useful as a no-model, always-available
 baseline (position + yaw + roll); the neural path adds the pitch it cannot give.
+
+## Getting the neural model
+
+The weights are **not in this repository and are never fetched automatically.**
+opentrack's tracker code is free software, but its head-pose models are trained
+on data that is not: CC BY-NC 4.0 (non-commercial) sets, Microsoft's "Research
+Use of Data" terms, and a non-commercial face model. That is incompatible with
+redistribution under GPL-3.0-only, so the model is the user's to obtain:
+
+| | |
+|---|---|
+| model | `head-pose-0.5-small.onnx`, 12,919,981 bytes |
+| source | `https://raw.githubusercontent.com/opentrack/opentrack/master/tracker-neuralnet/models/head-pose-0.5-small.onnx` |
+| sha256 | `7c14f84114fb9eca89759d8a36350c6faae2b4187258cae07afb77a93c2d7eec` |
+| installs to | `$XDG_CONFIG_HOME/tobii-linux/models/` (default `~/.config/…`) |
+
+The digest is **pinned and enforced** (`crates/tobii-headpose/src/sha256.rs`, a
+dependency-free streaming SHA-256 checked against the NIST vectors and against
+`sha256sum` on the real file). A model whose bytes do not match is refused by
+`install` and reported as `Corrupt` by `status` — never quietly used, because a
+different model's output is plausible-looking and wrong.
+
+Two front ends, one code path (`crates/tobii-headpose/src/model_store.rs`):
+
+- **CLI** — `tobii headpose --fetch-model` prints [`TERMS`], asks for consent,
+  then downloads (via `curl`, falling back to `wget`; no HTTP crate is linked
+  in), verifies, and installs. `--model-status` reports what is installed.
+- **GUI** — the hub's **Head tracking** section
+  (`crates/tobii-gtk/src/head_model.rs`) shows the same status line, and its
+  button opens a dialog with the same terms. Agreeing runs the fetch on a
+  worker thread with a progress line driven by the part-file's size; Escape and
+  the default button both mean "no".
+
+`model_store::fetch` deliberately takes **no** "yes" argument, so consent cannot
+be defaulted by a caller — it must be taken in the UI that showed the terms.
+
+**[CONFIRMED]** — end-to-end run against a sandbox config dir on 2026-08-26:
+download → digest match → install → `--model-status` reads
+"installed and verified", with the `.download` part-file removed.
+
+The localizer model is defined in the store but is **not** fetched: the face ROI
+comes from the tracker's own metric eye origins, which beat a detector's guess
+and cost nothing.

@@ -24,6 +24,9 @@ fn main() -> ExitCode {
             args.iter().any(|a| a == "--json"),
             args.iter().any(|a| a == "--eyes"),
         ),
+        (Some("headpose"), Some("--model-status")) => model_status(),
+        (Some("headpose"), Some("--fetch-model")) => fetch_model(&args),
+        (Some("headpose"), Some("--install-model")) => install_model(&args),
         (Some("headpose"), _) => headpose(&args),
         (Some("columns"), _) => columns(),
         (Some("probe-streams"), _) => probe_streams(&args),
@@ -46,6 +49,9 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  tobii stream [--json] [--eyes]\n  \
                  tobii headpose [--udp ADDR] [--rate HZ]\n  \
+                 tobii headpose --model-status\n  \
+                 tobii headpose --fetch-model [--agree]\n  \
+                 tobii headpose --install-model <FILE>\n  \
                  tobii columns\n  \
                  tobii probe-streams [START] [END]\n  \
                  tobii streams\n  \
@@ -73,6 +79,65 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Report which head-pose models are installed and whether they verify.
+fn model_status() -> CmdResult {
+    use tobii_headpose::model_store::{self, Status};
+    println!("model directory: {}", model_store::model_dir().display());
+    for src in [&model_store::HEAD_POSE, &model_store::HEAD_LOCALIZER] {
+        let state = match model_store::status(src) {
+            Status::Ready => "installed and verified".to_string(),
+            Status::Missing => "not installed".to_string(),
+            Status::Corrupt { found } => format!("PRESENT BUT WRONG (sha256 {found})"),
+        };
+        println!("  {:32} {state}", src.name);
+    }
+    println!("\nHead tracking works without these — just without pitch.");
+    Ok(())
+}
+
+/// Download a model after showing its terms and taking an explicit decision.
+///
+/// The consent prompt is not a formality: these weights are non-commercial-use
+/// only and this program is GPL-3.0-only, so fetching them can only ever be the
+/// user's choice, never a default or a background step. `--agree` exists for
+/// people scripting their own setup, and still prints the terms.
+fn fetch_model(args: &[String]) -> CmdResult {
+    use tobii_headpose::model_store;
+    println!("{}\n", model_store::TERMS);
+    let src = &model_store::HEAD_POSE;
+    println!(
+        "About to download {} ({:.1} MB)\n  from {}\n",
+        src.file,
+        src.bytes as f64 / 1e6,
+        src.url
+    );
+    if !args.iter().any(|a| a == "--agree") {
+        print!("Type 'agree' to accept those terms and download: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != "agree" {
+            println!("Not downloaded. Head tracking still works without it, without pitch.");
+            return Ok(());
+        }
+    }
+    println!("downloading...");
+    let path = model_store::fetch(src)?;
+    println!("installed and verified: {}", path.display());
+    Ok(())
+}
+
+/// Install a model the user downloaded themselves. Verified the same way.
+fn install_model(args: &[String]) -> CmdResult {
+    use tobii_headpose::model_store;
+    let path = args
+        .get(3)
+        .ok_or("usage: tobii headpose --install-model <FILE>")?;
+    let dest = model_store::install_from_file(&model_store::HEAD_POSE, std::path::Path::new(path))?;
+    println!("installed and verified: {}", dest.display());
+    Ok(())
 }
 
 /// Get (and optionally set) which eye(s) the tracker detects (Spike S4).
