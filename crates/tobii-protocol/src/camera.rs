@@ -1,6 +1,10 @@
 //! Decode the ET5 eye-camera image streams (subscribe ids `0x501` / `0x50e`).
 //!
-//! The ET5 has **two near-infrared cameras** (a stereo pair). Each streams
+//! The ET5 exposes **two near-infrared image streams**. Whether they are two
+//! cameras or one image published twice is **[UNCONFIRMED]** — an earlier
+//! revision of this line asserted "a stereo pair" with nothing behind it, and a
+//! byte-comparison of timestamp-matched frames found them identical (on an
+//! empty scene, so not conclusive). `tobii camera both` decides it. Each streams
 //! full-face wide-angle images at ~33 Hz. Live-decoded 2026-07-23 from real
 //! captures: `280 × 280`, 8-bit grayscale, ~78 KB per frame.
 //!

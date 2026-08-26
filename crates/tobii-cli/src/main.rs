@@ -31,6 +31,7 @@ fn main() -> ExitCode {
         (Some("log"), _) => device_log(&args),
         (Some("probe-stream"), _) => probe_stream(&args),
         (Some("dump-stream"), _) => dump_stream(&args),
+        (Some("camera"), Some("both")) => camera_both(&args),
         (Some("camera"), _) => camera(&args),
         (Some("setup"), _) => setup(),
         (Some("display"), Some("get")) => display_get(),
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
                  tobii probe-stream <ID> [SECS]\n  \
                  tobii dump-stream <ID> [COUNT]\n  \
                  tobii camera [ID] [COUNT]\n  \
+                 tobii camera both [SECS]\n  \
                  tobii setup\n  \
                  tobii display get\n  \
                  tobii display set\n  \
@@ -537,6 +539,118 @@ fn hex(bytes: &[u8]) -> String {
 /// images. Confirms the camera pipeline end-to-end and lets you eyeball the NIR
 /// image the head-pose model will consume. `tobii camera [id-hex] [count]`
 /// (default 0x501, 3 frames). PGM is dependency-free; open with any image viewer.
+/// Subscribe BOTH eye-camera streams at once and answer the two questions the
+/// head-pose work is blocked on.
+///
+/// 1. Are `0x501` and `0x50e` a stereo pair, or the same image twice? The
+///    module doc for `camera.rs` asserts "two near-infrared cameras (a stereo
+///    pair)", and that has never been checked with a face in view. It decides
+///    whether a depth-from-stereo path exists at all, and whether the
+///    `PoseModel` trait should take a second frame.
+/// 2. Is a face legible in an ET5 NIR frame? Every measurement so far was taken
+///    on an empty scene, where the frames are the illuminator's own vignette
+///    (peak 30 of 255) and say nothing.
+///
+/// Matching is by the frames' own device timestamps, so the comparison is
+/// between images captured at the same instant rather than merely adjacent.
+fn camera_both(args: &[String]) -> CmdResult {
+    use std::collections::HashMap;
+    use tobii_protocol::camera::decode_camera_frame;
+    let secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6);
+
+    let dir = private_dump_dir()?;
+    let transport = UsbTransport::open()?;
+    let mut conn = Connection::connect(transport)?;
+    reapply_display_area(&mut conn);
+    conn.set_request_timeout(Duration::from_millis(300));
+    conn.subscribe_stream(0x501)?;
+    conn.subscribe_stream(0x50e)?;
+    eprintln!("SIT IN FRONT OF THE TRACKER. Capturing both cameras for {secs}s...");
+
+    let mut left: HashMap<i64, Vec<u8>> = HashMap::new();
+    let mut right: HashMap<i64, Vec<u8>> = HashMap::new();
+    let (mut eye_frames, mut gaze_frames) = (0u32, 0u32);
+    let mut best: Option<(u8, i64)> = None;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        for (op, payload) in conn.read_notifications() {
+            if op == tobii_protocol::frame::OP_GAZE_NOTIFY {
+                if let Some(g) = tobii_protocol::GazeSample::decode(&payload) {
+                    gaze_frames += 1;
+                    eye_frames += u32::from(g.validity_l == 0 || g.validity_r == 0);
+                }
+                continue;
+            }
+            let Some(f) = decode_camera_frame(&payload) else {
+                continue;
+            };
+            let peak = f.pixels.iter().copied().max().unwrap_or(0);
+            if best.is_none_or(|(b, _)| peak > b) {
+                best = Some((peak, f.timestamp_us));
+            }
+            let slot = if op == 0x501 { &mut left } else { &mut right };
+            slot.insert(f.timestamp_us, f.pixels);
+        }
+    }
+    let _ = conn.unsubscribe_stream(0x501);
+    let _ = conn.unsubscribe_stream(0x50e);
+
+    let mut matched = 0usize;
+    let mut identical = 0usize;
+    for (ts, l) in &left {
+        if let Some(r) = right.get(ts) {
+            matched += 1;
+            identical += usize::from(l == r);
+        }
+    }
+    println!(
+        "\ncaptured {} left, {} right frames",
+        left.len(),
+        right.len()
+    );
+    println!(
+        "gaze: {eye_frames}/{gaze_frames} frames with an eye detected{}",
+        if eye_frames == 0 {
+            "  <-- NOBODY IN VIEW; everything below is meaningless"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "brightest pixel seen anywhere: {}",
+        best.map_or(0, |(b, _)| b)
+    );
+    if matched == 0 {
+        println!("no timestamp-matched pairs — the two streams are not aligned");
+    } else {
+        println!(
+            "timestamp-matched pairs: {matched}, byte-identical: {identical} ({:.0}%)",
+            100.0 * identical as f64 / matched as f64
+        );
+        println!(
+            "  => {}",
+            if identical == matched {
+                "NOT a stereo pair — 0x50e is the same image as 0x501"
+            } else if identical == 0 {
+                "genuinely two different views"
+            } else {
+                "mixed; inconclusive, capture again"
+            }
+        );
+    }
+    // Keep the brightest frame so a human can look at whether it shows a face.
+    if let Some((_, ts)) = best {
+        if let Some(px) = left.get(&ts).or_else(|| right.get(&ts)) {
+            let path = dir.join("brightest.pgm");
+            let mut out = "P5\n280 280\n255\n".to_string().into_bytes();
+            out.extend_from_slice(px);
+            std::fs::write(&path, out)?;
+            println!("brightest frame written to {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn camera(args: &[String]) -> CmdResult {
     use tobii_protocol::camera::decode_camera_frame;
     let id = args
