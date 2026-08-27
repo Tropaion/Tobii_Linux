@@ -49,6 +49,31 @@ pub fn progress_line(so_far: u64, total: u64) -> String {
     )
 }
 
+/// The pitch-zero line: what it is set to, or that it is not set.
+pub fn pitch_line(offset: Option<f64>) -> String {
+    match offset {
+        Some(d) => format!("Pitch zero set to {d:+.1}°."),
+        None => "Pitch zero not set — up-and-down will read about 20° off.".to_string(),
+    }
+}
+
+/// Progress text for a running pitch measurement.
+pub fn pitch_progress(secs_left: u64, samples: usize) -> String {
+    if samples == 0 {
+        format!("Hold still… {secs_left}s")
+    } else {
+        format!("Hold still… {secs_left}s, {samples} frames")
+    }
+}
+
+/// How a finished measurement reads.
+pub fn pitch_outcome(r: &Result<f64, String>) -> String {
+    match r {
+        Ok(d) => format!("Pitch zero set to {d:+.1}°."),
+        Err(e) => format!("Not set: {e}"),
+    }
+}
+
 /// Undo hard line wrapping so a widget can wrap the text to its own width.
 ///
 /// [`model_store::TERMS`] is wrapped at ~76 columns because its other consumer
@@ -104,44 +129,290 @@ pub fn download_summary(src: &ModelSource) -> String {
     )
 }
 
-/// Build the control: a status line plus, when there is something to fetch, a
-/// button that shows the terms and downloads on explicit agreement.
-pub fn control() -> gtk::Box {
+/// Build the control: a status line, the pitch-zero state, and the actions that
+/// apply to whichever of those two is missing.
+///
+/// `state` and `cmd_tx` are the device thread's, because measuring the pitch
+/// zero needs camera frames and the model — everything else here is local.
+pub fn control(
+    state: std::sync::Arc<std::sync::Mutex<crate::device::DeviceState>>,
+    cmd_tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>,
+) -> gtk::Box {
     let b = gtk::Box::new(Orientation::Vertical, 6);
     let status = Label::new(None);
     status.add_css_class("section-desc");
     status.set_halign(Align::Start);
     status.set_xalign(0.0);
     status.set_wrap(true);
-    let button = Button::with_label("Get the model…");
+
+    let pitch = Label::new(None);
+    pitch.add_css_class("section-desc");
+    pitch.set_halign(Align::Start);
+    pitch.set_xalign(0.0);
+    pitch.set_wrap(true);
+
+    let get = Button::with_label("Get the model…");
+    let set_pitch = Button::with_label("Set pitch zero…");
+    let updates = Button::with_label("Check for updates");
+    let remove = Button::with_label("Remove");
+    for small in [&updates, &remove] {
+        small.add_css_class("help-btn");
+    }
+
+    let actions = gtk::Box::new(Orientation::Horizontal, 8);
+    actions.set_halign(Align::Start);
+    actions.append(&get);
+    actions.append(&set_pitch);
+    actions.append(&updates);
+    actions.append(&remove);
 
     let refresh = {
-        let status = status.clone();
-        let button = button.clone();
+        let (status, pitch) = (status.clone(), pitch.clone());
+        let (get, set_pitch, updates, remove) = (
+            get.clone(),
+            set_pitch.clone(),
+            updates.clone(),
+            remove.clone(),
+        );
         move || {
             let st = model_store::status(SRC);
+            let ready = matches!(st, Status::Ready);
             status.set_text(&status_line(&st));
-            button.set_visible(!matches!(st, Status::Ready));
+            pitch.set_text(&pitch_line(model_store::pitch_offset()));
+            pitch.set_visible(ready);
+            get.set_visible(!ready);
+            for only_when_installed in [&set_pitch, &updates, &remove] {
+                only_when_installed.set_visible(ready);
+            }
         }
     };
     refresh();
     b.append(&status);
-    b.append(&button);
+    b.append(&pitch);
+    b.append(&actions);
 
-    let status_for_click = status.clone();
-    let refresh_for_click = refresh.clone();
-    button.connect_clicked(move |btn| {
-        let status = status_for_click.clone();
-        let refresh = refresh_for_click.clone();
-        let btn = btn.clone();
-        // The hub window is built after this control, so the parent is taken
-        // from the button's own root at click time rather than captured.
-        let parent = btn.root().and_downcast::<gtk::Window>();
-        terms_dialog(parent.as_ref(), move || {
-            start_download(&btn, &status, refresh.clone())
+    // --- get the model ---
+    {
+        let (status, refresh) = (status.clone(), refresh.clone());
+        get.connect_clicked(move |btn| {
+            let (status, refresh, btn) = (status.clone(), refresh.clone(), btn.clone());
+            let parent = btn.root().and_downcast::<gtk::Window>();
+            terms_dialog(parent.as_ref(), move || {
+                start_download(&btn, &status, refresh.clone())
+            });
         });
-    });
+    }
+
+    // --- measure the pitch zero ---
+    {
+        let (pitch_label, refresh) = (pitch.clone(), refresh.clone());
+        set_pitch.connect_clicked(move |btn| {
+            let parent = btn.root().and_downcast::<gtk::Window>();
+            pitch_dialog(
+                parent.as_ref(),
+                state.clone(),
+                cmd_tx.clone(),
+                pitch_label.clone(),
+                refresh.clone(),
+            );
+        });
+    }
+
+    // --- is there a newer model upstream? ---
+    {
+        let status = status.clone();
+        updates.connect_clicked(move |btn| {
+            use tobii_headpose::model_store::Update;
+            btn.set_sensitive(false);
+            status.set_text("Checking…");
+            let (tx, rx) = std::sync::mpsc::channel();
+            // A network call, so off the UI thread like the download.
+            std::thread::spawn(move || {
+                let _ = tx.send(model_store::check_update(SRC));
+            });
+            let (btn, status) = (btn.clone(), status.clone());
+            glib::timeout_add_local(Duration::from_millis(150), move || {
+                match rx.try_recv() {
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Ok(u) => {
+                        btn.set_sensitive(true);
+                        status.set_text(&match u {
+                            Update::UpToDate => "This is the current model.".to_string(),
+                            // Deliberately not offered as a download: a new model
+                            // has its own pose conventions and its own pitch
+                            // zero, so adopting one is a new release of this
+                            // program, not a fetch.
+                            Update::Newer { date, .. } => format!(
+                                "opentrack published a newer model on {}. It needs new \
+                                 measurements before this program can use it.",
+                                date.split('T').next().unwrap_or(&date)
+                            ),
+                            Update::Unknown(why) => format!("Could not check: {why}"),
+                        });
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        btn.set_sensitive(true);
+                        status.set_text("Could not check.");
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+    }
+
+    // --- remove it ---
+    {
+        let (status, refresh) = (status.clone(), refresh.clone());
+        remove.connect_clicked(move |btn| {
+            let dlg = gtk::AlertDialog::builder()
+                .modal(true)
+                .message("Remove the head-pose model?")
+                .detail(
+                    "Head tracking keeps working without it, minus the up-and-down angle. \
+                     You can download it again at any time.",
+                )
+                .buttons(["Cancel", "Remove"])
+                .cancel_button(0)
+                .default_button(0)
+                .build();
+            let (status, refresh) = (status.clone(), refresh.clone());
+            let parent = btn.root().and_downcast::<gtk::Window>();
+            dlg.choose(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+                if res.unwrap_or(0) != 1 {
+                    return;
+                }
+                match std::fs::remove_file(model_store::path_of(SRC)) {
+                    Ok(()) => refresh(),
+                    Err(e) => status.set_text(&format!("Could not remove it: {e}")),
+                }
+            });
+        });
+    }
+
     b
+}
+
+/// The guided pitch-zero measurement: instructions, a live countdown, a result.
+fn pitch_dialog<F: Fn() + Clone + 'static>(
+    parent: Option<&gtk::Window>,
+    state: std::sync::Arc<std::sync::Mutex<crate::device::DeviceState>>,
+    cmd_tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>,
+    pitch_label: Label,
+    refresh: F,
+) {
+    const SECS: u64 = 10;
+
+    let heading = Label::new(Some("Set the pitch zero"));
+    heading.add_css_class("dialog-heading");
+    heading.set_halign(Align::Start);
+    heading.set_xalign(0.0);
+
+    let body = Label::new(Some(concat!(
+        "Sit the way you normally do and look at the middle of the screen. ",
+        "Hold still until the countdown finishes.\n\n",
+        "The model measures how far your head is tilted in its own frame, which is ",
+        "offset from level by how this tracker is mounted. This measures that offset ",
+        "once, so up-and-down reads zero when you sit like this.",
+    )));
+    body.add_css_class("dialog-terms");
+    body.set_wrap(true);
+    body.set_xalign(0.0);
+    body.set_halign(Align::Start);
+    body.set_max_width_chars(52);
+
+    let progress = Label::new(Some("Ready."));
+    progress.add_css_class("dialog-lead");
+    progress.set_halign(Align::Start);
+    progress.set_xalign(0.0);
+    progress.set_wrap(true);
+    progress.set_max_width_chars(52);
+
+    let close = Button::with_label("Cancel");
+    let go = Button::with_label("Start");
+    go.add_css_class("suggested");
+    let buttons = gtk::Box::new(Orientation::Horizontal, 10);
+    buttons.set_halign(Align::End);
+    buttons.set_margin_top(4);
+    buttons.append(&close);
+    buttons.append(&go);
+
+    let content = gtk::Box::new(Orientation::Vertical, 12);
+    content.set_margin_top(24);
+    content.set_margin_bottom(20);
+    content.set_margin_start(26);
+    content.set_margin_end(26);
+    content.append(&heading);
+    content.append(&body);
+    content.append(&progress);
+    content.append(&buttons);
+
+    let win = gtk::Window::builder()
+        .title("Pitch zero")
+        .modal(true)
+        .resizable(false)
+        .default_width(520)
+        .child(&content)
+        .build();
+    if let Some(p) = parent {
+        win.set_transient_for(Some(p));
+    }
+
+    {
+        let w = win.clone();
+        let state = state.clone();
+        close.connect_clicked(move |_| {
+            // Tell a running measurement to stop; the device thread checks this
+            // flag each loop and returns without saving.
+            state.lock().unwrap().pitch_cal.active = false;
+            w.close();
+        });
+    }
+    {
+        let (progress, close, pitch_label) = (progress.clone(), close.clone(), pitch_label.clone());
+        let refresh = refresh.clone();
+        let state = state.clone();
+        go.connect_clicked(move |go| {
+            go.set_sensitive(false);
+            close.set_label("Stop");
+            progress.set_text("Get comfortable — starting in 3 seconds…");
+            let _ = cmd_tx.send(crate::device::DeviceCommand::PitchCalibrate { secs: SECS });
+            let (state, progress, go, close) =
+                (state.clone(), progress.clone(), go.clone(), close.clone());
+            let (pitch_label, refresh) = (pitch_label.clone(), refresh.clone());
+            glib::timeout_add_local(Duration::from_millis(200), move || {
+                let cal = state.lock().unwrap().pitch_cal.clone();
+                if let Some(result) = &cal.result {
+                    progress.set_text(&pitch_outcome(result));
+                    pitch_label.set_text(&pitch_line(model_store::pitch_offset()));
+                    refresh();
+                    go.set_sensitive(true);
+                    close.set_label("Done");
+                    return glib::ControlFlow::Break;
+                }
+                if cal.active {
+                    progress.set_text(&pitch_progress(cal.secs_left, cal.samples));
+                }
+                glib::ControlFlow::Continue
+            });
+        });
+    }
+
+    let keys = gtk::EventControllerKey::new();
+    let w = win.clone();
+    let state_for_esc = state.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            state_for_esc.lock().unwrap().pitch_cal.active = false;
+            w.close();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    win.add_controller(keys);
+    win.present();
+    close.grab_focus();
 }
 
 /// A modal window showing the licence terms, with an explicit agree/cancel.
@@ -340,6 +611,31 @@ mod tests {
         // thing that turns a cosmetic surprise into a crash in the hub.
         let s = status_line(&Status::Corrupt { found: "ab".into() });
         assert!(s.contains("ab"), "{s}");
+    }
+
+    /// An unset pitch zero is not a neutral state — it is about 20 degrees of
+    /// error — so the line has to say so rather than just "not set".
+    #[test]
+    fn an_unset_pitch_zero_says_what_it_costs() {
+        let s = pitch_line(None);
+        assert!(s.contains("not set"), "{s}");
+        assert!(s.contains("20°"), "the consequence must be visible: {s}");
+        assert_eq!(pitch_line(Some(-24.08)), "Pitch zero set to -24.1°.");
+        assert_eq!(pitch_line(Some(3.0)), "Pitch zero set to +3.0°.");
+    }
+
+    #[test]
+    fn the_pitch_countdown_reads_sensibly_before_any_frames_arrive() {
+        assert_eq!(pitch_progress(12, 0), "Hold still… 12s");
+        assert_eq!(pitch_progress(4, 130), "Hold still… 4s, 130 frames");
+    }
+
+    #[test]
+    fn a_failed_pitch_measurement_does_not_read_as_a_number() {
+        assert_eq!(pitch_outcome(&Ok(-24.08)), "Pitch zero set to -24.1°.");
+        let s = pitch_outcome(&Err("only 3 usable frames".into()));
+        assert!(s.starts_with("Not set:"), "{s}");
+        assert!(s.contains("3 usable frames"), "{s}");
     }
 
     #[test]

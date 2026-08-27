@@ -438,7 +438,7 @@ fn build_ui(app: &Application) {
     right.append(&section(
         "Head tracking",
         "Sends your head position and angle to games and apps, over opentrack.",
-        &head_model::control(),
+        &head_model::control(state.clone(), cmd_tx.clone()),
     ));
     right.append(&section(
         "Preview my gaze",

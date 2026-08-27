@@ -127,6 +127,26 @@ pub struct DeviceState {
     /// mode. Deliberately separate from `calibration.active`, which `on_finish`
     /// clears on the start/clear failure path — exactly when a stop is needed.
     pub cal_session_open: bool,
+    /// Progress and result of a head-pose pitch-zero measurement.
+    pub pitch_cal: PitchCal,
+}
+
+/// A pitch-zero measurement in flight, or its result.
+///
+/// The neural model reports pitch in its own frame, offset from level by the
+/// training set's convention plus how far this tracker is tilted up. That sum is
+/// fixed per installation and cannot be derived, so it is measured: sit
+/// square-on, hold still, take the median.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PitchCal {
+    pub active: bool,
+    /// Seconds remaining, including the settle-in countdown.
+    pub secs_left: u64,
+    /// Accepted frames so far — a run that ends with very few of these was not
+    /// a measurement, whatever number it would otherwise produce.
+    pub samples: usize,
+    /// `Ok(offset_deg)` once saved, or a human-readable failure.
+    pub result: Option<Result<f64, String>>,
 }
 
 pub enum DeviceCommand {
@@ -146,6 +166,14 @@ pub enum DeviceCommand {
         /// bad model as the starting point.
         improve: bool,
         token: u64,
+    },
+    /// Measure the head-pose pitch zero over `secs` of held-still frames, then
+    /// save it. Runs inline on the device thread, publishing progress into
+    /// [`DeviceState::pitch_cal`]; the hub is briefly not updating gaze while it
+    /// does, which is the correct trade for a measurement the user is holding
+    /// still for anyway.
+    PitchCalibrate {
+        secs: u64,
     },
     /// Compute and apply the model from the points collected so far, without
     /// ending the session.
@@ -194,6 +222,9 @@ pub fn device_tick<T: Transport>(
         match cmd {
             DeviceCommand::SetDisplayArea(c) => {
                 let _ = conn.set_display_area(&c);
+            }
+            DeviceCommand::PitchCalibrate { secs } => {
+                calibrate_pitch(conn, state, secs);
             }
             DeviceCommand::SetEnabledEye(e) => {
                 let _ = conn.set_enabled_eye(e);
@@ -352,6 +383,110 @@ pub fn device_tick<T: Transport>(
     }
 }
 
+/// Measure and save the head-pose pitch zero.
+///
+/// Takes over the connection for the duration rather than threading a model
+/// through every tick. The hub stops updating gaze while it runs, which is
+/// acceptable precisely because the user is sitting still for it — and the
+/// alternative, holding a 13 MB model and 12 ms of inference inside the state
+/// mutex the UI redraws from, is not.
+fn calibrate_pitch<T: Transport>(conn: &mut Connection<T>, state: &Mutex<DeviceState>, secs: u64) {
+    let finish = |r: Result<f64, String>| {
+        let mut s = state.lock().unwrap();
+        s.pitch_cal = PitchCal {
+            active: false,
+            secs_left: 0,
+            samples: s.pitch_cal.samples,
+            result: Some(r),
+        };
+    };
+
+    let mut model = match tobii_headpose::onnx::OnnxPose::from_store() {
+        Ok(m) => m,
+        Err(e) => return finish(Err(e.to_string())),
+    };
+    // Measure the model's RAW pitch. Applying the saved offset while measuring a
+    // new one would make each run a correction of the last, not a measurement.
+    let mut signs = model.tracker().signs();
+    signs.pitch_offset_deg = 0.0;
+    model.tracker().set_signs(signs);
+
+    // A settle-in pause, so the frames from while the user was still reaching
+    // for the mouse are not part of the measurement.
+    const SETTLE: Duration = Duration::from_secs(3);
+    let start = Instant::now() + SETTLE;
+    let deadline = start + Duration::from_secs(secs);
+    let mut samples: Vec<f64> = Vec::new();
+    {
+        let mut s = state.lock().unwrap();
+        s.pitch_cal = PitchCal {
+            active: true,
+            secs_left: secs + SETTLE.as_secs(),
+            samples: 0,
+            result: None,
+        };
+    }
+
+    while Instant::now() < deadline {
+        for (op, payload) in conn.read_notifications().iter() {
+            if *op != CAMERA_STREAM as u32 {
+                continue;
+            }
+            let Some(frame) = decode_camera_frame(payload) else {
+                continue;
+            };
+            if let Some(p) = model.estimate_detailed(&frame) {
+                if Instant::now() >= start {
+                    samples.push(p.pitch_deg);
+                }
+            }
+            state.lock().unwrap().latest_camera = Some(frame);
+        }
+        let mut s = state.lock().unwrap();
+        s.pitch_cal.secs_left = deadline.saturating_duration_since(Instant::now()).as_secs();
+        s.pitch_cal.samples = samples.len();
+        if !s.pitch_cal.active {
+            return; // cancelled from the UI
+        }
+    }
+
+    match pitch_offset_from(&mut samples) {
+        Some((offset, spread)) => match tobii_config::save_pitch_offset(offset) {
+            Ok(()) => {
+                if spread > 8.0 {
+                    finish(Err(format!(
+                        "saved, but your head moved during the measurement \
+                         ({spread:.1}° of spread) — run it again if pitch looks off"
+                    )));
+                } else {
+                    finish(Ok(offset));
+                }
+            }
+            Err(e) => finish(Err(format!("could not save: {e}"))),
+        },
+        None => finish(Err(format!(
+            "only {} usable frames — was your face in view? Nothing was saved.",
+            samples.len()
+        ))),
+    }
+}
+
+/// The offset to apply, and the 10-90% spread, from a run's pitch samples.
+///
+/// Median rather than mean: the first frames after the ROI seeds are not yet
+/// converged, and a handful of those can drag a mean while they cannot drag a
+/// median. The spread is returned so a run where the user moved is visible as a
+/// number rather than as a quietly wrong zero.
+pub fn pitch_offset_from(samples: &mut [f64]) -> Option<(f64, f64)> {
+    if samples.len() < 20 {
+        return None;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("pitch is never NaN"));
+    let median = samples[samples.len() / 2];
+    let spread = samples[samples.len() * 9 / 10] - samples[samples.len() / 10];
+    Some((-median, spread))
+}
+
 /// What one [`device_tick`] observed, for the reconnect watchdog.
 ///
 /// `published` and `saw_traffic` differ exactly when a transport chunk ended
@@ -361,6 +496,13 @@ pub fn device_tick<T: Transport>(
 pub struct Tick {
     pub published: bool,
     pub saw_traffic: bool,
+}
+
+/// A device state and command channel with no device behind them, for
+/// rendering a UI surface standalone to look at it.
+pub fn spawn_for_probe() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
+    let (tx, _rx) = channel();
+    (Arc::new(Mutex::new(DeviceState::default())), tx)
 }
 
 /// Spawn the device thread. It handshakes, then loops `device_tick`; on any
@@ -550,6 +692,40 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Median, not mean: the frames before the ROI converges are outliers, and a
+    /// handful of them must not be able to move the answer.
+    #[test]
+    fn the_pitch_offset_is_a_median_and_is_negated() {
+        let mut s: Vec<f64> = (0..100).map(|i| 24.0 + (i % 3) as f64 * 0.1).collect();
+        s[0] = -180.0; // an unconverged first frame
+        s[1] = 90.0;
+        let (offset, _) = pitch_offset_from(&mut s).expect("enough samples");
+        assert!(
+            (offset + 24.1).abs() < 0.2,
+            "two wild outliers moved the answer: {offset}"
+        );
+    }
+
+    #[test]
+    fn a_short_run_is_not_a_measurement() {
+        let mut few: Vec<f64> = (0..19).map(|i| i as f64).collect();
+        assert_eq!(pitch_offset_from(&mut few), None);
+        let mut enough: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        assert!(pitch_offset_from(&mut enough).is_some());
+    }
+
+    /// The spread is what makes "you moved" visible instead of silently
+    /// producing a confident wrong zero.
+    #[test]
+    fn the_spread_reports_a_head_that_moved() {
+        let mut still: Vec<f64> = (0..100).map(|i| 24.0 + (i % 5) as f64 * 0.05).collect();
+        let (_, tight) = pitch_offset_from(&mut still).unwrap();
+        assert!(tight < 1.0, "a still head should be tight: {tight}");
+        let mut moved: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
+        let (_, wide) = pitch_offset_from(&mut moved).unwrap();
+        assert!(wide > 8.0, "a moving head should be visible: {wide}");
+    }
     use std::collections::VecDeque;
     use std::sync::mpsc::channel;
     use std::sync::Mutex;

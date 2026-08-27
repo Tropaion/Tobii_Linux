@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         (Some("headpose"), Some("--model-status")) => model_status(),
         (Some("headpose"), Some("--fetch-model")) => fetch_model(&args),
         (Some("headpose"), Some("--check-update")) => check_model_update(),
+        (Some("headpose"), Some("--remove-model")) => remove_model(),
         (Some("headpose"), Some("--install-model")) => install_model(&args),
         (Some("headpose"), _) => headpose(&args),
         (Some("columns"), _) => columns(),
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
                  tobii headpose --model-status\n  \
                  tobii headpose --fetch-model [--agree]\n  \
                  tobii headpose --check-update\n  \
+                 tobii headpose --remove-model\n  \
                  tobii headpose --install-model <FILE>\n  \
                  tobii columns\n  \
                  tobii probe-streams [START] [END]\n  \
@@ -81,6 +83,24 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Delete the installed model. Head tracking keeps working without it.
+fn remove_model() -> CmdResult {
+    use tobii_headpose::model_store;
+    let path = model_store::path_of(&model_store::HEAD_POSE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!("removed {}", path.display());
+            println!("head tracking still works — without the up-and-down angle.");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("nothing to remove: no model at {}", path.display());
+            Ok(())
+        }
+        Err(e) => Err(format!("could not remove {}: {e}", path.display()).into()),
     }
 }
 
@@ -117,7 +137,11 @@ fn model_status() -> CmdResult {
         };
         println!("  {:32} {state}", src.name);
     }
-    println!("\nHead tracking works without these — just without pitch.");
+    match model_store::pitch_offset() {
+        Some(d) => println!("\npitch zero: {d:+.1}°"),
+        None => println!("\npitch zero: not measured — run `tobii headpose --calibrate-pitch`"),
+    }
+    println!("Head tracking works without a model — just without pitch.");
     Ok(())
 }
 
