@@ -264,6 +264,10 @@ fn build_ui(app: &Application) {
     // `draw_eye_view` insets by `EYE_VIEW_PAD` on each side, so the *content*
     // size is padded out to make the DRAWN rectangle golden.
     const GOLDEN_RATIO: f64 = 1.618;
+    // Shared with the draw func below: head orientation is drawn ON the
+    // eye-position box rather than in a second widget showing the same head.
+    let head_view: Rc<RefCell<Option<widget::HeadView>>> = Rc::new(RefCell::new(None));
+    let head_for_draw = head_view.clone();
     let area = DrawingArea::new();
     let box_w = 380;
     let pad = 2 * widget::EYE_VIEW_PAD as i32;
@@ -280,6 +284,7 @@ fn build_ui(app: &Application) {
         area.set_draw_func(move |_, cr, w, h| {
             let view = widget::eye_view_for(&state.lock().unwrap());
             widget::draw_eye_view(cr, w, h, &view);
+            widget::draw_head_overlay(cr, w, h, &view, head_for_draw.borrow().as_ref());
         });
     }
     // Redraw on the frame clock so every gaze frame reaches the screen exactly
@@ -319,45 +324,22 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Live head pose, beside the camera it is computed from. Shared view drawn
-    // by the tick, like the eye box and the camera.
-    let head_title = Label::new(Some("Head pose"));
-    head_title.add_css_class("section-title");
-    head_title.set_halign(Align::Start);
-    let head_view: Rc<RefCell<Option<widget::HeadView>>> = Rc::new(RefCell::new(None));
-    let head_area = DrawingArea::new();
-    head_area.set_content_width(220);
-    head_area.set_content_height(220);
-    head_area.set_halign(Align::Center);
-    {
-        let head_view = head_view.clone();
-        head_area.set_draw_func(move |_, cr, w, h| {
-            widget::draw_head_view(cr, w, h, head_view.borrow().as_ref());
-        });
-    }
+    // The head readout sits under the eye box, because that is where the head
+    // is now drawn — one view, not two.
     let head_msg = Label::new(Some("No head detected"));
     head_msg.add_css_class("status");
     head_msg.set_halign(Align::Center);
     head_msg.set_wrap(true);
     head_msg.set_justify(gtk::Justification::Center);
 
-    let previews = gtk::Box::new(Orientation::Horizontal, 14);
-    previews.append(&cam_area);
-    previews.append(&head_area);
-    let preview_titles = gtk::Box::new(Orientation::Horizontal, 14);
-    cam_title.set_width_request(220);
-    head_title.set_width_request(220);
-    preview_titles.append(&cam_title);
-    preview_titles.append(&head_title);
-
     let left = gtk::Box::new(Orientation::Vertical, 10);
     left.set_width_request(380);
     left.append(&eye_title);
     left.append(&area);
     left.append(&guidance);
-    left.append(&preview_titles);
-    left.append(&previews);
     left.append(&head_msg);
+    left.append(&cam_title);
+    left.append(&cam_area);
 
     // --- Right column: settings sections (original wording) ---
     let b_setup = crate::widget::button("Set up display");
@@ -663,7 +645,7 @@ fn build_ui(app: &Application) {
             let next = widget::head_view_for(&snap);
             if *head_view.borrow() != next {
                 *head_view.borrow_mut() = next;
-                head_area.queue_draw();
+                area.queue_draw();
                 head_msg.set_text(&widget::head_message(next.as_ref()));
             }
         }

@@ -232,15 +232,6 @@ mod tests {
         assert!(head_view_for(&s).is_none());
     }
 
-    #[test]
-    fn drawing_a_head_view_never_panics_on_a_degenerate_size() {
-        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).unwrap();
-        let cr = cairo::Context::new(&surface).unwrap();
-        for (w, h) in [(0, 0), (1, 1), (220, 220)] {
-            draw_head_view(&cr, w, h, None);
-            draw_head_view(&cr, w, h, Some(&head(90.0, -90.0, 180.0, Some(0.05))));
-        }
-    }
     use crate::eyeview::{EyeView, Guidance};
 
     fn view(g: Guidance, d: Option<f32>) -> EyeView {
@@ -320,6 +311,81 @@ mod tests {
         s.latest_gaze = None;
         s.eye_view = None;
         assert!(matches!(eye_view_for(&s).guidance, Guidance::NoEyes));
+    }
+
+    fn eyes_at(l: [f32; 2], r: [f32; 2]) -> EyeView {
+        EyeView {
+            left: Some(l),
+            right: Some(r),
+            left_alpha: 1.0,
+            right_alpha: 1.0,
+            ..EyeView::none()
+        }
+    }
+
+    fn a_head(yaw: f64, pitch: f64, sigma: Option<f32>) -> HeadView {
+        HeadView {
+            yaw_deg: yaw,
+            pitch_deg: pitch,
+            roll_deg: 0.0,
+            z_mm: 680.0,
+            sigma,
+            has_pitch: sigma.is_some(),
+        }
+    }
+
+    /// The overlay needs BOTH eyes: from a reconstructed midpoint the arrow
+    /// would move with the reconstruction rather than with the head.
+    #[test]
+    fn the_head_overlay_is_skipped_unless_both_eyes_and_a_pose_are_present() {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 120).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        let v = a_head(20.0, 0.0, Some(0.07));
+        let one_eye = EyeView {
+            left: Some([0.4, 0.5]),
+            right: None,
+            ..EyeView::none()
+        };
+        draw_head_overlay(&cr, 200, 120, &one_eye, Some(&v));
+        draw_head_overlay(&cr, 200, 120, &EyeView::none(), Some(&v));
+        draw_head_overlay(&cr, 200, 120, &eyes_at([0.4, 0.5], [0.6, 0.5]), None);
+        drop(cr);
+        let data = surface.take_data().unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "nothing should be drawn without two eyes and a pose"
+        );
+    }
+
+    #[test]
+    fn the_head_overlay_draws_when_both_eyes_and_a_pose_are_present() {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 120).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        draw_head_overlay(
+            &cr,
+            200,
+            120,
+            &eyes_at([0.4, 0.5], [0.6, 0.5]),
+            Some(&a_head(25.0, -10.0, Some(0.07))),
+        );
+        drop(cr);
+        let data = surface.take_data().unwrap();
+        assert!(data.iter().any(|&b| b != 0), "the overlay drew nothing");
+    }
+
+    #[test]
+    fn the_head_overlay_survives_a_degenerate_box_and_extreme_angles() {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        for (w, h) in [(0, 0), (1, 1), (380, 240)] {
+            draw_head_overlay(
+                &cr,
+                w,
+                h,
+                &eyes_at([0.0, 0.0], [1.0, 1.0]),
+                Some(&a_head(180.0, -180.0, None)),
+            );
+        }
     }
 }
 
@@ -434,71 +500,67 @@ pub fn head_message(view: Option<&HeadView>) -> String {
     }
 }
 
-/// Draw the head preview: a head seen from the front, turned and tilted as the
-/// tracker reports, over a fixed reference frame so the motion has something to
-/// be relative to.
-pub fn draw_head_view(cr: &cairo::Context, w: i32, h: i32, view: Option<&HeadView>) {
-    let (w, h) = (w as f64, h as f64);
-    let (cx, cy) = (w / 2.0, h / 2.0);
-    let r = (w.min(h) / 2.0) - 12.0;
-
-    // Reference frame: a fixed ring and crosshair, so "centred" is visible even
-    // when nothing is detected.
-    cr.set_source_rgb(0.16, 0.18, 0.21);
-    cr.set_line_width(1.0);
-    cr.arc(cx, cy, r, 0.0, std::f64::consts::TAU);
-    let _ = cr.stroke();
-    cr.move_to(cx - r, cy);
-    cr.line_to(cx + r, cy);
-    cr.move_to(cx, cy - r);
-    cr.line_to(cx, cy + r);
-    let _ = cr.stroke();
-
-    let Some(v) = view else {
+/// Overlay head orientation onto the eye-position box, at the point between the
+/// eyes.
+///
+/// One view rather than two: the eye dots already carry the head's *position* in
+/// the trackbox and its *roll* (they tilt with it), so the only thing missing is
+/// where the face is pointing. That is one arrow from the midpoint - the cue a
+/// person reads off a face instantly - rather than a second widget drawing the
+/// same head again.
+///
+/// Drawn only when both eyes are present: from a reconstructed midpoint the
+/// arrow would move with the reconstruction rather than with the head, and
+/// report motion that did not happen.
+pub fn draw_head_overlay(
+    cr: &cairo::Context,
+    w: i32,
+    h: i32,
+    eyes: &EyeView,
+    head: Option<&HeadView>,
+) {
+    let (Some(v), Some(l), Some(r)) = (head, eyes.left, eyes.right) else {
         return;
     };
-
-    // Yaw and pitch move the head within the ring; roll rotates it. The gain is
-    // chosen so a comfortable +/-30 degrees reaches the ring, which is about the
-    // range this tracker keeps both eyes for.
+    let (w, h) = (w as f64, h as f64);
+    // The same mapping the eye dots use: normalized trackbox coordinates into
+    // the inset box.
+    let to_px = |p: [f32; 2]| -> (f64, f64) {
+        (
+            EYE_VIEW_PAD + p[0] as f64 * (w - 2.0 * EYE_VIEW_PAD),
+            EYE_VIEW_PAD + p[1] as f64 * (h - 2.0 * EYE_VIEW_PAD),
+        )
+    };
+    let (lx, ly) = to_px(l);
+    let (rx, ry) = to_px(r);
+    let (mx, my) = ((lx + rx) / 2.0, (ly + ry) / 2.0);
+    // Length scales with the interocular distance on screen, so the arrow stays
+    // proportional to the head as the user moves nearer or further away.
+    let ipd = ((rx - lx).powi(2) + (ry - ly).powi(2)).sqrt().max(8.0);
     const FULL_SCALE_DEG: f64 = 30.0;
-    let dx = (v.yaw_deg / FULL_SCALE_DEG).clamp(-1.0, 1.0) * r * 0.55;
-    let dy = if v.has_pitch {
-        -(v.pitch_deg / FULL_SCALE_DEG).clamp(-1.0, 1.0) * r * 0.55
+    let ax = (v.yaw_deg / FULL_SCALE_DEG).clamp(-1.6, 1.6) * ipd;
+    let ay = if v.has_pitch {
+        -(v.pitch_deg / FULL_SCALE_DEG).clamp(-1.6, 1.6) * ipd
     } else {
         0.0
     };
 
-    let _ = cr.save();
-    cr.translate(cx + dx, cy + dy);
-    cr.rotate(v.roll_deg.to_radians());
-
-    // Confident poses are drawn in the app's accent; a held or geometric pose is
-    // drawn grey, so a frozen preview never looks like a live one.
+    // Confident poses in the accent colour, a held or geometric one in grey, so
+    // a frozen overlay never reads as a live one.
     match v.sigma {
         Some(_) => cr.set_source_rgb(0.12, 0.62, 0.63),
         None => cr.set_source_rgb(0.42, 0.46, 0.50),
     }
     cr.set_line_width(2.0);
-
-    let hr = r * 0.42;
-    // Head
-    cr.arc(0.0, 0.0, hr, 0.0, std::f64::consts::TAU);
+    cr.move_to(mx, my);
+    cr.line_to(mx + ax, my + ay);
     let _ = cr.stroke();
-    // Nose, pointing the way the head is turned — the cue that reads fastest.
-    cr.move_to(0.0, 0.0);
-    cr.line_to(
-        (v.yaw_deg / FULL_SCALE_DEG).clamp(-1.5, 1.5) * hr,
-        if v.has_pitch {
-            -(v.pitch_deg / FULL_SCALE_DEG).clamp(-1.5, 1.5) * hr
-        } else {
-            0.0
-        },
-    );
-    let _ = cr.stroke();
-    // Eye line: shows roll directly, and is what the geometric pose measures.
-    cr.move_to(-hr * 0.55, -hr * 0.22);
-    cr.line_to(hr * 0.55, -hr * 0.22);
-    let _ = cr.stroke();
-    let _ = cr.restore();
+    // A head pointing straight at the tracker has almost no arrow, so mark the
+    // origin - otherwise "centred" and "no data" look identical.
+    cr.arc(mx, my, 2.5, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+    if ax.hypot(ay) > 6.0 {
+        cr.arc(mx + ax, my + ay, 4.0, 0.0, std::f64::consts::TAU);
+        let _ = cr.fill();
+    }
 }
