@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         ),
         (Some("headpose"), Some("--model-status")) => model_status(),
         (Some("headpose"), Some("--fetch-model")) => fetch_model(&args),
+        (Some("headpose"), Some("--check-update")) => check_model_update(),
         (Some("headpose"), Some("--install-model")) => install_model(&args),
         (Some("headpose"), _) => headpose(&args),
         (Some("columns"), _) => columns(),
@@ -48,9 +49,11 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage:\n  \
                  tobii stream [--json] [--eyes]\n  \
-                 tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE] [--check]\n  \
+                 tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE]\n  \
+                 tobii headpose --check [--calibrate-pitch [SECS]]\n  \
                  tobii headpose --model-status\n  \
                  tobii headpose --fetch-model [--agree]\n  \
+                 tobii headpose --check-update\n  \
                  tobii headpose --install-model <FILE>\n  \
                  tobii columns\n  \
                  tobii probe-streams [START] [END]\n  \
@@ -79,6 +82,27 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Ask whether opentrack has published a newer model than the one pinned here.
+fn check_model_update() -> CmdResult {
+    use tobii_headpose::model_store::{self, Update};
+    let src = &model_store::HEAD_POSE;
+    println!("pinned to opentrack commit {}", src.commit);
+    match model_store::check_update(src) {
+        Update::UpToDate => println!("up to date — nothing newer has touched {}", src.file),
+        Update::Newer { sha, date } => {
+            println!("upstream has a NEWER {} (commit {sha}, {date})", src.file);
+            println!();
+            println!("This is deliberately not downloadable from here. A different model is a");
+            println!("different model: its rotation conventions, its pitch zero and the scale of");
+            println!("its confidence output are all measured against the pinned one, and this");
+            println!("driver's constants come from those measurements. Adopting a new model means");
+            println!("re-measuring and shipping a new pin, not re-running the download.");
+        }
+        Update::Unknown(why) => println!("could not check: {why}"),
+    }
+    Ok(())
 }
 
 /// Report which head-pose models are installed and whether they verify.
@@ -1108,8 +1132,23 @@ fn open_model(choice: &ModelChoice) -> Option<Model> {
         }),
     };
     match loaded {
-        Ok(m) => {
-            eprintln!("head-pose model loaded — reporting 6 DOF");
+        Ok(mut m) => {
+            // The model reports pitch in its own frame, which is offset from
+            // level by the training set's convention plus the tracker's upward
+            // tilt. That offset is a per-installation measurement, not a
+            // constant we can ship — see `--calibrate-pitch`.
+            match tobii_headpose::model_store::pitch_offset() {
+                Some(off) => {
+                    let mut signs = m.tracker().signs();
+                    signs.pitch_offset_deg = off;
+                    m.tracker().set_signs(signs);
+                    eprintln!("head-pose model loaded — 6 DOF, pitch zero {off:+.1}°");
+                }
+                None => eprintln!(
+                    "head-pose model loaded — 6 DOF, but pitch has no zero yet. \
+                     Run `tobii headpose --calibrate-pitch` once."
+                ),
+            }
             Some(m)
         }
         Err(e) => {
@@ -1225,6 +1264,95 @@ fn print_check_line(
     }
 }
 
+/// Measure the pitch zero: sit square-on, hold still, average, save.
+///
+/// The model's pitch is offset from level by two constants that nothing in the
+/// software can separate — the training set's own pose convention, and how far
+/// the tracker is tilted up on this particular desk. Both are fixed for an
+/// installation, so one measurement settles them together.
+#[cfg(feature = "onnx")]
+fn calibrate_pitch_zero(
+    conn: &mut Connection<UsbTransport>,
+    model: &mut Option<Model>,
+    secs: u64,
+) -> CmdResult {
+    let Some(m) = model.as_mut() else {
+        return Err("pitch calibration needs the model — `tobii headpose --fetch-model`".into());
+    };
+    // Measure the model's RAW pitch: applying the old offset while measuring the
+    // new one would make each run a correction of the last, not a measurement.
+    let mut signs = m.tracker().signs();
+    signs.pitch_offset_deg = 0.0;
+    m.tracker().set_signs(signs);
+
+    eprintln!(
+        "\nSit square-on to the screen, look at its centre, and hold still for {secs}s.\n\
+         Starting in 3 seconds..."
+    );
+    let start = Instant::now() + Duration::from_secs(3);
+    let deadline = start + Duration::from_secs(secs);
+    let mut samples: Vec<f64> = Vec::new();
+    let mut last_note = Instant::now();
+
+    while Instant::now() < deadline {
+        for (op, payload) in conn.read_notifications().iter() {
+            if *op != u32::from(CAMERA_STREAM) {
+                continue;
+            }
+            let Some(frame) = tobii_protocol::camera::decode_camera_frame(payload) else {
+                continue;
+            };
+            if let Some(p) = m.estimate_detailed(&frame) {
+                if Instant::now() >= start {
+                    samples.push(p.pitch_deg);
+                }
+            }
+        }
+        if last_note.elapsed() >= STATUS_INTERVAL {
+            let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+            eprintln!("  {left}s to go, {} samples", samples.len());
+            last_note = Instant::now();
+        }
+    }
+
+    if samples.len() < 20 {
+        return Err(format!(
+            "only {} usable frames — was your face in view? Nothing was saved.",
+            samples.len()
+        )
+        .into());
+    }
+    // Median, not mean: a couple of frames where the ROI had not settled would
+    // drag a mean and cannot drag a median.
+    samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN pitch"));
+    let median = samples[samples.len() / 2];
+    let spread = samples[samples.len() * 9 / 10] - samples[samples.len() / 10];
+    let offset = -median;
+
+    println!(
+        "\nmeasured pitch while sitting square-on: {median:+.2}° (10-90% spread {spread:.2}°)"
+    );
+    if spread > 8.0 {
+        println!("that is a wide spread — you may have moved. Consider re-running.");
+    }
+    tobii_config::save_pitch_offset(offset)?;
+    println!(
+        "saved pitch zero {offset:+.2}° to {}",
+        tobii_config::pitch_offset_path().display()
+    );
+    println!("`tobii headpose` will now report 0° when you sit like that.");
+    Ok(())
+}
+
+#[cfg(not(feature = "onnx"))]
+fn calibrate_pitch_zero(
+    _conn: &mut Connection<UsbTransport>,
+    _model: &mut Option<Model>,
+    _secs: u64,
+) -> CmdResult {
+    Err("this build has no head-pose model support".into())
+}
+
 fn headpose(args: &[String]) -> CmdResult {
     let addr = parse_udp_addr(flag_value(args, "--udp").unwrap_or(DEFAULT_UDP_ADDR))?;
     let rate_hz = match flag_value(args, "--rate") {
@@ -1237,6 +1365,13 @@ fn headpose(args: &[String]) -> CmdResult {
     // conventions: turn your head one axis at a time and the two must move
     // TOGETHER. If one is inverted, that sign is wrong.
     let check = args.iter().any(|a| a == "--check");
+    // `--calibrate-pitch [SECS]` measures the pitch zero instead of streaming:
+    // sit square-on to the screen and hold still.
+    let calibrate_pitch = args.iter().position(|a| a == "--calibrate-pitch").map(|i| {
+        args.get(i + 1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10)
+    });
 
     // Bind an ephemeral local port; opentrack only ever receives from us.
     let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -1255,6 +1390,10 @@ fn headpose(args: &[String]) -> CmdResult {
             eprintln!("the device refused the camera subscription; falling back to 5 DOF");
             model = None;
         }
+    }
+
+    if let Some(secs) = calibrate_pitch {
+        return calibrate_pitch_zero(&mut conn, &mut model, secs);
     }
 
     eprintln!("sending head pose to {addr} at {rate_hz:.0} Hz (Ctrl-C to stop)");

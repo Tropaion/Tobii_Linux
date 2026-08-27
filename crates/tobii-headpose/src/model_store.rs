@@ -275,6 +275,14 @@ pub fn download_path(src: &ModelSource) -> PathBuf {
     model_dir().join(format!("{}.download", src.file))
 }
 
+/// The saved head-pose pitch zero, in degrees, if it has been measured.
+///
+/// Lives here rather than in the caller so the CLI and the GUI cannot disagree
+/// about where it is kept.
+pub fn pitch_offset() -> Option<f64> {
+    tobii_config::load_pitch_offset().ok().flatten()
+}
+
 /// What upstream has, relative to the commit this build is pinned to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Update {

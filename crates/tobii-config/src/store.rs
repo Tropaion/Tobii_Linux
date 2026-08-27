@@ -221,6 +221,36 @@ pub fn load_enabled_eye() -> io::Result<Option<tobii_protocol::EnabledEye>> {
     }
 }
 
+/// Path to the persisted head-pose pitch offset, beside `config.toml`.
+pub fn pitch_offset_path() -> PathBuf {
+    config_path().with_file_name("headpose_pitch_offset")
+}
+
+/// Persist the head-pose pitch zero, in degrees, as plain text.
+///
+/// This is a *measurement*, not a preference: the neural model reports pitch in
+/// its own frame, which is offset from level by the training set's convention
+/// plus the tracker's own upward tilt. The offset is whatever the user reads
+/// while sitting square-on, negated, and it is per-installation because it
+/// depends on how the tracker is mounted.
+pub fn save_pitch_offset(deg: f64) -> io::Result<()> {
+    let path = pitch_offset_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{deg}\n"))
+}
+
+/// Load the persisted pitch offset. `Ok(None)` if unset or unparseable — an
+/// unreadable file must mean "not calibrated", never a wrong angle.
+pub fn load_pitch_offset() -> io::Result<Option<f64>> {
+    match std::fs::read_to_string(pitch_offset_path()) {
+        Ok(s) => Ok(s.trim().parse::<f64>().ok().filter(|v| v.is_finite())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Path to the persisted setup-time chosen monitor id, beside `config.toml`.
 fn setup_monitor_id_path() -> PathBuf {
     config_path().with_file_name("setup_monitor_id")
@@ -301,6 +331,39 @@ mod tests {
             .join("nope.toml");
         let _ = std::fs::remove_file(&path);
         assert!(load_from(&path).expect("io ok").is_none());
+    }
+
+    #[test]
+    fn a_pitch_offset_round_trips_and_bad_input_reads_as_uncalibrated() {
+        let dir = std::env::temp_dir().join(format!("tobii-pitch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("headpose_pitch_offset");
+        for text in ["-22.4\n", "0", "  13.5  "] {
+            std::fs::write(&path, text).expect("write");
+            let got: Option<f64> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite());
+            assert_eq!(got, Some(text.trim().parse::<f64>().unwrap()), "{text:?}");
+        }
+        for bad in ["", "nonsense", "NaN", "inf"] {
+            std::fs::write(&path, bad).expect("write");
+            let got: Option<f64> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite());
+            assert_eq!(
+                got, None,
+                "{bad:?} must read as uncalibrated, not as an angle"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_pitch_offset_lives_beside_the_rest_of_the_config() {
+        assert_eq!(pitch_offset_path().parent(), config_path().parent());
+        assert!(pitch_offset_path().ends_with("headpose_pitch_offset"));
     }
 
     #[test]
