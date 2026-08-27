@@ -64,6 +64,14 @@ button.help-btn { min-width: 22px; padding: 0 8px; background-color: #2a2f36;
 button.help-btn:hover { background-color: #3a424b; color: #e6e8ea; }
 .spin-entry { padding: 2px 6px; }
 .overlay-window { background-color: transparent; }
+.dialog-heading { font-size: 19px; font-weight: bold; }
+.dialog-lead { font-size: 14px; color: #c9d1d8; }
+.dialog-terms { font-size: 13px; color: #9aa4ad; }
+.dialog-facts { font-size: 12px; color: #7d868e; border-top: 1px solid #262b31;
+                padding-top: 10px; margin-top: 2px; }
+.dialog-url { font-size: 11px; }
+button.suggested { background-color: #1f9ea0; }
+button.suggested:hover { background-color: #26b6b8; }
 ";
 
 /// Run the GTK application.
@@ -109,7 +117,12 @@ pub(crate) fn accuracy_mode() -> bool {
     std::env::args().any(|a| a == "--accuracy")
 }
 
-fn load_css() {
+/// Install this app's stylesheet on the default display.
+///
+/// Public so a dialog can be rendered outside the hub for a visual check —
+/// GTK's own `render_texture` gives an honest picture of a widget tree without
+/// a compositor screenshot, which is how this dialog's width bug was found.
+pub fn load_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(CSS);
     if let Some(display) = gtk::gdk::Display::default() {
@@ -424,9 +437,7 @@ fn build_ui(app: &Application) {
     ));
     right.append(&section(
         "Head tracking",
-        "Reports where your head is, for games and applications that accept head \
-         tracking. Position works with no extra download; the up-and-down angle \
-         needs a model from the opentrack project, which you must fetch yourself.",
+        "Sends your head position and angle to games and apps, over opentrack.",
         &head_model::control(),
     ));
     right.append(&section(

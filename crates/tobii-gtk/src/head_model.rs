@@ -27,17 +27,13 @@ const SRC: &ModelSource = &model_store::HEAD_POSE;
 /// will be used, and never implies head tracking is unavailable without it.
 pub fn status_line(st: &Status) -> String {
     match st {
-        Status::Ready => "Model installed and verified — head tracking reports full 6DOF, \
-                          including pitch."
-            .to_string(),
-        Status::Missing => "No model installed. Head tracking still works without one, but \
-                            cannot report pitch (looking up and down)."
-            .to_string(),
+        Status::Ready => "Working, with the up-and-down angle.".to_string(),
+        Status::Missing => "Working. Add the model for the up-and-down angle too.".to_string(),
         // Truncated because the label is one line in a narrow column; the full
         // hash is of no use to the user anyway, only the fact of a mismatch is.
         Status::Corrupt { found } => format!(
-            "A model file is present but is not the expected one (sha256 {}…). It will not be \
-             used — fetch it again.",
+            "The model file on disk is not the expected one (sha256 {}…), so it is not being \
+             used. Fetch it again.",
             &found[..12.min(found.len())]
         ),
     }
@@ -95,12 +91,16 @@ pub fn reflow(text: &str) -> String {
 }
 
 /// What the download is about to do, in the user's terms rather than ours.
+///
+/// Deliberately without the URL: it is 120 characters of raw link, it is shown
+/// on its own line below, and a label containing it sets the dialog's natural
+/// width to 1131 px — which is how the first version of this dialog came out
+/// twice as wide as it needed to be.
 pub fn download_summary(src: &ModelSource) -> String {
     format!(
-        "{} — {:.1} MB, from {}",
+        "{} — {:.1} MB, from the opentrack project",
         src.file,
-        src.bytes as f64 / 1e6,
-        src.url
+        src.bytes as f64 / 1e6
     )
 }
 
@@ -146,62 +146,91 @@ pub fn control() -> gtk::Box {
 
 /// A modal window showing the licence terms, with an explicit agree/cancel.
 ///
-/// Deliberately a real window rather than a `gtk::AlertDialog`: the terms run to
-/// several paragraphs, and `AlertDialog`'s detail text neither scrolls nor gives
-/// any control over how it is laid out — it grows the dialog until it is taller
-/// than the screen. `on_agree` runs only for the agree button.
-fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F) {
+/// Public so it can be rendered standalone for a visual check; the hub only
+/// reaches it through the button in [`control`].
+///
+/// Deliberately a real window rather than a `gtk::AlertDialog`: `AlertDialog`'s
+/// detail text neither scrolls nor takes any layout direction, so several
+/// paragraphs of licence simply grow it past the height of the screen.
+/// `on_agree` runs only for the agree button.
+pub fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F) {
     let heading = Label::new(Some("Download the head-pose model?"));
-    heading.add_css_class("cal-fail-heading");
+    heading.add_css_class("dialog-heading");
     heading.set_halign(Align::Start);
-    heading.set_wrap(true);
     heading.set_xalign(0.0);
 
+    let lead = Label::new(Some(
+        "It adds the up-and-down head angle. Everything else already works without it.",
+    ));
+    lead.add_css_class("dialog-lead");
+    lead.set_wrap(true);
+    lead.set_xalign(0.0);
+    lead.set_halign(Align::Start);
+    lead.set_max_width_chars(58);
+
     let terms = Label::new(Some(&reflow(model_store::TERMS)));
+    terms.add_css_class("dialog-terms");
     terms.set_wrap(true);
     terms.set_xalign(0.0);
     terms.set_halign(Align::Start);
-    // Without this a wrapping label reports its *unwrapped* width as natural,
-    // and the window opens as wide as the longest paragraph.
-    terms.set_max_width_chars(64);
-    terms.set_selectable(true);
+    // A wrapping label reports its *unwrapped* width as its natural width, so
+    // without this the window opens as wide as the longest paragraph.
+    terms.set_max_width_chars(58);
+    // NOT selectable. A selectable GtkLabel takes the initial focus and shows
+    // its whole text selected the moment the dialog opens, which reads as a
+    // rendering fault. The licence URL is a link below instead, which is the
+    // only part anyone would want to copy.
+    terms.set_selectable(false);
 
-    let scroller = gtk::ScrolledWindow::new();
-    scroller.set_child(Some(&terms));
-    scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
-    scroller.set_vexpand(true);
-    scroller.set_min_content_height(320);
-
+    let facts = gtk::Box::new(Orientation::Vertical, 2);
+    facts.add_css_class("dialog-facts");
     let what = Label::new(Some(&download_summary(SRC)));
-    what.add_css_class("section-desc");
-    what.set_wrap(true);
-    what.set_wrap_mode(gtk::pango::WrapMode::WordChar); // the URL has no spaces
     what.set_xalign(0.0);
     what.set_halign(Align::Start);
-    what.set_max_width_chars(64);
+    what.set_wrap(true);
+    what.set_max_width_chars(58);
+    let from = Label::new(None);
+    from.set_markup(&format!(
+        "<a href=\"{url}\">{url}</a>",
+        url = glib::markup_escape_text(SRC.url)
+    ));
+    from.add_css_class("dialog-url");
+    from.set_xalign(0.0);
+    from.set_halign(Align::Start);
+    from.set_wrap(true);
+    from.set_wrap_mode(gtk::pango::WrapMode::Char);
+    from.set_max_width_chars(58);
+    facts.append(&what);
+    facts.append(&from);
 
-    let cancel = Button::with_label("Cancel");
+    let cancel = Button::with_label("Not now");
     let agree = Button::with_label("I agree — download");
-    let buttons = gtk::Box::new(Orientation::Horizontal, 12);
+    agree.add_css_class("suggested");
+    let buttons = gtk::Box::new(Orientation::Horizontal, 10);
     buttons.set_halign(Align::End);
+    buttons.set_margin_top(4);
     buttons.append(&cancel);
     buttons.append(&agree);
 
-    let content = gtk::Box::new(Orientation::Vertical, 14);
-    content.set_margin_top(20);
+    let content = gtk::Box::new(Orientation::Vertical, 12);
+    content.set_margin_top(24);
     content.set_margin_bottom(20);
-    content.set_margin_start(24);
-    content.set_margin_end(24);
+    content.set_margin_start(26);
+    content.set_margin_end(26);
     content.append(&heading);
-    content.append(&scroller);
-    content.append(&what);
+    content.append(&lead);
+    content.append(&terms);
+    content.append(&facts);
     content.append(&buttons);
 
     let win = gtk::Window::builder()
         .title("Head-pose model")
         .modal(true)
-        .default_width(620)
-        .default_height(560)
+        .resizable(false)
+        // Every label above is width-capped, because with `resizable(false)` the
+        // window takes the widest child's natural width — and one unwrapped URL
+        // was enough to make it 1131 px.
+        .default_width(560)
         .child(&content)
         .build();
     if let Some(p) = parent {
@@ -228,6 +257,9 @@ fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F) {
     });
     win.add_controller(keys);
     win.present();
+    // Focus the refusal, not the download. Nothing here should be one stray
+    // Return away from a network fetch the user has not read the terms for.
+    cancel.grab_focus();
 }
 
 /// Fetch on a worker thread, reporting progress from the part-file's size.
@@ -275,11 +307,22 @@ fn start_download<F: Fn() + Clone + 'static>(btn: &Button, status: &Label, refre
 mod tests {
     use super::*;
 
+    /// The section must never read as "broken" when there is no model: head
+    /// tracking works fine without one, it just loses one axis.
     #[test]
     fn a_missing_model_does_not_read_as_a_broken_feature() {
         let s = status_line(&Status::Missing);
-        assert!(s.contains("still works"), "{s}");
-        assert!(s.contains("pitch"), "{s}");
+        assert!(s.starts_with("Working"), "{s}");
+        assert!(s.contains("angle"), "{s}");
+    }
+
+    /// These sit under a heading in a narrow column. Long is unread.
+    #[test]
+    fn the_status_lines_stay_short_enough_to_scan() {
+        for st in [Status::Ready, Status::Missing] {
+            let s = status_line(&st);
+            assert!(s.len() <= 60, "{} chars is too long: {s:?}", s.len());
+        }
     }
 
     #[test]
@@ -288,7 +331,7 @@ mod tests {
             found: "deadbeefcafebabe0123".into(),
         });
         assert!(s.contains("deadbeefcafe"), "{s}");
-        assert!(s.contains("will not be used"), "{s}");
+        assert!(s.contains("not being used"), "{s}");
     }
 
     #[test]
@@ -325,22 +368,25 @@ mod tests {
         );
     }
 
-    /// The bug this function exists for: the real terms, rendered by a wrapping
-    /// widget, came out ragged because they were already wrapped at 76 columns.
+    /// The bug this function exists for: consent text that a wrapping widget
+    /// wraps a second time comes out ragged, every paragraph broken at an
+    /// arbitrary point. The invariant is that each paragraph reaches the widget
+    /// as ONE logical line — a line ending mid-sentence is the signature of the
+    /// bug, so every paragraph must end on real punctuation.
     #[test]
-    fn the_real_terms_contain_no_short_hard_wrapped_lines_after_reflow() {
+    fn every_paragraph_of_the_real_terms_survives_as_one_line() {
         let got = reflow(model_store::TERMS);
         for line in got.lines() {
-            let l = line.trim();
-            if l.is_empty() || line.starts_with(char::is_whitespace) {
-                continue;
+            if line.trim().is_empty() || line.starts_with(char::is_whitespace) {
+                continue; // blank, or the deliberately-kept licence URL
             }
+            let last = line.trim_end().chars().last().unwrap();
             assert!(
-                l.len() > 76,
-                "a paragraph should be one long logical line, got {} chars: {l:?}",
-                l.len()
+                matches!(last, '.' | ':' | '?' | '!'),
+                "this line stops mid-sentence, so the paragraph was wrapped: {line:?}"
             );
         }
+        assert_eq!(reflow(&got), got, "reflow must be idempotent");
     }
 
     #[test]
@@ -349,5 +395,13 @@ mod tests {
         assert!(s.contains(SRC.file), "{s}");
         assert!(s.contains("12.9 MB"), "{s}");
         assert!(s.contains("opentrack"), "{s}");
+        // The URL belongs on its own line. Inline, it sets the dialog's natural
+        // width and doubles it.
+        assert!(!s.contains("http"), "the URL must not be inline: {s}");
+        assert!(
+            s.len() < 70,
+            "{} chars is too wide for the dialog: {s}",
+            s.len()
+        );
     }
 }
