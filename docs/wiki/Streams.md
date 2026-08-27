@@ -28,11 +28,21 @@ The two ~78 KB streams carry the **same** near-infrared image of the whole face,
 wide-angle (the tracker sits below the monitor and looks up, so the face appears
 low in frame with empty wall above it).
 
-**They are NOT a stereo pair.** That was the reading here until it was measured:
-`tobii camera both` captured 199 timestamp-matched pairs with a face in view and
-**199 of them were byte-identical**. Whatever the second stream is for, it is not
-a second viewpoint, and there is no stereo depth to be had from this device — which
-is why the head-pose model is monocular and takes its depth from the gaze frame's
+**They are NOT two viewpoints.** That was the reading here until it was measured,
+twice: `tobii camera both` captured 199 timestamp-matched pairs with a face in
+view and **199 were byte-identical**, then 166 pairs of a dark empty scene and
+**166 were byte-identical**. The second run is the stronger one — two separate
+sensors differ in their *noise*, not merely in what they are pointed at, so
+identical bytes on an empty scene means one source, not two cameras that happen
+to agree.
+
+The device's own stream catalog says the same thing in its naming: `0x501` is
+`image` and `0x50e` is `primary_camera_image` — one primary camera, exposed
+twice. A third stream, `0x508 image_collection`, acks a subscribe and then
+delivers **nothing** (5 s, 0 notifications), so if a second sensor exists it is
+not reachable over any stream this device advertises.
+
+Hence the head-pose model is monocular and takes depth from the gaze frame's
 metric eye origins instead (see [[Head-Pose]]). Decoded live 2026-07-23: same XDS/TLV framing as
 gaze, with columns `[timestamp(s64), bit_depth=8, width=280, height=280,
 image-blob]`; the `0x05` blob is a 4-byte prefix (`00 01 ..`) followed by

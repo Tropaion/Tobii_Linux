@@ -129,6 +129,17 @@ pub struct DeviceState {
     pub cal_session_open: bool,
     /// Progress and result of a head-pose pitch-zero measurement.
     pub pitch_cal: PitchCal,
+    /// Most recent head pose, as the opentrack stream would see it: position
+    /// from the eye origins, rotation from the model. `None` until a model is
+    /// installed AND a frame it was confident about has arrived.
+    pub head_pose: Option<tobii_headpose::HeadPose>,
+    /// The model's confidence for that pose — lower is better; see
+    /// `tobii_headpose::onnx::SIGMA_MAX`. `None` when the pose is geometric.
+    pub head_sigma: Option<f32>,
+    /// Camera frames dropped because inference was still busy. Not an error:
+    /// the preview only needs the latest pose, and blocking the device thread
+    /// on 12 ms of inference is what this design exists to avoid.
+    pub head_dropped: u64,
 }
 
 /// A pitch-zero measurement in flight, or its result.
@@ -217,6 +228,7 @@ pub fn device_tick<T: Transport>(
     conn: &mut Connection<T>,
     state: &Mutex<DeviceState>,
     cmd_rx: &Receiver<DeviceCommand>,
+    head: Option<&HeadWorker>,
 ) -> Tick {
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
@@ -370,6 +382,21 @@ pub fn device_tick<T: Transport>(
             }
             op if op == CAMERA_STREAM as u32 => {
                 if let Some(f) = decode_camera_frame(&payload) {
+                    if let Some(w) = head {
+                        // Pair the image with the eye origins from the newest
+                        // gaze sample: the model supplies rotation, the eyes
+                        // supply metric position. A dropped frame here costs the
+                        // preview one update and nothing else.
+                        let eyes = {
+                            let s = state.lock().unwrap();
+                            s.latest_gaze
+                                .as_ref()
+                                .and_then(tobii_headpose::pose_from_sample)
+                        };
+                        if !w.offer(f.clone(), eyes) {
+                            state.lock().unwrap().head_dropped += 1;
+                        }
+                    }
                     state.lock().unwrap().latest_camera = Some(f);
                 }
                 got = true;
@@ -380,6 +407,74 @@ pub fn device_tick<T: Transport>(
     Tick {
         published: got,
         saw_traffic,
+    }
+}
+
+/// Runs the head-pose model off the device thread.
+///
+/// Inference is ~12 ms a frame against a 33 ms frame interval. That fits, but
+/// not with room to spare, and the device thread is also publishing gaze — the
+/// path where a stall shows up as visible lag. So frames go to a worker over a
+/// one-slot channel and a frame that arrives while the worker is busy is
+/// **dropped**, not queued: the preview wants the newest pose, and a queue would
+/// turn a momentary overrun into permanent latency.
+pub struct HeadWorker {
+    tx: std::sync::mpsc::SyncSender<(CameraFrame, Option<tobii_headpose::HeadPose>)>,
+}
+
+impl HeadWorker {
+    /// `None` when no model is installed, which is the ordinary case.
+    fn spawn(state: Arc<Mutex<DeviceState>>) -> Option<HeadWorker> {
+        use tobii_headpose::onnx::{fuse, OnnxPose, RotationSource};
+        // No model installed is the ordinary state, not a failure.
+        tobii_headpose::model_store::installed(&tobii_headpose::model_store::HEAD_POSE)?;
+        let mut model = match OnnxPose::from_store() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("head pose: {e}");
+                return None;
+            }
+        };
+        if let Some(off) = tobii_headpose::model_store::pitch_offset() {
+            let mut signs = model.tracker().signs();
+            signs.pitch_offset_deg = off;
+            model.tracker().set_signs(signs);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            while let Ok((frame, eyes)) = rx.recv() {
+                let pose = model.estimate_detailed(&frame);
+                let mut s = state.lock().unwrap();
+                match pose {
+                    Some(m) => {
+                        s.head_pose = fuse(eyes, Some(&m), RotationSource::Model);
+                        s.head_sigma = Some(m.sigma);
+                    }
+                    None => {
+                        // Hold the last rotation rather than snapping to zero,
+                        // but stop claiming a confidence for it.
+                        s.head_sigma = None;
+                        if let Some(e) = eyes {
+                            s.head_pose = Some(match s.head_pose {
+                                Some(prev) => tobii_headpose::HeadPose {
+                                    x_mm: e.x_mm,
+                                    y_mm: e.y_mm,
+                                    z_mm: e.z_mm,
+                                    ..prev
+                                },
+                                None => e,
+                            });
+                        }
+                    }
+                }
+            }
+        });
+        Some(HeadWorker { tx })
+    }
+
+    /// Hand a frame over if the worker is idle; otherwise drop it and say so.
+    fn offer(&self, frame: CameraFrame, eyes: Option<tobii_headpose::HeadPose>) -> bool {
+        self.tx.try_send((frame, eyes)).is_ok()
     }
 }
 
@@ -556,9 +651,11 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 // jump when they all land at once. Back off only when the
                 // transport itself went silent, and even then only briefly,
                 // since `read_notifications` already blocks for up to a second.
+                // One model, one worker, for the life of the connection.
+                let head = HeadWorker::spawn(thread_state.clone());
                 let mut quiet_since = Instant::now();
                 loop {
-                    let tick = device_tick(&mut conn, &thread_state, &rx);
+                    let tick = device_tick(&mut conn, &thread_state, &rx, head.as_ref());
                     let calibrating = thread_state.lock().unwrap().calibration.active;
                     if tick.published || calibrating {
                         quiet_since = Instant::now();
@@ -805,7 +902,7 @@ mod tests {
         let mut conn = connected(vec![inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload())]);
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
-        assert!(device_tick(&mut conn, &state, &rx).published);
+        assert!(device_tick(&mut conn, &state, &rx, None).published);
         let g = state
             .lock()
             .unwrap()
@@ -820,7 +917,7 @@ mod tests {
         let mut conn = connected(vec![]);
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
-        assert!(!device_tick(&mut conn, &state, &rx).published);
+        assert!(!device_tick(&mut conn, &state, &rx, None).published);
     }
 
     #[test]
@@ -876,7 +973,7 @@ mod tests {
         let (tx, rx) = channel::<DeviceCommand>();
         tx.send(DeviceCommand::CalCollect { x: 0.5, y: 0.5 })
             .unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         assert_eq!(state.lock().unwrap().calibration.collected, 1);
     }
 
@@ -914,7 +1011,7 @@ mod tests {
             token: 99,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         let s = state.lock().unwrap();
         assert_eq!(s.calibration.token, 99, "UI's token is echoed back");
         assert!(s.calibration.active);
@@ -947,7 +1044,7 @@ mod tests {
             token: 1,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         assert!(sent_op(&conn, 0x456), "retrieved blob was re-applied");
         let s = state.lock().unwrap();
         assert!(s.calibration.started, "start+clear+reapply all acked");
@@ -973,7 +1070,7 @@ mod tests {
             token: 1,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         let s = state.lock().unwrap();
         assert!(s.calibration.started, "session must open anyway");
         assert!(
@@ -1003,7 +1100,7 @@ mod tests {
             token: 5,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         {
             let s = state.lock().unwrap();
             assert!(!s.calibration.active, "on_finish cleared active");
@@ -1019,7 +1116,7 @@ mod tests {
         // assertions below deliberately do not depend on that, but the coupling
         // is real and this test would be better with a config seam.
         tx.send(DeviceCommand::CalAbort).unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         assert!(sent_op(&conn, 0x3fc), "CAL_STOP was sent");
         // The mock never acks that stop, so the realm may well still be open:
         // the flag must STAY set so a later abort retries it. Clearing on a
@@ -1058,7 +1155,7 @@ mod tests {
             s.cal_session_open = false;
         }
         tx.send(DeviceCommand::CalAbort).unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         assert!(!sent_op(&conn, 0x3fc), "no redundant CAL_STOP");
         assert_eq!(state.lock().unwrap().calibration, CalPhase::default());
     }
@@ -1076,7 +1173,7 @@ mod tests {
             },
         ))
         .unwrap();
-        device_tick(&mut conn, &state, &rx);
+        device_tick(&mut conn, &state, &rx, None);
         // A SET_DISPLAY_AREA (op 0x5a0) frame was sent (5th send after 4 handshake sends).
         assert_eq!(
             &conn.transport().sent.last().unwrap()[20..24],

@@ -59,8 +59,11 @@ Feasible: subscribe to `0x501`/`0x50e` → run a head-pose model (Rust
 `openvino` / `ort` / `tract`) → 6 DOF. Both former open questions are now
 settled by measurement:
 - **Camera-image format** — **[CONFIRMED]** `0x501` and `0x50e` are the *same*
-  wide face image, not eye crops and not a stereo pair: over a 199-frame capture
-  every timestamp-matched pair was byte-identical (`tobii camera both`). The raw
+  wide face image, not eye crops and not two viewpoints: 199/199 timestamp-matched
+  pairs byte-identical with a face in view, and 166/166 on an empty scene, where
+  two separate sensors would differ in noise alone (`tobii camera both`). The
+  device names them `image` and `primary_camera_image`; `0x508 image_collection`
+  acks but delivers nothing. The raw
   pixels sit in a narrow 8..42-of-255 band lit from below, with blown-out
   corneal glints at 255, but the face is plainly legible after a percentile
   stretch — face-like enough for a face model (see

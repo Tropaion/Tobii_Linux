@@ -589,7 +589,7 @@ pub fn launch(
         });
     }
 
-    let continue_btn = Button::with_label("Continue anyway");
+    let continue_btn = crate::widget::button("Continue anyway");
     continue_btn.set_visible(false);
 
     let eye_preview_box = gtk::Box::new(Orientation::Vertical, 10);
@@ -646,15 +646,15 @@ pub fn launch(
     fail_box.append(&fail_detail);
     fail_box.set_visible(false);
 
-    let done_btn = Button::with_label("Done");
-    let retry_btn = Button::with_label("Try again");
+    let done_btn = crate::widget::button("Done");
+    let retry_btn = crate::widget::button("Try again");
     let done_box = gtk::Box::new(Orientation::Horizontal, 10);
     done_box.set_halign(Align::Center);
     done_box.append(&retry_btn);
     done_box.append(&done_btn);
     done_box.set_visible(false);
 
-    let cancel = Button::with_label("Cancel");
+    let cancel = crate::widget::button("Cancel");
     cancel.set_halign(Align::Center);
 
     let header = gtk::Box::new(Orientation::Vertical, 16);

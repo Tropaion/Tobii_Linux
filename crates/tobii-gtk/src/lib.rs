@@ -26,8 +26,7 @@ use std::time::Duration;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Align, Application, ApplicationWindow, Button, CheckButton, DrawingArea, Label, Orientation,
-    Switch,
+    Align, Application, ApplicationWindow, CheckButton, DrawingArea, Label, Orientation, Switch,
 };
 
 use tobii_protocol::EnabledEye;
@@ -320,16 +319,48 @@ fn build_ui(app: &Application) {
         });
     }
 
+    // Live head pose, beside the camera it is computed from. Shared view drawn
+    // by the tick, like the eye box and the camera.
+    let head_title = Label::new(Some("Head pose"));
+    head_title.add_css_class("section-title");
+    head_title.set_halign(Align::Start);
+    let head_view: Rc<RefCell<Option<widget::HeadView>>> = Rc::new(RefCell::new(None));
+    let head_area = DrawingArea::new();
+    head_area.set_content_width(220);
+    head_area.set_content_height(220);
+    head_area.set_halign(Align::Center);
+    {
+        let head_view = head_view.clone();
+        head_area.set_draw_func(move |_, cr, w, h| {
+            widget::draw_head_view(cr, w, h, head_view.borrow().as_ref());
+        });
+    }
+    let head_msg = Label::new(Some("No head detected"));
+    head_msg.add_css_class("status");
+    head_msg.set_halign(Align::Center);
+    head_msg.set_wrap(true);
+    head_msg.set_justify(gtk::Justification::Center);
+
+    let previews = gtk::Box::new(Orientation::Horizontal, 14);
+    previews.append(&cam_area);
+    previews.append(&head_area);
+    let preview_titles = gtk::Box::new(Orientation::Horizontal, 14);
+    cam_title.set_width_request(220);
+    head_title.set_width_request(220);
+    preview_titles.append(&cam_title);
+    preview_titles.append(&head_title);
+
     let left = gtk::Box::new(Orientation::Vertical, 10);
     left.set_width_request(380);
     left.append(&eye_title);
     left.append(&area);
     left.append(&guidance);
-    left.append(&cam_title);
-    left.append(&cam_area);
+    left.append(&preview_titles);
+    left.append(&previews);
+    left.append(&head_msg);
 
     // --- Right column: settings sections (original wording) ---
-    let b_setup = Button::with_label("Set up display");
+    let b_setup = crate::widget::button("Set up display");
     {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
@@ -399,7 +430,7 @@ fn build_ui(app: &Application) {
         });
     }
 
-    let b_cal = Button::with_label("Improve calibration");
+    let b_cal = crate::widget::button("Improve calibration");
     {
         let app = app.clone();
         let state = state.clone();
@@ -465,8 +496,8 @@ fn build_ui(app: &Application) {
     let banner_label = Label::new(None);
     banner_label.set_hexpand(true);
     banner_label.set_xalign(0.0);
-    let banner_recal = Button::with_label("Recalibrate");
-    let banner_dismiss = Button::with_label("×");
+    let banner_recal = crate::widget::button("Recalibrate");
+    let banner_dismiss = crate::widget::button("×");
     banner.append(&banner_label);
     banner.append(&banner_recal);
     banner.append(&banner_dismiss);
@@ -625,6 +656,16 @@ fn build_ui(app: &Application) {
         } else if new_cam.is_some() {
             *cam_frame.borrow_mut() = new_cam;
             cam_area.queue_draw();
+        }
+        // Head pose: same discipline as the camera — only redraw when the view
+        // actually changed, so an unchanged pose costs nothing.
+        {
+            let next = widget::head_view_for(&snap);
+            if *head_view.borrow() != next {
+                *head_view.borrow_mut() = next;
+                head_area.queue_draw();
+                head_msg.set_text(&widget::head_message(next.as_ref()));
+            }
         }
         glib::ControlFlow::Continue
     });

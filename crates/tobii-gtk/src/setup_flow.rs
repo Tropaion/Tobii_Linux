@@ -33,7 +33,7 @@ use std::sync::mpsc::Sender;
 use gtk::prelude::*;
 use gtk::{
     cairo, Align, Application, Button, DrawingArea, Entry, GestureDrag, Grid, Label, Orientation,
-    Overlay, Stack, ToggleButton,
+    Overlay, Stack,
 };
 
 use crate::align;
@@ -321,7 +321,7 @@ fn diagram_curvature(cr: &cairo::Context) {
 
 /// A "?" button whose tooltip is `diagram` over `text`.
 fn help_button(diagram: fn(&cairo::Context), text: &'static str) -> Button {
-    let btn = Button::with_label("?");
+    let btn = crate::widget::button("?");
     btn.add_css_class("help-btn");
     btn.set_valign(Align::Center);
     btn.set_has_tooltip(true);
@@ -366,13 +366,13 @@ fn add_spinner(
     lbl.set_halign(Align::Start);
     lbl.add_css_class("section-desc");
 
-    let minus = Button::with_label("−");
+    let minus = crate::widget::button("−");
     minus.add_css_class("spin-btn");
     let entry = Entry::new();
     entry.set_width_chars(5);
     entry.set_max_width_chars(5);
     entry.add_css_class("spin-entry");
-    let plus = Button::with_label("+");
+    let plus = crate::widget::button("+");
     plus.add_css_class("spin-btn");
 
     let rowbox = gtk::Box::new(Orientation::Horizontal, 4);
@@ -576,9 +576,9 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
         })
     };
 
-    let align_done = Button::with_label("Done");
-    let advanced = ToggleButton::with_label("Show advanced");
-    let align_cancel = Button::with_label("Cancel");
+    let align_done = crate::widget::button("Done");
+    let advanced = crate::widget::toggle_button("Show advanced");
+    let align_cancel = crate::widget::button("Cancel");
     let buttons = gtk::Box::new(Orientation::Horizontal, 10);
     buttons.set_halign(Align::Center);
     buttons.append(&align_done);
@@ -843,7 +843,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     let pick_buttons = gtk::Box::new(Orientation::Vertical, 10);
     pick_buttons.set_halign(Align::Center);
     for m in &monitors {
-        let btn = Button::with_label(&crate::screen_pick::monitor_label(m));
+        let btn = crate::widget::button(&crate::screen_pick::monitor_label(m));
         {
             let m = m.clone();
             let chosen = chosen.clone();
@@ -870,7 +870,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
         pick_buttons.append(&btn);
     }
 
-    let pick_cancel = Button::with_label("Cancel");
+    let pick_cancel = crate::widget::button("Cancel");
 
     let screen_pick_page = gtk::Box::new(Orientation::Vertical, 16);
     screen_pick_page.set_halign(Align::Center);
@@ -900,8 +900,8 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     posture_warn.set_max_width_chars(70);
     posture_warn.set_visible(false);
 
-    let posture_done = Button::with_label("Done");
-    let posture_cancel = Button::with_label("Cancel");
+    let posture_done = crate::widget::button("Done");
+    let posture_cancel = crate::widget::button("Cancel");
     let posture_buttons = gtk::Box::new(Orientation::Horizontal, 10);
     posture_buttons.set_halign(Align::Center);
     posture_buttons.append(&posture_done);
@@ -932,7 +932,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
         advanced.connect_toggled(move |t| {
             let on = t.is_active();
             adv_panel.set_visible(on);
-            t.set_label(if on { "Hide advanced" } else { "Show advanced" });
+            crate::widget::set_button_text(t, if on { "Hide advanced" } else { "Show advanced" });
         });
     }
 

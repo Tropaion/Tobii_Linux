@@ -24,7 +24,7 @@ display area first (the device wipes it on reboot; see [[Display-Area]]).
 | `tobii log [SECS]` | Subscribe to the device's ASCII log stream (`0x1772`) and print it for `SECS` (default 30). The firmware's own view of what it is doing. |
 | `tobii dump-stream <ID_hex> [COUNT]` | Dump `COUNT` (default 3) raw payloads of one stream to files in a fresh private directory. |
 | `tobii camera [ID] [COUNT]` | Capture camera frames from one image stream (default `0x501`) and write them as PGM. |
-| `tobii camera both [SECS]` | Capture `0x501` and `0x50e` together for `SECS` (default 6), pair them by timestamp, and report whether the two cameras differ. On this ET5 they are byte-identical — **there is no stereo pair**. |
+| `tobii camera both [SECS]` | Capture `0x501` and `0x50e` together for `SECS` (default 6), pair them by timestamp, and report whether the two cameras differ. On this ET5 they are byte-identical, on a face and on an empty scene alike — `0x50e` is the **same** camera as `0x501`, not a second view. |
 | `tobii cal-blob` | Retrieve the stored calibration (`0x44c`) and report its size, the 2-byte status prefix, and a preview — the quickest way to tell a real blob from a stub. See [[Calibration]]. |
 | `tobii cal-points` | Ask the device for its own stimulus point set (`0x460`) and decode the reply. |
 | `tobii setup` | Interactive display-geometry wizard: detect the monitor, prompt for width/height/tilt/offsets/curvature, compute corners, save config, and apply to the device. |

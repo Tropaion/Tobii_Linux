@@ -3,6 +3,7 @@
 //! unit-tested; `draw_eye_view` is the cairo drawing (live-validated).
 
 use gtk::cairo;
+use gtk::prelude::*;
 
 use crate::device::{ConnStatus, DeviceState};
 use crate::eyeview::{EyeView, Guidance};
@@ -171,6 +172,75 @@ pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_proto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn head(yaw: f64, pitch: f64, roll: f64, sigma: Option<f32>) -> HeadView {
+        HeadView {
+            yaw_deg: yaw,
+            pitch_deg: pitch,
+            roll_deg: roll,
+            z_mm: 680.0,
+            sigma,
+            has_pitch: sigma.is_some(),
+        }
+    }
+
+    /// Without a model, `pitch_deg` is hardcoded 0.0. Reporting that as a level
+    /// head would be a lie, so the message has to say the number is absent
+    /// rather than print a zero.
+    #[test]
+    fn a_pose_without_a_model_does_not_claim_a_pitch_of_zero() {
+        let v = HeadView {
+            has_pitch: false,
+            sigma: None,
+            ..head(12.0, 0.0, -3.0, None)
+        };
+        let m = head_message(Some(&v));
+        assert!(m.contains("no pitch"), "{m}");
+        assert!(!m.contains("pitch +0"), "{m}");
+        assert!(m.contains("yaw +12"), "{m}");
+    }
+
+    #[test]
+    fn a_full_pose_reports_all_three_angles_and_a_distance() {
+        let m = head_message(Some(&head(-5.0, 8.0, 2.0, Some(0.07))));
+        assert!(m.contains("yaw -5"), "{m}");
+        assert!(m.contains("pitch +8"), "{m}");
+        assert!(m.contains("roll +2"), "{m}");
+        assert!(m.contains("68 cm"), "{m}");
+    }
+
+    #[test]
+    fn no_pose_says_so_rather_than_showing_zeros() {
+        assert_eq!(head_message(None), "No head detected");
+    }
+
+    /// A disconnected device must never leave the last pose on screen looking
+    /// live — the same rule `eye_view_for` follows.
+    #[test]
+    fn a_device_that_is_not_connected_has_no_head_view() {
+        let mut s = DeviceState {
+            status: ConnStatus::Connected,
+            head_pose: Some(tobii_headpose::HeadPose {
+                yaw_deg: 5.0,
+                ..Default::default()
+            }),
+            head_sigma: Some(0.07),
+            ..Default::default()
+        };
+        assert!(head_view_for(&s).is_some());
+        s.status = ConnStatus::Error("unplugged".into());
+        assert!(head_view_for(&s).is_none());
+    }
+
+    #[test]
+    fn drawing_a_head_view_never_panics_on_a_degenerate_size() {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        for (w, h) in [(0, 0), (1, 1), (220, 220)] {
+            draw_head_view(&cr, w, h, None);
+            draw_head_view(&cr, w, h, Some(&head(90.0, -90.0, 180.0, Some(0.05))));
+        }
+    }
     use crate::eyeview::{EyeView, Guidance};
 
     fn view(g: Guidance, d: Option<f32>) -> EyeView {
@@ -251,4 +321,184 @@ mod tests {
         s.eye_view = None;
         assert!(matches!(eye_view_for(&s).guidance, Guidance::NoEyes));
     }
+}
+
+/// A button whose label is a standalone [`gtk::Label`] with a little vertical
+/// slack, instead of the button's own built-in label.
+///
+/// **This is a workaround for a real, repeatedly-reported rendering fault**: on
+/// this theme the tops of tall glyphs are shaved off a widget's *built-in*
+/// label, while a standalone `Label` in the same place renders whole. The
+/// eye-selection radios in the hub hit exactly this and were fixed exactly this
+/// way; the buttons were left on `Button::with_label` and kept clipping.
+///
+/// What has been ruled out first, so nobody repeats it: every CSS rule in this
+/// app's stylesheet (GTK4 pushes no clip anywhere in the Button->Label path),
+/// and the `GSK_RENDERER=gl` override this program used to force (removed; the
+/// clipping survived it). Rendering the same widgets offscreen through GTK's own
+/// renderer at scale 1.0, 1.15, 1.25, 1.5 and 2.0 does not reproduce it either,
+/// which is why the fix is empirical rather than explanatory.
+///
+/// Use this instead of [`gtk::Button::with_label`] everywhere in this app.
+pub fn button(text: &str) -> gtk::Button {
+    let label = gtk::Label::new(Some(text));
+    // The slack is the load-bearing part: the ink of a tall glyph needs a
+    // little more vertical room than the label's logical box gives it here.
+    label.set_margin_top(2);
+    label.set_margin_bottom(2);
+    let b = gtk::Button::new();
+    b.set_child(Some(&label));
+    b
+}
+
+/// Replace the text of a button built by [`button`].
+///
+/// `gtk::Button::set_label` would throw the child label away and go back to the
+/// built-in one, reintroducing the clipping on that button alone — which is a
+/// nasty way to find this out, because it only shows up after the first state
+/// change.
+pub fn set_button_text(b: &impl IsA<gtk::Button>, text: &str) {
+    let b = b.as_ref();
+    match b.child().and_downcast::<gtk::Label>() {
+        Some(l) => l.set_text(text),
+        None => b.set_label(text),
+    }
+}
+
+/// [`button`], but a [`gtk::ToggleButton`] — same built-in-label problem, same
+/// workaround.
+pub fn toggle_button(text: &str) -> gtk::ToggleButton {
+    let label = gtk::Label::new(Some(text));
+    label.set_margin_top(2);
+    label.set_margin_bottom(2);
+    let b = gtk::ToggleButton::new();
+    b.set_child(Some(&label));
+    b
+}
+
+/// What the head-pose preview draws for one frame.
+///
+/// Pure data so the mapping from a pose to what you see is testable without a
+/// drawing context — the same split as [`eye_view_for`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeadView {
+    /// Degrees, this crate's convention: +yaw = turned to the user's right,
+    /// +pitch = looking up, +roll = tilted to the user's right.
+    pub yaw_deg: f64,
+    pub pitch_deg: f64,
+    pub roll_deg: f64,
+    /// Distance from the tracker, millimetres.
+    pub z_mm: f64,
+    /// Model confidence, if this pose came from the model. `None` means the
+    /// rotation is stale or geometric, and the view says so rather than
+    /// implying a live measurement.
+    pub sigma: Option<f32>,
+    /// Whether pitch is real. Without a model it is hardcoded 0.0, and drawing
+    /// that as a level head would be a lie.
+    pub has_pitch: bool,
+}
+
+/// The head view for a device snapshot, or `None` when there is no pose at all.
+pub fn head_view_for(state: &DeviceState) -> Option<HeadView> {
+    if !matches!(state.status, ConnStatus::Connected) {
+        return None;
+    }
+    let p = state.head_pose?;
+    Some(HeadView {
+        yaw_deg: p.yaw_deg,
+        pitch_deg: p.pitch_deg,
+        roll_deg: p.roll_deg,
+        z_mm: p.z_mm,
+        sigma: state.head_sigma,
+        has_pitch: state.head_sigma.is_some() || p.pitch_deg != 0.0,
+    })
+}
+
+/// One-line summary under the head preview.
+pub fn head_message(view: Option<&HeadView>) -> String {
+    match view {
+        None => "No head detected".to_string(),
+        Some(v) if !v.has_pitch => format!(
+            "yaw {:+.0}°  roll {:+.0}°  ·  {:.0} cm  ·  no model, so no pitch",
+            v.yaw_deg,
+            v.roll_deg,
+            v.z_mm / 10.0
+        ),
+        Some(v) => format!(
+            "yaw {:+.0}°  pitch {:+.0}°  roll {:+.0}°  ·  {:.0} cm",
+            v.yaw_deg,
+            v.pitch_deg,
+            v.roll_deg,
+            v.z_mm / 10.0
+        ),
+    }
+}
+
+/// Draw the head preview: a head seen from the front, turned and tilted as the
+/// tracker reports, over a fixed reference frame so the motion has something to
+/// be relative to.
+pub fn draw_head_view(cr: &cairo::Context, w: i32, h: i32, view: Option<&HeadView>) {
+    let (w, h) = (w as f64, h as f64);
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let r = (w.min(h) / 2.0) - 12.0;
+
+    // Reference frame: a fixed ring and crosshair, so "centred" is visible even
+    // when nothing is detected.
+    cr.set_source_rgb(0.16, 0.18, 0.21);
+    cr.set_line_width(1.0);
+    cr.arc(cx, cy, r, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke();
+    cr.move_to(cx - r, cy);
+    cr.line_to(cx + r, cy);
+    cr.move_to(cx, cy - r);
+    cr.line_to(cx, cy + r);
+    let _ = cr.stroke();
+
+    let Some(v) = view else {
+        return;
+    };
+
+    // Yaw and pitch move the head within the ring; roll rotates it. The gain is
+    // chosen so a comfortable +/-30 degrees reaches the ring, which is about the
+    // range this tracker keeps both eyes for.
+    const FULL_SCALE_DEG: f64 = 30.0;
+    let dx = (v.yaw_deg / FULL_SCALE_DEG).clamp(-1.0, 1.0) * r * 0.55;
+    let dy = if v.has_pitch {
+        -(v.pitch_deg / FULL_SCALE_DEG).clamp(-1.0, 1.0) * r * 0.55
+    } else {
+        0.0
+    };
+
+    let _ = cr.save();
+    cr.translate(cx + dx, cy + dy);
+    cr.rotate(v.roll_deg.to_radians());
+
+    // Confident poses are drawn in the app's accent; a held or geometric pose is
+    // drawn grey, so a frozen preview never looks like a live one.
+    match v.sigma {
+        Some(_) => cr.set_source_rgb(0.12, 0.62, 0.63),
+        None => cr.set_source_rgb(0.42, 0.46, 0.50),
+    }
+    cr.set_line_width(2.0);
+
+    let hr = r * 0.42;
+    // Head
+    cr.arc(0.0, 0.0, hr, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke();
+    // Nose, pointing the way the head is turned — the cue that reads fastest.
+    cr.move_to(0.0, 0.0);
+    cr.line_to(
+        (v.yaw_deg / FULL_SCALE_DEG).clamp(-1.5, 1.5) * hr,
+        if v.has_pitch {
+            -(v.pitch_deg / FULL_SCALE_DEG).clamp(-1.5, 1.5) * hr
+        } else {
+            0.0
+        },
+    );
+    let _ = cr.stroke();
+    // Eye line: shows roll directly, and is what the geometric pose measures.
+    cr.move_to(-hr * 0.55, -hr * 0.22);
+    cr.line_to(hr * 0.55, -hr * 0.22);
+    let _ = cr.stroke();
+    let _ = cr.restore();
 }

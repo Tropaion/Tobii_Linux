@@ -151,10 +151,10 @@ pub fn control(
     pitch.set_xalign(0.0);
     pitch.set_wrap(true);
 
-    let get = Button::with_label("Get the model…");
-    let set_pitch = Button::with_label("Set pitch zero…");
-    let updates = Button::with_label("Check for updates");
-    let remove = Button::with_label("Remove");
+    let get = crate::widget::button("Get the model…");
+    let set_pitch = crate::widget::button("Set pitch zero…");
+    let updates = crate::widget::button("Check for updates");
+    let remove = crate::widget::button("Remove");
     for small in [&updates, &remove] {
         small.add_css_class("help-btn");
     }
@@ -328,8 +328,8 @@ fn pitch_dialog<F: Fn() + Clone + 'static>(
     progress.set_wrap(true);
     progress.set_max_width_chars(52);
 
-    let close = Button::with_label("Cancel");
-    let go = Button::with_label("Start");
+    let close = crate::widget::button("Cancel");
+    let go = crate::widget::button("Start");
     go.add_css_class("suggested");
     let buttons = gtk::Box::new(Orientation::Horizontal, 10);
     buttons.set_halign(Align::End);
@@ -374,7 +374,7 @@ fn pitch_dialog<F: Fn() + Clone + 'static>(
         let state = state.clone();
         go.connect_clicked(move |go| {
             go.set_sensitive(false);
-            close.set_label("Stop");
+            crate::widget::set_button_text(&close, "Stop");
             progress.set_text("Get comfortable — starting in 3 seconds…");
             let _ = cmd_tx.send(crate::device::DeviceCommand::PitchCalibrate { secs: SECS });
             let (state, progress, go, close) =
@@ -387,7 +387,7 @@ fn pitch_dialog<F: Fn() + Clone + 'static>(
                     pitch_label.set_text(&pitch_line(model_store::pitch_offset()));
                     refresh();
                     go.set_sensitive(true);
-                    close.set_label("Done");
+                    crate::widget::set_button_text(&close, "Done");
                     return glib::ControlFlow::Break;
                 }
                 if cal.active {
@@ -474,8 +474,8 @@ pub fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F
     facts.append(&what);
     facts.append(&from);
 
-    let cancel = Button::with_label("Not now");
-    let agree = Button::with_label("I agree — download");
+    let cancel = crate::widget::button("Not now");
+    let agree = crate::widget::button("I agree — download");
     agree.add_css_class("suggested");
     let buttons = gtk::Box::new(Orientation::Horizontal, 10);
     buttons.set_halign(Align::End);
