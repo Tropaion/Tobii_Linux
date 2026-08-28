@@ -500,18 +500,25 @@ pub fn head_message(view: Option<&HeadView>) -> String {
     }
 }
 
-/// Overlay head orientation onto the eye-position box, at the point between the
-/// eyes.
+/// Draw the head itself onto the eye-position box, around the eyes already
+/// there.
 ///
-/// One view rather than two: the eye dots already carry the head's *position* in
-/// the trackbox and its *roll* (they tilt with it), so the only thing missing is
-/// where the face is pointing. That is one arrow from the midpoint - the cue a
-/// person reads off a face instantly - rather than a second widget drawing the
-/// same head again.
+/// One view rather than two. The eye dots carry position in the trackbox and
+/// roll; what they cannot show is which way the face is *pointing*. A bare arrow
+/// showed that but read as an abstract gauge stuck on top of the dots, so this
+/// draws the head those eyes belong to: an oval that foreshortens as the head
+/// turns, exactly as a real face does, with a nose that leaves the centre. The
+/// dots become the eyes in it.
 ///
-/// Drawn only when both eyes are present: from a reconstructed midpoint the
-/// arrow would move with the reconstruction rather than with the head, and
-/// report motion that did not happen.
+/// Geometry is anchored to the interocular distance on screen, so everything
+/// scales with the head as the user moves nearer or further away, and the oval
+/// is aligned to the *drawn dots* rather than to the reported roll — the two
+/// agree, and taking it from the dots means the face can never appear tilted
+/// differently from the eyes inside it.
+///
+/// Drawn only when both eyes are present: from a reconstructed midpoint the head
+/// would move with the reconstruction rather than with the user, and report
+/// motion that did not happen.
 pub fn draw_head_overlay(
     cr: &cairo::Context,
     w: i32,
@@ -534,33 +541,86 @@ pub fn draw_head_overlay(
     let (lx, ly) = to_px(l);
     let (rx, ry) = to_px(r);
     let (mx, my) = ((lx + rx) / 2.0, (ly + ry) / 2.0);
-    // Length scales with the interocular distance on screen, so the arrow stays
-    // proportional to the head as the user moves nearer or further away.
-    let ipd = ((rx - lx).powi(2) + (ry - ly).powi(2)).sqrt().max(8.0);
-    const FULL_SCALE_DEG: f64 = 30.0;
-    let ax = (v.yaw_deg / FULL_SCALE_DEG).clamp(-1.6, 1.6) * ipd;
-    let ay = if v.has_pitch {
-        -(v.pitch_deg / FULL_SCALE_DEG).clamp(-1.6, 1.6) * ipd
+    let ipd = ((rx - lx).powi(2) + (ry - ly).powi(2)).sqrt();
+    // `is_finite` first, then a plain comparison: a NaN here must mean "draw
+    // nothing", never "draw something arbitrary".
+    if !ipd.is_finite() || ipd <= 4.0 {
+        return;
+    }
+    // Roll from the dots themselves, so the face can never disagree with the
+    // eyes drawn inside it.
+    let roll = (ry - ly).atan2(rx - lx);
+
+    let yaw = v.yaw_deg.to_radians().clamp(-1.2, 1.2);
+    let pitch = if v.has_pitch {
+        v.pitch_deg.to_radians().clamp(-1.2, 1.2)
     } else {
         0.0
     };
 
-    // Confident poses in the accent colour, a held or geometric one in grey, so
-    // a frozen overlay never reads as a live one.
+    // Head proportions in units of interocular distance: a face is roughly 2.1
+    // IPD across and 2.7 tall, with the eye line about a third of the way down.
+    const HALF_W: f64 = 1.05;
+    const HALF_H: f64 = 1.35;
+    const EYES_ABOVE_CENTRE: f64 = 0.40;
+
     match v.sigma {
-        Some(_) => cr.set_source_rgb(0.12, 0.62, 0.63),
-        None => cr.set_source_rgb(0.42, 0.46, 0.50),
+        // Confident poses in the accent colour; a held or geometric one in grey,
+        // so a frozen overlay never reads as a live one.
+        Some(_) => cr.set_source_rgba(0.12, 0.62, 0.63, 0.9),
+        None => cr.set_source_rgba(0.42, 0.46, 0.50, 0.75),
     }
-    cr.set_line_width(2.0);
-    cr.move_to(mx, my);
-    cr.line_to(mx + ax, my + ay);
+
+    let _ = cr.save();
+    // Clip to the trackbox. Sitting close, a head genuinely does not fit in the
+    // tracking volume's view, and letting it spill over the box would say the
+    // opposite of what the box means.
+    cr.rectangle(
+        EYE_VIEW_PAD,
+        EYE_VIEW_PAD,
+        w - 2.0 * EYE_VIEW_PAD,
+        h - 2.0 * EYE_VIEW_PAD,
+    );
+    cr.clip();
+    cr.translate(mx, my);
+    cr.rotate(roll);
+
+    // Turning the head foreshortens the face and slides it sideways; nodding
+    // does the same vertically.
+    let cx = yaw.sin() * ipd * 0.35;
+    let cy = EYES_ABOVE_CENTRE * ipd - pitch.sin() * ipd * 0.35;
+    let (ex, ey) = (HALF_W * ipd * yaw.cos(), HALF_H * ipd * pitch.cos());
+
+    // The outline.
+    cr.set_line_width(1.5);
+    let _ = cr.save();
+    cr.translate(cx, cy);
+    cr.scale(ex.max(0.1), ey.max(0.1));
+    cr.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.restore();
     let _ = cr.stroke();
-    // A head pointing straight at the tracker has almost no arrow, so mark the
-    // origin - otherwise "centred" and "no data" look identical.
-    cr.arc(mx, my, 2.5, 0.0, std::f64::consts::TAU);
+
+    // The facial midline and brow line. These are what actually read as
+    // orientation: the midline swings across the face as the head turns, the
+    // brow rides up and down as it nods, and where they cross is the nose. A
+    // bare arrow conveyed the same numbers and looked like a gauge stuck on top
+    // of the dots.
+    let nose_x = yaw.sin() * ipd * HALF_W;
+    let nose_y = -pitch.sin() * ipd * HALF_H;
+    // Half-extent of the outline at the nose's offset from the face centre, so
+    // the lines stop on the oval instead of running past it.
+    let chord = |t: f64| (1.0 - t.clamp(-1.0, 1.0).powi(2)).max(0.0).sqrt();
+    cr.set_line_width(1.2);
+    let dy = ey * chord((nose_x - cx) / ex.max(0.1));
+    cr.move_to(nose_x, cy - dy);
+    cr.line_to(nose_x, cy + dy);
+    let dx = ex * chord((nose_y - cy) / ey.max(0.1));
+    cr.move_to(cx - dx, nose_y);
+    cr.line_to(cx + dx, nose_y);
+    let _ = cr.stroke();
+
+    // The nose itself, where they meet.
+    cr.arc(nose_x, nose_y, 2.6, 0.0, std::f64::consts::TAU);
     let _ = cr.fill();
-    if ax.hypot(ay) > 6.0 {
-        cr.arc(mx + ax, my + ay, 4.0, 0.0, std::f64::consts::TAU);
-        let _ = cr.fill();
-    }
+    let _ = cr.restore();
 }
