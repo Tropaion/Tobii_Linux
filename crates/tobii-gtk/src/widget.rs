@@ -66,13 +66,75 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     let (w, h) = (w as f64, h as f64);
     let pad = EYE_VIEW_PAD;
     let (rx, ry, rw, rh) = (pad, pad, (w - 2.0 * pad).max(0.0), (h - 2.0 * pad).max(0.0));
+    if rw <= 0.0 || rh <= 0.0 {
+        return;
+    }
+    let nx = |t: f64| rx + t * rw;
+    let ny = |t: f64| ry + t * rh;
 
-    // Trackbox outline.
+    // --- Graticule -------------------------------------------------------
+    // The box is a normalized [0,1] volume, and until now it was an empty
+    // rectangle: a dot could sit anywhere in it with nothing to read its
+    // position against. The grid is at 10% so the eye can count, and it is dim
+    // enough to stay behind the data.
+    cr.set_line_width(1.0);
+    cr.set_source_rgb(0.11, 0.13, 0.15);
+    let mut t = 0.1;
+    while t < 0.999 {
+        cr.move_to(nx(t).floor() + 0.5, ry);
+        cr.line_to(nx(t).floor() + 0.5, ry + rh);
+        cr.move_to(rx, ny(t).floor() + 0.5);
+        cr.line_to(rx + rw, ny(t).floor() + 0.5);
+        t += 0.1;
+    }
+    let _ = cr.stroke();
+
+    // --- Tolerance region -------------------------------------------------
+    // 0.1..0.9 on both axes is where the tracker stops nudging (`XY_MIN`,
+    // `XY_MAX`). Drawing it makes the guidance text's threshold visible instead
+    // of implicit: you can see how much room is left before it complains.
+    let (lo, hi) = (crate::eyeview::XY_MIN as f64, crate::eyeview::XY_MAX as f64);
+    cr.set_source_rgb(0.20, 0.24, 0.28);
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.rectangle(nx(lo), ny(lo), (hi - lo) * rw, (hi - lo) * rh);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+
+    // --- Centre reticle ---------------------------------------------------
+    // The target. Short ticks rather than full crosshairs, so it marks the
+    // middle without drawing a line through the data.
+    let (cx, cy) = (nx(0.5), ny(0.5));
+    let tick = (rw.min(rh) * 0.05).clamp(3.0, 9.0);
+    cr.set_source_rgb(0.28, 0.32, 0.36);
+    cr.move_to(cx - tick, cy);
+    cr.line_to(cx + tick, cy);
+    cr.move_to(cx, cy - tick);
+    cr.line_to(cx, cy + tick);
+    let _ = cr.stroke();
+
+    // --- Frame and edge ticks ---------------------------------------------
     cr.set_source_rgb(0.42, 0.45, 0.5);
     cr.set_line_width(1.5);
     cr.rectangle(rx, ry, rw, rh);
     let _ = cr.stroke();
+    // Quarter marks on each edge, longer at the midpoint: a scale to read the
+    // dots against.
+    cr.set_line_width(1.0);
+    for (i, t) in [0.25, 0.5, 0.75].iter().enumerate() {
+        let len = if i == 1 { 6.0 } else { 3.5 };
+        let (x, y) = (nx(*t).floor() + 0.5, ny(*t).floor() + 0.5);
+        cr.move_to(x, ry);
+        cr.line_to(x, ry + len);
+        cr.move_to(x, ry + rh);
+        cr.line_to(x, ry + rh - len);
+        cr.move_to(rx, y);
+        cr.line_to(rx + len, y);
+        cr.move_to(rx + rw, y);
+        cr.line_to(rx + rw - len, y);
+    }
+    let _ = cr.stroke();
 
+    // --- The eyes ---------------------------------------------------------
     // `raw_guidance`, not `guidance`: the damping exists to steady the *text*,
     // and colouring from it would leave the dots green for up to ~1.5 s after
     // the user has already moved out of position. See `EyeView`'s doc comment.
@@ -112,6 +174,16 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
         let Some(eye) = eye else { continue };
         let ex = rx + (eye[0].clamp(0.0, 1.0) as f64) * rw;
         let ey = ry + (eye[1].clamp(0.0, 1.0) as f64) * rh;
+        // A thin drop line to each axis: it turns a floating dot into a reading,
+        // and it is what makes an off-centre position legible at a glance.
+        cr.set_source_rgba(r, g, b, 0.22 * alpha as f64);
+        cr.set_line_width(1.0);
+        cr.move_to(ex.floor() + 0.5, ry);
+        cr.line_to(ex.floor() + 0.5, ry + rh);
+        cr.move_to(rx, ey.floor() + 0.5);
+        cr.line_to(rx + rw, ey.floor() + 0.5);
+        let _ = cr.stroke();
+
         cr.set_source_rgba(r, g, b, alpha as f64);
         cr.arc(ex, ey, radius, 0.0, std::f64::consts::TAU);
         let _ = cr.fill();
@@ -182,36 +254,6 @@ mod tests {
             sigma,
             has_pitch: sigma.is_some(),
         }
-    }
-
-    /// Without a model, `pitch_deg` is hardcoded 0.0. Reporting that as a level
-    /// head would be a lie, so the message has to say the number is absent
-    /// rather than print a zero.
-    #[test]
-    fn a_pose_without_a_model_does_not_claim_a_pitch_of_zero() {
-        let v = HeadView {
-            has_pitch: false,
-            sigma: None,
-            ..head(12.0, 0.0, -3.0, None)
-        };
-        let m = head_message(Some(&v));
-        assert!(m.contains("no pitch"), "{m}");
-        assert!(!m.contains("pitch +0"), "{m}");
-        assert!(m.contains("yaw +12"), "{m}");
-    }
-
-    #[test]
-    fn a_full_pose_reports_all_three_angles_and_a_distance() {
-        let m = head_message(Some(&head(-5.0, 8.0, 2.0, Some(0.07))));
-        assert!(m.contains("yaw -5"), "{m}");
-        assert!(m.contains("pitch +8"), "{m}");
-        assert!(m.contains("roll +2"), "{m}");
-        assert!(m.contains("68 cm"), "{m}");
-    }
-
-    #[test]
-    fn no_pose_says_so_rather_than_showing_zeros() {
-        assert_eq!(head_message(None), "No head detected");
     }
 
     /// A disconnected device must never leave the last pose on screen looking
@@ -387,6 +429,98 @@ mod tests {
             );
         }
     }
+
+    fn ev(guidance: Guidance, dist: Option<f32>, tracked: bool) -> EyeView {
+        EyeView {
+            left: tracked.then_some([0.45, 0.5]),
+            right: tracked.then_some([0.55, 0.5]),
+            left_alpha: 1.0,
+            right_alpha: 1.0,
+            distance_mm: dist,
+            guidance,
+            raw_guidance: guidance,
+            ..EyeView::none()
+        }
+    }
+
+    /// Every row is always present. A value that is not available reads as
+    /// absent rather than being dropped: a row that vanishes leaves the user
+    /// wondering whether the feature broke.
+    #[test]
+    fn the_readout_keeps_every_row_and_marks_missing_values_absent() {
+        let rows = readout_rows(&EyeView::none(), None);
+        let names: Vec<&str> = rows.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names, ["Position", "Distance", "Yaw", "Pitch", "Roll"]);
+        assert_eq!(rows[0].1, "not detected");
+        for (name, value, _) in &rows[1..] {
+            assert_eq!(value, "—", "{name} should read as absent");
+        }
+    }
+
+    /// Pitch without a model is hardcoded 0.0, so printing "+0.0°" would be a
+    /// lie. It has to say why it is missing.
+    #[test]
+    fn pitch_says_it_needs_a_model_rather_than_reporting_zero() {
+        let head = HeadView {
+            yaw_deg: 3.0,
+            pitch_deg: 0.0,
+            roll_deg: -1.0,
+            z_mm: 680.0,
+            sigma: None,
+            has_pitch: false,
+        };
+        let rows = readout_rows(&ev(Guidance::Centered, Some(684.0), true), Some(&head));
+        let pitch = &rows.iter().find(|(n, _, _)| *n == "Pitch").unwrap().1;
+        assert!(pitch.contains("no model"), "{pitch}");
+        assert!(!pitch.contains("0.0"), "{pitch}");
+        assert_eq!(
+            rows.iter().find(|(n, _, _)| *n == "Yaw").unwrap().1,
+            "+3.0°"
+        );
+        assert_eq!(
+            rows.iter().find(|(n, _, _)| *n == "Roll").unwrap().1,
+            "-1.0°"
+        );
+    }
+
+    #[test]
+    fn the_position_row_is_emphasised_only_while_it_is_asking_for_a_move() {
+        let centred = readout_rows(&ev(Guidance::Centered, Some(684.0), true), None);
+        assert!(!centred[0].2, "a centred head must not shout");
+        let nudged = readout_rows(&ev(Guidance::MoveCloser, Some(900.0), true), None);
+        assert!(nudged[0].2, "a nudge should be emphasised");
+        // "Not detected" is a state, not a nudge; it must not flash either.
+        let gone = readout_rows(&ev(Guidance::NoEyes, None, false), None);
+        assert!(!gone[0].2);
+    }
+
+    #[test]
+    fn the_distance_is_reported_in_whole_millimetres() {
+        let rows = readout_rows(&ev(Guidance::Centered, Some(683.7), true), None);
+        assert_eq!(rows[1].1, "684 mm");
+    }
+
+    /// `guidance_message` appends the distance to its "centred" wording, which
+    /// in a table would print the same millimetres twice, one row apart.
+    #[test]
+    fn the_position_row_does_not_repeat_the_distance() {
+        let rows = readout_rows(&ev(Guidance::Centered, Some(684.0), true), None);
+        assert_eq!(rows[0].1, "good");
+        assert!(!rows[0].1.contains("684"), "{}", rows[0].1);
+        assert_eq!(rows[1].1, "684 mm");
+    }
+
+    /// The graticule, reticle and drop lines all draw from the same rectangle;
+    /// a zero-sized allocation happens during window construction.
+    #[test]
+    fn the_eye_view_survives_a_degenerate_allocation() {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        for (w, h) in [(0, 0), (1, 1), (20, 20), (380, 240)] {
+            draw_eye_view(&cr, w, h, &EyeView::none());
+            draw_eye_view(&cr, w, h, &ev(Guidance::Centered, Some(684.0), true));
+        }
+    }
 }
 
 /// A button whose label is a standalone [`gtk::Label`] with a little vertical
@@ -480,24 +614,68 @@ pub fn head_view_for(state: &DeviceState) -> Option<HeadView> {
     })
 }
 
-/// One-line summary under the head preview.
-pub fn head_message(view: Option<&HeadView>) -> String {
-    match view {
-        None => "No head detected".to_string(),
-        Some(v) if !v.has_pitch => format!(
-            "yaw {:+.0}°  roll {:+.0}°  ·  {:.0} cm  ·  no model, so no pitch",
-            v.yaw_deg,
-            v.roll_deg,
-            v.z_mm / 10.0
+/// The unified readout under the live view: one row per measured quantity.
+///
+/// This replaces two separate lines — a guidance nudge and a head-pose sentence
+/// — that sat under the same picture reporting different halves of the same
+/// thing, in different formats, one of them a sentence and one a list. A table
+/// says what is measured and what it currently reads, which is both easier to
+/// scan and honest about which values are absent right now.
+///
+/// Returns `(label, value, emphasis)`. `emphasis` marks the row that currently
+/// wants attention — the guidance, when it is asking the user to move.
+pub fn readout_rows(eyes: &EyeView, head: Option<&HeadView>) -> Vec<(&'static str, String, bool)> {
+    const ABSENT: &str = "—";
+    let tracked = eyes.left.is_some() || eyes.right.is_some();
+
+    // NOT `guidance_message`: its "Centered" arm appends the distance, which in
+    // a table would print the same millimetres twice, one row apart. The table
+    // gives distance its own row, so this row is the status alone.
+    let position = match (tracked, eyes.guidance) {
+        (false, _) | (_, Guidance::NoEyes) => "not detected".to_string(),
+        (_, Guidance::Centered) => "good".to_string(),
+        (_, Guidance::MoveCloser) => "move closer".to_string(),
+        (_, Guidance::MoveBack) => "lean back".to_string(),
+        (_, Guidance::MoveRight) => "move right".to_string(),
+        (_, Guidance::MoveLeft) => "move left".to_string(),
+        (_, Guidance::MoveDown) => "move down".to_string(),
+        (_, Guidance::MoveUp) => "move up".to_string(),
+    };
+    let mut rows = vec![(
+        "Position",
+        position,
+        tracked && !matches!(eyes.raw_guidance, Guidance::Centered),
+    )];
+
+    rows.push((
+        "Distance",
+        match eyes.distance_mm {
+            Some(mm) => format!("{:.0} mm", mm),
+            None => ABSENT.to_string(),
+        },
+        false,
+    ));
+
+    // Angles come from the head pose. Pitch is listed even when no model is
+    // installed, reading as absent rather than being silently dropped: a
+    // missing row would leave the user wondering whether it is broken, and a
+    // zero would be a lie (`pose_from_eyes` hardcodes it).
+    let (yaw, pitch, roll) = match head {
+        Some(v) => (
+            format!("{:+.1}°", v.yaw_deg),
+            if v.has_pitch {
+                format!("{:+.1}°", v.pitch_deg)
+            } else {
+                "— (no model)".to_string()
+            },
+            format!("{:+.1}°", v.roll_deg),
         ),
-        Some(v) => format!(
-            "yaw {:+.0}°  pitch {:+.0}°  roll {:+.0}°  ·  {:.0} cm",
-            v.yaw_deg,
-            v.pitch_deg,
-            v.roll_deg,
-            v.z_mm / 10.0
-        ),
-    }
+        None => (ABSENT.to_string(), ABSENT.to_string(), ABSENT.to_string()),
+    };
+    rows.push(("Yaw", yaw, false));
+    rows.push(("Pitch", pitch, false));
+    rows.push(("Roll", roll, false));
+    rows
 }
 
 /// Draw the head itself onto the eye-position box, around the eyes already

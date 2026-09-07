@@ -69,6 +69,13 @@ button.help-btn:hover { background-color: #3a424b; color: #e6e8ea; }
 .dialog-facts { font-size: 12px; color: #7d868e; border-top: 1px solid #262b31;
                 padding-top: 10px; margin-top: 2px; }
 .dialog-url { font-size: 11px; }
+/* The live-view readout. Monospace on the VALUES only: they change every frame,
+   and a proportional font makes the column width breathe as digits change,
+   which reads as the number twitching rather than the value moving. */
+.readout { margin-top: 2px; }
+.readout-name { font-size: 12px; color: #7d868e; }
+.readout-value { font-size: 13px; color: #e6e8ea; font-family: monospace; }
+.readout-alert { color: #f2b134; font-weight: bold; }
 button.suggested { background-color: #1f9ea0; }
 button.suggested:hover { background-color: #26b6b8; }
 ";
@@ -296,12 +303,6 @@ fn build_ui(app: &Application) {
         glib::ControlFlow::Continue
     });
 
-    let guidance = Label::new(None);
-    guidance.add_css_class("guidance");
-    guidance.set_halign(Align::Start);
-    guidance.set_wrap(true);
-    guidance.set_xalign(0.0);
-
     // Live NIR camera preview below the eye-position box (square, matches the
     // 280×280 stream). Shared frame drawn by the tick.
     let cam_title = Label::new(Some("Camera"));
@@ -324,20 +325,36 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // The head readout sits under the eye box, because that is where the head
-    // is now drawn — one view, not two.
-    let head_msg = Label::new(Some("No head detected"));
-    head_msg.add_css_class("status");
-    head_msg.set_halign(Align::Center);
-    head_msg.set_wrap(true);
-    head_msg.set_justify(gtk::Justification::Center);
+    // One readout for the whole live view. Previously two labels sat here — a
+    // guidance nudge and a head-pose sentence — reporting different halves of
+    // the same measurement in different formats. A table scans faster and can
+    // say "absent" where a sentence would have to omit the value silently.
+    let readout = gtk::Grid::new();
+    readout.add_css_class("readout");
+    readout.set_halign(Align::Center);
+    readout.set_column_spacing(14);
+    readout.set_row_spacing(2);
+    let readout_cells: Vec<(Label, Label)> = (0..5)
+        .map(|row| {
+            let name = Label::new(None);
+            name.add_css_class("readout-name");
+            name.set_halign(Align::Start);
+            name.set_xalign(0.0);
+            let value = Label::new(None);
+            value.add_css_class("readout-value");
+            value.set_halign(Align::End);
+            value.set_xalign(1.0);
+            readout.attach(&name, 0, row, 1, 1);
+            readout.attach(&value, 1, row, 1, 1);
+            (name, value)
+        })
+        .collect();
 
     let left = gtk::Box::new(Orientation::Vertical, 10);
     left.set_width_request(380);
     left.append(&eye_title);
     left.append(&area);
-    left.append(&guidance);
-    left.append(&head_msg);
+    left.append(&readout);
     left.append(&cam_title);
     left.append(&cam_area);
 
@@ -624,7 +641,25 @@ fn build_ui(app: &Application) {
         // Only the guidance *text* is driven from this tick — the dots redraw
         // themselves on the frame clock (see `area.add_tick_callback` above).
         // Text at 33 ms is ample: it is damped over 11-49 frames upstream.
-        guidance.set_text(&widget::guidance_message(&widget::eye_view_for(&snap)));
+        {
+            let ev = widget::eye_view_for(&snap);
+            let hv = widget::head_view_for(&snap);
+            for (i, (name, value, emphasis)) in widget::readout_rows(&ev, hv.as_ref())
+                .into_iter()
+                .enumerate()
+            {
+                let Some((n, v)) = readout_cells.get(i) else {
+                    break;
+                };
+                n.set_text(name);
+                v.set_text(&value);
+                if emphasis {
+                    v.add_css_class("readout-alert");
+                } else {
+                    v.remove_css_class("readout-alert");
+                }
+            }
+        }
         // Camera preview: keep the last frame between device frames; update on a
         // new one; clear on disconnect so nothing stale lingers. Only redraw when
         // something actually changed — repainting a 78 KB frame every tick is
@@ -646,7 +681,6 @@ fn build_ui(app: &Application) {
             if *head_view.borrow() != next {
                 *head_view.borrow_mut() = next;
                 area.queue_draw();
-                head_msg.set_text(&widget::head_message(next.as_ref()));
             }
         }
         glib::ControlFlow::Continue

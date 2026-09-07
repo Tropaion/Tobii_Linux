@@ -37,15 +37,15 @@ const DISTANCE_BUFFER: usize = 3;
 
 /// Trackbox edges, in normalized coords, past which the user is nudged back
 /// toward the middle. Original: `_xyMin = 0.1`, `_xyMax = 0.9`.
-const XY_MIN: f32 = 0.1;
-const XY_MAX: f32 = 0.9;
+pub const XY_MIN: f32 = 0.1;
+pub const XY_MAX: f32 = 0.9;
 
 /// Normalized-depth breakpoints. Original: `MinDistance = 0.2`,
 /// `CloseEdge = 0.4`, `FarEdge = 0.65`, `MaxDistance = 0.8`.
-const D_NEAR: f64 = 0.2;
-const D_CLOSE_EDGE: f64 = 0.4;
-const D_FAR_EDGE: f64 = 0.65;
-const D_FAR: f64 = 0.8;
+pub const D_NEAR: f64 = 0.2;
+pub const D_CLOSE_EDGE: f64 = 0.4;
+pub const D_FAR_EDGE: f64 = 0.65;
+pub const D_FAR: f64 = 0.8;
 
 /// Rendered eye sizes. Original: `SmallEyeSize = 25`, `DefaultEyeSize = 50`,
 /// `BigEyeSize = 100`. The dot grows as you lean in and shrinks as you move
