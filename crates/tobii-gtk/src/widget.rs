@@ -435,15 +435,27 @@ mod tests {
     /// Every row is always present. A value that is not available reads as
     /// absent rather than being dropped: a row that vanishes leaves the user
     /// wondering whether the feature broke.
+    /// Every row is always present, in two groups: where the head is, and
+    /// which way it faces.
     #[test]
     fn the_readout_keeps_every_row_and_marks_missing_values_absent() {
-        let rows = readout_rows(&EyeView::none(), None);
-        let names: Vec<&str> = rows.iter().map(|(n, _, _)| *n).collect();
-        assert_eq!(names, ["Position", "Distance", "Yaw", "Pitch", "Roll"]);
-        assert_eq!(rows[0].1, "not detected");
-        for (name, value, _) in &rows[1..] {
-            assert_eq!(value, "—", "{name} should read as absent");
+        let [placement, facing] = readout_groups(&EyeView::none(), None);
+        let names = |g: &[ReadoutRow]| g.iter().map(|r| r.label).collect::<Vec<_>>();
+        assert_eq!(names(&placement), ["Position", "Distance"]);
+        assert_eq!(names(&facing), ["Yaw", "Pitch", "Roll"]);
+        assert_eq!(placement[0].value, "not detected");
+        for r in placement[1..].iter().chain(facing.iter()) {
+            assert_eq!(r.value, "—", "{} should read as absent", r.label);
         }
+    }
+
+    /// Side by side, the taller group sets the height. Five values stacked was
+    /// what made the panel too long.
+    #[test]
+    fn the_readout_is_three_rows_tall_not_five() {
+        let [placement, facing] = readout_groups(&EyeView::none(), None);
+        assert_eq!(placement.len().max(facing.len()), 3);
+        assert_eq!(placement.len() + facing.len(), 5, "no value may be dropped");
     }
 
     /// Pitch without a model is hardcoded 0.0, so printing "+0.0°" would be a
@@ -458,45 +470,54 @@ mod tests {
             sigma: None,
             has_pitch: false,
         };
-        let rows = readout_rows(&ev(Guidance::Centered, Some(684.0), true), Some(&head));
-        let pitch = &rows.iter().find(|(n, _, _)| *n == "Pitch").unwrap().1;
+        let [_, facing] = readout_groups(&ev(Guidance::Centered, Some(684.0), true), Some(&head));
+        let get = |n: &str| facing.iter().find(|r| r.label == n).unwrap().value.clone();
+        let pitch = get("Pitch");
         assert!(pitch.contains("no model"), "{pitch}");
+        assert!(
+            pitch.len() <= 12,
+            "the pitch value shares a fixed-width column: {pitch:?}"
+        );
         assert!(!pitch.contains("0.0"), "{pitch}");
-        assert_eq!(
-            rows.iter().find(|(n, _, _)| *n == "Yaw").unwrap().1,
-            "+3.0°"
-        );
-        assert_eq!(
-            rows.iter().find(|(n, _, _)| *n == "Roll").unwrap().1,
-            "-1.0°"
-        );
+        assert_eq!(get("Yaw"), "+3.0°");
+        assert_eq!(get("Roll"), "-1.0°");
     }
 
     #[test]
     fn the_position_row_is_emphasised_only_while_it_is_asking_for_a_move() {
-        let centred = readout_rows(&ev(Guidance::Centered, Some(684.0), true), None);
-        assert!(!centred[0].2, "a centred head must not shout");
-        let nudged = readout_rows(&ev(Guidance::MoveCloser, Some(900.0), true), None);
-        assert!(nudged[0].2, "a nudge should be emphasised");
+        let alert = |g: Guidance, d: Option<f32>, tracked: bool| {
+            readout_groups(&ev(g, d, tracked), None)[0][0].alert
+        };
+        assert!(
+            !alert(Guidance::Centered, Some(684.0), true),
+            "a centred head must not shout"
+        );
+        assert!(
+            alert(Guidance::MoveCloser, Some(900.0), true),
+            "a nudge should be emphasised"
+        );
         // "Not detected" is a state, not a nudge; it must not flash either.
-        let gone = readout_rows(&ev(Guidance::NoEyes, None, false), None);
-        assert!(!gone[0].2);
+        assert!(!alert(Guidance::NoEyes, None, false));
     }
 
     #[test]
     fn the_distance_is_reported_in_whole_millimetres() {
-        let rows = readout_rows(&ev(Guidance::Centered, Some(683.7), true), None);
-        assert_eq!(rows[1].1, "684 mm");
+        let [placement, _] = readout_groups(&ev(Guidance::Centered, Some(683.7), true), None);
+        assert_eq!(placement[1].value, "684 mm");
     }
 
     /// `guidance_message` appends the distance to its "centred" wording, which
     /// in a table would print the same millimetres twice, one row apart.
     #[test]
     fn the_position_row_does_not_repeat_the_distance() {
-        let rows = readout_rows(&ev(Guidance::Centered, Some(684.0), true), None);
-        assert_eq!(rows[0].1, "good");
-        assert!(!rows[0].1.contains("684"), "{}", rows[0].1);
-        assert_eq!(rows[1].1, "684 mm");
+        let [placement, _] = readout_groups(&ev(Guidance::Centered, Some(684.0), true), None);
+        assert_eq!(placement[0].value, "good");
+        assert!(
+            !placement[0].value.contains("684"),
+            "{}",
+            placement[0].value
+        );
+        assert_eq!(placement[1].value, "684 mm");
     }
 
     /// The graticule, reticle and drop lines all draw from the same rectangle;
@@ -603,23 +624,40 @@ pub fn head_view_for(state: &DeviceState) -> Option<HeadView> {
     })
 }
 
-/// The unified readout under the live view: one row per measured quantity.
+/// One row of the live-view readout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadoutRow {
+    pub label: &'static str,
+    pub value: String,
+    /// Whether this row currently wants attention — the position, while it is
+    /// asking the user to move.
+    pub alert: bool,
+}
+
+/// The readout under the live view, as two side-by-side groups.
 ///
 /// This replaces two separate lines — a guidance nudge and a head-pose sentence
 /// — that sat under the same picture reporting different halves of the same
-/// thing, in different formats, one of them a sentence and one a list. A table
-/// says what is measured and what it currently reads, which is both easier to
-/// scan and honest about which values are absent right now.
+/// measurement in different formats. It is grouped rather than a single list
+/// because the two halves answer different questions: **where the head is**, and
+/// **which way it faces**. Side by side, that is three rows instead of five, and
+/// the split is the meaning rather than a way to save space.
 ///
-/// Returns `(label, value, emphasis)`. `emphasis` marks the row that currently
-/// wants attention — the guidance, when it is asking the user to move.
-pub fn readout_rows(eyes: &EyeView, head: Option<&HeadView>) -> Vec<(&'static str, String, bool)> {
+/// Every row is always present. A value that is unavailable reads as absent
+/// rather than being dropped: a row that vanishes leaves the user wondering
+/// whether the feature broke.
+pub fn readout_groups(eyes: &EyeView, head: Option<&HeadView>) -> [Vec<ReadoutRow>; 2] {
     const ABSENT: &str = "—";
     let tracked = eyes.left.is_some() || eyes.right.is_some();
+    let row = |label, value: String, alert| ReadoutRow {
+        label,
+        value,
+        alert,
+    };
 
-    // NOT `guidance_message`: its "Centered" arm appends the distance, which in
-    // a table would print the same millimetres twice, one row apart. The table
-    // gives distance its own row, so this row is the status alone.
+    // NOT `guidance_message`: its "centred" arm appends the distance, which
+    // here would print the same millimetres twice, one row apart. Distance has
+    // its own row, so this one is the status alone.
     let position = match (tracked, eyes.guidance) {
         (false, _) | (_, Guidance::NoEyes) => "not detected".to_string(),
         (_, Guidance::Centered) => "good".to_string(),
@@ -630,62 +668,73 @@ pub fn readout_rows(eyes: &EyeView, head: Option<&HeadView>) -> Vec<(&'static st
         (_, Guidance::MoveDown) => "move down".to_string(),
         (_, Guidance::MoveUp) => "move up".to_string(),
     };
-    let mut rows = vec![(
-        "Position",
-        position,
-        tracked && !matches!(eyes.raw_guidance, Guidance::Centered),
-    )];
+    let placement = vec![
+        row(
+            "Position",
+            position,
+            tracked && !matches!(eyes.raw_guidance, Guidance::Centered),
+        ),
+        row(
+            "Distance",
+            match eyes.distance_mm {
+                Some(mm) => format!("{mm:.0} mm"),
+                None => ABSENT.to_string(),
+            },
+            false,
+        ),
+    ];
 
-    rows.push((
-        "Distance",
-        match eyes.distance_mm {
-            Some(mm) => format!("{:.0} mm", mm),
-            None => ABSENT.to_string(),
-        },
-        false,
-    ));
-
-    // Angles come from the head pose. Pitch is listed even when no model is
-    // installed, reading as absent rather than being silently dropped: a
-    // missing row would leave the user wondering whether it is broken, and a
-    // zero would be a lie (`pose_from_eyes` hardcodes it).
+    // Pitch is listed even with no model installed, reading as absent rather
+    // than being silently dropped — and never as a zero, which is what
+    // `pose_from_eyes` hardcodes and would be a lie.
     let (yaw, pitch, roll) = match head {
         Some(v) => (
             format!("{:+.1}°", v.yaw_deg),
             if v.has_pitch {
                 format!("{:+.1}°", v.pitch_deg)
             } else {
-                "— (no model)".to_string()
+                "no model".to_string()
             },
             format!("{:+.1}°", v.roll_deg),
         ),
         None => (ABSENT.to_string(), ABSENT.to_string(), ABSENT.to_string()),
     };
-    rows.push(("Yaw", yaw, false));
-    rows.push(("Pitch", pitch, false));
-    rows.push(("Roll", roll, false));
-    rows
+    let facing = vec![
+        row("Yaw", yaw, false),
+        row("Pitch", pitch, false),
+        row("Roll", roll, false),
+    ];
+
+    [placement, facing]
 }
 
-/// Draw the head itself onto the eye-position box, around the eyes already
-/// there.
+/// Draw the head those eyes belong to, onto the eye-position box.
 ///
-/// One view rather than two. The eye dots carry position in the trackbox and
-/// roll; what they cannot show is which way the face is *pointing*. A bare arrow
-/// showed that but read as an abstract gauge stuck on top of the dots, so this
-/// draws the head those eyes belong to: an oval that foreshortens as the head
-/// turns, exactly as a real face does, with a nose that leaves the centre. The
-/// dots become the eyes in it.
+/// One view rather than two. The eye dots already carry position in the
+/// trackbox and roll; what they cannot show is which way the face is *pointing*.
 ///
-/// Geometry is anchored to the interocular distance on screen, so everything
-/// scales with the head as the user moves nearer or further away, and the oval
-/// is aligned to the *drawn dots* rather than to the reported roll — the two
-/// agree, and taking it from the dots means the face can never appear tilted
-/// differently from the eyes inside it.
+/// Two earlier attempts are recorded here because both were worse in a way that
+/// is not obvious until you look at it:
 ///
-/// Drawn only when both eyes are present: from a reconstructed midpoint the head
-/// would move with the reconstruction rather than with the user, and report
-/// motion that did not happen.
+/// * An arrow from between the eyes. It carried the right numbers and read as
+///   an abstract gauge stuck over the dots — it did not look like anything.
+/// * An ellipse with a full-height midline and a brow line. Two lines crossing
+///   inside a circle read as a gunsight, not as a face.
+///
+/// So this draws an actual silhouette — cranium, temples, tapering jaw, chin —
+/// with a nose. Foreshortening swings the outline as the head turns and the
+/// nose says which way it points; nothing else is drawn inside, because the
+/// dots in there are already the eyes.
+///
+/// Geometry is anchored to the interocular distance on screen, so the head
+/// scales with the user as they move nearer or further away. Roll comes from
+/// the *drawn dots* rather than the reported angle: the two agree, and taking
+/// it from the dots means the face can never appear tilted differently from the
+/// eyes inside it.
+///
+/// Drawn only when both eyes are present — from a reconstructed midpoint the
+/// head would move with the reconstruction rather than with the user, and
+/// report motion that did not happen.
 pub fn draw_head_overlay(
     cr: &cairo::Context,
     w: i32,
@@ -697,8 +746,6 @@ pub fn draw_head_overlay(
         return;
     };
     let (w, h) = (w as f64, h as f64);
-    // The same mapping the eye dots use: normalized trackbox coordinates into
-    // the inset box.
     let to_px = |p: [f32; 2]| -> (f64, f64) {
         (
             EYE_VIEW_PAD + p[0] as f64 * (w - 2.0 * EYE_VIEW_PAD),
@@ -714,33 +761,31 @@ pub fn draw_head_overlay(
     if !ipd.is_finite() || ipd <= 4.0 {
         return;
     }
-    // Roll from the dots themselves, so the face can never disagree with the
-    // eyes drawn inside it.
     let roll = (ry - ly).atan2(rx - lx);
-
-    let yaw = v.yaw_deg.to_radians().clamp(-1.2, 1.2);
+    let yaw = v.yaw_deg.to_radians().clamp(-1.3, 1.3);
     let pitch = if v.has_pitch {
-        v.pitch_deg.to_radians().clamp(-1.2, 1.2)
+        v.pitch_deg.to_radians().clamp(-1.3, 1.3)
     } else {
         0.0
     };
 
-    // Head proportions in units of interocular distance: a face is roughly 2.1
-    // IPD across and 2.7 tall, with the eye line about a third of the way down.
-    const HALF_W: f64 = 1.05;
-    const HALF_H: f64 = 1.35;
-    const EYES_ABOVE_CENTRE: f64 = 0.40;
-
     match v.sigma {
         // Confident poses in the accent colour; a held or geometric one in grey,
-        // so a frozen overlay never reads as a live one.
-        Some(_) => cr.set_source_rgba(0.12, 0.62, 0.63, 0.9),
-        None => cr.set_source_rgba(0.42, 0.46, 0.50, 0.75),
+        // so a frozen overlay never reads as a live one. Translucent either way:
+        // the head is the context the eye dots sit in, not the subject.
+        //
+        // Setting this explicitly is load-bearing. Without it the head inherits
+        // whatever `draw_eye_view` last set, so it silently took the eye-dot
+        // colour — green when centred, amber when being nudged. It looked
+        // coherent and was wrong: that colour is a *position* signal, and here it
+        // has to mean model confidence.
+        Some(_) => cr.set_source_rgba(0.16, 0.68, 0.70, 0.75),
+        None => cr.set_source_rgba(0.45, 0.49, 0.53, 0.6),
     }
 
     let _ = cr.save();
     // Clip to the trackbox. Sitting close, a head genuinely does not fit in the
-    // tracking volume's view, and letting it spill over the box would say the
+    // tracking volume's view, and letting it spill outside the box would say the
     // opposite of what the box means.
     cr.rectangle(
         EYE_VIEW_PAD,
@@ -752,42 +797,71 @@ pub fn draw_head_overlay(
     cr.translate(mx, my);
     cr.rotate(roll);
 
-    // Turning the head foreshortens the face and slides it sideways; nodding
-    // does the same vertically.
-    let cx = yaw.sin() * ipd * 0.35;
-    let cy = EYES_ABOVE_CENTRE * ipd - pitch.sin() * ipd * 0.35;
-    let (ex, ey) = (HALF_W * ipd * yaw.cos(), HALF_H * ipd * pitch.cos());
+    // Turning swings the face across and narrows it; nodding does the same
+    // vertically. The shift is what makes it read as a head rotating rather
+    // than as a shape being squashed.
+    let (sy, cyaw) = (yaw.sin(), yaw.cos());
+    let (sp, cpitch) = (pitch.sin(), pitch.cos());
+    let shift_x = sy * ipd * 0.30;
+    let shift_y = -sp * ipd * 0.30;
 
-    // The outline.
-    cr.set_line_width(1.5);
-    let _ = cr.save();
-    cr.translate(cx, cy);
-    cr.scale(ex.max(0.1), ey.max(0.1));
-    cr.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
-    let _ = cr.restore();
+    // Proportions in interocular distances. Deliberately a little smaller than
+    // a real head (a face is nearer 2.2 IPD across): at true scale it fills the
+    // trackbox and competes with the dots for attention, when its job is to be
+    // the context they sit in.
+    let hw = 0.95 * ipd * cyaw;
+    let hh = 1.25 * ipd * cpitch;
+    // Eyes sit ~45% down a head, so the outline's centre is just below them.
+    let cy = shift_y + 0.10 * hh;
+    let px = |x: f64| shift_x + x * hw;
+    let py = |y: f64| cy + y * hh;
+
+    // The outline: chin -> jaw -> cheek -> temple -> over the cranium and back
+    // down the other side. Widest at the temples, tapering to a rounded chin.
+    cr.set_line_width(1.4);
+    cr.set_line_join(cairo::LineJoin::Round);
+    cr.move_to(px(0.0), py(1.0));
+    cr.curve_to(
+        px(-0.42),
+        py(0.97),
+        px(-0.80),
+        py(0.72),
+        px(-0.93),
+        py(0.18),
+    );
+    cr.curve_to(
+        px(-1.0),
+        py(-0.16),
+        px(-1.0),
+        py(-0.68),
+        px(-0.60),
+        py(-0.92),
+    );
+    cr.curve_to(
+        px(-0.36),
+        py(-1.06),
+        px(0.36),
+        py(-1.06),
+        px(0.60),
+        py(-0.92),
+    );
+    cr.curve_to(px(1.0), py(-0.68), px(1.0), py(-0.16), px(0.93), py(0.18));
+    cr.curve_to(px(0.80), py(0.72), px(0.42), py(0.97), px(0.0), py(1.0));
+    cr.close_path();
     let _ = cr.stroke();
 
-    // The facial midline and brow line. These are what actually read as
-    // orientation: the midline swings across the face as the head turns, the
-    // brow rides up and down as it nods, and where they cross is the nose. A
-    // bare arrow conveyed the same numbers and looked like a gauge stuck on top
-    // of the dots.
-    let nose_x = yaw.sin() * ipd * HALF_W;
-    let nose_y = -pitch.sin() * ipd * HALF_H;
-    // Half-extent of the outline at the nose's offset from the face centre, so
-    // the lines stop on the oval instead of running past it.
-    let chord = |t: f64| (1.0 - t.clamp(-1.0, 1.0).powi(2)).max(0.0).sqrt();
-    cr.set_line_width(1.2);
-    let dy = ey * chord((nose_x - cx) / ex.max(0.1));
-    cr.move_to(nose_x, cy - dy);
-    cr.line_to(nose_x, cy + dy);
-    let dx = ex * chord((nose_y - cy) / ey.max(0.1));
-    cr.move_to(cx - dx, nose_y);
-    cr.line_to(cx + dx, nose_y);
+    // The nose. Seen straight on it is a short line down from the bridge; as
+    // the head turns it swings across and as the head nods it shortens and
+    // rises. It is the only mark inside the outline, and the one that actually
+    // says which way the face points — the dots are already the eyes.
+    let base_y = shift_y + 0.10 * ipd;
+    let tip_x = shift_x + sy * ipd * 0.66;
+    let tip_y = base_y + (0.62 - sp * 0.66) * ipd * cpitch.max(0.4);
+    cr.set_line_width(2.2);
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.move_to(shift_x, base_y);
+    cr.line_to(tip_x, tip_y);
     let _ = cr.stroke();
-
-    // The nose itself, where they meet.
-    cr.arc(nose_x, nose_y, 2.6, 0.0, std::f64::consts::TAU);
-    let _ = cr.fill();
+    cr.set_line_cap(cairo::LineCap::Butt);
     let _ = cr.restore();
 }

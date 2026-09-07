@@ -334,21 +334,36 @@ fn build_ui(app: &Application) {
     readout.set_halign(Align::Center);
     readout.set_column_spacing(14);
     readout.set_row_spacing(2);
-    let readout_cells: Vec<(Label, Label)> = (0..5)
-        .map(|row| {
-            let name = Label::new(None);
-            name.add_css_class("readout-name");
-            name.set_halign(Align::Start);
-            name.set_xalign(0.0);
-            let value = Label::new(None);
-            value.add_css_class("readout-value");
-            value.set_halign(Align::End);
-            value.set_xalign(1.0);
-            readout.attach(&name, 0, row, 1, 1);
-            readout.attach(&value, 1, row, 1, 1);
-            (name, value)
+    // Two groups side by side — where the head is, and which way it faces — so
+    // the readout is three rows tall rather than five. Column 2 is a spacer
+    // between the groups.
+    readout.set_column_spacing(10);
+    // `width_chars` per group is what stops the table jumping: the values change
+    // every frame, and a grid column sized to its content would resize the whole
+    // readout as "good" becomes "not detected" or an angle gains a digit.
+    let readout_cells: Vec<Vec<(Label, Label)>> = [(0i32, 2i32, 12), (3, 3, 9)]
+        .iter()
+        .map(|&(col, rows, chars)| {
+            (0..rows)
+                .map(|row| {
+                    let name = Label::new(None);
+                    name.add_css_class("readout-name");
+                    name.set_halign(Align::Start);
+                    name.set_xalign(0.0);
+                    let value = Label::new(None);
+                    value.add_css_class("readout-value");
+                    value.set_halign(Align::End);
+                    value.set_xalign(1.0);
+                    value.set_width_chars(chars);
+                    readout.attach(&name, col, row, 1, 1);
+                    readout.attach(&value, col + 1, row, 1, 1);
+                    (name, value)
+                })
+                .collect()
         })
         .collect();
+    let spacer = Label::new(Some(" "));
+    readout.attach(&spacer, 2, 0, 1, 1);
 
     let left = gtk::Box::new(Orientation::Vertical, 10);
     left.set_width_request(380);
@@ -644,19 +659,21 @@ fn build_ui(app: &Application) {
         {
             let ev = widget::eye_view_for(&snap);
             let hv = widget::head_view_for(&snap);
-            for (i, (name, value, emphasis)) in widget::readout_rows(&ev, hv.as_ref())
+            for (group, rows) in widget::readout_groups(&ev, hv.as_ref())
                 .into_iter()
                 .enumerate()
             {
-                let Some((n, v)) = readout_cells.get(i) else {
-                    break;
-                };
-                n.set_text(name);
-                v.set_text(&value);
-                if emphasis {
-                    v.add_css_class("readout-alert");
-                } else {
-                    v.remove_css_class("readout-alert");
+                for (i, r) in rows.into_iter().enumerate() {
+                    let Some((n, v)) = readout_cells.get(group).and_then(|g| g.get(i)) else {
+                        break;
+                    };
+                    n.set_text(r.label);
+                    v.set_text(&r.value);
+                    if r.alert {
+                        v.add_css_class("readout-alert");
+                    } else {
+                        v.remove_css_class("readout-alert");
+                    }
                 }
             }
         }
