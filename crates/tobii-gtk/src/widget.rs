@@ -13,6 +13,39 @@ use crate::eyeview::{EyeView, Guidance};
 /// add `2 * EYE_VIEW_PAD` to both axes to compensate.
 pub const EYE_VIEW_PAD: f64 = 10.0;
 
+/// Width/height of the drawn trackbox. The original's own
+/// `SetTrackBoxToGoldenRatio`.
+pub const EYE_VIEW_RATIO: f64 = 1.618;
+
+/// The rectangle the trackbox is drawn into: the largest golden-ratio box that
+/// fits inside `w`×`h` after [`EYE_VIEW_PAD`], centred.
+///
+/// **The aspect is not decoration.** The trackbox is a volume in front of the
+/// sensor, and the normalized `[0,1]` coordinates are stretched to fill this
+/// rectangle — so its shape sets the ratio of horizontal to vertical motion
+/// gain. Drawn into a widget's raw allocation on a 3.56:1 monitor, the box came
+/// out 4.1:1 and compressed vertical head movement ~2.6x against horizontal,
+/// which reads as a dot that is sluggish vertically and twitchy horizontally.
+///
+/// Letterboxing here rather than pinning the widget to a fixed pixel size is
+/// what lets the panel resize with the window and still be honest.
+///
+/// Both [`draw_eye_view`] and [`draw_head_overlay`] map through this, so they
+/// cannot disagree about where the box is.
+pub fn eye_view_rect(w: f64, h: f64) -> (f64, f64, f64, f64) {
+    let avail_w = (w - 2.0 * EYE_VIEW_PAD).max(0.0);
+    let avail_h = (h - 2.0 * EYE_VIEW_PAD).max(0.0);
+    if avail_w <= 0.0 || avail_h <= 0.0 {
+        return (w / 2.0, h / 2.0, 0.0, 0.0);
+    }
+    let (rw, rh) = if avail_w / avail_h > EYE_VIEW_RATIO {
+        (avail_h * EYE_VIEW_RATIO, avail_h)
+    } else {
+        (avail_w, avail_w / EYE_VIEW_RATIO)
+    };
+    ((w - rw) / 2.0, (h - rh) / 2.0, rw, rh)
+}
+
 /// The `EyeView` to render for a device snapshot: never show stale gaze — force
 /// "no eyes" unless the device is connected AND a sample is present.
 pub fn eye_view_for(state: &DeviceState) -> EyeView {
@@ -64,8 +97,7 @@ pub fn guidance_message(view: &EyeView) -> String {
 /// dimming to grey), so keeping hue is a deliberate, additive departure.
 pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     let (w, h) = (w as f64, h as f64);
-    let pad = EYE_VIEW_PAD;
-    let (rx, ry, rw, rh) = (pad, pad, (w - 2.0 * pad).max(0.0), (h - 2.0 * pad).max(0.0));
+    let (rx, ry, rw, rh) = eye_view_rect(w, h);
     if rw <= 0.0 || rh <= 0.0 {
         return;
     }
@@ -531,6 +563,59 @@ mod tests {
             draw_eye_view(&cr, w, h, &ev(Guidance::Centered, Some(684.0), true));
         }
     }
+
+    /// The drawn box keeps its aspect at every allocation. It is the ratio of
+    /// horizontal to vertical motion gain, so a box that stretched with the
+    /// widget would make the dot sluggish on one axis and twitchy on the other.
+    #[test]
+    fn the_trackbox_keeps_its_aspect_at_any_size() {
+        for (w, h) in [
+            (380.0, 245.0),
+            (900.0, 250.0),
+            (300.0, 900.0),
+            (640.0, 400.0),
+        ] {
+            let (x, y, rw, rh) = eye_view_rect(w, h);
+            assert!(
+                (rw / rh - EYE_VIEW_RATIO).abs() < 1e-9,
+                "{w}x{h} gave {rw}x{rh}, ratio {}",
+                rw / rh
+            );
+            assert!(rw <= w - 2.0 * EYE_VIEW_PAD + 1e-9, "wider than the widget");
+            assert!(
+                rh <= h - 2.0 * EYE_VIEW_PAD + 1e-9,
+                "taller than the widget"
+            );
+            // Centred, so growing the window does not slide the instrument.
+            assert!((x - (w - rw) / 2.0).abs() < 1e-9);
+            assert!((y - (h - rh) / 2.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_widget_too_small_for_the_padding_draws_nothing() {
+        for (w, h) in [(0.0, 0.0), (10.0, 10.0), (20.0, 5.0)] {
+            let (_, _, rw, rh) = eye_view_rect(w, h);
+            assert_eq!((rw, rh), (0.0, 0.0), "{w}x{h} should be empty");
+        }
+    }
+
+    /// The overlay maps through the same rectangle, so the head can never be
+    /// drawn somewhere the eye dots are not.
+    #[test]
+    fn the_head_overlay_follows_the_box_when_the_widget_grows() {
+        let e = eyes_at([0.5, 0.5], [0.6, 0.5]);
+        let v = a_head(0.0, 0.0, Some(0.07));
+        for (w, h) in [(380, 245), (900, 500), (500, 900)] {
+            let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+            let cr = cairo::Context::new(&surface).unwrap();
+            draw_eye_view(&cr, w, h, &e);
+            draw_head_overlay(&cr, w, h, &e, Some(&v));
+            drop(cr);
+            let data = surface.take_data().unwrap();
+            assert!(data.iter().any(|&b| b != 0), "{w}x{h} drew nothing");
+        }
+    }
 }
 
 /// A button whose label is a standalone [`gtk::Label`] with a little vertical
@@ -746,12 +831,11 @@ pub fn draw_head_overlay(
         return;
     };
     let (w, h) = (w as f64, h as f64);
-    let to_px = |p: [f32; 2]| -> (f64, f64) {
-        (
-            EYE_VIEW_PAD + p[0] as f64 * (w - 2.0 * EYE_VIEW_PAD),
-            EYE_VIEW_PAD + p[1] as f64 * (h - 2.0 * EYE_VIEW_PAD),
-        )
-    };
+    let (bx, by, bw, bh) = eye_view_rect(w, h);
+    if bw <= 0.0 || bh <= 0.0 {
+        return;
+    }
+    let to_px = |p: [f32; 2]| -> (f64, f64) { (bx + p[0] as f64 * bw, by + p[1] as f64 * bh) };
     let (lx, ly) = to_px(l);
     let (rx, ry) = to_px(r);
     let (mx, my) = ((lx + rx) / 2.0, (ly + ry) / 2.0);
@@ -787,12 +871,7 @@ pub fn draw_head_overlay(
     // Clip to the trackbox. Sitting close, a head genuinely does not fit in the
     // tracking volume's view, and letting it spill outside the box would say the
     // opposite of what the box means.
-    cr.rectangle(
-        EYE_VIEW_PAD,
-        EYE_VIEW_PAD,
-        w - 2.0 * EYE_VIEW_PAD,
-        h - 2.0 * EYE_VIEW_PAD,
-    );
+    cr.rectangle(bx, by, bw, bh);
     cr.clip();
     cr.translate(mx, my);
     cr.rotate(roll);

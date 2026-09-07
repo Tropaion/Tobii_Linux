@@ -155,8 +155,12 @@ pub fn control(
     let set_pitch = crate::widget::button("Set pitch zero…");
     let updates = crate::widget::button("Check for updates");
     let remove = crate::widget::button("Remove");
-    for small in [&updates, &remove] {
-        small.add_css_class("help-btn");
+    // Fetching the model is the action this section exists for; checking for a
+    // newer one and removing it are housekeeping. The accent goes to the first
+    // and nothing at all to the other two.
+    get.add_css_class("primary");
+    for housekeeping in [&updates, &remove] {
+        housekeeping.add_css_class("quiet");
     }
 
     let actions = gtk::Box::new(Orientation::Horizontal, 8);

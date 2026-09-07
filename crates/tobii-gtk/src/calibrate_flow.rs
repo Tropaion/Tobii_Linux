@@ -590,6 +590,7 @@ pub fn launch(
     }
 
     let continue_btn = crate::widget::button("Continue anyway");
+    continue_btn.add_css_class("primary");
     continue_btn.set_visible(false);
 
     let eye_preview_box = gtk::Box::new(Orientation::Vertical, 10);
@@ -647,7 +648,9 @@ pub fn launch(
     fail_box.set_visible(false);
 
     let done_btn = crate::widget::button("Done");
+    done_btn.add_css_class("primary");
     let retry_btn = crate::widget::button("Try again");
+    retry_btn.add_css_class("primary");
     let done_box = gtk::Box::new(Orientation::Horizontal, 10);
     done_box.set_halign(Align::Center);
     done_box.append(&retry_btn);

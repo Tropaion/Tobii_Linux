@@ -577,6 +577,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     };
 
     let align_done = crate::widget::button("Done");
+    align_done.add_css_class("primary");
     let advanced = crate::widget::toggle_button("Show advanced");
     let align_cancel = crate::widget::button("Cancel");
     let buttons = gtk::Box::new(Orientation::Horizontal, 10);
@@ -901,6 +902,7 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     posture_warn.set_visible(false);
 
     let posture_done = crate::widget::button("Done");
+    posture_done.add_css_class("primary");
     let posture_cancel = crate::widget::button("Cancel");
     let posture_buttons = gtk::Box::new(Orientation::Horizontal, 10);
     posture_buttons.set_halign(Align::Center);

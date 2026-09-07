@@ -33,51 +33,94 @@ use tobii_protocol::EnabledEye;
 
 const APP_ID: &str = "com.tobiilinux.Configuration";
 
+/// The stylesheet.
+///
+/// This is a control panel for a measuring instrument, and it is styled as one
+/// rather than as a settings app: the live trackbox is the subject, everything
+/// else is a quiet rack of controls beside it.
+///
+/// Three rules carry that:
+///
+/// * **Two surfaces, not one.** A darker ground with cards raised on it, so
+///   grouping is visible without boxes-inside-boxes. The old sheet painted
+///   everything one flat colour and leaned on headings alone.
+/// * **One accent, spent once per view.** Teal marks the action that commits;
+///   everything else is a quiet surface button. Previously every button was
+///   accent-filled, which made five equal settings look like five urgent calls
+///   to action.
+/// * **Uppercase micro-labels and monospace values.** The panel reports
+///   millimetres and degrees; labelling it the way instruments are labelled is
+///   truer to the subject than sentence-case captions, and monospace digits
+///   stop live values from twitching as they change width.
 const CSS: &str = "
-window { background-color: #15181c; color: #e6e8ea; }
-.app-title { font-size: 22px; font-weight: bold; }
-.status { font-size: 13px; color: #9aa4ad; }
-.guidance { font-size: 14px; }
-.section-title { font-size: 15px; font-weight: bold; }
-.section-desc { font-size: 12px; color: #9aa4ad; }
+/* --- ground and surfaces ------------------------------------------------ */
+window { background-color: #0d1013; color: #e8ecef; }
+.surface { background-color: #161a1f; border: 1px solid #232a32; border-radius: 12px; }
+.panel-pad { padding: 16px; }
+.hairline { background-color: #232a32; min-height: 1px; }
+
+/* --- type --------------------------------------------------------------- */
+.app-title { font-size: 20px; font-weight: bold; letter-spacing: 0.01em; }
+.eyebrow { font-size: 10px; font-weight: bold; letter-spacing: 0.16em;
+           color: #79838d; }
+.section-title { font-size: 14px; font-weight: bold; }
+.section-desc { font-size: 12px; color: #8a949d; }
 .section-warn { color: #f2b134; font-weight: bold; }
-.cal-fail-heading { font-size: 26px; font-weight: bold; }
-.cal-fail-tips { font-size: 14px; color: #9aa4ad; }
-.cal-fail-detail { font-size: 12px; color: #6b7178; font-style: italic; }
-.cal-success-heading { font-size: 32px; font-weight: bold; }
-/* No min-height and no label padding. A previous revision claimed those two
-   were clipping the tops of tall glyphs; that claim is DISPROVEN — GTK4 pushes
-   no clip anywhere in the Button->Label path (only overflow:hidden does, and
-   nothing here sets it), and a minimal program using this stylesheet verbatim
-   renders cleanly at every renderer tested. Their absence is a simplification,
-   not a fix. The clipping is a rendering-stack problem, not a CSS one: see the
-   GSK_RENDERER note in `run`. Do not cite this rule as its cause. */
-button { background-image: none; background-color: #1f9ea0; color: #ffffff;
-         border: none; border-radius: 8px; padding: 10px 18px; }
-button:hover { background-color: #26b6b8; }
-button:disabled { background-color: #2a2f36; color: #6b7178; }
-button:checked { background-color: #14696b; }
+.status { font-size: 12px; color: #8a949d; }
+.guidance { font-size: 14px; }
+.hint { font-size: 11px; color: #6f7982; }
+
+/* --- buttons ------------------------------------------------------------ */
+/* Base is QUIET. The hub is five co-equal settings; filling every one of them
+   with the accent made them shout over each other and over the instrument. */
+button { background-image: none; background-color: #1e242b; color: #dfe5ea;
+         border: 1px solid #2b333c; border-radius: 9px; padding: 9px 16px; }
+button:hover { background-color: #262e37; border-color: #37414c; }
+button:active { background-color: #2c3540; }
+button:disabled { background-color: #171b20; color: #5b646c; border-color: #232a32; }
+button:checked { background-color: #14696b; border-color: #1f9ea0; color: #ffffff; }
+/* The accent, for the one action in a view that commits. */
+button.primary, button.suggested {
+    background-color: #1f9ea0; color: #ffffff; border-color: #1f9ea0; }
+button.primary:hover, button.suggested:hover {
+    background-color: #27b4b6; border-color: #27b4b6; }
+button.primary:disabled, button.suggested:disabled {
+    background-color: #1a3f42; border-color: #1a3f42; color: #6d8b8c; }
+/* Tertiary: no fill at all, for actions that are rarely the point. */
+button.quiet { background-color: transparent; border-color: transparent;
+               color: #8a949d; padding: 7px 10px; }
+button.quiet:hover { background-color: #1e242b; color: #e8ecef; }
 button.spin-btn { min-width: 26px; padding: 2px 10px; }
-button.help-btn { min-width: 22px; padding: 0 8px; background-color: #2a2f36;
-                  color: #9aa4ad; font-size: 12px; }
-button.help-btn:hover { background-color: #3a424b; color: #e6e8ea; }
+button.help-btn { min-width: 22px; padding: 0 8px; background-color: transparent;
+                  border-color: transparent; color: #8a949d; font-size: 12px; }
+button.help-btn:hover { background-color: #1e242b; color: #e8ecef; }
 .spin-entry { padding: 2px 6px; }
 .overlay-window { background-color: transparent; }
+
+/* --- dialogs ------------------------------------------------------------ */
 .dialog-heading { font-size: 19px; font-weight: bold; }
 .dialog-lead { font-size: 14px; color: #c9d1d8; }
-.dialog-terms { font-size: 13px; color: #9aa4ad; }
-.dialog-facts { font-size: 12px; color: #7d868e; border-top: 1px solid #262b31;
+.dialog-terms { font-size: 13px; color: #8a949d; }
+.dialog-facts { font-size: 12px; color: #79838d; border-top: 1px solid #232a32;
                 padding-top: 10px; margin-top: 2px; }
 .dialog-url { font-size: 11px; }
-/* The live-view readout. Monospace on the VALUES only: they change every frame,
-   and a proportional font makes the column width breathe as digits change,
-   which reads as the number twitching rather than the value moving. */
-.readout { margin-top: 2px; }
-.readout-name { font-size: 12px; color: #7d868e; }
-.readout-value { font-size: 13px; color: #e6e8ea; font-family: monospace; }
+.cal-fail-heading { font-size: 26px; font-weight: bold; }
+.cal-fail-tips { font-size: 14px; color: #8a949d; }
+.cal-fail-detail { font-size: 12px; color: #6f7982; font-style: italic; }
+.cal-success-heading { font-size: 32px; font-weight: bold; }
+
+/* --- the live readout ---------------------------------------------------- */
+/* Monospace on the VALUES only: they change every frame, and a proportional
+   font makes the column width breathe as digits change, which reads as the
+   number twitching rather than the value moving. */
+.readout-name { font-size: 11px; color: #79838d; letter-spacing: 0.05em; }
+.readout-value { font-size: 13px; color: #e8ecef; font-family: monospace; }
 .readout-alert { color: #f2b134; font-weight: bold; }
-button.suggested { background-color: #1f9ea0; }
-button.suggested:hover { background-color: #26b6b8; }
+
+/* --- banner -------------------------------------------------------------- */
+.banner { background-color: #2a2313; border: 1px solid #4a3d1a; border-radius: 10px;
+          padding: 10px 12px; }
+.banner-text { color: #f2b134; font-size: 13px; }
 ";
 
 /// Run the GTK application.
@@ -188,6 +231,15 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
     win.add_controller(keys);
 }
 
+/// Build the hub, for rendering it standalone to look at the layout.
+///
+/// GTK's own `render_texture` gives an honest picture of a widget tree without a
+/// compositor screenshot, which is how the model dialog's width bug was found.
+pub fn build_ui_for_probe(app: &Application) {
+    load_css();
+    build_ui(app);
+}
+
 fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
     // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
@@ -248,14 +300,18 @@ fn build_ui(app: &Application) {
     }
     let status_label = Label::new(Some("Disconnected"));
     status_label.add_css_class("status");
+    // Connection state belongs beside the title, not stranded at the bottom of
+    // the window: it is the first thing that decides whether anything else on
+    // screen means anything.
     let status_bar = gtk::Box::new(Orientation::Horizontal, 8);
-    status_bar.set_halign(Align::Start);
+    status_bar.set_halign(Align::End);
+    status_bar.set_valign(Align::Center);
     status_bar.append(&status_dot);
     status_bar.append(&status_label);
 
     // --- Left column: live eye position ---
-    let eye_title = Label::new(Some("Eye position"));
-    eye_title.add_css_class("section-title");
+    let eye_title = Label::new(Some("EYE POSITION"));
+    eye_title.add_css_class("eyebrow");
     eye_title.set_halign(Align::Start);
 
     // The trackbox is a volume in front of the sensor, not a window onto the
@@ -270,17 +326,35 @@ fn build_ui(app: &Application) {
     //
     // `draw_eye_view` insets by `EYE_VIEW_PAD` on each side, so the *content*
     // size is padded out to make the DRAWN rectangle golden.
-    const GOLDEN_RATIO: f64 = 1.618;
     // Shared with the draw func below: head orientation is drawn ON the
     // eye-position box rather than in a second widget showing the same head.
     let head_view: Rc<RefCell<Option<widget::HeadView>>> = Rc::new(RefCell::new(None));
     let head_for_draw = head_view.clone();
     let area = DrawingArea::new();
-    let box_w = 380;
+    // A minimum, not a size. `widget::eye_view_rect` letterboxes the golden box
+    // inside whatever it is given, so the instrument can grow with the window
+    // without skewing the motion gain — which is what "fixed 380px" was
+    // protecting against, at the cost of never using the space.
     let pad = 2 * widget::EYE_VIEW_PAD as i32;
-    let box_h = (((box_w - pad) as f64) / GOLDEN_RATIO).round() as i32 + pad;
-    area.set_content_width(box_w);
-    area.set_content_height(box_h);
+    let min_w = 320;
+    let min_h = (((min_w - pad) as f64) / widget::EYE_VIEW_RATIO).round() as i32 + pad;
+    area.set_size_request(min_w, min_h);
+    area.set_hexpand(true);
+    // Height follows width, so the golden box fills the card instead of
+    // pillarboxing inside a taller-than-needed allocation. Without this the
+    // widget's height is whatever the layout hands it and the drawn box shrinks
+    // to fit the *smaller* constraint — which is why it stayed small in a wide
+    // window.
+    {
+        const MAX_H: i32 = 300;
+        area.connect_resize(move |a, w, _h| {
+            let want = ((((w - pad) as f64) / widget::EYE_VIEW_RATIO).round() as i32 + pad)
+                .clamp(min_h, MAX_H);
+            if a.content_height() != want {
+                a.set_content_height(want);
+            }
+        });
+    }
     {
         // Sample at PAINT time (as the calibration flow's preview already does)
         // rather than reading a snapshot written by the 33 ms tick: that tick is
@@ -305,13 +379,17 @@ fn build_ui(app: &Application) {
 
     // Live NIR camera preview below the eye-position box (square, matches the
     // 280×280 stream). Shared frame drawn by the tick.
-    let cam_title = Label::new(Some("Camera"));
-    cam_title.add_css_class("section-title");
+    let cam_title = Label::new(Some("SENSOR VIEW"));
+    cam_title.add_css_class("eyebrow");
     cam_title.set_halign(Align::Start);
     let cam_frame: Rc<RefCell<Option<tobii_protocol::CameraFrame>>> = Rc::new(RefCell::new(None));
     let cam_area = DrawingArea::new();
-    cam_area.set_content_width(220);
-    cam_area.set_content_height(220);
+    // Deliberately a fixed, modest square rather than something that expands.
+    // The frame is 280x280 and `draw_camera_view` letterboxes it, so a
+    // full-width strip is a small image in a wide black band — and this is the
+    // supporting view, not the subject.
+    cam_area.set_content_width(165);
+    cam_area.set_content_height(165);
     cam_area.set_halign(Align::Center);
     {
         let cam_frame = cam_frame.clone();
@@ -365,13 +443,24 @@ fn build_ui(app: &Application) {
     let spacer = Label::new(Some(" "));
     readout.attach(&spacer, 2, 0, 1, 1);
 
-    let left = gtk::Box::new(Orientation::Vertical, 10);
-    left.set_width_request(380);
-    left.append(&eye_title);
-    left.append(&area);
-    left.append(&readout);
-    left.append(&cam_title);
-    left.append(&cam_area);
+    // --- The instrument, as one card: trackbox, readout, camera. ---
+    let instrument = gtk::Box::new(Orientation::Vertical, 12);
+    instrument.add_css_class("surface");
+    instrument.add_css_class("panel-pad");
+    instrument.set_hexpand(true);
+    instrument.set_vexpand(true);
+    instrument.append(&eye_title);
+    instrument.append(&area);
+    let rule = gtk::Box::new(Orientation::Horizontal, 0);
+    rule.add_css_class("hairline");
+    instrument.append(&rule);
+    instrument.append(&readout);
+    let rule2 = gtk::Box::new(Orientation::Horizontal, 0);
+    rule2.add_css_class("hairline");
+    instrument.append(&rule2);
+    instrument.append(&cam_title);
+    instrument.append(&cam_area);
+    let left = instrument;
 
     // --- Right column: settings sections (original wording) ---
     let b_setup = crate::widget::button("Set up display");
@@ -471,9 +560,14 @@ fn build_ui(app: &Application) {
         });
     }
 
-    let right = gtk::Box::new(Orientation::Vertical, 18);
-    right.set_hexpand(true);
+    let right = gtk::Box::new(Orientation::Vertical, 12);
+    right.set_size_request(360, -1);
     right.set_valign(Align::Start);
+    // Explicit, at build time. Left to the breakpoint handler alone this was
+    // never set before the first layout, so the control rack absorbed every
+    // spare pixel and the instrument — the thing the window is for — stayed at
+    // its minimum in a wide window.
+    right.set_hexpand(false);
     right.append(&section(
         "Improve my calibration",
         "If the light conditions change or if you experience less tracker precision, you might \
@@ -505,13 +599,20 @@ fn build_ui(app: &Application) {
     // --- Recommend-recalibration banner: a dismissible row, not a modal. Shown
     // by the tick's once-per-connection `decide()` evaluation below. ---
     let banner = gtk::Box::new(Orientation::Horizontal, 12);
-    banner.add_css_class("section-warn"); // reuse the existing warn-color class
+    banner.add_css_class("banner");
     banner.set_visible(false);
     let banner_label = Label::new(None);
+    banner_label.add_css_class("banner-text");
     banner_label.set_hexpand(true);
     banner_label.set_xalign(0.0);
+    banner_label.set_wrap(true);
+    banner_label.set_valign(Align::Center);
+    // The banner is the one place in the hub with a call to action, so it is
+    // the one place the accent is spent.
     let banner_recal = crate::widget::button("Recalibrate");
-    let banner_dismiss = crate::widget::button("×");
+    banner_recal.add_css_class("primary");
+    let banner_dismiss = crate::widget::button("Dismiss");
+    banner_dismiss.add_css_class("quiet");
     banner.append(&banner_label);
     banner.append(&banner_recal);
     banner.append(&banner_dismiss);
@@ -544,30 +645,97 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // --- Two-column split ---
-    let split = gtk::Box::new(Orientation::Horizontal, 30);
+    // --- Responsive split -------------------------------------------------
+    // Side by side when there is room, stacked when there is not. GTK4 has no
+    // media queries, so the breakpoint is watched on the window's width and the
+    // container's orientation is swapped — which is all this layout needs,
+    // because both halves already expand.
+    // A Grid, not a Box. In a Box the rack's natural width won over the
+    // instrument's `hexpand` and it absorbed every spare pixel (measured: 590px
+    // allocated against a 389px natural, while the instrument sat at its floor).
+    // A Grid lets the two columns' expansion be stated per child and honoured.
+    let split = gtk::Grid::new();
     split.set_hexpand(true);
     split.set_vexpand(true);
-    split.append(&left);
-    split.append(&right);
+    split.set_column_spacing(16);
+    split.set_row_spacing(16);
+    split.attach(&left, 0, 0, 1, 1);
+    split.attach(&right, 1, 0, 1, 1);
 
-    let root = gtk::Box::new(Orientation::Vertical, 12);
-    root.set_margin_top(20);
-    root.set_margin_bottom(20);
-    root.set_margin_start(24);
-    root.set_margin_end(24);
-    root.append(&title);
+    let header = gtk::Box::new(Orientation::Horizontal, 12);
+    header.append(&title);
+    title.set_hexpand(true);
+    header.append(&status_bar);
+
+    let root = gtk::Box::new(Orientation::Vertical, 14);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    root.set_margin_start(20);
+    root.set_margin_end(20);
+    root.append(&header);
     root.append(&banner);
     root.append(&split);
-    root.append(&status_bar);
+
+    // Set by the breakpoint block below, and re-checked from the UI tick.
+    #[allow(unused_assignments)]
+    let mut breakpoint: Option<Rc<dyn Fn(i32)>> = None;
+
+    // Scroll rather than clip: a short window (or a stacked narrow one) must
+    // still be able to reach the controls at the bottom.
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scroller.set_child(Some(&root));
+    scroller.set_propagate_natural_height(true);
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Tobii Configuration")
-        .default_width(940)
-        .default_height(760)
+        .default_width(1020)
+        .default_height(780)
         .build();
-    window.set_child(Some(&root));
+    window.set_child(Some(&scroller));
+
+    // The breakpoint. 820 is where the instrument's 340px floor plus the
+    // control column's 360px floor plus margins stop fitting side by side.
+    {
+        // 820 is where the instrument's 320px floor and the control rack's
+        // 360px floor stop fitting side by side with the margins.
+        const STACK_BELOW: i32 = 820;
+        let split = split.clone();
+        let left_bp = left.clone();
+        let right_bp = right.clone();
+        let stacked_now = std::cell::Cell::new(None::<bool>);
+        let apply = move |width: i32| {
+            let stacked = width < STACK_BELOW;
+            if stacked_now.get() == Some(stacked) {
+                return;
+            }
+            stacked_now.set(Some(stacked));
+            // Re-place both children: side by side, or one above the other.
+            split.remove(&left_bp);
+            split.remove(&right_bp);
+            if stacked {
+                split.attach(&left_bp, 0, 0, 1, 1);
+                split.attach(&right_bp, 0, 1, 1, 1);
+            } else {
+                split.attach(&left_bp, 0, 0, 1, 1);
+                split.attach(&right_bp, 1, 0, 1, 1);
+            }
+            // Stacked, the rack has the full width to itself and should use it;
+            // side by side it must not crowd the instrument.
+            right_bp.set_hexpand(stacked);
+        };
+        // Shared, because one signal is not enough to be sure. `default-width`
+        // does not fire for every way a window can change size (tiling and
+        // maximising among them), and a breakpoint that misses those is exactly
+        // the "not responsive" complaint. The hub already runs a 33 ms tick, so
+        // it also re-checks there — one integer compare, and `apply` returns
+        // immediately when nothing changed.
+        let apply: Rc<dyn Fn(i32)> = Rc::new(apply);
+        apply(window.default_width());
+        breakpoint = Some(apply.clone());
+        window.connect_default_width_notify(move |w| apply(w.width().max(w.default_width())));
+    }
 
     // ~30 fps tick: read the device snapshot, refresh status + eye view.
     let tick_app = app.clone();
@@ -575,7 +743,15 @@ fn build_ui(app: &Application) {
     let tick_cmd_tx = cmd_tx.clone();
     let tick_banner = banner.clone();
     let tick_banner_label = banner_label.clone();
+    let tick_breakpoint = breakpoint.take();
+    let bp_window = window.clone();
     glib::timeout_add_local(Duration::from_millis(33), move || {
+        // Re-check the layout breakpoint. `notify::default-width` misses some
+        // ways a window changes size (tiling, maximising), and this costs one
+        // integer compare — `apply` returns immediately when nothing changed.
+        if let Some(bp) = tick_breakpoint.as_ref() {
+            bp(bp_window.width());
+        }
         // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
         // under one lock. `new_cam` is None on the ticks between device frames.
         let (snap, new_cam) = {
@@ -756,18 +932,31 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 
 /// A settings section: bold title, wrapped description (original wording), and
 /// a control widget beneath — the right-column building block.
+/// One setting, as a card: what it is, what it does, and its control.
+///
+/// A card rather than a bare stack because the hub holds five co-equal
+/// settings; stacked headings alone left the eye no boundary between them, so
+/// the column read as one long paragraph with buttons in it.
 fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Box {
     let b = gtk::Box::new(Orientation::Vertical, 6);
+    b.add_css_class("surface");
+    b.add_css_class("panel-pad");
     let t = Label::new(Some(title));
     t.add_css_class("section-title");
     t.set_halign(Align::Start);
+    t.set_xalign(0.0);
+    t.set_wrap(true);
     let d = Label::new(Some(desc));
     d.add_css_class("section-desc");
     d.set_halign(Align::Start);
     d.set_xalign(0.0);
     d.set_wrap(true);
+    // A wrapping label reports its UNWRAPPED width as natural, so without a cap
+    // the longest sentence in the column sets the column's width — and the
+    // control rack grew until it crowded the instrument beside it.
+    d.set_max_width_chars(44);
     control.set_halign(Align::Start);
-    control.set_margin_top(4);
+    control.set_margin_top(6);
     b.append(&t);
     b.append(&d);
     b.append(control);
