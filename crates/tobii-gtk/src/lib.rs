@@ -686,7 +686,14 @@ fn build_ui(app: &Application) {
     // A Grid lets the two columns' expansion be stated per child and honoured.
     let split = gtk::Grid::new();
     split.set_hexpand(true);
-    split.set_vexpand(true);
+    // NOT vexpand. With it, the row took the window's whole remaining height and
+    // the instrument card — which fills its cell — grew past the control rack,
+    // which sizes to its cards. That is why the two columns kept ending at
+    // different heights however the card itself was configured: the mismatch was
+    // the ROW being taller than either column needed. Sized to content, both
+    // columns end level and any spare window height is plain background.
+    split.set_vexpand(false);
+    split.set_valign(Align::Start);
     split.set_column_spacing(16);
     split.set_row_spacing(16);
     split.attach(&left, 0, 0, 1, 1);
@@ -721,11 +728,11 @@ fn build_ui(app: &Application) {
         .application(app)
         .title("Tobii Configuration")
         // Sized to the content, not padded past it: the hub's natural height
-        // measures 857 px at this width, and a default of 960 left ~100 px of
-        // dead space under both columns. The scroller stays for windows the
-        // user shrinks.
+        // measures 857 px at this width. The margin over that is small but not
+        // zero — font metrics vary between systems, and a little background at
+        // the bottom is better than a scrollbar for the sake of ten pixels.
         .default_width(1040)
-        .default_height(900)
+        .default_height(880)
         .build();
     window.set_child(Some(&scroller));
     // A floor, kept deliberately low. Width is the constraint that carries
