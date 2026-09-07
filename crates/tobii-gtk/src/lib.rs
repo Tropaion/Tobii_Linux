@@ -475,7 +475,11 @@ fn build_ui(app: &Application) {
     instrument.add_css_class("surface");
     instrument.add_css_class("panel-pad");
     instrument.set_hexpand(true);
-    instrument.set_vexpand(true);
+    // Sized to its content, not stretched to the taller column. With vexpand it
+    // grew to match the control rack and carried ~110 px of empty card below the
+    // sensor view — dead space inside a bordered box reads as something missing,
+    // where the same gap as plain background reads as layout.
+    instrument.set_valign(Align::Start);
     instrument.append(&eye_title);
     instrument.append(&area);
     let rule = gtk::Box::new(Orientation::Horizontal, 0);
@@ -717,18 +721,20 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Tobii Configuration")
-        // Sized so the hub fits without scrolling: the content's natural height
-        // measures ~920 px side by side, so this clears it with room for the
-        // window chrome. The scroller stays for windows the user shrinks.
+        // Sized to the content, not padded past it: the hub's natural height
+        // measures 857 px at this width, and a default of 960 left ~100 px of
+        // dead space under both columns. The scroller stays for windows the
+        // user shrinks.
         .default_width(1040)
-        .default_height(960)
+        .default_height(900)
         .build();
     window.set_child(Some(&scroller));
-    // A floor, so the window cannot be dragged down to something unusable.
-    // Deliberately below the natural size rather than equal to it — a hard
-    // minimum of 900 px tall would not fit a 768 px laptop screen at all, and an
-    // unopenable window is worse than a scrollbar.
-    window.set_size_request(820, 600);
+    // A floor, so the window cannot be dragged down to something unusable —
+    // and no higher than that. A minimum near the natural height would not fit a
+    // 768 px laptop screen at all, and an unopenable window is worse than a
+    // scrollbar. Width is the one that matters: below ~800 the two columns stop
+    // fitting side by side, which the breakpoint handles by stacking them.
+    window.set_size_request(820, 460);
 
     // The breakpoint. 820 is where the instrument's 340px floor plus the
     // control column's 360px floor plus margins stop fitting side by side.
