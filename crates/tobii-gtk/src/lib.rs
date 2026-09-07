@@ -411,13 +411,13 @@ fn build_ui(app: &Application) {
     cam_title.set_halign(Align::Start);
     let cam_frame: Rc<RefCell<Option<tobii_protocol::CameraFrame>>> = Rc::new(RefCell::new(None));
     let cam_area = DrawingArea::new();
-    // Deliberately a fixed, modest square rather than something that expands.
-    // The frame is 280x280 and `draw_camera_view` letterboxes it, so a
-    // full-width strip is a small image in a wide black band — and this is the
-    // supporting view, not the subject.
-    cam_area.set_content_width(230);
-    cam_area.set_content_height(230);
-    cam_area.set_halign(Align::Center);
+    // A floor plus room to grow. `draw_camera_view` letterboxes the square
+    // frame, so extra height makes the image bigger rather than adding black
+    // bands — which is what lets this soak up the card's spare height instead of
+    // leaving an empty gap under it.
+    cam_area.set_size_request(230, 230);
+    cam_area.set_hexpand(true);
+    cam_area.set_vexpand(true);
     {
         let cam_frame = cam_frame.clone();
         cam_area.set_draw_func(move |_, cr, w, h| {
@@ -475,11 +475,10 @@ fn build_ui(app: &Application) {
     instrument.add_css_class("surface");
     instrument.add_css_class("panel-pad");
     instrument.set_hexpand(true);
-    // Sized to its content, not stretched to the taller column. With vexpand it
-    // grew to match the control rack and carried ~110 px of empty card below the
-    // sensor view — dead space inside a bordered box reads as something missing,
-    // where the same gap as plain background reads as layout.
-    instrument.set_valign(Align::Start);
+    // Both columns are the same height — two cards of different heights side by
+    // side look like a mistake. The slack that used to sit empty below the
+    // sensor view is absorbed by the sensor view itself, which expands into it.
+    instrument.set_vexpand(true);
     instrument.append(&eye_title);
     instrument.append(&area);
     let rule = gtk::Box::new(Orientation::Horizontal, 0);
@@ -729,12 +728,11 @@ fn build_ui(app: &Application) {
         .default_height(900)
         .build();
     window.set_child(Some(&scroller));
-    // A floor, so the window cannot be dragged down to something unusable —
-    // and no higher than that. A minimum near the natural height would not fit a
-    // 768 px laptop screen at all, and an unopenable window is worse than a
-    // scrollbar. Width is the one that matters: below ~800 the two columns stop
-    // fitting side by side, which the breakpoint handles by stacking them.
-    window.set_size_request(820, 460);
+    // A floor, kept deliberately low. Width is the constraint that carries
+    // meaning — below ~800 the two columns stop fitting side by side, which the
+    // breakpoint handles by stacking them — while height only decides how much
+    // scrolling there is, so there is no reason to stop the user shrinking it.
+    window.set_size_request(820, 340);
 
     // The breakpoint. 820 is where the instrument's 340px floor plus the
     // control column's 360px floor plus margins stop fitting side by side.

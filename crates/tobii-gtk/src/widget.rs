@@ -222,12 +222,26 @@ pub fn draw_eye_view(cr: &cairo::Context, w: i32, h: i32, view: &EyeView) {
     }
 }
 
+/// Corner radius of the sensor image, matching the `.surface` cards it sits
+/// among so the panel reads as one family of shapes.
+pub const CAMERA_CORNER_RADIUS: f64 = 10.0;
+
+/// Append a rounded rectangle to the current path.
+pub fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let (hp, tau4) = (std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -hp, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, hp);
+    cr.arc(x + r, y + h - r, r, hp, tau4);
+    cr.arc(x + r, y + r, r, tau4, tau4 + hp);
+    cr.close_path();
+}
+
 /// Draw the latest NIR camera frame into a cairo context of size `w`×`h`,
 /// contrast-stretched (the raw frames are very dark) and letterboxed to preserve
 /// the square aspect. Mirrored horizontally so it reads like a mirror.
 pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_protocol::CameraFrame) {
-    cr.set_source_rgb(0.05, 0.05, 0.06);
-    let _ = cr.paint();
     let (iw, ih) = (frame.width as i32, frame.height as i32);
     if iw <= 0 || ih <= 0 || frame.pixels.len() < (iw * ih) as usize {
         return;
@@ -263,9 +277,18 @@ pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_proto
 
     let scale = (w as f64 / iw as f64).min(h as f64 / ih as f64);
     let (dw, dh) = (iw as f64 * scale, ih as f64 * scale);
+    let (ox, oy) = ((w as f64 - dw) / 2.0, (h as f64 - dh) / 2.0);
     cr.save().ok();
+    // Round the image's own corners to match the cards it sits among. Clipping
+    // to the LETTERBOXED rect rather than the widget keeps the radius on the
+    // picture: rounding the widget would round empty space when the allocation
+    // is not square.
+    rounded_rect(cr, ox, oy, dw, dh, CAMERA_CORNER_RADIUS);
+    cr.clip();
+    cr.set_source_rgb(0.05, 0.05, 0.06);
+    let _ = cr.paint();
     // Centre, then mirror horizontally (flip x about the image centre).
-    cr.translate((w as f64 - dw) / 2.0, (h as f64 - dh) / 2.0);
+    cr.translate(ox, oy);
     cr.translate(dw, 0.0);
     cr.scale(-scale, scale);
     let _ = cr.set_source_surface(&surface, 0.0, 0.0);
