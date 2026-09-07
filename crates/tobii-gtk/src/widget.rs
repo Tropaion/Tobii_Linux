@@ -245,17 +245,6 @@ pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_proto
 mod tests {
     use super::*;
 
-    fn head(yaw: f64, pitch: f64, roll: f64, sigma: Option<f32>) -> HeadView {
-        HeadView {
-            yaw_deg: yaw,
-            pitch_deg: pitch,
-            roll_deg: roll,
-            z_mm: 680.0,
-            sigma,
-            has_pitch: sigma.is_some(),
-        }
-    }
-
     /// A disconnected device must never leave the last pose on screen looking
     /// live — the same rule `eye_view_for` follows.
     #[test]
