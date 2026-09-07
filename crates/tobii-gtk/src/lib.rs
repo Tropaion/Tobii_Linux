@@ -86,10 +86,13 @@ button.primary:hover, button.suggested:hover {
     background-color: #27b4b6; border-color: #27b4b6; }
 button.primary:disabled, button.suggested:disabled {
     background-color: #1a3f42; border-color: #1a3f42; color: #6d8b8c; }
-/* Tertiary: no fill at all, for actions that are rarely the point. */
-button.quiet { background-color: transparent; border-color: transparent;
-               color: #8a949d; padding: 7px 10px; }
-button.quiet:hover { background-color: #1e242b; color: #e8ecef; }
+/* Tertiary: outlined, no fill. Rarely the point, but still a button — an
+   invisible border that only appears on hover leaves it looking like a link
+   until you happen to touch it. */
+button.quiet { background-color: transparent; border-color: #2b333c;
+               color: #8a949d; padding: 8px 12px; }
+button.quiet:hover { background-color: #1e242b; border-color: #3a444f;
+                     color: #e8ecef; }
 button.spin-btn { min-width: 26px; padding: 2px 10px; }
 button.help-btn { min-width: 22px; padding: 0 8px; background-color: transparent;
                   border-color: transparent; color: #8a949d; font-size: 12px; }
@@ -166,12 +169,36 @@ pub(crate) fn accuracy_mode() -> bool {
     std::env::args().any(|a| a == "--accuracy")
 }
 
+/// Ask GTK to round font metrics to whole pixels.
+///
+/// **A targeted guess at the reported glyph clipping, not a proven fix.** The
+/// tops of tall glyphs are shaved on the reporter's display, which runs at
+/// fractional scale 1.15 — GTK renders at scale 2 and the compositor scales the
+/// buffer back down by 0.575. Everything else has been ruled out: the
+/// stylesheet, the `GSK_RENDERER=gl` override this program used to force, and
+/// rendering the same widgets offscreen at 1.0/1.15/1.25/1.5/2.0, none of which
+/// reproduce it.
+///
+/// `gtk-hint-font-metrics` exists for this situation: with it off, font metrics
+/// carry fractional values through a scaled pipeline and glyph extents can land
+/// a fraction of a pixel short. It costs nothing to turn on.
+///
+/// If the clipping survives this, the remaining suspect is the compositor's own
+/// downscale, which nothing here can reach — the test for that is to put the
+/// display on an integer scale (100% or 200%) and look again.
+fn hint_font_metrics() {
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_hint_font_metrics(true);
+    }
+}
+
 /// Install this app's stylesheet on the default display.
 ///
 /// Public so a dialog can be rendered outside the hub for a visual check —
 /// GTK's own `render_texture` gives an honest picture of a widget tree without
 /// a compositor screenshot, which is how this dialog's width bug was found.
 pub fn load_css() {
+    hint_font_metrics();
     let provider = gtk::CssProvider::new();
     provider.load_from_string(CSS);
     if let Some(display) = gtk::gdk::Display::default() {
@@ -388,8 +415,8 @@ fn build_ui(app: &Application) {
     // The frame is 280x280 and `draw_camera_view` letterboxes it, so a
     // full-width strip is a small image in a wide black band — and this is the
     // supporting view, not the subject.
-    cam_area.set_content_width(165);
-    cam_area.set_content_height(165);
+    cam_area.set_content_width(230);
+    cam_area.set_content_height(230);
     cam_area.set_halign(Align::Center);
     {
         let cam_frame = cam_frame.clone();
@@ -690,10 +717,18 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Tobii Configuration")
-        .default_width(1020)
-        .default_height(780)
+        // Sized so the hub fits without scrolling: the content's natural height
+        // measures ~920 px side by side, so this clears it with room for the
+        // window chrome. The scroller stays for windows the user shrinks.
+        .default_width(1040)
+        .default_height(960)
         .build();
     window.set_child(Some(&scroller));
+    // A floor, so the window cannot be dragged down to something unusable.
+    // Deliberately below the natural size rather than equal to it — a hard
+    // minimum of 900 px tall would not fit a 768 px laptop screen at all, and an
+    // unopenable window is worse than a scrollbar.
+    window.set_size_request(820, 600);
 
     // The breakpoint. 820 is where the instrument's 340px floor plus the
     // control column's 360px floor plus margins stop fitting side by side.
