@@ -1,6 +1,6 @@
 [package]
 name = "tobii-recap"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Decode a usbmon pcap capture of the Tobii ET5 into a TTP op catalog."

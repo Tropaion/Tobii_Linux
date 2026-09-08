@@ -1,6 +1,6 @@
 [package]
 name = "tobii-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Command-line interface for the Tobii ET5 Linux runtime."
@@ -13,6 +13,7 @@ path = "src/main.rs"
 tobii-usb = { path = "../tobii-usb" }
 tobii-protocol = { path = "../tobii-protocol" }
 tobii-config = { path = "../tobii-config" }
+tobii-update = { path = "../tobii-update" }
 tobii-headpose = { path = "../tobii-headpose", default-features = false }
 
 [features]

@@ -1471,6 +1471,7 @@ dependencies = [
  "tobii-config",
  "tobii-headpose",
  "tobii-protocol",
+ "tobii-update",
  "tobii-usb",
 ]
 
@@ -1490,6 +1491,7 @@ dependencies = [
  "tobii-config",
  "tobii-headpose",
  "tobii-protocol",
+ "tobii-update",
  "tobii-usb",
 ]
 
@@ -1511,6 +1513,13 @@ name = "tobii-recap"
 version = "0.1.0"
 dependencies = [
  "tobii-protocol",
+]
+
+[[package]]
+name = "tobii-update"
+version = "0.1.0"
+dependencies = [
+ "tobii-config",
 ]
 
 [[package]]

@@ -17,6 +17,7 @@ pub mod overlay;
 pub mod particles;
 pub mod screen_pick;
 pub mod setup_flow;
+pub mod update;
 pub mod widget;
 
 use std::cell::{Cell, RefCell};
@@ -718,6 +719,7 @@ pub fn build_ui(app: &Application) {
     root.set_margin_start(PAGE_MARGIN);
     root.set_margin_end(PAGE_MARGIN);
     root.append(&header);
+    root.append(&update::banner());
     root.append(&banner);
     root.append(&split);
 

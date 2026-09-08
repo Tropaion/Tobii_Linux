@@ -1,9 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/tobii-protocol", "crates/tobii-usb", "crates/tobii-cli", "crates/tobii-config", "crates/tobii-gtk", "crates/tobii-headpose", "crates/tobii-recap"]
+members = ["crates/tobii-protocol", "crates/tobii-usb", "crates/tobii-cli", "crates/tobii-config", "crates/tobii-gtk", "crates/tobii-headpose", "crates/tobii-recap", "crates/tobii-update"]
 
 [workspace.package]
+# One version for the whole workspace: it is what a release is tagged with and
+# what the updater compares against, so it cannot be per-crate without the
+# question "which crate's version am I running?" having several answers.
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["Fabian Plaimauer"]
-repository = ""
+repository = "https://github.com/Tropaion/Tobii_Linux"

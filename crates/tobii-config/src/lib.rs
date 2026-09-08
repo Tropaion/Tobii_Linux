@@ -17,6 +17,14 @@ mod calibration_state;
 mod edid;
 mod setpm;
 mod setup;
+/// A dependency-free SHA-256.
+///
+/// Lives here, in the lowest shared crate, because two unrelated things need to
+/// verify a download before trusting it: the head-pose model store and the
+/// updater. It was written for the first and moved here for the second rather
+/// than duplicated, or reached for across a crate that has nothing to do with
+/// either.
+pub mod sha256;
 mod store;
 
 pub use calibration_state::{decide, CalAction, RecommendReason};

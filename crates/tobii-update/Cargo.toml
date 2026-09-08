@@ -1,0 +1,9 @@
+[package]
+name = "tobii-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Checks for, verifies and installs new releases of the Tobii ET5 Linux runtime."
+
+[dependencies]
+tobii-config = { path = "../tobii-config" }

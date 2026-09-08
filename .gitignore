@@ -15,3 +15,5 @@ target/
 
 # Local Claude Code settings (machine-specific permissions)
 .claude/settings.local.json
+# Release artifacts built by scripts/release.sh
+dist/

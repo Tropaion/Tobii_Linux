@@ -1,6 +1,6 @@
 [package]
 name = "tobii-usb"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "libusb (rusb) transport + connection driver for the Tobii Eye Tracker 5."
