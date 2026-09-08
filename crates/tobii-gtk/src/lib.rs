@@ -704,11 +704,14 @@ fn build_ui(app: &Application) {
     title.set_hexpand(true);
     header.append(&status_bar);
 
+    // One margin all round, so the frame of background around the content is
+    // even. Anything else reads as a mistake at the corners.
+    const PAGE_MARGIN: i32 = 20;
     let root = gtk::Box::new(Orientation::Vertical, 14);
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(20);
-    root.set_margin_end(20);
+    root.set_margin_top(PAGE_MARGIN);
+    root.set_margin_bottom(PAGE_MARGIN);
+    root.set_margin_start(PAGE_MARGIN);
+    root.set_margin_end(PAGE_MARGIN);
     root.append(&header);
     root.append(&banner);
     root.append(&split);
@@ -716,6 +719,11 @@ fn build_ui(app: &Application) {
     // Set by the breakpoint block below, and re-checked from the UI tick.
     #[allow(unused_assignments)]
     let mut breakpoint: Option<Rc<dyn Fn(i32)>> = None;
+
+    // How tall the content wants to be at the width the window will open at.
+    // Measured before the window exists, so the window can be built around it.
+    const DEFAULT_WIDTH: i32 = 1040;
+    let (_, natural_height, _, _) = root.measure(Orientation::Vertical, DEFAULT_WIDTH);
 
     // Scroll rather than clip: a short window (or a stacked narrow one) must
     // still be able to reach the controls at the bottom.
@@ -727,12 +735,13 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Tobii Configuration")
-        // Sized to the content, not padded past it: the hub's natural height
-        // measures 857 px at this width. The margin over that is small but not
-        // zero — font metrics vary between systems, and a little background at
-        // the bottom is better than a scrollbar for the sake of ten pixels.
-        .default_width(1040)
-        .default_height(880)
+        .default_width(DEFAULT_WIDTH)
+        // Measured, not chosen. Asking the content how tall it wants to be at
+        // this width means the background below the last card is exactly
+        // `PAGE_MARGIN`, matching the sides — and it stays that way if the
+        // user's font metrics differ from the ones this was written against,
+        // which a hardcoded number could not.
+        .default_height(natural_height)
         .build();
     window.set_child(Some(&scroller));
     // A floor, kept deliberately low. Width is the constraint that carries
