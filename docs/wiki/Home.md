@@ -24,7 +24,8 @@ page cites the source file that backs it.
 | **[HYPOTHESIS]** | Inferred or partially observed; unproven. Treat as a lead, not a fact. |
 
 Source-of-truth code lives under `crates/tobii-protocol/src/` (pure codec),
-`crates/tobii-usb/src/` (libusb transport + connection driver), and
+`crates/tobii-usb/src/` (libusb transport + connection driver),
+`crates/tobii-headpose/src/` (head pose, geometric and neural) and
 `crates/tobii-cli/` (the `tobii` command). File citations on each page are
 relative to the repo root.
 
@@ -42,6 +43,6 @@ relative to the repo root.
 | [[Display-Area]] | GET `0x596` / SET `0x5a0`, corner layout, geometry model, reboot wipe, curved monitors |
 | [[Calibration]] | Follow-the-dot protocol: op sequence, payloads, point sets, blob persistence |
 | [[Select-Eyes]] | `enabled_eye` GET `0xc62` / SET `0xc58`, wire enum, calibration-time semantics |
-| [[Head-Pose]] | The open investigation: head pose is NOT in the gaze frame; evidence & next steps |
+| [[Head-Pose]] | Head pose is NOT in the gaze frame — how it is derived host-side instead: the 5-DOF eye-origin fallback and the 6-DOF neural path |
 | [[Tools]] | The `tobii` CLI subcommands and the `tobii-recap` pcap decoder |
 | [[Reverse-Engineering-Methodology]] | How the protocol was mapped, taking a usbmon capture, contributing findings |
