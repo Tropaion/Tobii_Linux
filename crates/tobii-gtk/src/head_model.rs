@@ -138,6 +138,16 @@ pub fn control(
     state: std::sync::Arc<std::sync::Mutex<crate::device::DeviceState>>,
     cmd_tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>,
 ) -> gtk::Box {
+    // Installing or removing the model changes what the device thread can do,
+    // and it resolves that once when it connects. Every path that changes the
+    // file tells it to look again, so a fetch takes effect immediately instead
+    // of at the next restart.
+    let reload = {
+        let cmd_tx = cmd_tx.clone();
+        move || {
+            let _ = cmd_tx.send(crate::device::DeviceCommand::ReloadHeadModel);
+        }
+    };
     let b = gtk::Box::new(Orientation::Vertical, 6);
     let status = Label::new(None);
     status.add_css_class("section-desc");
@@ -179,7 +189,10 @@ pub fn control(
             remove.clone(),
         );
         move || {
-            let st = model_store::status(SRC);
+            // The cheap check: `status` reads and digests 13 MB, and this runs
+            // during hub construction and after every change. The digest is
+            // still enforced where it decides whether to RUN the model.
+            let st = model_store::status_quick(SRC);
             let ready = matches!(st, Status::Ready);
             status.set_text(&status_line(&st));
             pitch.set_text(&pitch_line(model_store::pitch_offset()));
@@ -198,11 +211,14 @@ pub fn control(
     // --- get the model ---
     {
         let (status, refresh) = (status.clone(), refresh.clone());
+        let reload = reload.clone();
         get.connect_clicked(move |btn| {
             let (status, refresh, btn) = (status.clone(), refresh.clone(), btn.clone());
+            let reload = reload.clone();
             let parent = btn.root().and_downcast::<gtk::Window>();
+            let reload = reload.clone();
             terms_dialog(parent.as_ref(), move || {
-                start_download(&btn, &status, refresh.clone())
+                start_download(&btn, &status, refresh.clone(), reload.clone())
             });
         });
     }
@@ -268,6 +284,7 @@ pub fn control(
     // --- remove it ---
     {
         let (status, refresh) = (status.clone(), refresh.clone());
+        let reload = reload.clone();
         remove.connect_clicked(move |btn| {
             let dlg = gtk::AlertDialog::builder()
                 .modal(true)
@@ -281,13 +298,17 @@ pub fn control(
                 .default_button(0)
                 .build();
             let (status, refresh) = (status.clone(), refresh.clone());
+            let reload = reload.clone();
             let parent = btn.root().and_downcast::<gtk::Window>();
             dlg.choose(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
                 if res.unwrap_or(0) != 1 {
                     return;
                 }
                 match std::fs::remove_file(model_store::path_of(SRC)) {
-                    Ok(()) => refresh(),
+                    Ok(()) => {
+                        refresh();
+                        reload();
+                    }
                     Err(e) => status.set_text(&format!("Could not remove it: {e}")),
                 }
             });
@@ -372,22 +393,66 @@ fn pitch_dialog<F: Fn() + Clone + 'static>(
             w.close();
         });
     }
+    // The dialog's lifetime, so the poll below can stop when it closes. Without
+    // it a cancelled run left a 5 Hz timeout running for the life of the
+    // process, holding every widget in this window alive with it.
+    let alive = std::rc::Rc::new(std::cell::Cell::new(true));
+    {
+        let (alive, state) = (alive.clone(), state.clone());
+        win.connect_close_request(move |_| {
+            alive.set(false);
+            state.lock().unwrap().pitch_cal.active = false;
+            glib::Propagation::Proceed
+        });
+    }
     {
         let (progress, close, pitch_label) = (progress.clone(), close.clone(), pitch_label.clone());
         let refresh = refresh.clone();
         let state = state.clone();
+        let cmd_tx = cmd_tx.clone();
+        let alive = alive.clone();
         go.connect_clicked(move |go| {
             go.set_sensitive(false);
             crate::widget::set_button_text(&close, "Stop");
             progress.set_text("Get comfortable — starting in 3 seconds…");
-            let _ = cmd_tx.send(crate::device::DeviceCommand::PitchCalibrate { secs: SECS });
+
+            // Claim the state BEFORE sending, with a fresh token. This is what
+            // clears the previous run's result: the device thread can sit in a
+            // one-second read before it dequeues the command, and a poll that
+            // started meanwhile would otherwise read the OLD outcome, report
+            // "done", and stop — while the real measurement ran unobserved and
+            // overwrote the saved zero.
+            let token = crate::device::next_cal_token();
+            state.lock().unwrap().pitch_cal = crate::device::PitchCal {
+                token,
+                active: true,
+                secs_left: SECS + 3,
+                samples: 0,
+                result: None,
+            };
+            let _ = cmd_tx.send(crate::device::DeviceCommand::PitchCalibrate { secs: SECS, token });
+
             let (state, progress, go, close) =
                 (state.clone(), progress.clone(), go.clone(), close.clone());
-            let (pitch_label, refresh) = (pitch_label.clone(), refresh.clone());
+            let (pitch_label, refresh, alive) =
+                (pitch_label.clone(), refresh.clone(), alive.clone());
+            let cmd_tx = cmd_tx.clone();
             glib::timeout_add_local(Duration::from_millis(200), move || {
+                if !alive.get() {
+                    return glib::ControlFlow::Break; // the dialog is gone
+                }
                 let cal = state.lock().unwrap().pitch_cal.clone();
+                if cal.token != token {
+                    return glib::ControlFlow::Break; // a newer run owns it
+                }
                 if let Some(result) = &cal.result {
                     progress.set_text(&pitch_outcome(result));
+                    if result.is_ok() {
+                        // The running model holds the offset it was built with,
+                        // so the number just measured means nothing until it is
+                        // rebuilt — including to the very model that measured it.
+                        let _ = cmd_tx.send(crate::device::DeviceCommand::ReloadHeadModel);
+                    }
                     pitch_label.set_text(&pitch_line(model_store::pitch_offset()));
                     refresh();
                     go.set_sensitive(true);
@@ -396,8 +461,14 @@ fn pitch_dialog<F: Fn() + Clone + 'static>(
                 }
                 if cal.active {
                     progress.set_text(&pitch_progress(cal.secs_left, cal.samples));
+                    glib::ControlFlow::Continue
+                } else {
+                    // Not active and no result: cancelled before the device
+                    // thread ever saw it.
+                    progress.set_text("Stopped. Nothing was saved.");
+                    go.set_sensitive(true);
+                    glib::ControlFlow::Break
                 }
-                glib::ControlFlow::Continue
             });
         });
     }
@@ -538,7 +609,12 @@ pub fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F
 }
 
 /// Fetch on a worker thread, reporting progress from the part-file's size.
-fn start_download<F: Fn() + Clone + 'static>(btn: &Button, status: &Label, refresh: F) {
+fn start_download<F: Fn() + Clone + 'static, R: Fn() + Clone + 'static>(
+    btn: &Button,
+    status: &Label,
+    refresh: F,
+    reload: R,
+) {
     btn.set_sensitive(false);
     btn.set_visible(true);
     status.set_text(&progress_line(0, SRC.bytes));
@@ -563,6 +639,7 @@ fn start_download<F: Fn() + Clone + 'static>(btn: &Button, status: &Label, refre
         Ok(Ok(_)) => {
             btn.set_sensitive(true);
             refresh();
+            reload();
             glib::ControlFlow::Break
         }
         Ok(Err(e)) => {

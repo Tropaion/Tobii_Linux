@@ -1,6 +1,6 @@
 //! GTK/cairo rendering + pure presentation helpers over the `eyeview` data.
-//! The pure helpers (`eye_view_for`, `guidance_message`) are
-//! unit-tested; `draw_eye_view` is the cairo drawing (live-validated).
+//! The pure helpers (`eye_view_for`, `readout_groups`) are unit-tested;
+//! `draw_eye_view` is the cairo drawing (live-validated).
 
 use gtk::cairo;
 use gtk::prelude::*;
@@ -53,30 +53,6 @@ pub fn eye_view_for(state: &DeviceState) -> EyeView {
         return EyeView::none();
     }
     state.eye_view.unwrap_or_else(EyeView::none)
-}
-
-/// Human-readable eye-position guidance line.
-///
-/// The nudge wording is the original Windows software's own, recovered from its
-/// `LanguageResources` string table (`EyesPositioning_FullScreenMessage_*`), so
-/// the guidance reads exactly as it does there. `Centered` is the one
-/// deliberate departure: the original shows "Press a key to continue" on its
-/// fullscreen step, which would be wrong on our always-on hub, so we report the
-/// live distance instead.
-pub fn guidance_message(view: &EyeView) -> String {
-    match view.guidance {
-        Guidance::NoEyes => "Are you there?".to_string(),
-        Guidance::MoveCloser => "Move closer".to_string(),
-        Guidance::MoveBack => "Lean back".to_string(),
-        Guidance::MoveRight => "Move right".to_string(),
-        Guidance::MoveLeft => "Move left".to_string(),
-        Guidance::MoveDown => "Move down".to_string(),
-        Guidance::MoveUp => "Move up".to_string(),
-        Guidance::Centered => match view.distance_mm {
-            Some(d) => format!("Good position ({d:.0} mm)."),
-            None => "Good position.".to_string(),
-        },
-    }
 }
 
 /// Draw the trackbox rectangle + both eyes into a cairo context of size `w`×`h`.
@@ -320,14 +296,6 @@ mod tests {
 
     use crate::eyeview::{EyeView, Guidance};
 
-    fn view(g: Guidance, d: Option<f32>) -> EyeView {
-        EyeView {
-            distance_mm: d,
-            guidance: g,
-            ..EyeView::none()
-        }
-    }
-
     fn valid_sample() -> tobii_protocol::GazeSample {
         use tobii_protocol::gaze::present;
         tobii_protocol::GazeSample {
@@ -344,41 +312,6 @@ mod tests {
             validity_l: 0,
             validity_r: 0,
             ..Default::default()
-        }
-    }
-
-    #[test]
-    fn guidance_messages_match_each_state() {
-        // Wording is the original software's own (see `guidance_message`).
-        assert_eq!(
-            guidance_message(&view(Guidance::NoEyes, None)),
-            "Are you there?"
-        );
-        assert_eq!(
-            guidance_message(&view(Guidance::MoveCloser, None)),
-            "Move closer"
-        );
-        assert_eq!(
-            guidance_message(&view(Guidance::MoveBack, None)),
-            "Lean back"
-        );
-        assert_eq!(
-            guidance_message(&view(Guidance::Centered, Some(680.0))),
-            "Good position (680 mm)."
-        );
-    }
-
-    #[test]
-    fn guidance_messages_name_every_direction() {
-        // The original nudges the user a specific way rather than saying
-        // "center yourself", so each direction needs its own line.
-        for (g, want) in [
-            (Guidance::MoveRight, "Move right"),
-            (Guidance::MoveLeft, "Move left"),
-            (Guidance::MoveDown, "Move down"),
-            (Guidance::MoveUp, "Move up"),
-        ] {
-            assert_eq!(guidance_message(&view(g, None)), want);
         }
     }
 
@@ -414,7 +347,6 @@ mod tests {
             yaw_deg: yaw,
             pitch_deg: pitch,
             roll_deg: 0.0,
-            z_mm: 680.0,
             sigma,
             has_pitch: sigma.is_some(),
         }
@@ -521,7 +453,6 @@ mod tests {
             yaw_deg: 3.0,
             pitch_deg: 0.0,
             roll_deg: -1.0,
-            z_mm: 680.0,
             sigma: None,
             has_pitch: false,
         };
@@ -553,6 +484,27 @@ mod tests {
         );
         // "Not detected" is a state, not a nudge; it must not flash either.
         assert!(!alert(Guidance::NoEyes, None, false));
+    }
+
+    /// The damped `guidance` and the undamped `raw_guidance` disagree for about
+    /// a third of a second whenever the user crosses the tolerance boundary.
+    /// Whichever one the row uses, it has to use it for both halves.
+    #[test]
+    fn the_position_text_and_its_emphasis_never_disagree() {
+        let mut e = ev(Guidance::Centered, Some(684.0), true);
+        e.raw_guidance = Guidance::MoveLeft; // mid-damping
+        let row = &readout_groups(&e, None)[0][0];
+        assert_eq!(row.value, "good");
+        assert!(!row.alert, "the word says good, so the styling must too");
+
+        e.guidance = Guidance::MoveLeft;
+        e.raw_guidance = Guidance::Centered; // damping the other way
+        let row = &readout_groups(&e, None)[0][0];
+        assert_eq!(row.value, "move left");
+        assert!(
+            row.alert,
+            "the word asks for a move, so the styling must too"
+        );
     }
 
     #[test]
@@ -705,8 +657,6 @@ pub struct HeadView {
     pub yaw_deg: f64,
     pub pitch_deg: f64,
     pub roll_deg: f64,
-    /// Distance from the tracker, millimetres.
-    pub z_mm: f64,
     /// Model confidence, if this pose came from the model. `None` means the
     /// rotation is stale or geometric, and the view says so rather than
     /// implying a live measurement.
@@ -726,7 +676,6 @@ pub fn head_view_for(state: &DeviceState) -> Option<HeadView> {
         yaw_deg: p.yaw_deg,
         pitch_deg: p.pitch_deg,
         roll_deg: p.roll_deg,
-        z_mm: p.z_mm,
         sigma: state.head_sigma,
         has_pitch: state.head_sigma.is_some() || p.pitch_deg != 0.0,
     })
@@ -763,9 +712,11 @@ pub fn readout_groups(eyes: &EyeView, head: Option<&HeadView>) -> [Vec<ReadoutRo
         alert,
     };
 
-    // NOT `guidance_message`: its "centred" arm appends the distance, which
-    // here would print the same millimetres twice, one row apart. Distance has
-    // its own row, so this one is the status alone.
+    // The wording is the original Windows software's own, recovered from its
+    // `LanguageResources` string table (`EyesPositioning_FullScreenMessage_*`)
+    // and lowercased for a table. Its "centred" string appends the distance,
+    // which here would print the same millimetres twice one row apart, so that
+    // one is the status alone and Distance has its own row.
     let position = match (tracked, eyes.guidance) {
         (false, _) | (_, Guidance::NoEyes) => "not detected".to_string(),
         (_, Guidance::Centered) => "good".to_string(),
@@ -780,7 +731,12 @@ pub fn readout_groups(eyes: &EyeView, head: Option<&HeadView>) -> [Vec<ReadoutRo
         row(
             "Position",
             position,
-            tracked && !matches!(eyes.raw_guidance, Guidance::Centered),
+            // `guidance`, the same field the text came from — NOT `raw_guidance`.
+            // The two differ for up to 11 frames while the damping settles, so
+            // reading one for the words and the other for the emphasis rendered
+            // "good" in alert amber on the way out of position, and "move left"
+            // in calm grey on the way back in.
+            tracked && !matches!(eyes.guidance, Guidance::Centered),
         ),
         row(
             "Distance",

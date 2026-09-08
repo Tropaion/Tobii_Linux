@@ -39,9 +39,16 @@ pub struct ModelSource {
     /// constants are calibrated against *this* one.
     pub url: &'static str,
     /// The opentrack commit `url` points into, and the path within that repo.
-    /// Used by [`check_update`] to ask whether anything newer exists.
     pub commit: &'static str,
     pub repo_path: &'static str,
+    /// The git blob hash of the pinned file.
+    ///
+    /// This, not the commit, is what [`check_update`] compares. A commit id
+    /// answers "has this path been touched since?", which is the wrong question:
+    /// pin a snapshot at any commit later than the one that last changed the
+    /// file and that comparison reports a new model forever. The blob hash
+    /// identifies the *content*, so it changes exactly when the model does.
+    pub blob_sha: &'static str,
     /// Pinned digest. Verified 2026-08-26 against a fresh download, by both
     /// `sha256sum` and [`crate::sha256`].
     pub sha256: &'static str,
@@ -55,6 +62,7 @@ pub const HEAD_POSE: ModelSource = ModelSource {
     url: "https://raw.githubusercontent.com/opentrack/opentrack/03a0e69b02a11c425e2f07c728686ff7f2d6517a/tracker-neuralnet/models/head-pose-0.5-small.onnx",
     commit: "03a0e69b02a11c425e2f07c728686ff7f2d6517a",
     repo_path: "tracker-neuralnet/models/head-pose-0.5-small.onnx",
+    blob_sha: "52f4c5f3da0110bb4862610051fdbad5cb3195ff",
     sha256: "7c14f84114fb9eca89759d8a36350c6faae2b4187258cae07afb77a93c2d7eec",
     bytes: 12_919_981,
 };
@@ -68,6 +76,7 @@ pub const HEAD_LOCALIZER: ModelSource = ModelSource {
     url: "https://raw.githubusercontent.com/opentrack/opentrack/03a0e69b02a11c425e2f07c728686ff7f2d6517a/tracker-neuralnet/models/head-localizer.onnx",
     commit: "03a0e69b02a11c425e2f07c728686ff7f2d6517a",
     repo_path: "tracker-neuralnet/models/head-localizer.onnx",
+    blob_sha: "",
     sha256: "f26679fe5e01a08dab0b3b9b586b613c68622775e0b8e14ddae53f30391f7402",
     bytes: 279_403,
 };
@@ -111,6 +120,28 @@ pub enum Status {
     Corrupt {
         found: String,
     },
+}
+
+/// Presence check for a UI, without hashing 13 MB on the caller's thread.
+///
+/// [`status`] reads the whole file and digests it. That is right where it
+/// decides whether to *run* the model, and wrong in a redraw: it was being
+/// called during hub construction and after every download, stalling the GTK
+/// main loop on 12.9 MB of I/O plus a full SHA-256.
+///
+/// Size alone cannot prove the bytes are right, so `Ready` here means "present
+/// and the expected length". The digest is still enforced where it matters —
+/// [`crate::onnx::OnnxPose::from_store`] refuses to load anything else — so the
+/// worst case is a wrong file reported as installed and then rejected at load
+/// with a message that says exactly that.
+pub fn status_quick(src: &ModelSource) -> Status {
+    match std::fs::metadata(path_of(src)) {
+        Err(_) => Status::Missing,
+        Ok(m) if m.len() == src.bytes => Status::Ready,
+        // Wrong length is already proof it is not the model; hashing it here is
+        // cheap in the only case it happens and makes the message specific.
+        Ok(_) => status(src),
+    }
 }
 
 pub fn status(src: &ModelSource) -> Status {
@@ -258,7 +289,7 @@ pub fn download_to(src: &ModelSource, dest: &Path) -> Result<(), StoreError> {
 /// never characterised is worse than no model, because its output looks
 /// plausible.
 pub fn installed(src: &ModelSource) -> Option<crate::model::ModelConfig> {
-    match status(src) {
+    match status_quick(src) {
         Status::Ready => Some(crate::model::ModelConfig {
             kind: crate::model::ModelKind::OpentrackOnnx,
             model_path: path_of(src),
@@ -307,8 +338,11 @@ pub enum Update {
 /// Never called on its own; it is a network request, and this program does not
 /// make those unasked.
 pub fn check_update(src: &ModelSource) -> Update {
+    if src.blob_sha.is_empty() {
+        return Update::Unknown("no pinned blob hash to compare against".into());
+    }
     let url = format!(
-        "https://api.github.com/repos/opentrack/opentrack/commits?path={}&per_page=1",
+        "https://api.github.com/repos/opentrack/opentrack/contents/{}",
         src.repo_path
     );
     let out = match std::process::Command::new("curl")
@@ -325,29 +359,27 @@ pub fn check_update(src: &ModelSource) -> Update {
     {
         Ok(o) if o.status.success() => o.stdout,
         Ok(o) => {
-            return Update::Unknown(format!(
-                "GitHub request failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ))
+            // `curl -s --fail` prints nothing of its own on an HTTP error, so
+            // without the status this said only "GitHub request failed:". The
+            // common cause is rate limiting — 60 requests an hour per IP,
+            // unauthenticated — and the user deserves to be told which.
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            return Update::Unknown(if err.is_empty() {
+                format!("GitHub request failed ({})", o.status)
+            } else {
+                format!("GitHub request failed: {err}")
+            });
         }
         Err(e) => return Update::Unknown(format!("could not run curl: {e}")),
     };
     let body = String::from_utf8_lossy(&out);
-    match (
-        json_first_string(&body, "sha"),
-        json_first_string(&body, "date"),
-    ) {
-        (Some(sha), date) => {
-            if sha == src.commit {
-                Update::UpToDate
-            } else {
-                Update::Newer {
-                    sha,
-                    date: date.unwrap_or_default(),
-                }
-            }
-        }
-        _ => Update::Unknown("could not read a commit sha from the reply".into()),
+    match json_first_string(&body, "sha") {
+        Some(sha) if sha == src.blob_sha => Update::UpToDate,
+        Some(sha) => Update::Newer {
+            sha,
+            date: String::new(),
+        },
+        None => Update::Unknown("could not read a blob hash from the reply".into()),
     }
 }
 
@@ -434,6 +466,26 @@ mod tests {
                 src.name
             );
         }
+    }
+
+    /// The blob hash is what identifies the model's content. Comparing commits
+    /// answers "was this path touched?", which reports a new model forever as
+    /// soon as the pin is taken at a commit later than the last change.
+    #[test]
+    fn every_fetchable_source_pins_a_blob_hash() {
+        assert_eq!(
+            HEAD_POSE.blob_sha.len(),
+            40,
+            "the model we ship must be pinned"
+        );
+        assert!(HEAD_POSE.blob_sha.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Without a pin there is nothing to compare, and saying so beats reporting
+    /// an update that was never checked for.
+    #[test]
+    fn a_source_without_a_blob_hash_reports_unknown_rather_than_newer() {
+        assert!(matches!(check_update(&HEAD_LOCALIZER), Update::Unknown(_)));
     }
 
     #[test]

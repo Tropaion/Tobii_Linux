@@ -99,6 +99,12 @@ button.help-btn { min-width: 22px; padding: 0 8px; background-color: transparent
 button.help-btn:hover { background-color: #1e242b; color: #e8ecef; }
 .spin-entry { padding: 2px 6px; }
 .overlay-window { background-color: transparent; }
+/* The scrollbar's slider needs an explicit floor. The theme sizes it with a
+   negative margin over a small min-size, and against this sheet that computes
+   to -2, which GTK reports once per scrollbar as
+   \"GtkGizmo (slider) reported min width -2\". Stating the minimum here is the
+   fix; it is not a cosmetic choice. */
+scrollbar slider { min-width: 8px; min-height: 8px; }
 
 /* --- dialogs ------------------------------------------------------------ */
 .dialog-heading { font-size: 19px; font-weight: bold; }
@@ -258,16 +264,15 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
     win.add_controller(keys);
 }
 
-/// Build the hub, for rendering it standalone to look at the layout.
+/// Build the hub window.
 ///
-/// GTK's own `render_texture` gives an honest picture of a widget tree without a
-/// compositor screenshot, which is how the model dialog's width bug was found.
-pub fn build_ui_for_probe(app: &Application) {
-    load_css();
-    build_ui(app);
-}
-
-fn build_ui(app: &Application) {
+/// Public, together with [`load_css`], so the layout can be rendered outside a
+/// normal run: GTK's own `render_texture` gives an honest picture of a widget
+/// tree without a compositor screenshot, and that is how the model dialog's
+/// width and the panel's margins were checked. Exposing the real constructor
+/// rather than a probe-only twin means there is nothing here that only test
+/// scaffolding calls.
+pub fn build_ui(app: &Application) {
     let (state, cmd_tx) = device::spawn();
     // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
     // needs the device thread, so it branches here rather than in `run`.
@@ -409,7 +414,8 @@ fn build_ui(app: &Application) {
     let cam_title = Label::new(Some("SENSOR VIEW"));
     cam_title.add_css_class("eyebrow");
     cam_title.set_halign(Align::Start);
-    let cam_frame: Rc<RefCell<Option<tobii_protocol::CameraFrame>>> = Rc::new(RefCell::new(None));
+    let cam_frame: Rc<RefCell<Option<std::sync::Arc<tobii_protocol::CameraFrame>>>> =
+        Rc::new(RefCell::new(None));
     let cam_area = DrawingArea::new();
     // A floor plus room to grow. `draw_camera_view` letterboxes the square
     // frame, so extra height makes the image bigger rather than adding black
@@ -437,7 +443,6 @@ fn build_ui(app: &Application) {
     let readout = gtk::Grid::new();
     readout.add_css_class("readout");
     readout.set_halign(Align::Center);
-    readout.set_column_spacing(14);
     readout.set_row_spacing(2);
     // Two groups side by side — where the head is, and which way it faces — so
     // the readout is three rows tall rather than five. Column 2 is a spacer
@@ -887,9 +892,10 @@ fn build_ui(app: &Application) {
         // Only the guidance *text* is driven from this tick — the dots redraw
         // themselves on the frame clock (see `area.add_tick_callback` above).
         // Text at 33 ms is ample: it is damped over 11-49 frames upstream.
+        let head_now = widget::head_view_for(&snap);
         {
             let ev = widget::eye_view_for(&snap);
-            let hv = widget::head_view_for(&snap);
+            let hv = head_now;
             for (group, rows) in widget::readout_groups(&ev, hv.as_ref())
                 .into_iter()
                 .enumerate()
@@ -925,7 +931,7 @@ fn build_ui(app: &Application) {
         // Head pose: same discipline as the camera — only redraw when the view
         // actually changed, so an unchanged pose costs nothing.
         {
-            let next = widget::head_view_for(&snap);
+            let next = head_now;
             if *head_view.borrow() != next {
                 *head_view.borrow_mut() = next;
                 area.queue_draw();

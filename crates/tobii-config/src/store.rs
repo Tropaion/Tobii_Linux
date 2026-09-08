@@ -234,21 +234,33 @@ pub fn pitch_offset_path() -> PathBuf {
 /// while sitting square-on, negated, and it is per-installation because it
 /// depends on how the tracker is mounted.
 pub fn save_pitch_offset(deg: f64) -> io::Result<()> {
-    let path = pitch_offset_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{deg}\n"))
+    save_pitch_offset_to(&pitch_offset_path(), deg)
+}
+
+/// [`save_pitch_offset`] to a given path, for tests.
+pub fn save_pitch_offset_to(path: &Path, deg: f64) -> io::Result<()> {
+    // `write_atomic`, not `fs::write`: a plain write truncates first, so a crash
+    // mid-write would leave a file that parses as garbage — and garbage here
+    // reads as "not calibrated", silently throwing the measurement away.
+    write_atomic(path, format!("{deg}\n").as_bytes())
 }
 
 /// Load the persisted pitch offset. `Ok(None)` if unset or unparseable — an
 /// unreadable file must mean "not calibrated", never a wrong angle.
 pub fn load_pitch_offset() -> io::Result<Option<f64>> {
-    match std::fs::read_to_string(pitch_offset_path()) {
-        Ok(s) => Ok(s.trim().parse::<f64>().ok().filter(|v| v.is_finite())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    load_pitch_offset_from(&pitch_offset_path())
+}
+
+/// [`load_pitch_offset`] from a given path, so a test can drive the real
+/// parsing rather than re-implementing it and passing whatever it does.
+pub fn load_pitch_offset_from(path: &Path) -> io::Result<Option<f64>> {
+    let Some(bytes) = read_opt(path)? else {
+        return Ok(None);
+    };
+    Ok(std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite()))
 }
 
 /// Path to the persisted setup-time chosen monitor id, beside `config.toml`.
@@ -338,25 +350,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tobii-pitch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("headpose_pitch_offset");
-        for text in ["-22.4\n", "0", "  13.5  "] {
-            std::fs::write(&path, text).expect("write");
-            let got: Option<f64> = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .filter(|v| v.is_finite());
-            assert_eq!(got, Some(text.trim().parse::<f64>().unwrap()), "{text:?}");
+
+        for deg in [-24.08, 0.0, 13.5] {
+            save_pitch_offset_to(&path, deg).expect("save");
+            assert_eq!(load_pitch_offset_from(&path).unwrap(), Some(deg), "{deg}");
         }
-        for bad in ["", "nonsense", "NaN", "inf"] {
-            std::fs::write(&path, bad).expect("write");
-            let got: Option<f64> = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .filter(|v| v.is_finite());
+        // Whitespace around a hand-edited value is still a value.
+        std::fs::write(&path, "  -7.25  \n").unwrap();
+        assert_eq!(load_pitch_offset_from(&path).unwrap(), Some(-7.25));
+
+        // Anything that is not a finite number means "not calibrated". `inf` is
+        // the one that matters: it parses as a float, and an infinite pitch
+        // offset would be applied to every frame.
+        for bad in ["", "nonsense", "NaN", "inf", "-inf", "1.0 2.0"] {
+            std::fs::write(&path, bad).unwrap();
             assert_eq!(
-                got, None,
+                load_pitch_offset_from(&path).unwrap(),
+                None,
                 "{bad:?} must read as uncalibrated, not as an angle"
             );
         }
+        assert_eq!(
+            load_pitch_offset_from(&dir.join("absent")).unwrap(),
+            None,
+            "a missing file is not an error"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

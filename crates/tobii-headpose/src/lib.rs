@@ -58,13 +58,37 @@ pub mod model_store;
 pub mod onnx;
 pub mod opentrack;
 pub mod preprocess;
-pub mod sha256;
+/// Re-exported from `tobii-config`, where it moved once the updater needed it
+/// too. Kept here so `tobii_headpose::sha256` still resolves.
+pub use tobii_config::sha256;
 
 pub use filter::PoseFilter;
 pub use model::{ModelConfig, ModelKind, PoseModel};
 pub use opentrack::to_opentrack_datagram;
 
 use tobii_protocol::gaze::{present, GazeSample};
+
+/// The pitch zero to apply, and the 10-90% spread, from a run's samples.
+///
+/// Shared by the GUI and the CLI, which each measure the same thing and were
+/// each deciding independently how to reduce it.
+///
+/// Median rather than mean: the frames before the crop converges are outliers,
+/// and a handful of them must not move the answer. The spread comes back so a
+/// run where the user moved shows up as a number instead of a quietly wrong
+/// zero. Non-finite samples are dropped rather than sorted — a degenerate
+/// quaternion normalises to NaN, `partial_cmp` returns `None` for it, and an
+/// `expect` there would panic whichever thread is measuring.
+pub fn pitch_offset_from(samples: &mut Vec<f64>) -> Option<(f64, f64)> {
+    samples.retain(|v| v.is_finite());
+    if samples.len() < 20 {
+        return None;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = samples[samples.len() / 2];
+    let spread = samples[samples.len() * 9 / 10] - samples[samples.len() / 10];
+    Some((-median, spread))
+}
 
 /// Validity value meaning "this eye is tracked". Anything else (in practice 4,
 /// "not detected") means the eye's origin column is meaningless.
@@ -155,6 +179,40 @@ pub fn pose_from_sample(s: &GazeSample) -> Option<HeadPose> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spread is what makes "you moved" visible instead of silently
+    /// producing a confident wrong zero.
+    /// Median, not mean: the frames before the ROI converges are outliers, and a
+    /// handful of them must not be able to move the answer.
+    #[test]
+    fn the_pitch_offset_is_a_median_and_is_negated() {
+        let mut s: Vec<f64> = (0..100).map(|i| 24.0 + (i % 3) as f64 * 0.1).collect();
+        s[0] = -180.0; // an unconverged first frame
+        s[1] = 90.0;
+        let (offset, _) = pitch_offset_from(&mut s).expect("enough samples");
+        assert!(
+            (offset + 24.1).abs() < 0.2,
+            "two wild outliers moved the answer: {offset}"
+        );
+    }
+
+    #[test]
+    fn a_short_run_is_not_a_measurement() {
+        let mut few: Vec<f64> = (0..19).map(|i| i as f64).collect();
+        assert_eq!(pitch_offset_from(&mut few), None);
+        let mut enough: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        assert!(pitch_offset_from(&mut enough).is_some());
+    }
+
+    #[test]
+    fn the_spread_reports_a_head_that_moved() {
+        let mut still: Vec<f64> = (0..100).map(|i| 24.0 + (i % 5) as f64 * 0.05).collect();
+        let (_, tight) = pitch_offset_from(&mut still).unwrap();
+        assert!(tight < 1.0, "a still head should be tight: {tight}");
+        let mut moved: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
+        let (_, wide) = pitch_offset_from(&mut moved).unwrap();
+        assert!(wide > 8.0, "a moving head should be visible: {wide}");
+    }
 
     /// Half the interocular distance used to build synthetic eye pairs.
     const HALF_IPD: f64 = 31.5;

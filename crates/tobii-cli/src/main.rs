@@ -24,6 +24,7 @@ fn main() -> ExitCode {
             args.iter().any(|a| a == "--json"),
             args.iter().any(|a| a == "--eyes"),
         ),
+        (Some("update"), _) => update(&args),
         (Some("headpose"), Some("--model-status")) => model_status(),
         (Some("headpose"), Some("--fetch-model")) => fetch_model(&args),
         (Some("headpose"), Some("--check-update")) => check_model_update(),
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage:\n  \
+                 tobii update [--install]\n  \
                  tobii stream [--json] [--eyes]\n  \
                  tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE]\n  \
                  tobii headpose --check [--calibrate-pitch [SECS]]\n  \
@@ -82,6 +84,58 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+/// Check for a newer release, and install it when asked.
+///
+/// The check is the default and the install is opt-in, because replacing the
+/// binaries a user is running is not something to do because they typed a bare
+/// verb.
+fn update(args: &[String]) -> CmdResult {
+    use tobii_update::release::Check;
+    let current = tobii_update::Version::current();
+    println!("running {current}");
+    match tobii_update::release::check()? {
+        Check::UpToDate => {
+            println!("up to date — nothing newer has been released.");
+            Ok(())
+        }
+        Check::Newer(r) => {
+            println!("\n{} is available.\n", r.version);
+            if r.notes.trim().is_empty() {
+                println!("(this release has no notes)");
+            } else {
+                println!("{}", r.notes.trim_end());
+            }
+            println!("\n{}", r.html_url);
+            if !args.iter().any(|a| a == "--install") {
+                println!("\nRun `tobii update --install` to download and install it.");
+                return Ok(());
+            }
+            let dir = tobii_update::install::install_dir()?;
+            if tobii_update::install::is_build_tree(&dir) {
+                // Not a refusal: somebody may well want to drop a release build
+                // into their checkout. But the next `cargo build` silently
+                // reverts it, and finding that out later is worse than being
+                // told now.
+                println!(
+                    "\nnote: {} is a Cargo build directory — the next `cargo build` will \
+                     overwrite what is installed here.",
+                    dir.display()
+                );
+            }
+            println!();
+            let done = tobii_update::install_release(&r, &|step| println!("  {step}"))?;
+            println!(
+                "\ninstalled {} into {} ({})",
+                done.version,
+                done.dir.display(),
+                done.replaced.join(", ")
+            );
+            println!("Restart anything that is still running the old build.");
+            Ok(())
         }
     }
 }
@@ -1339,19 +1393,14 @@ fn calibrate_pitch_zero(
         }
     }
 
-    if samples.len() < 20 {
+    let Some((offset, spread)) = tobii_headpose::pitch_offset_from(&mut samples) else {
         return Err(format!(
             "only {} usable frames — was your face in view? Nothing was saved.",
             samples.len()
         )
         .into());
-    }
-    // Median, not mean: a couple of frames where the ROI had not settled would
-    // drag a mean and cannot drag a median.
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN pitch"));
-    let median = samples[samples.len() / 2];
-    let spread = samples[samples.len() * 9 / 10] - samples[samples.len() / 10];
-    let offset = -median;
+    };
+    let median = -offset;
 
     println!(
         "\nmeasured pitch while sitting square-on: {median:+.2}° (10-90% spread {spread:.2}°)"

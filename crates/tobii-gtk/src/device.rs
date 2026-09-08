@@ -102,7 +102,10 @@ pub struct DeviceState {
     pub latest_gaze: Option<GazeSample>,
     /// Most recent decoded eye-camera frame ([`CAMERA_STREAM`]), for the hub
     /// preview. `None` until the camera stream is subscribed and a frame arrives.
-    pub latest_camera: Option<CameraFrame>,
+    ///
+    /// An `Arc` because the head-pose worker is handed the same frame, and a
+    /// 78 KB copy per frame at 33 Hz to serve two readers is pure memcpy.
+    pub latest_camera: Option<Arc<CameraFrame>>,
     /// Rolling per-eye extrapolation windows, smoothed depth and guidance
     /// damping (see `eyeview::EyeHistory`) — updated once per incoming gaze
     /// notification, here, not at display-consumption time. This placement is
@@ -136,10 +139,6 @@ pub struct DeviceState {
     /// The model's confidence for that pose — lower is better; see
     /// `tobii_headpose::onnx::SIGMA_MAX`. `None` when the pose is geometric.
     pub head_sigma: Option<f32>,
-    /// Camera frames dropped because inference was still busy. Not an error:
-    /// the preview only needs the latest pose, and blocking the device thread
-    /// on 12 ms of inference is what this design exists to avoid.
-    pub head_dropped: u64,
 }
 
 /// A pitch-zero measurement in flight, or its result.
@@ -150,6 +149,14 @@ pub struct DeviceState {
 /// square-on, hold still, take the median.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PitchCal {
+    /// Identifies the run this state belongs to.
+    ///
+    /// Without it a cancel could not be told from the start of the next run:
+    /// the device thread can sit in `read_notifications` for a second, so a
+    /// user who presses Start then Stop has both happen before the command is
+    /// even dequeued. The UI mints the token and the device thread refuses to
+    /// touch state carrying a different one.
+    pub token: u64,
     pub active: bool,
     /// Seconds remaining, including the settle-in countdown.
     pub secs_left: u64,
@@ -185,7 +192,16 @@ pub enum DeviceCommand {
     /// still for anyway.
     PitchCalibrate {
         secs: u64,
+        token: u64,
     },
+    /// Rebuild the head-pose worker: pick up a model that was just installed or
+    /// removed, and re-read the pitch zero.
+    ///
+    /// The worker resolves both once, when it is created, and a connection can
+    /// live for hours. Without this, a model fetched from the hub did nothing
+    /// until a restart, and a pitch zero measured in the hub was written to disk
+    /// and then ignored by the very model that had just been used to measure it.
+    ReloadHeadModel,
     /// Compute and apply the model from the points collected so far, without
     /// ending the session.
     ///
@@ -230,14 +246,16 @@ pub fn device_tick<T: Transport>(
     cmd_rx: &Receiver<DeviceCommand>,
     head: Option<&HeadWorker>,
 ) -> Tick {
+    let mut reload_head = false;
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
             DeviceCommand::SetDisplayArea(c) => {
                 let _ = conn.set_display_area(&c);
             }
-            DeviceCommand::PitchCalibrate { secs } => {
-                calibrate_pitch(conn, state, secs);
+            DeviceCommand::PitchCalibrate { secs, token } => {
+                calibrate_pitch(conn, state, secs, token);
             }
+            DeviceCommand::ReloadHeadModel => reload_head = true,
             DeviceCommand::SetEnabledEye(e) => {
                 let _ = conn.set_enabled_eye(e);
                 let _ = tobii_config::save_enabled_eye(e);
@@ -373,15 +391,29 @@ pub fn device_tick<T: Transport>(
         match op {
             OP_GAZE_NOTIFY => {
                 if let Some(g) = GazeSample::decode(&payload) {
+                    // Without a model the eye origins are the only head pose
+                    // there is — 5 DOF, no pitch. Publishing it here is what
+                    // makes yaw and roll appear in the hub on a fresh install;
+                    // before this the readout showed "—" for all three even
+                    // though the CLI reported two of them from the same data.
+                    let geometric = head
+                        .is_none()
+                        .then(|| tobii_headpose::pose_from_sample(&g))
+                        .flatten();
                     let mut s = state.lock().unwrap();
                     s.eye_view = Some(s.eye_history.update(&g));
                     s.latest_gaze = Some(g);
                     s.status = ConnStatus::Connected;
+                    if head.is_none() {
+                        s.head_pose = geometric;
+                        s.head_sigma = None;
+                    }
                 }
                 got = true;
             }
             op if op == CAMERA_STREAM as u32 => {
                 if let Some(f) = decode_camera_frame(&payload) {
+                    let f = Arc::new(f);
                     if let Some(w) = head {
                         // Pair the image with the eye origins from the newest
                         // gaze sample: the model supplies rotation, the eyes
@@ -393,9 +425,7 @@ pub fn device_tick<T: Transport>(
                                 .as_ref()
                                 .and_then(tobii_headpose::pose_from_sample)
                         };
-                        if !w.offer(f.clone(), eyes) {
-                            state.lock().unwrap().head_dropped += 1;
-                        }
+                        w.offer(Arc::clone(&f), eyes);
                     }
                     state.lock().unwrap().latest_camera = Some(f);
                 }
@@ -407,6 +437,7 @@ pub fn device_tick<T: Transport>(
     Tick {
         published: got,
         saw_traffic,
+        reload_head,
     }
 }
 
@@ -419,17 +450,21 @@ pub fn device_tick<T: Transport>(
 /// **dropped**, not queued: the preview wants the newest pose, and a queue would
 /// turn a momentary overrun into permanent latency.
 pub struct HeadWorker {
-    tx: std::sync::mpsc::SyncSender<(CameraFrame, Option<tobii_headpose::HeadPose>)>,
+    tx: std::sync::mpsc::SyncSender<(Arc<CameraFrame>, Option<tobii_headpose::HeadPose>)>,
 }
 
 impl HeadWorker {
     /// `None` when no model is installed, which is the ordinary case.
+    ///
+    /// No pre-check for the file: `from_store` already reads it, hashes it and
+    /// returns `ModelMissing` when it is absent. Asking `installed()` first read
+    /// and digested the same 13 MB a second time, on the device thread, every
+    /// time the connection was re-established.
     fn spawn(state: Arc<Mutex<DeviceState>>) -> Option<HeadWorker> {
         use tobii_headpose::onnx::{fuse, OnnxPose, RotationSource};
-        // No model installed is the ordinary state, not a failure.
-        tobii_headpose::model_store::installed(&tobii_headpose::model_store::HEAD_POSE)?;
         let mut model = match OnnxPose::from_store() {
             Ok(m) => m,
+            Err(tobii_headpose::onnx::OnnxError::ModelMissing(_)) => return None,
             Err(e) => {
                 eprintln!("head pose: {e}");
                 return None;
@@ -443,6 +478,7 @@ impl HeadWorker {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             while let Ok((frame, eyes)) = rx.recv() {
+                let frame: Arc<CameraFrame> = frame;
                 let pose = model.estimate_detailed(&frame);
                 let mut s = state.lock().unwrap();
                 match pose {
@@ -472,8 +508,12 @@ impl HeadWorker {
         Some(HeadWorker { tx })
     }
 
-    /// Hand a frame over if the worker is idle; otherwise drop it and say so.
-    fn offer(&self, frame: CameraFrame, eyes: Option<tobii_headpose::HeadPose>) -> bool {
+    /// Hand a frame over if the worker is idle; otherwise drop it.
+    ///
+    /// Takes an `Arc` because the common case is a *refused* send — the comment
+    /// above says overruns are expected — and cloning 78 KB at 33 Hz to throw it
+    /// away was 2.6 MB/s of memcpy on the device thread.
+    fn offer(&self, frame: Arc<CameraFrame>, eyes: Option<tobii_headpose::HeadPose>) -> bool {
         self.tx.try_send((frame, eyes)).is_ok()
     }
 }
@@ -485,10 +525,26 @@ impl HeadWorker {
 /// acceptable precisely because the user is sitting still for it — and the
 /// alternative, holding a 13 MB model and 12 ms of inference inside the state
 /// mutex the UI redraws from, is not.
-fn calibrate_pitch<T: Transport>(conn: &mut Connection<T>, state: &Mutex<DeviceState>, secs: u64) {
+fn calibrate_pitch<T: Transport>(
+    conn: &mut Connection<T>,
+    state: &Mutex<DeviceState>,
+    secs: u64,
+    token: u64,
+) {
+    // The UI put `active` and `token` in place before sending the command. If
+    // either has changed, this run was cancelled or superseded while it sat in
+    // the queue, and going ahead would spend 13 s measuring a user who has
+    // walked away and then save it over their good calibration.
+    if !current(state, token) {
+        return;
+    }
     let finish = |r: Result<f64, String>| {
         let mut s = state.lock().unwrap();
+        if s.pitch_cal.token != token {
+            return; // a newer run owns the state now
+        }
         s.pitch_cal = PitchCal {
+            token,
             active: false,
             secs_left: 0,
             samples: s.pitch_cal.samples,
@@ -514,12 +570,8 @@ fn calibrate_pitch<T: Transport>(conn: &mut Connection<T>, state: &Mutex<DeviceS
     let mut samples: Vec<f64> = Vec::new();
     {
         let mut s = state.lock().unwrap();
-        s.pitch_cal = PitchCal {
-            active: true,
-            secs_left: secs + SETTLE.as_secs(),
-            samples: 0,
-            result: None,
-        };
+        s.pitch_cal.secs_left = secs + SETTLE.as_secs();
+        s.pitch_cal.samples = 0;
     }
 
     while Instant::now() < deadline {
@@ -535,17 +587,17 @@ fn calibrate_pitch<T: Transport>(conn: &mut Connection<T>, state: &Mutex<DeviceS
                     samples.push(p.pitch_deg);
                 }
             }
-            state.lock().unwrap().latest_camera = Some(frame);
+            state.lock().unwrap().latest_camera = Some(Arc::new(frame));
         }
         let mut s = state.lock().unwrap();
+        if s.pitch_cal.token != token || !s.pitch_cal.active {
+            return; // cancelled from the UI, or superseded by a newer run
+        }
         s.pitch_cal.secs_left = deadline.saturating_duration_since(Instant::now()).as_secs();
         s.pitch_cal.samples = samples.len();
-        if !s.pitch_cal.active {
-            return; // cancelled from the UI
-        }
     }
 
-    match pitch_offset_from(&mut samples) {
+    match tobii_headpose::pitch_offset_from(&mut samples) {
         Some((offset, spread)) => match tobii_config::save_pitch_offset(offset) {
             Ok(()) => {
                 if spread > 8.0 {
@@ -566,20 +618,10 @@ fn calibrate_pitch<T: Transport>(conn: &mut Connection<T>, state: &Mutex<DeviceS
     }
 }
 
-/// The offset to apply, and the 10-90% spread, from a run's pitch samples.
-///
-/// Median rather than mean: the first frames after the ROI seeds are not yet
-/// converged, and a handful of those can drag a mean while they cannot drag a
-/// median. The spread is returned so a run where the user moved is visible as a
-/// number rather than as a quietly wrong zero.
-pub fn pitch_offset_from(samples: &mut [f64]) -> Option<(f64, f64)> {
-    if samples.len() < 20 {
-        return None;
-    }
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("pitch is never NaN"));
-    let median = samples[samples.len() / 2];
-    let spread = samples[samples.len() * 9 / 10] - samples[samples.len() / 10];
-    Some((-median, spread))
+/// Whether `token` still owns the pitch-calibration state.
+fn current(state: &Mutex<DeviceState>, token: u64) -> bool {
+    let s = state.lock().unwrap();
+    s.pitch_cal.token == token && s.pitch_cal.active
 }
 
 /// What one [`device_tick`] observed, for the reconnect watchdog.
@@ -591,13 +633,9 @@ pub fn pitch_offset_from(samples: &mut [f64]) -> Option<(f64, f64)> {
 pub struct Tick {
     pub published: bool,
     pub saw_traffic: bool,
-}
-
-/// A device state and command channel with no device behind them, for
-/// rendering a UI surface standalone to look at it.
-pub fn spawn_for_probe() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
-    let (tx, _rx) = channel();
-    (Arc::new(Mutex::new(DeviceState::default())), tx)
+    /// A [`DeviceCommand::ReloadHeadModel`] arrived; the loop owns the worker,
+    /// so it does the rebuilding.
+    pub reload_head: bool,
 }
 
 /// Spawn the device thread. It handshakes, then loops `device_tick`; on any
@@ -652,10 +690,15 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 // transport itself went silent, and even then only briefly,
                 // since `read_notifications` already blocks for up to a second.
                 // One model, one worker, for the life of the connection.
-                let head = HeadWorker::spawn(thread_state.clone());
+                let mut head = HeadWorker::spawn(thread_state.clone());
                 let mut quiet_since = Instant::now();
                 loop {
                     let tick = device_tick(&mut conn, &thread_state, &rx, head.as_ref());
+                    if tick.reload_head {
+                        // Dropping the old worker closes its channel, so its
+                        // thread ends after the frame it is on.
+                        head = HeadWorker::spawn(thread_state.clone());
+                    }
                     let calibrating = thread_state.lock().unwrap().calibration.active;
                     if tick.published || calibrating {
                         quiet_since = Instant::now();
@@ -790,39 +833,6 @@ fn now_unix_secs() -> i64 {
 mod tests {
     use super::*;
 
-    /// Median, not mean: the frames before the ROI converges are outliers, and a
-    /// handful of them must not be able to move the answer.
-    #[test]
-    fn the_pitch_offset_is_a_median_and_is_negated() {
-        let mut s: Vec<f64> = (0..100).map(|i| 24.0 + (i % 3) as f64 * 0.1).collect();
-        s[0] = -180.0; // an unconverged first frame
-        s[1] = 90.0;
-        let (offset, _) = pitch_offset_from(&mut s).expect("enough samples");
-        assert!(
-            (offset + 24.1).abs() < 0.2,
-            "two wild outliers moved the answer: {offset}"
-        );
-    }
-
-    #[test]
-    fn a_short_run_is_not_a_measurement() {
-        let mut few: Vec<f64> = (0..19).map(|i| i as f64).collect();
-        assert_eq!(pitch_offset_from(&mut few), None);
-        let mut enough: Vec<f64> = (0..20).map(|i| i as f64).collect();
-        assert!(pitch_offset_from(&mut enough).is_some());
-    }
-
-    /// The spread is what makes "you moved" visible instead of silently
-    /// producing a confident wrong zero.
-    #[test]
-    fn the_spread_reports_a_head_that_moved() {
-        let mut still: Vec<f64> = (0..100).map(|i| 24.0 + (i % 5) as f64 * 0.05).collect();
-        let (_, tight) = pitch_offset_from(&mut still).unwrap();
-        assert!(tight < 1.0, "a still head should be tight: {tight}");
-        let mut moved: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
-        let (_, wide) = pitch_offset_from(&mut moved).unwrap();
-        assert!(wide > 8.0, "a moving head should be visible: {wide}");
-    }
     use std::collections::VecDeque;
     use std::sync::mpsc::channel;
     use std::sync::Mutex;
