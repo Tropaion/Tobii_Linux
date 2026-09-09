@@ -1,0 +1,91 @@
+name: Bug report
+description: Something does not work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this.
+
+        **Please run `tobii debug` first.** It prints a short report — versions,
+        libraries, whether the tracker is on the bus, whether the udev rule is
+        installed, what is configured — and it is asked for below because
+        roughly every question a triager would otherwise have to ask is
+        answered by it.
+
+        It is deliberately readable before you paste it. It contains **no
+        calibration data**, and your username, home path, hostname and monitor
+        serial are left out or hashed. Read it; if something in it still looks
+        personal to you, edit it out and say so.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Output of `tobii debug`
+      description: Run `tobii debug` and paste the whole thing here.
+      placeholder: |
+        tobii-linux diagnostics
+        =======================
+        version    0.1.0
+        …
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        I clicked "Improve calibration" and …
+        I expected …
+        Instead …
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: >
+        The steps you would give someone else to see the same thing. "It happens
+        sometimes" is a fine answer — say roughly how often, and what you were
+        doing when it did.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how-installed
+    attributes:
+      label: How did you install it?
+      description: >
+        This decides who should update it. A package-managed copy is updated by
+        your package manager; only the tarball is updated by the built-in
+        updater.
+      options:
+        - The .tar.gz release (built-in updater)
+        - A .deb / .rpm / PKGBUILD package
+        - Built from source
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Any output on the terminal
+      description: >
+        If you can, run the failing thing from a terminal and paste what it
+        printed. Warnings that look unrelated are often the useful part.
+      render: shell
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **If this is about tracking accuracy**, `tobii-gtk --accuracy` runs a
+        39-target sweep and prints error per target, per angle band and per eye.
+        Pasting that turns "it feels off" into something measurable.

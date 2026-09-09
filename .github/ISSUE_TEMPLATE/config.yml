@@ -1,0 +1,14 @@
+# Blank issues are disabled so the bug form — and its required `tobii debug`
+# block — cannot be bypassed by accident. The two links below are the honest
+# escape hatches: not every report is a bug, and forcing a question through a
+# bug form gets a worse answer.
+blank_issues_enabled: false
+contact_links:
+  - name: Question, or not sure whether it is a bug
+    url: https://github.com/Tropaion/Tobii_Linux/discussions
+    about: Ask here. No form, no diagnostics required.
+  - name: Is my device supported?
+    url: https://github.com/Tropaion/Tobii_Linux#requirements
+    about: >
+      Only the Eye Tracker 5 (USB 2104:0313). Other Tobii hardware speaks a
+      different protocol and is not supported.

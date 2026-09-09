@@ -48,15 +48,15 @@ pinned; see [[Architecture-Decisions]] §18.
 
 | Crate | Tests | Shape |
 |---|---|---|
-| `tobii-protocol` | 74 | Inline unit tests over captured real frames |
-| `tobii-usb` | 47 | 41 unit + 6 replay (see below) |
+| `tobii-protocol` | 79 | Inline unit tests over captured real frames |
+| `tobii-usb` | 49 | 41 unit + 6 replay (see below) |
 | `tobii-config` | 53 | Unit; SHA-256 cross-checked against coreutils |
 | `tobii-headpose` | 93 (+7 ignored) | The ignored ones need the 13 MB model |
-| `tobii-update` | 59 | 51 unit + 8 install end-to-end |
-| `tobii-cli` | 9 | Argument parsing and text helpers |
+| `tobii-update` | 61 | 51 unit + 8 install end-to-end |
+| `tobii-cli` | 14 | Argument parsing and text helpers |
 | `tobii-gtk` | 191 | Inline; pure logic split out from widget code |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
-| **Total** | **558** | |
+| **Total** | **572** | |
 
 There are almost no integration-test directories: the convention is inline
 `#[cfg(test)]` modules next to the code, with pure logic deliberately factored
@@ -115,6 +115,23 @@ and the techniques are reusable:
   directional op catalog. See [[Reverse-Engineering-Methodology]].
 
 ---
+
+## Reporting a bug
+
+`tobii debug` prints the report the issue form asks for. It answers, in one
+paste, most of what a triager would otherwise have to ask for over three
+round trips.
+
+It is written to be read before it is sent: no calibration data, the monitor id
+hashed (it is derived from the EDID serial), and no username, home path or
+hostname. There is a test that fails if any of those appear in the output.
+
+Issue forms are under `.github/ISSUE_TEMPLATE/`. Blank issues are disabled so
+the bug form cannot be bypassed by accident, with links out to Discussions for
+anything that is not a bug — forcing a question through a bug form gets a worse
+answer. Note the constraint that shaped this: GitHub issue forms **can** mark a
+field required, but have **no file-upload field type**, so a pasted block is the
+only thing that can actually be enforced.
 
 ## Conventions
 

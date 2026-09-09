@@ -1,6 +1,8 @@
 //! `tobii` CLI. Subcommands: `stream`, `headpose`, `setup`, `display get|set`,
 //! `calibrate`.
 
+mod diagnostics;
+
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::ExitCode;
@@ -46,6 +48,7 @@ fn main() -> ExitCode {
         (Some("log"), _) => device_log(&args),
         (Some("probe-stream"), _) => probe_stream(&args),
         (Some("dump-stream"), _) => dump_stream(&args),
+        (Some("debug"), _) => debug_report(&args),
         (Some("record"), _) => record_session(&args),
         (Some("camera"), Some("both")) => camera_both(&args),
         (Some("camera"), _) => camera(&args),
@@ -68,6 +71,7 @@ fn main() -> ExitCode {
                  tobii headpose --fetch-model [--agree]\n  \
                  tobii headpose --check-update\n  \
                  tobii record [FILE]\n  \
+                 tobii debug [--file PATH]\n  \
                  tobii headpose --remove-model\n  \
                  tobii headpose --install-model <FILE>\n  \
                  tobii columns\n  \
@@ -885,6 +889,31 @@ fn camera_both(args: &[String]) -> CmdResult {
             out.extend_from_slice(px);
             std::fs::write(&path, out)?;
             println!("brightest frame written to {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Print everything an issue report needs, and nothing that identifies you.
+///
+/// Written to stdout by default because that is what can be pasted into a
+/// GitHub issue form — which is the only place it can be made *required*, since
+/// issue forms have no file-upload field at all. `--file` is for anyone who
+/// would rather send a file.
+fn debug_report(args: &[String]) -> CmdResult {
+    let text = diagnostics::report();
+    match flag_value(args, "--file") {
+        Some(path) => {
+            std::fs::write(path, &text)?;
+            eprintln!("wrote {path}");
+            eprintln!("Please read it before attaching it — it is plain text on purpose.");
+        }
+        None => {
+            print!("{text}");
+            eprintln!(
+                "\nPaste the above into an issue at \
+                 https://github.com/Tropaion/Tobii_Linux/issues/new/choose"
+            );
         }
     }
     Ok(())

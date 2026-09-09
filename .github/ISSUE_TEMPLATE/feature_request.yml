@@ -1,0 +1,36 @@
+name: Feature request
+description: Something is missing
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        No diagnostics needed for this one — describe what you want to do.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: >
+        The situation, not the solution. "I want to use this in DCS but the
+        camera does not pitch" tells us more than "add an Extended View slider",
+        because it leaves room for a better answer than the one you had in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What do you do today instead?
+      description: Workarounds, other software, or nothing.
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        Some things are deliberately out of scope, so it is worth checking
+        [Architecture §3](../../docs/wiki/Architecture.md) before writing much:
+        gaze as a mouse, other Tobii hardware, and a daemon with a public IPC
+        API are all listed there with the reasoning.
