@@ -89,6 +89,7 @@ pub fn is_enabled_at(path: &std::path::Path) -> bool {
 /// is exactly the kind of thing that works when tested and silently does
 /// nothing at the next login.
 pub fn entry_text(exec: &str) -> String {
+    let exec = quote_exec(exec);
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -101,6 +102,32 @@ pub fn entry_text(exec: &str) -> String {
          NoDisplay=true\n\
          X-GNOME-Autostart-enabled=true\n"
     )
+}
+
+/// One argument of an `Exec` value, quoted as the Desktop Entry spec requires.
+///
+/// A launcher splits `Exec` on unquoted whitespace, so a path containing a
+/// space becomes two arguments and the program it tries to run is the first
+/// fragment. Nothing warns: `desktop-file-validate` accepts the file,
+/// `set_enabled` returns `Ok`, the switch stays on, and reading the file back
+/// says it is enabled — it simply never starts, once, at the next login.
+///
+/// A `%` is doubled because the spec gives it meaning (field codes like `%U`),
+/// and inside a quoted argument the reserved characters `"`, `` ` ``, `$` and
+/// `\` are escaped with a backslash — which, since this is also a desktop-entry
+/// *value*, has to be written as an escaped backslash.
+fn quote_exec(exec: &str) -> String {
+    let escaped: String = exec
+        .chars()
+        .flat_map(|c| match c {
+            '"' | '`' | '$' | '\\' => vec!['\\', '\\', c],
+            '%' => vec!['%', '%'],
+            c => vec![c],
+        })
+        .collect();
+    // Always quoted, not only when it contains a space: a path that acquires
+    // one later should not change whether this is correct.
+    format!("\"{escaped}\"")
 }
 
 /// The command the autostart entry should run.
@@ -162,7 +189,7 @@ mod tests {
         assert!(text.starts_with("[Desktop Entry]\n"));
         assert!(text.contains("Type=Application\n"));
         // The point of the whole feature: no window at login.
-        assert!(text.contains("Exec=/home/u/.local/bin/tobii-gtk --background\n"));
+        assert!(text.contains("Exec=\"/home/u/.local/bin/tobii-gtk\" --background\n"));
         // It is not an application to show in the menu — the installed
         // com.tobiilinux.Configuration.desktop is.
         assert!(text.contains("NoDisplay=true\n"));
@@ -179,9 +206,40 @@ mod tests {
             .find_map(|l| l.strip_prefix("Exec="))
             .expect("an Exec line");
         assert!(
-            exec.starts_with('/'),
-            "Exec must be absolute or a login session may not find it: {exec}"
+            exec.starts_with("\"/"),
+            "Exec must be an absolute path, quoted: {exec}"
         );
+    }
+
+    /// A launcher splits `Exec` on unquoted whitespace, so an unquoted path
+    /// with a space in it runs the first fragment — and nothing warns:
+    /// `desktop-file-validate` accepts it, the write succeeds, and reading it
+    /// back says enabled. It just silently never starts.
+    #[test]
+    fn a_path_with_a_space_still_produces_a_launchable_entry() {
+        let text = entry_text("/home/u/My Projects/tobii-gtk");
+        let exec = text
+            .lines()
+            .find_map(|l| l.strip_prefix("Exec="))
+            .expect("an Exec line");
+        assert_eq!(exec, "\"/home/u/My Projects/tobii-gtk\" --background");
+        // The path is one argument, not two.
+        assert!(exec.starts_with('"'));
+        let end = exec[1..].find('"').expect("a closing quote") + 1;
+        assert_eq!(&exec[1..end], "/home/u/My Projects/tobii-gtk");
+    }
+
+    /// `%` is a field code in an Exec value, so a literal one must be doubled,
+    /// and the spec's reserved characters escaped inside the quotes.
+    #[test]
+    fn reserved_characters_in_the_path_are_escaped() {
+        let text = entry_text("/home/u/100%/tobii-gtk");
+        assert!(
+            text.contains("Exec=\"/home/u/100%%/tobii-gtk\" --background"),
+            "{text}"
+        );
+        let dollar = entry_text("/home/u/$HOME/tobii-gtk");
+        assert!(dollar.contains("\\\\$HOME"), "{dollar}");
     }
 
     #[test]

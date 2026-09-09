@@ -77,6 +77,14 @@ pub const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 /// curl's exit code for "exceeded the maximum allowed file size".
 const CURL_TOO_LARGE: i32 = 63;
 
+/// Most header text to keep from a fetcher's stderr.
+///
+/// wget's `-S` dump is parsed for `Location` and `Content-Length`, so it has to
+/// be read — but a reply's headers are chosen by the server, and an unbounded
+/// read of them is an unbounded allocation driven by the network. 256 KiB is
+/// far more than any real GitHub reply and still bounded.
+const MAX_HEADER_BYTES: u64 = 256 * 1024;
+
 #[derive(Debug)]
 pub enum NetError {
     /// The URL is not https on a GitHub host.
@@ -241,18 +249,36 @@ fn run(prog: &str, args: &[String], limit: u64) -> std::io::Result<Ran> {
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
+    // BOTH pipes are drained CONCURRENTLY, and that is not a refinement.
+    //
+    // Reading stdout to EOF first deadlocks the wget backend: wget writes its
+    // `-S` header dump to stderr *before* any body reaches stdout, so once the
+    // dump fills the 64 KiB pipe buffer wget blocks in write(2) on stderr, never
+    // writes to stdout, and never exits — while this end blocks in
+    // `read_to_end` on a stdout that will never close. Neither side can move.
+    // Measured to hang forever at roughly 64 KiB of headers, which a server
+    // chooses, not us. `Command::output()` gets this right, and this code stopped
+    // using it in order to cap stdout while reading.
+    let err_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            // Bounded too: a server that streams headers forever must not be
+            // able to grow this without limit either.
+            let _ = std::io::Read::take(&mut err, MAX_HEADER_BYTES).read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let mut stdout = Vec::new();
     if let Some(out) = child.stdout.take() {
         // `limit + 1` so a reply exactly at the cap stays distinguishable from
         // one that ran over it.
         out.take(limit.saturating_add(1)).read_to_end(&mut stdout)?;
     }
-    let mut stderr = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let mut buf = Vec::new();
-        let _ = err.read_to_end(&mut buf);
-        stderr = String::from_utf8_lossy(&buf).trim().to_string();
-    }
+    let stderr = err_handle
+        .and_then(|h| h.join().ok())
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_default();
     let status = child.wait()?;
     Ok(Ran {
         stdout,

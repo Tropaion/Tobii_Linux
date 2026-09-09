@@ -883,6 +883,27 @@ fn device_session(
             }
             Err(e) => {
                 set_error(thread_state, &e);
+                // A command queued while the tracker was off is a reason to
+                // OPEN the session, and this attempt to open it failed. Drop
+                // the queue rather than carrying it: `pending` is only emptied
+                // inside the success arm, so a command that can never be
+                // applied — the commonest case being a setting changed with the
+                // tracker unplugged — kept the thread out of its idle wait
+                // forever, retrying `UsbTransport::open` every 750 ms and
+                // pinning the status to "Disconnected". One such command
+                // permanently defeated the demand gate.
+                //
+                // Dropping is right rather than merely convenient: everything
+                // that can be queued is also re-applied from saved config on
+                // the next successful connect, so nothing is actually lost.
+                if !pending.is_empty() {
+                    eprintln!(
+                        "warning: could not reach the tracker to apply {} queued setting(s) ({e}); \
+                         they will be applied from saved config on the next connect",
+                        pending.len()
+                    );
+                    pending.clear();
+                }
                 std::thread::sleep(Duration::from_millis(750));
             }
         }

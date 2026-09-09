@@ -195,7 +195,26 @@ pub fn run() -> glib::ExitCode {
     {
         let session = session.clone();
         let hub = hub.clone();
+        // Whether the launch-time activation has already been seen.
+        let launched = std::rc::Rc::new(Cell::new(false));
         app.connect_activate(move |app| {
+            // THE BACKGROUND-MODE GUARD, and it is the whole feature.
+            //
+            // `GApplication` emits `activate` from `run()` whenever argv has no
+            // files or options left to handle — and `--background` is filtered
+            // out of argv before GTK sees it, so argc is 1 and activate fires.
+            // Without this, `--background` built and presented the hub at
+            // login, which took the focus claim, which opened a USB session:
+            // the settings window popping up and the illuminators coming on at
+            // every login, the exact inverse of what the flag means and of what
+            // its own documentation promised.
+            //
+            // Only the FIRST activation is suppressed. Later ones arrive from a
+            // second launch handing off to this instance — the user picking the
+            // app from the menu — and must raise the hub.
+            if autostart::background_mode() && !launched.replace(true) {
+                return;
+            }
             // A second launch — from the menu, the dock, `tobii-gtk` again —
             // hands off to this instance and lands here. Raise the hub that
             // already exists rather than building a second one.
@@ -203,7 +222,16 @@ pub fn run() -> glib::ExitCode {
                 w.present();
                 return;
             }
-            let s = session.borrow_mut().take().unwrap_or_else(device::spawn);
+            // Cloned, not taken. Every handle in a `Session` is a clone of a
+            // shared thing — an `Arc`, a `Sender`, a `Demand` — so this shares
+            // the one device thread. Taking it left the slot empty, and the
+            // next hub in a long-lived background process spawned a SECOND
+            // device thread that never exits; two of them then raced for a USB
+            // interface only one can claim.
+            let s = session
+                .borrow_mut()
+                .get_or_insert_with(device::spawn)
+                .clone();
             if let Some(w) = build_hub(app, s) {
                 *hub.borrow_mut() = Some(w);
             }
@@ -944,19 +972,36 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     let tick_app = app.clone();
     let tick_window = window.clone();
     let tick_cmd_tx = cmd_tx.clone();
-    // A forced flow opens without the user clicking anything, so it has to ask
-    // for the tracker itself just like the flows the buttons open.
+    // Used twice inside the tick: to sync the hub's own focus claim, and
+    // because a forced flow opens without the user clicking anything and so has
+    // to ask for the tracker itself, just like the flows the buttons open.
     let tick_demand = demand.clone();
     let tick_banner = banner.clone();
     let tick_banner_label = banner_label.clone();
     let tick_breakpoint = breakpoint.take();
     let bp_window = window.clone();
+    // The hub's claim on the tracker, synced from `window.is_active()` on every
+    // tick. Declared here because the tick below owns it.
+    let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
+    let tick_focus = focus_hold.clone();
+
     // Kept so the close handler can retire it: the tick captures the
     // application and can open a forced flow, so it must not outlive the hub.
     let tick_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     *tick_id.borrow_mut() = Some(glib::timeout_add_local(
         Duration::from_millis(33),
         move || {
+            // Ask for the tracker exactly while this window has focus. Polled
+            // rather than driven by `notify::is-active`: see the note below.
+            {
+                let active = tick_window.is_active();
+                let mut h = tick_focus.borrow_mut();
+                match (active, h.is_some()) {
+                    (true, false) => *h = Some(tick_demand.hold("the hub window")),
+                    (false, true) => *h = None,
+                    _ => {}
+                }
+            }
             // Re-check the layout breakpoint. `notify::default-width` misses some
             // ways a window changes size (tiling, maximising), and this costs one
             // integer compare — `apply` returns immediately when nothing changed.
@@ -1118,26 +1163,14 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     // flicker of opening a dialog, and every flow that needs the tracker
     // without the hub focused — calibration, setup, the gaze overlay — holds
     // its own claim.
-    let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
-    {
-        let demand = demand.clone();
-        let focus_hold = focus_hold.clone();
-        window.connect_is_active_notify(move |w| {
-            if w.is_active() {
-                let mut h = focus_hold.borrow_mut();
-                if h.is_none() {
-                    *h = Some(demand.hold("the hub window"));
-                }
-            } else {
-                *focus_hold.borrow_mut() = None;
-            }
-        });
-    }
-    // Presenting does not always deliver an is-active notification — on Wayland
-    // it depends on the compositor granting focus — so the first claim is taken
-    // here rather than waited for. If focus never arrives, the notify handler
-    // drops it.
-    *focus_hold.borrow_mut() = Some(demand.hold("the hub window"));
+    //
+    // Driven from the tick above, from `window.is_active()`, and from nowhere
+    // else. It was previously an unconditional claim taken at build time plus a
+    // `notify::is-active` handler to release it — and where a compositor never
+    // granted focus the notification never fired, so the claim was never
+    // released and the tracker stayed lit for the life of the process. Polling
+    // a boolean 30 times a second is not elegant, but it is self-correcting,
+    // which a one-shot signal is not.
     // Everything the hub owns is released here, and all of it matters.
     {
         let focus_hold = focus_hold.clone();
