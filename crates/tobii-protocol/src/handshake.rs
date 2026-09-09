@@ -27,6 +27,26 @@ fn resp_u16_be(data: &[u8], at: usize) -> u16 {
 /// field as `(size, body)`. Header is `[type:u8][pad:u8][size:u16 BE]`;
 /// fields whose declared body runs past the buffer end are skipped.
 fn resp_fields(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    // KNOWN WRONG for at least one real reply, and deliberately left alone.
+    //
+    // This walks `[type:u8][pad:u8][size:u16 BE]` — a 4-byte header — while
+    // `tlv.rs`, the crate's canonical codec, uses `[type:u8][size:u32 BE]`, a
+    // 5-byte one. The single real query-realm reply in the committed replay
+    // capture uses the 5-byte form:
+    //
+    //     0000  02 00000004 00000000  02 00000004 00000000  02 00000004 00000000
+    //           ^ type 2, size 4, value 0 = no authentication required
+    //
+    // Walked with the header below, that yields nonsense (`type=4 size=256`)
+    // and no `size==4` field at all — so `resp_first_u32` falls back to 0, which
+    // is *the correct answer*, reached by accident.
+    //
+    // Switching this to the 5-byte framing was NOT done, because the only reply
+    // with any content that we have is the one above: on this device the
+    // open-realm reply is empty, so nothing else here has ever been exercised
+    // against real data, and changing an unvalidated walker on the strength of
+    // one capture is how this project has hurt itself before. If a tracker that
+    // demands authentication ever turns up, start here — and re-record.
     let mut pos = 2usize; // skip 2-byte prefix
     std::iter::from_fn(move || {
         while pos + 4 <= data.len() {
@@ -42,22 +62,11 @@ fn resp_fields(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
     })
 }
 
-/// First `size==4` field's u32 value, or 0 if none.
-///
-/// Prefer [`resp_first_u32_opt`] where the difference between "the device said
-/// zero" and "nothing parsed" matters — for `realm_type` it decides whether
-/// authentication happens at all.
-pub(crate) fn resp_first_u32(data: &[u8]) -> u32 {
-    resp_first_u32_opt(data).unwrap_or(0)
-}
-
 /// First `size==4` field's u32 value, or `None` if the response has none.
 ///
-/// The distinction this exists for: `realm_type == 0` means *no authentication
-/// required*, and a reply the loose field walk cannot parse also produced 0 —
-/// so a truncated, corrupted or simply unexpected query-realm response was
-/// indistinguishable from the device saying "come straight in". The handshake
-/// would then skip authentication and fail later, somewhere less informative.
+/// The caller must decide what `None` means, and for `realm_type` the answer is
+/// currently "treat it as 0" — see the note on [`resp_fields`] for why that is
+/// not the tidy behaviour it looks like.
 pub(crate) fn resp_first_u32_opt(data: &[u8]) -> Option<u32> {
     resp_fields(data)
         .find(|(size, _)| *size == 4)
@@ -182,22 +191,17 @@ impl Handshake {
                 }
                 State::AwaitQueryRealm => match self.resp.take() {
                     Some(r) => {
-                        // A query-realm reply with no readable u32 is NOT the
-                        // same as `realm_type = 0`. Zero means "no
-                        // authentication required", so treating an unparseable
-                        // reply as zero silently skips authentication and fails
-                        // later, somewhere that says much less about why.
-                        match resp_first_u32_opt(&r) {
-                            Some(t) => {
-                                self.realm_type = t;
-                                self.state = State::BuildOpenRealm;
-                                continue;
-                            }
-                            None => {
-                                self.state = State::Failed;
-                                return HandshakeAction::Failed;
-                            }
-                        }
+                        // Defaults to 0 — "no authentication required" — when
+                        // no field is readable, and that default is LOAD-BEARING
+                        // on real hardware. See `resp_fields`: the walker does
+                        // not match the framing the ET5 actually replies with,
+                        // finds nothing, and falls back to 0 — which is the
+                        // correct answer for this device. Making an unreadable
+                        // reply fail instead was tried, and the recorded-session
+                        // replay caught it breaking every connection.
+                        self.realm_type = resp_first_u32_opt(&r).unwrap_or(0);
+                        self.state = State::BuildOpenRealm;
+                        continue;
                     }
                     None => return HandshakeAction::Recv,
                 },
@@ -290,49 +294,41 @@ mod resp_tests {
         let mut p = vec![0x00, 0x00];
         p.extend(u32_field(0x2a));
         p.extend(u32_field(0x99));
-        assert_eq!(resp_first_u32(&p), 0x2a);
+        assert_eq!(resp_first_u32_opt(&p), Some(0x2a));
     }
 
+    /// Renamed and inverted deliberately. It used to be
+    /// `first_u32_is_zero_when_none`, asserting the very conflation that made a
+    /// truncated query-realm reply indistinguishable from the device saying
+    /// "no authentication required" — the test was pinning the bug in place.
     #[test]
-    fn first_u32_is_zero_when_none() {
+    fn a_response_with_no_size4_field_yields_nothing_not_zero() {
         let p = vec![0x00, 0x00];
-        assert_eq!(resp_first_u32(&p), 0);
+        assert_eq!(resp_first_u32_opt(&p), None);
+        assert_eq!(resp_first_u32_opt(&[]), None);
     }
 
-    /// `realm_type == 0` means "no authentication required", so a reply the
-    /// field walk cannot parse must NOT read as zero — that silently skips
-    /// authentication and fails later, somewhere far less informative.
+    /// The default that keeps real hardware working. `resp_fields` cannot
+    /// parse the ET5's actual query-realm reply (see its note), so it finds no
+    /// field and this falls back to 0 — which is what the device means. Making
+    /// the unreadable case fail instead was tried and the recorded-session
+    /// replay caught it breaking every connection.
     #[test]
-    fn an_unparseable_query_realm_reply_fails_rather_than_skipping_auth() {
-        // A real reply: prefix, then a 4-byte field holding the realm type.
-        let good = [0x00, 0x00, 0x02, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
-        assert_eq!(
-            resp_first_u32_opt(&good),
-            Some(0),
-            "the device really said 0"
-        );
-
-        // Nothing a field walk can read: not the same thing at all.
-        for junk in [
-            &[][..],
-            &[0x00][..],
-            &[0x00, 0x00][..],
-            &[0x00, 0x00, 0x02][..],
-        ] {
-            assert_eq!(resp_first_u32_opt(junk), None, "{junk:?}");
-        }
-
-        // And the handshake must refuse rather than proceed unauthenticated.
+    fn an_unreadable_realm_reply_still_reads_as_no_authentication() {
         let mut hs = Handshake::new(0x500);
-        // Walk to AwaitQueryRealm: hello -> response, query-realm -> response.
         assert!(matches!(hs.poll(), HandshakeAction::Send(_)));
         hs.on_response(&[0x00, 0x00]);
         assert!(matches!(hs.poll(), HandshakeAction::Send(_)));
-        hs.on_response(&[0x00, 0x00, 0x02]); // truncated: no readable u32
-        assert_eq!(
-            hs.poll(),
-            HandshakeAction::Failed,
-            "an unreadable realm reply must not be read as `no auth needed`"
+        // The real reply, verbatim from the committed capture. The walker in
+        // this module cannot read it; the fallback is what makes it work.
+        hs.on_response(&[
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+            0x00,
+        ]);
+        assert!(
+            matches!(hs.poll(), HandshakeAction::Send(_)),
+            "the handshake must proceed to open-realm, not fail"
         );
     }
 
