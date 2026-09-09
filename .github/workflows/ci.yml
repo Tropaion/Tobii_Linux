@@ -1,0 +1,88 @@
+# Checks every push and pull request has to pass.
+#
+# These are exactly the three commands the maintainer runs by hand before every
+# commit. They pass today; nothing but habit was keeping them passing, and habit
+# does not survive a second contributor.
+#
+# Runs inside the same Debian 13 container the releases are built in, rather
+# than on the runner image directly. Not for purity — because it is *simpler*:
+# `libgtk4-layer-shell-dev` only exists in Debian 13 / Ubuntu 24.10 and newer,
+# so pinning the container is one fewer thing to be wrong about than tracking
+# what `ubuntu-latest` happens to be this month. It also means a pull request is
+# compiled against the same GTK the releases use.
+#
+# Rust comes from rustup, not from Debian: the container is here for the C
+# libraries and the glibc floor, and there is no reason to also inherit whatever
+# rustc version Debian froze.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A build failure should print the error, not a backtrace of cargo itself.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    container: debian:trixie
+
+    steps:
+      # Before checkout: actions/checkout needs git, and the container has none.
+      - name: Install system dependencies
+        run: |
+          set -eux
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git pkg-config \
+            libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable \
+                       --component rustfmt --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Report versions
+        run: |
+          rustc --version
+          cargo --version
+          pkg-config --modversion gtk4 gtk4-layer-shell-0 libusb-1.0
+          ldd --version | head -1
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-trixie-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-trixie-
+
+      # Formatting first: it is the fastest to run and the least interesting to
+      # argue about in review.
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # `--all-targets` so tests and examples are linted too. Several real
+      # defects in this repository have been found by clippy in test code.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked

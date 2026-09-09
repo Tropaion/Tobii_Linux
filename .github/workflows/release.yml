@@ -1,0 +1,165 @@
+# Build a release and publish it.
+#
+# # Why this exists at all
+#
+# The machine a binary is compiled on *is* its compatibility floor, and a
+# developer's machine is the worst possible choice. Measured on the maintainer's
+# (glibc 2.44, September 2026):
+#
+#     tobii      GLIBC_2.44
+#     tobii-gtk  GLIBC_2.44
+#
+# Ubuntu 24.04 has 2.39 and Debian 13 has 2.41, so a release cut there would
+# fail to start for very nearly everyone who downloaded it — and it would fail
+# *loudly*, because `tobii-update` runs the new binary once before installing
+# it, gets a dynamic-linker error, and reports "built against newer system
+# libraries than this machine has" before rolling back. The updater would be
+# blamed for working correctly.
+#
+# So releases are built in a Debian 13 container, which fixes the floor at
+# glibc 2.41 whatever the maintainer happens to be running. `glibc-floor` below
+# turns that from a hope into an enforced check.
+#
+# # How to cut a release
+#
+#     # 1. bump [workspace.package] version in Cargo.toml, commit
+#     # 2. git tag v0.2.0 && git push origin v0.2.0
+#
+# `scripts/release.sh` refuses to build if the tag and Cargo.toml disagree,
+# because a build that reports a different version than its tag offers itself
+# its own update forever.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The oldest glibc this release may require. Debian 13 is 2.41; anything
+  # higher means the container drifted and the release would be narrower than
+  # intended, which is exactly the failure this workflow exists to prevent.
+  MAX_GLIBC: "2.41"
+
+jobs:
+  build:
+    name: Build in the compatibility container
+    runs-on: ubuntu-latest
+    container: debian:trixie
+
+    steps:
+      # The tag is the only untrusted input here — anyone able to push a tag
+      # chooses its name, and it reaches a shell. It is validated against a
+      # strict pattern before it is used for anything, and passed through the
+      # environment rather than interpolated into a script.
+      - name: Check the tag is a version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag '$TAG' is not vMAJOR.MINOR.PATCH" >&2; exit 1 ;;
+          esac
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$' || {
+            echo "tag '$TAG' has characters a version tag may not have" >&2
+            exit 1
+          }
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          set -eux
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential binutils ca-certificates curl git pkg-config \
+            libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # The same script a maintainer would run locally, so there is one
+      # definition of what a release archive is. It builds, refuses on a
+      # version mismatch, reports the glibc floor, runs `--version` on both
+      # binaries (the same probe the updater uses), and writes SHA256SUMS.
+      - name: Build the release archive
+        run: scripts/release.sh "$VERSION"
+
+      # release.sh reports the floor; this makes it a gate. Without it, a
+      # container image bump could silently narrow every future release and
+      # nobody would notice until users could not start the binaries.
+      - name: Check the glibc floor
+        run: |
+          set -eu
+          worst=""
+          tmp="$(mktemp -d)"
+          tar -xzf dist/tobii-linux-"$VERSION"-*.tar.gz -C "$tmp"
+          for bin in "$tmp"/*/tobii "$tmp"/*/tobii-gtk; do
+            [ -f "$bin" ] || continue
+            need="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
+            need="${need#GLIBC_}"
+            echo "$(basename "$bin") needs glibc $need"
+            if [ -z "$worst" ] || [ "$(printf '%s\n%s\n' "$worst" "$need" | sort -V | tail -1)" = "$need" ]; then
+              worst="$need"
+            fi
+          done
+          echo "archive floor: glibc $worst (limit $MAX_GLIBC)"
+          if [ "$(printf '%s\n%s\n' "$worst" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+            echo "::error::this build needs glibc $worst, above the $MAX_GLIBC limit — it would not start for most users" >&2
+            exit 1
+          fi
+
+      - name: Verify SHA256SUMS matches the archive
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    # Not in the container: `gh` is preinstalled on the runner image, and
+    # publishing needs no particular glibc.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: List what will be published
+        run: ls -l dist
+
+      # A draft, deliberately. The release notes are the changelog the updater
+      # shows every user, and they are worth a human's eyes before they are
+      # published — publishing is one click in the GitHub UI. It also means a
+      # mistaken tag can be deleted without anyone's updater ever seeing it.
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --draft \
+            --generate-notes
+          echo "::notice::Draft release $TAG created. Review the notes and publish it."

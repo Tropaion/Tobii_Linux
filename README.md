@@ -428,19 +428,48 @@ compiled into the binary; there isn't one.
 
 ### Publishing a release
 
-`scripts/release.sh <version> [triple]` builds the archive and `SHA256SUMS` in
-the layout the updater expects, refuses to build if `Cargo.toml` disagrees with
-the tag, reports the oldest glibc the binaries need, and checks they answer
-`--version` — the same probe the updater runs before installing.
-
-A `gnu` build only runs on a glibc at least as new as the one it was built
-against, so building on a rolling distribution produces binaries that will not
-start on older ones. Build in an old-glibc container, or target musl:
+Bump `[workspace.package] version` in `Cargo.toml`, commit, then:
 
 ```sh
-rustup target add x86_64-unknown-linux-musl
-scripts/release.sh 0.2.0 x86_64-unknown-linux-musl
+git tag v0.2.0 && git push origin v0.2.0
 ```
+
+**Releases are built by CI, not on a developer's machine, and that is the
+point.** The machine a binary is compiled on *is* its compatibility floor: on
+the maintainer's current system both binaries come out needing `GLIBC_2.44`,
+which almost nobody has, so such a release would fail to start for nearly
+everyone who downloaded it. `.github/workflows/release.yml` builds in a
+Debian 13 container instead, fixing the floor at glibc 2.41, and **fails the
+build if the floor ever rises above that** rather than shipping a narrower
+release quietly.
+
+It publishes a **draft** — the notes are the changelog every user's updater
+shows them, so a human sees them before anyone does.
+
+`scripts/release.sh <version> [triple]` is what CI runs and works locally too:
+it refuses to build if `Cargo.toml` disagrees with the tag, reports the oldest
+glibc each binary needs, and checks both answer `--version` — the same probe the
+updater runs before installing.
+
+## Contributing
+
+Pull requests run `.github/workflows/ci.yml`, which is these three commands:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
+
+They pass on `main`; running them before you push saves a round trip. CI runs
+them in the same Debian 13 container the releases are built in, so a pull
+request is also compiled against the GTK version releases use.
+
+**What CI cannot check:** anything needing the tracker itself. The accuracy
+figure, the head-pose sign conventions and the tracker-on behaviour above were
+all measured on hardware by hand, and the `Status` section says which claims
+those are. If you change the protocol layer or the device thread, say in the
+pull request what you tested against a real ET5.
 
 ## Credits & license
 
