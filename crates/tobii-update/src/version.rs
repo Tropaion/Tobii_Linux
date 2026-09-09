@@ -117,11 +117,10 @@ fn cmp_pre(a: &str, b: &str) -> std::cmp::Ordering {
 /// — which agrees with semver wherever semver has an opinion and gets `rc10`
 /// right where semver would not.
 fn cmp_ident(a: &str, b: &str) -> std::cmp::Ordering {
-    let split = |s: &str| {
+    fn split(s: &str) -> (&str, Option<u64>) {
         let stem = s.trim_end_matches(|c: char| c.is_ascii_digit());
-        let digits = &s[stem.len()..];
-        (stem.to_string(), digits.parse::<u64>().ok())
-    };
+        (stem, s[stem.len()..].parse::<u64>().ok())
+    }
     let (a_stem, a_num) = split(a);
     let (b_stem, b_num) = split(b);
     if a_stem != b_stem {
@@ -129,7 +128,7 @@ fn cmp_ident(a: &str, b: &str) -> std::cmp::Ordering {
         return match (a_stem.is_empty(), b_stem.is_empty()) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a_stem.cmp(&b_stem),
+            _ => a_stem.cmp(b_stem),
         };
     }
     match (a_num, b_num) {

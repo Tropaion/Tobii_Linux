@@ -199,24 +199,21 @@ pub fn decide(latest: Option<Release>, running: &Version, triple: &str) -> Check
     // checksums without which a truncated download cannot be told from a
     // complete one. Missing either means the Update button could only fail.
     let why = if r.archive_for(triple).is_none() {
-        Some(Blocked::NoBuildForTarget)
+        Blocked::NoBuildForTarget
     } else if r.checksums().is_none() {
-        Some(Blocked::NoChecksums)
+        Blocked::NoChecksums
     } else {
-        None
+        return Check::Newer(Box::new(r));
     };
-    if let Some(why) = why {
-        return Check::CannotInstall {
-            version: r.version.clone(),
-            url: if r.html_url.is_empty() {
-                crate::releases_url()
-            } else {
-                r.html_url.clone()
-            },
-            why,
-        };
+    Check::CannotInstall {
+        version: r.version,
+        url: if r.html_url.is_empty() {
+            crate::releases_url()
+        } else {
+            r.html_url
+        },
+        why,
     }
-    Check::Newer(Box::new(r))
 }
 
 #[cfg(test)]

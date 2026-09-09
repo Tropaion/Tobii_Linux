@@ -410,20 +410,26 @@ pub fn install_verified_archive(
     // here at all, changes nothing.
     progress("checking the new binaries");
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Binaries installed here that the archive does not carry. Installing only
+    // the ones it happens to carry leaves a new `tobii` beside an old
+    // `tobii-gtk` — the exact mismatched pair the backups and rollback exist to
+    // prevent, arriving by the front door and reported as success.
+    let mut missing: Vec<&str> = Vec::new();
     let discard = |staged: &[(PathBuf, PathBuf)]| {
         for (s, _) in staged {
             let _ = std::fs::remove_file(s);
         }
     };
     for name in BINARIES {
-        let Some(src) = find_regular_file(&unpacked, name) else {
-            continue;
-        };
         let target = dir.join(name);
         // Only replace what is already installed here.
         if !target.symlink_metadata().is_ok_and(|m| m.is_file()) {
             continue;
         }
+        let Some(src) = find_regular_file(&unpacked, name) else {
+            missing.push(name);
+            continue;
+        };
         let staging = dir.join(format!(".{name}.new-{}", std::process::id()));
         let _ = std::fs::remove_file(&staging);
         if let Err(e) = std::fs::copy(&src, &staging) {
@@ -448,25 +454,7 @@ pub fn install_verified_archive(
     if staged.is_empty() {
         return Err(InstallError::NothingToInstall);
     }
-    // Every binary installed here must be in the archive. Installing only the
-    // ones it happens to carry leaves a new `tobii` beside an old `tobii-gtk`
-    // — the exact mismatched pair the backups and rollback exist to prevent,
-    // arriving by the front door and reported as success.
-    let installed_here: Vec<&str> = BINARIES
-        .iter()
-        .copied()
-        .filter(|n| dir.join(n).symlink_metadata().is_ok_and(|m| m.is_file()))
-        .collect();
-    if staged.len() != installed_here.len() {
-        let have: Vec<&str> = staged
-            .iter()
-            .filter_map(|(_, t)| t.file_name().and_then(|s| s.to_str()))
-            .collect();
-        let missing: Vec<&str> = installed_here
-            .iter()
-            .copied()
-            .filter(|n| !have.contains(n))
-            .collect();
+    if !missing.is_empty() {
         discard(&staged);
         return Err(InstallError::Incomplete {
             missing: missing.join(", "),
@@ -499,7 +487,6 @@ pub fn install_verified_archive(
 ///    fails.
 fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
     let mut done: Vec<(PathBuf, PathBuf)> = Vec::new(); // (target, backup)
-    let mut replaced = Vec::new();
 
     for (staging, target) in staged {
         let backup = target.with_file_name(format!(
@@ -515,12 +502,7 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
             // a link to that same inode, the old binary is still reachable.
             .and_then(|_| std::fs::rename(staging, target));
         match step {
-            Ok(()) => {
-                done.push((target.clone(), backup));
-                if let Some(n) = target.file_name().and_then(|s| s.to_str()) {
-                    replaced.push(n.to_string());
-                }
-            }
+            Ok(()) => done.push((target.clone(), backup)),
             Err(e) => {
                 // Undo the swaps that did land, newest first.
                 let mut detail = e.to_string();
@@ -559,6 +541,12 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
         }
     }
 
+    // The names that landed, in the order they were written — `done` is that
+    // order.
+    let replaced = done
+        .iter()
+        .filter_map(|(t, _)| Some(t.file_name()?.to_str()?.to_string()))
+        .collect();
     for (_, backup) in &done {
         let _ = std::fs::remove_file(backup);
     }
@@ -596,14 +584,9 @@ const ETXTBSY_TRIES: usize = 6;
 fn spawn_probe(path: &Path) -> Result<std::process::Child, String> {
     let mut last = String::new();
     for attempt in 0..ETXTBSY_TRIES {
-        match std::process::Command::new(path)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
+        match version_command(path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // A GUI binary must not try to talk to the session's display here.
-            .env_remove("DISPLAY")
-            .env_remove("WAYLAND_DISPLAY")
             .spawn()
         {
             Ok(c) => return Ok(c),
@@ -617,6 +600,19 @@ fn spawn_probe(path: &Path) -> Result<std::process::Child, String> {
         }
     }
     Err(format!("it could not be started: {last}"))
+}
+
+/// `<path> --version`, set up the way both callers below need it.
+///
+/// The display is taken out of the environment because a GUI binary must not
+/// try to talk to the session's display just to say what version it is.
+fn version_command(path: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(path);
+    c.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    c
 }
 
 /// Whether an error is the kernel refusing to exec a file open for writing.
@@ -684,13 +680,7 @@ fn installed_version(dir: &Path) -> Option<String> {
         if !p.is_file() {
             continue;
         }
-        let out = std::process::Command::new(&p)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .env_remove("DISPLAY")
-            .env_remove("WAYLAND_DISPLAY")
-            .output()
-            .ok()?;
+        let out = version_command(&p).output().ok()?;
         if !out.status.success() {
             continue;
         }

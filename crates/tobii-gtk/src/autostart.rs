@@ -117,28 +117,26 @@ pub fn entry_text(exec: &str) -> String {
 /// `\` are escaped with a backslash — which, since this is also a desktop-entry
 /// *value*, has to be written as an escaped backslash.
 fn quote_exec(exec: &str) -> String {
-    let escaped: String = exec
-        .chars()
-        .flat_map(|c| match c {
-            '"' | '`' | '$' | '\\' => vec!['\\', '\\', c],
-            '%' => vec!['%', '%'],
-            c => vec![c],
-        })
-        .collect();
-    // Always quoted, not only when it contains a space: a path that acquires
-    // one later should not change whether this is correct.
-    format!("\"{escaped}\"")
-}
-
-/// The command the autostart entry should run.
-///
-/// The running binary's own path, so enabling autostart from a build tree
-/// autostarts that build, and enabling it from an installed copy autostarts
-/// that one. `current_exe` resolves symlinks, which is what we want here: the
-/// entry should survive the symlink being repointed.
-fn exec_command() -> io::Result<String> {
-    let exe = std::env::current_exe()?;
-    Ok(exe.display().to_string())
+    // Always quoted, not only when the path contains a space: a path that
+    // acquires one later should not change whether this is correct.
+    //
+    // One pass into one String. The `flat_map` this replaced allocated a Vec
+    // per character of the path to yield one to three chars.
+    let mut out = String::with_capacity(exec.len() + 2);
+    out.push('"');
+    for c in exec.chars() {
+        match c {
+            // Reserved inside a quoted argument. Written as an escaped
+            // backslash because this is also a desktop-entry *value*.
+            '"' | '`' | '$' | '\\' => out.push_str("\\\\"),
+            // `%` starts a field code, so a literal one is doubled.
+            '%' => out.push('%'),
+            _ => {}
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Turn start-at-login on or off.
@@ -153,7 +151,11 @@ pub fn set_enabled(on: bool) -> io::Result<()> {
             other => other,
         };
     }
-    let exec = exec_command()?;
+    // The running binary's own path, so enabling autostart from a build tree
+    // autostarts that build and enabling it from an installed copy autostarts
+    // that one. `current_exe` resolves symlinks, which is what we want here:
+    // the entry should survive the symlink being repointed.
+    let exec = std::env::current_exe()?.display().to_string();
     std::fs::create_dir_all(autostart_dir())?;
     // Written whole and renamed: a login that reads a half-written entry would
     // silently not start, and the failure would look like the setting never

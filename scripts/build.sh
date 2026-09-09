@@ -99,7 +99,10 @@ need_command() {
 # "gtk4-layer-shell" reports it missing on a machine where it is installed and
 # the build works. Each entry is "what to probe|what to call it".
 need_module() {
-    local probe="${1%%|*}" label="${1##*|}"
+    # The module to probe and, optionally, what to call it in the output — two
+    # plain arguments, like `need_command` above. It used to pack both into one
+    # pipe-separated string, which is a hand-rolled second parameter.
+    local probe="$1" label="${2:-$1}"
     if pkg-config --exists "$probe" 2>/dev/null; then
         printf '  %s%-24s%s %s\n' "$green" "$label" "$reset" "${dim}$(pkg-config --modversion "$probe")${reset}"
     else
@@ -114,10 +117,10 @@ need_command cc "a C compiler, for the -sys crates"
 need_command pkg-config "used to locate the system libraries"
 
 if command -v pkg-config >/dev/null 2>&1; then
-    need_module "libusb-1.0|libusb-1.0"
+    need_module libusb-1.0
     if [[ $lean -eq 0 ]]; then
-        need_module "gtk4|gtk4"
-        need_module "gtk4-layer-shell-0|gtk4-layer-shell"
+        need_module gtk4
+        need_module gtk4-layer-shell-0 gtk4-layer-shell
     fi
 fi
 

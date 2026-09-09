@@ -86,10 +86,9 @@ if command -v objdump >/dev/null 2>&1; then
             | sort -V | tail -1 || true)"
         [[ -n "$this" ]] || continue
         echo "  $bin needs $this"
-        if [[ -z "$need" ]] || [[ "$(printf '%s\n%s\n' "${need#GLIBC_}" "${this#GLIBC_}" \
-                | sort -V | tail -1)" == "${this#GLIBC_}" ]]; then
-            need="$this"
-        fi
+        # `sort -V` puts the newer version last, so the max of the two is the
+        # tail. Version sort, not string sort: 2.10 is newer than 2.9.
+        need="$(printf '%s\n%s\n' "$need" "$this" | sort -V | tail -1)"
     done
     if [[ -n "$need" ]]; then
         echo "  → this archive needs $need or newer; nobody on an older glibc can run it"

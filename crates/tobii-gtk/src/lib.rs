@@ -393,7 +393,10 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
     win.add_controller(keys);
 }
 
-/// Build the hub window.
+/// Build the hub over an existing device thread.
+///
+/// Returns the hub window, or `None` when `--accuracy` took over and there is
+/// no hub to return.
 ///
 /// Public, together with [`load_css`], so the layout can be rendered outside a
 /// normal run: GTK's own `render_texture` gives an honest picture of a widget
@@ -401,18 +404,6 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
 /// width and the panel's margins were checked. Exposing the real constructor
 /// rather than a probe-only twin means there is nothing here that only test
 /// scaffolding calls.
-/// Build the hub with its own device thread.
-///
-/// Kept for callers that just want a hub; `run` uses [`build_hub`] so it can
-/// share one device thread with the background session.
-pub fn build_ui(app: &Application) {
-    build_hub(app, device::spawn());
-}
-
-/// Build the hub over an existing device thread.
-///
-/// Returns the hub window, or `None` when `--accuracy` took over and there is
-/// no hub to return.
 pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindow> {
     let (state, cmd_tx, demand) = session;
     // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
@@ -513,8 +504,12 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     // without skewing the motion gain — which is what "fixed 380px" was
     // protecting against, at the cost of never using the space.
     let pad = 2 * widget::EYE_VIEW_PAD as i32;
+    // The content height that makes the DRAWN rectangle — inset by `pad` on
+    // every side — golden.
+    let golden_height =
+        move |w: i32| (((w - pad) as f64) / widget::EYE_VIEW_RATIO).round() as i32 + pad;
     let min_w = 320;
-    let min_h = (((min_w - pad) as f64) / widget::EYE_VIEW_RATIO).round() as i32 + pad;
+    let min_h = golden_height(min_w);
     area.set_size_request(min_w, min_h);
     area.set_hexpand(true);
     // Height follows width, so the golden box fills the card instead of
@@ -525,8 +520,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     {
         const MAX_H: i32 = 300;
         area.connect_resize(move |a, w, _h| {
-            let want = ((((w - pad) as f64) / widget::EYE_VIEW_RATIO).round() as i32 + pad)
-                .clamp(min_h, MAX_H);
+            let want = golden_height(w).clamp(min_h, MAX_H);
             if a.content_height() != want {
                 a.set_content_height(want);
             }
@@ -902,10 +896,6 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     root.append(&banner);
     root.append(&split);
 
-    // Set by the breakpoint block below, and re-checked from the UI tick.
-    #[allow(unused_assignments)]
-    let mut breakpoint: Option<Rc<dyn Fn(i32)>> = None;
-
     // How tall the content wants to be at the width the window will open at.
     // Measured before the window exists, so the window can be built around it.
     const DEFAULT_WIDTH: i32 = 1040;
@@ -938,7 +928,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
 
     // The breakpoint. 820 is where the instrument's 340px floor plus the
     // control column's 360px floor plus margins stop fitting side by side.
-    {
+    let breakpoint: Rc<dyn Fn(i32)> = {
         // 820 is where the instrument's 320px floor and the control rack's
         // 360px floor stop fitting side by side with the margins.
         const STACK_BELOW: i32 = 820;
@@ -974,9 +964,10 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
         // immediately when nothing changed.
         let apply: Rc<dyn Fn(i32)> = Rc::new(apply);
         apply(window.default_width());
-        breakpoint = Some(apply.clone());
-        window.connect_default_width_notify(move |w| apply(w.width().max(w.default_width())));
-    }
+        let on_notify = apply.clone();
+        window.connect_default_width_notify(move |w| on_notify(w.width().max(w.default_width())));
+        apply
+    };
 
     // ~30 fps tick: read the device snapshot, refresh status + eye view.
     let tick_app = app.clone();
@@ -988,8 +979,6 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     let tick_demand = demand.clone();
     let tick_banner = banner.clone();
     let tick_banner_label = banner_label.clone();
-    let tick_breakpoint = breakpoint.take();
-    let bp_window = window.clone();
     // The hub's claim on the tracker, synced from `window.is_active()` on every
     // tick. Declared here because the tick below owns it.
     let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
@@ -1015,9 +1004,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
             // Re-check the layout breakpoint. `notify::default-width` misses some
             // ways a window changes size (tiling, maximising), and this costs one
             // integer compare — `apply` returns immediately when nothing changed.
-            if let Some(bp) = tick_breakpoint.as_ref() {
-                bp(bp_window.width());
-            }
+            breakpoint(tick_window.width());
             // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
             // under one lock. `new_cam` is None on the ticks between device frames.
             let (snap, new_cam) = {
@@ -1037,12 +1024,9 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
             if conn {
                 if !cal_evaluated.get() && !forced_flow_open.get() {
                     cal_evaluated.set(true);
-                    let display_configured = tobii_config::load().ok().flatten().is_some();
-                    let fp = tobii_config::load()
-                        .ok()
-                        .flatten()
-                        .map(|s| s.fingerprint())
-                        .unwrap_or(0);
+                    let setup = tobii_config::load().ok().flatten();
+                    let display_configured = setup.is_some();
+                    let fp = setup.map(|s| s.fingerprint()).unwrap_or(0);
                     let cal = tobii_config::load_calibration()
                         .ok()
                         .flatten()
@@ -1118,15 +1102,11 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
             let head_now = widget::head_view_for(&snap);
             {
                 let ev = widget::eye_view_for(&snap);
-                let hv = head_now;
-                for (group, rows) in widget::readout_groups(&ev, hv.as_ref())
-                    .into_iter()
-                    .enumerate()
+                for (cells, rows) in readout_cells
+                    .iter()
+                    .zip(widget::readout_groups(&ev, head_now.as_ref()))
                 {
-                    for (i, r) in rows.into_iter().enumerate() {
-                        let Some((n, v)) = readout_cells.get(group).and_then(|g| g.get(i)) else {
-                            break;
-                        };
+                    for ((n, v), r) in cells.iter().zip(rows) {
                         n.set_text(r.label);
                         v.set_text(&r.value);
                         if r.alert {
@@ -1153,12 +1133,9 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
             }
             // Head pose: same discipline as the camera — only redraw when the view
             // actually changed, so an unchanged pose costs nothing.
-            {
-                let next = head_now;
-                if *head_view.borrow() != next {
-                    *head_view.borrow_mut() = next;
-                    area.queue_draw();
-                }
+            if *head_view.borrow() != head_now {
+                *head_view.borrow_mut() = head_now;
+                area.queue_draw();
             }
             glib::ControlFlow::Continue
         },

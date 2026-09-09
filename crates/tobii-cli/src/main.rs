@@ -907,11 +907,10 @@ fn camera_both(args: &[String]) -> CmdResult {
 /// meant to alter the conversation: a capture is a photograph of what happened
 /// once, not a specification.
 fn record_session(args: &[String]) -> CmdResult {
-    let path = std::path::PathBuf::from(
-        args.get(2)
-            .cloned()
-            .unwrap_or_else(|| "crates/tobii-usb/tests/captures/session.tobiicap".to_string()),
-    );
+    let path = std::path::PathBuf::from(match args.get(2) {
+        Some(p) => p.as_str(),
+        None => "crates/tobii-usb/tests/captures/session.tobiicap",
+    });
     let frames: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
 
     eprintln!("recording a session to {} ...", path.display());

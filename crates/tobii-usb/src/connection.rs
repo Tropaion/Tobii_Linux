@@ -164,7 +164,17 @@ impl<T: Transport> Connection<T> {
     /// Send a request and require a matching response (calibration ops always
     /// reply). Returns the response payload, or `NoResponse` on timeout.
     fn expect_response(&mut self, op: u32, payload: &[u8]) -> Result<Vec<u8>, UsbError> {
-        self.request(op, payload)?
+        self.expect_response_until(op, payload, self.request_timeout)
+    }
+
+    /// [`Connection::expect_response`] with an explicit response window.
+    fn expect_response_until(
+        &mut self,
+        op: u32,
+        payload: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, UsbError> {
+        self.request_until(op, payload, timeout)?
             .ok_or(UsbError::NoResponse { op })
     }
 
@@ -193,14 +203,11 @@ impl<T: Transport> Connection<T> {
     /// no zero-means-both: 0 selects nothing and the point is silently dropped.
     /// Assumes calibration runs in the already-open realm.
     pub fn add_calibration_point(&mut self, x: f64, y: f64, eye: u32) -> Result<(), UsbError> {
-        self.request_until(
+        self.expect_response_until(
             OP_CAL_ADD_POINT,
             &cal_add_point_payload(x, y, eye),
             CAL_POINT_TIMEOUT,
-        )?
-        .ok_or(UsbError::NoResponse {
-            op: OP_CAL_ADD_POINT,
-        })?;
+        )?;
         Ok(())
     }
 
@@ -211,14 +218,11 @@ impl<T: Transport> Connection<T> {
     /// best-effort (log and continue) rather than a fatal error, matching this
     /// codebase's existing `set_enabled_eye` best-effort precedent.
     pub fn discard_calibration_point(&mut self, x: f64, y: f64) -> Result<(), UsbError> {
-        self.request_until(
+        self.expect_response_until(
             OP_CAL_DISCARD_POINT,
             &cal_discard_point_payload(x, y),
             CAL_POINT_TIMEOUT,
-        )?
-        .ok_or(UsbError::NoResponse {
-            op: OP_CAL_DISCARD_POINT,
-        })?;
+        )?;
         Ok(())
     }
 
@@ -253,7 +257,7 @@ impl<T: Transport> Connection<T> {
     /// tiny is a leftover from before the calibration ops were corrected, when
     /// `retrieve` returned a stub that no amount of applying would help.
     pub fn apply_calibration(&mut self, blob: &[u8]) -> Result<(), UsbError> {
-        if blob.len() < MIN_PLAUSIBLE_BLOB {
+        if !is_plausible_calibration(blob) {
             return Err(UsbError::ImplausibleCalibration { len: blob.len() });
         }
         // Its own window: this pushes a few hundred KB across ~40 transfers and
@@ -267,8 +271,7 @@ impl<T: Transport> Connection<T> {
         } else {
             CAL_APPLY_TIMEOUT
         };
-        self.request_until(OP_CAL_APPLY, &cal_apply_payload(blob), window)?
-            .ok_or(UsbError::NoResponse { op: OP_CAL_APPLY })?;
+        self.expect_response_until(OP_CAL_APPLY, &cal_apply_payload(blob), window)?;
         Ok(())
     }
 
@@ -310,10 +313,10 @@ impl<T: Transport> Connection<T> {
             match hs.poll() {
                 HandshakeAction::Send(bytes) => {
                     self.transport.send(&bytes)?;
-                    self.drain(&mut buf, Some(&mut hs));
+                    self.drain(&mut buf, RECV_TIMEOUT, Some(&mut hs));
                 }
                 HandshakeAction::Recv => {
-                    self.drain(&mut buf, Some(&mut hs));
+                    self.drain(&mut buf, RECV_TIMEOUT, Some(&mut hs));
                 }
                 HandshakeAction::Done => {
                     self.seq = hs.seq();
@@ -325,11 +328,11 @@ impl<T: Transport> Connection<T> {
         Err(UsbError::Handshake)
     }
 
-    /// Read one transport chunk, parse frames, and route them. Response frames
-    /// go to the handshake (if any); gaze notifications are queued. Other
-    /// frames are ignored.
-    fn drain(&mut self, buf: &mut [u8], mut hs: Option<&mut Handshake>) {
-        if let Some(n) = self.transport.recv(buf, RECV_TIMEOUT) {
+    /// Read one transport chunk, waiting up to `timeout`, parse frames, and
+    /// route them. Response frames go to the handshake (if any); gaze
+    /// notifications are queued. Other frames are ignored.
+    fn drain(&mut self, buf: &mut [u8], timeout: Duration, mut hs: Option<&mut Handshake>) {
+        if let Some(n) = self.transport.recv(buf, timeout) {
             if let Ok(frames) = self.parser.feed(&buf[..n]) {
                 for f in frames {
                     self.route(f, hs.as_deref_mut());
@@ -359,13 +362,7 @@ impl<T: Transport> Connection<T> {
             return Some(s);
         }
         let mut buf = [0u8; READ_BUF];
-        if let Some(n) = self.transport.recv(&mut buf, GAZE_TIMEOUT) {
-            if let Ok(frames) = self.parser.feed(&buf[..n]) {
-                for f in frames {
-                    self.route(f, None);
-                }
-            }
-        }
+        self.drain(&mut buf, GAZE_TIMEOUT, None);
         self.gaze_queue.pop_front()
     }
 
@@ -375,13 +372,23 @@ impl<T: Transport> Connection<T> {
     /// first gaze frame in the chunk is returned; any other frames are routed
     /// normally so nothing is dropped. Returns `None` on read timeout.
     pub fn next_gaze_payload(&mut self) -> Option<Vec<u8>> {
+        self.first_notification(Some(OP_GAZE_NOTIFY))
+            .map(|(_, payload)| payload)
+    }
+
+    /// Read one transport chunk and return the first notification frame in it,
+    /// restricted to `want_op` when given. Every other frame — including the
+    /// notifications after the first — goes through [`Connection::route`], so a
+    /// gaze frame sharing the chunk is queued rather than dropped.
+    fn first_notification(&mut self, want_op: Option<u32>) -> Option<(u32, Vec<u8>)> {
         let mut buf = [0u8; READ_BUF];
         let n = self.transport.recv(&mut buf, GAZE_TIMEOUT)?;
         let frames = self.parser.feed(&buf[..n]).ok()?;
         let mut found = None;
         for f in frames {
-            if found.is_none() && f.magic == TTP_MAGIC_NOTIFY && f.op == OP_GAZE_NOTIFY {
-                found = Some(f.payload);
+            if found.is_none() && f.magic == TTP_MAGIC_NOTIFY && want_op.is_none_or(|op| f.op == op)
+            {
+                found = Some((f.op, f.payload));
             } else {
                 self.route(f, None);
             }
@@ -427,18 +434,7 @@ impl<T: Transport> Connection<T> {
     /// rest — so co-occurring streams are undercounted. Use
     /// [`Connection::read_notifications`] to characterize concurrent streams.
     pub fn next_notification(&mut self) -> Option<(u32, Vec<u8>)> {
-        let mut buf = [0u8; READ_BUF];
-        let n = self.transport.recv(&mut buf, GAZE_TIMEOUT)?;
-        let frames = self.parser.feed(&buf[..n]).ok()?;
-        let mut found = None;
-        for f in frames {
-            if found.is_none() && f.magic == TTP_MAGIC_NOTIFY {
-                found = Some((f.op, f.payload));
-            } else {
-                self.route(f, None);
-            }
-        }
-        found
+        self.first_notification(None)
     }
 
     /// Read one transport chunk and return EVERY notification frame in it as
@@ -452,22 +448,18 @@ impl<T: Transport> Connection<T> {
         let Some(n) = self.transport.recv(&mut self.read_buf, GAZE_TIMEOUT) else {
             return Notifications::silent();
         };
-        let Ok(frames) = self.parser.feed(&self.read_buf[..n]) else {
-            return Notifications {
-                frames: Vec::new(),
-                saw_traffic: true,
-            };
-        };
-        let mut out = Vec::new();
-        for f in frames {
-            if f.magic == TTP_MAGIC_NOTIFY {
-                out.push((f.op, f.payload));
-            } else {
-                self.route(f, None);
+        let mut frames = Vec::new();
+        if let Ok(parsed) = self.parser.feed(&self.read_buf[..n]) {
+            for f in parsed {
+                if f.magic == TTP_MAGIC_NOTIFY {
+                    frames.push((f.op, f.payload));
+                } else {
+                    self.route(f, None);
+                }
             }
         }
         Notifications {
-            frames: out,
+            frames,
             saw_traffic: true,
         }
     }

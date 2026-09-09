@@ -48,14 +48,12 @@ fn write_exe(path: &Path, body: &str) {
     std::fs::set_permissions(path, perms).unwrap();
 }
 
-/// Build a release archive the way `scripts/release.sh` does: one top-level
-/// directory named for the release, with the binaries inside it.
-fn build_archive(root: &Path, stem: &str, bodies: &[(&str, &str)]) -> (PathBuf, String) {
-    let staging = root.join("build").join(stem);
-    std::fs::create_dir_all(&staging).unwrap();
-    for (name, body) in bodies {
-        write_exe(&staging.join(name), body);
-    }
+/// Pack `<root>/build/<stem>` the way `scripts/release.sh` does: one top-level
+/// directory named for the release. Returns the archive and its digest.
+///
+/// Separate from [`build_archive`] because one test has to populate that
+/// directory itself — with a symlink, which `build_archive` cannot write.
+fn tar_up(root: &Path, stem: &str) -> (PathBuf, String) {
     let archive = root.join(format!("{stem}.tar.gz"));
     let out = std::process::Command::new("tar")
         .arg("-czf")
@@ -68,6 +66,16 @@ fn build_archive(root: &Path, stem: &str, bodies: &[(&str, &str)]) -> (PathBuf, 
     assert!(out.status.success(), "tar failed: {out:?}");
     let digest = tobii_config::sha256::hex_digest(&std::fs::read(&archive).unwrap());
     (archive, digest)
+}
+
+/// Build a release archive with the binaries inside it.
+fn build_archive(root: &Path, stem: &str, bodies: &[(&str, &str)]) -> (PathBuf, String) {
+    let staging = root.join("build").join(stem);
+    std::fs::create_dir_all(&staging).unwrap();
+    for (name, body) in bodies {
+        write_exe(&staging.join(name), body);
+    }
+    tar_up(root, stem)
 }
 
 /// Ask a binary for its version, retrying the one failure that is not its fault.
@@ -249,17 +257,7 @@ fn a_symlinked_member_is_not_installed() {
     let staging = s.path().join("build").join(stem);
     std::fs::create_dir_all(&staging).unwrap();
     std::os::unix::fs::symlink(&secret, staging.join("tobii")).unwrap();
-    let archive = s.path().join(format!("{stem}.tar.gz"));
-    let out = std::process::Command::new("tar")
-        .arg("-czf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(s.path().join("build"))
-        .arg(stem)
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let digest = tobii_config::sha256::hex_digest(&std::fs::read(&archive).unwrap());
+    let (archive, digest) = tar_up(s.path(), stem);
 
     let dir = install_dir_with_both(s.path());
     let work = work_dir(s.path());

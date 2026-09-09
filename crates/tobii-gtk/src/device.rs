@@ -647,13 +647,13 @@ fn calibrate_pitch<T: Transport>(
         if s.pitch_cal.token != token {
             return; // a newer run owns the state now
         }
-        s.pitch_cal = PitchCal {
-            token,
-            active: false,
-            secs_left: 0,
-            samples: s.pitch_cal.samples,
-            result: Some(r),
-        };
+        // Only the three fields that change. The struct literal this
+        // replaced assigned `samples` back to itself and `token` back to
+        // the value it had just been compared equal to, so a reader had to
+        // check all five to find the two that moved.
+        s.pitch_cal.active = false;
+        s.pitch_cal.secs_left = 0;
+        s.pitch_cal.result = Some(r);
     };
 
     let mut model = match tobii_headpose::onnx::OnnxPose::from_store() {
@@ -912,7 +912,7 @@ fn device_session(
                 }
             }
             Err(e) => {
-                set_error(thread_state, &e);
+                thread_state.lock().unwrap().status = ConnStatus::Error(e.to_string());
                 // A command queued while the tracker was off is a reason to
                 // OPEN the session, and this attempt to open it failed. Drop
                 // the queue rather than carrying it: `pending` is only emptied
@@ -948,10 +948,6 @@ fn device_session(
             }
         }
     }
-}
-
-fn set_error(state: &Mutex<DeviceState>, e: &UsbError) {
-    state.lock().unwrap().status = ConnStatus::Error(e.to_string());
 }
 
 /// Compute + stop + retrieve + persist. Always attempts `stop` so the device is

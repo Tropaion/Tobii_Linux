@@ -181,11 +181,6 @@ impl Capture {
         Ok(out)
     }
 
-    pub fn read_file(path: &Path) -> Result<Capture, CaptureError> {
-        let text = std::fs::read_to_string(path).map_err(CaptureError::Io)?;
-        Capture::parse(&text)
-    }
-
     pub fn write_file(&self, path: &Path) -> Result<(), CaptureError> {
         std::fs::write(path, self.to_text()).map_err(CaptureError::Io)
     }
@@ -273,11 +268,8 @@ impl<T: Transport> RecordTransport<T> {
         }
     }
 
-    pub fn with_note(mut self, note: &str) -> Self {
-        self.capture
-            .headers
-            .push(("note".to_string(), note.to_string()));
-        self
+    pub fn with_note(self, note: &str) -> Self {
+        self.header("note", note)
     }
 
     pub fn header(mut self, key: &str, value: &str) -> Self {
@@ -285,10 +277,6 @@ impl<T: Transport> RecordTransport<T> {
             .headers
             .push((key.to_string(), value.to_string()));
         self
-    }
-
-    pub fn capture(&self) -> &Capture {
-        &self.capture
     }
 
     pub fn into_capture(self) -> Capture {

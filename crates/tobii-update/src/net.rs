@@ -235,13 +235,13 @@ struct Ran {
     ok: bool,
 }
 
-/// Run `prog`, capping how much of its stdout is kept.
+/// Run `prog`, keeping at most [`MAX_DOWNLOAD`] bytes of its stdout.
 ///
 /// The cap is applied while reading rather than afterwards, because
 /// "afterwards" means the bytes are already resident: the point of a limit is
 /// that a reply this program did not ask for cannot decide how much memory it
 /// uses.
-fn run(prog: &str, args: &[String], limit: u64) -> std::io::Result<Ran> {
+fn run(prog: &str, args: &[String]) -> std::io::Result<Ran> {
     let mut child = std::process::Command::new(prog)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -271,9 +271,9 @@ fn run(prog: &str, args: &[String], limit: u64) -> std::io::Result<Ran> {
 
     let mut stdout = Vec::new();
     if let Some(out) = child.stdout.take() {
-        // `limit + 1` so a reply exactly at the cap stays distinguishable from
-        // one that ran over it.
-        out.take(limit.saturating_add(1)).read_to_end(&mut stdout)?;
+        // One byte over the cap, so a reply exactly at it stays distinguishable
+        // from one that ran over it.
+        out.take(MAX_DOWNLOAD + 1).read_to_end(&mut stdout)?;
     }
     let stderr = err_handle
         .and_then(|h| h.join().ok())
@@ -306,16 +306,11 @@ fn reason(prog: &str, r: &Ran) -> String {
 /// Fetch `url`, into `dest` if given and into memory otherwise.
 fn fetch(url: &str, dest: Option<&Path>) -> Result<Vec<u8>, NetError> {
     check(url)?;
-    match run("curl", &curl_args(url, dest), MAX_DOWNLOAD) {
+    match run("curl", &curl_args(url, dest)) {
         // curl is not installed. This is the ONLY reason to use wget.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => wget_fetch(url, dest),
         Err(e) => Err(NetError::Io(e)),
-        Ok(r) if r.ok => {
-            if r.stdout.len() as u64 > MAX_DOWNLOAD {
-                return Err(NetError::TooLarge(r.stdout.len() as u64));
-            }
-            finish(dest, r.stdout)
-        }
+        Ok(r) if r.ok => finish(dest, r.stdout),
         Ok(r) => {
             if let Some(p) = dest {
                 let _ = std::fs::remove_file(p);
@@ -332,8 +327,15 @@ fn fetch(url: &str, dest: Option<&Path>) -> Result<Vec<u8>, NetError> {
 }
 
 /// Check what landed on disk, or hand back what was read into memory.
+///
+/// The one place the size cap is applied to what actually arrived, either way.
+/// `run` stops reading stdout at `MAX_DOWNLOAD + 1` bytes, so a body over the
+/// cap is still recognisable by its length here.
 fn finish(dest: Option<&Path>, body: Vec<u8>) -> Result<Vec<u8>, NetError> {
     let Some(p) = dest else {
+        if body.len() as u64 > MAX_DOWNLOAD {
+            return Err(NetError::TooLarge(body.len() as u64));
+        }
         return Ok(body);
     };
     let size = std::fs::metadata(p)?.len();
@@ -349,7 +351,7 @@ fn wget_fetch(url: &str, dest: Option<&Path>) -> Result<Vec<u8>, NetError> {
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         check(&current)?;
-        let r = match run("wget", &wget_args(&current, dest), MAX_DOWNLOAD) {
+        let r = match run("wget", &wget_args(&current, dest)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(NetError::NoFetcher),
             Err(e) => return Err(NetError::Io(e)),
             Ok(r) => r,
@@ -377,9 +379,6 @@ fn wget_fetch(url: &str, dest: Option<&Path>) -> Result<Vec<u8>, NetError> {
                 }
                 return Err(NetError::TooLarge(n));
             }
-        }
-        if r.stdout.len() as u64 > MAX_DOWNLOAD {
-            return Err(NetError::TooLarge(r.stdout.len() as u64));
         }
         return finish(dest, r.stdout);
     }

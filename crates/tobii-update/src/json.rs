@@ -46,10 +46,7 @@ impl Value {
 
     /// The array at `key`, or an empty slice — callers iterate either way.
     pub fn array(&self, key: &str) -> &[Value] {
-        match self.get(key) {
-            Some(Value::Array(v)) => v,
-            _ => &[],
-        }
+        self.get(key).map_or(&[], Value::as_array)
     }
 
     pub fn as_array(&self) -> &[Value] {
