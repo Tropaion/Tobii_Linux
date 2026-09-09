@@ -80,15 +80,37 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = PathBuf::from(tmp_name);
-    std::fs::write(&tmp, bytes)?;
+
+    // Write AND fsync before the rename. Rename alone gives atomicity of
+    // *visibility* — the new name never points at a half-written file — but not
+    // durability of *content*: after a power loss the rename can be on disk
+    // while the bytes it points at are not, which yields an empty or partial
+    // file under a name that was never supposed to hold one. The documentation
+    // used to claim crash-safety this did not provide.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+
     // Same directory, so rename is atomic (never crosses a filesystem).
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp); // don't leave debris behind
-            Err(e)
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // don't leave debris behind
+        return Err(e);
+    }
+
+    // And fsync the directory, so the rename itself survives a power loss.
+    // Without this the file's contents are durable but the directory entry
+    // pointing at them may not be. Best-effort: some filesystems refuse to open
+    // a directory for this, and failing a config write over it would be worse
+    // than the durability gap it closes.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
+    Ok(())
 }
 
 /// Read `path` into bytes. `Ok(None)` if the file does not exist.

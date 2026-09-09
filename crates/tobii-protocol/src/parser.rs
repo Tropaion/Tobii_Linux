@@ -35,6 +35,40 @@ fn le32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
+/// Whether `src` begins with a continuation envelope for a frame that still
+/// needs `remaining` more bytes.
+///
+/// The `01 00 00 00` direction-plus-padding prefix is **not** sufficient on its
+/// own, which is what this used to test. That exact byte sequence is also the
+/// start of a legitimate type-`0x01` TLV field header (`01` then a big-endian
+/// size whose top three bytes are zero for any realistic length), and it occurs
+/// in camera pixel data often enough to matter — a 78 KB frame at 33 Hz gives
+/// the pattern many chances to land on a transfer boundary. When it false
+/// positives, eight bytes of real payload are silently discarded and the frame
+/// is corrupted rather than rejected.
+///
+/// So the envelope's own length field is checked too. Inbound it **includes**
+/// the 8-byte envelope (asymmetric with outbound — see the module docs), so a
+/// genuine continuation satisfies all three of:
+///
+/// * it is at least an envelope long, and no longer than the chunk carrying it;
+/// * it does not claim more payload than the in-flight frame still needs.
+///
+/// The TLV false positive fails the first test: `01 00 00 00 04 ...` reads a
+/// length of 4, which is smaller than the envelope it would have to be.
+fn looks_like_continuation(src: &[u8], remaining: usize) -> bool {
+    if src.len() < ENVELOPE_SIZE
+        || src[0] != 0x01
+        || src[1] != 0x00
+        || src[2] != 0x00
+        || src[3] != 0x00
+    {
+        return false;
+    }
+    let env_len = le32(&src[4..]) as usize;
+    env_len >= ENVELOPE_SIZE && env_len <= src.len() && env_len - ENVELOPE_SIZE <= remaining
+}
+
 impl Parser {
     pub fn new() -> Self {
         Self { acc: Vec::new() }
@@ -58,11 +92,7 @@ impl Parser {
             let plen = be32(&self.acc[ENVELOPE_SIZE + 20..]);
             let frame_size = ENVELOPE_SIZE + TTP_HDR_SIZE + plen as usize;
             if self.acc.len() < frame_size
-                && src.len() >= ENVELOPE_SIZE
-                && src[0] == 0x01
-                && src[1] == 0x00
-                && src[2] == 0x00
-                && src[3] == 0x00
+                && looks_like_continuation(src, frame_size - self.acc.len())
             {
                 data = &src[ENVELOPE_SIZE..];
             }
@@ -128,6 +158,98 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
+
+    /// The false positive this guard exists for. `01 00 00 00` is the start of
+    /// a continuation envelope AND of a legitimate type-0x01 TLV field header,
+    /// and it turns up in camera pixel data. Stripping eight bytes on that
+    /// alone silently corrupts the frame instead of rejecting anything.
+    #[test]
+    fn payload_that_merely_starts_like_an_envelope_is_not_stripped() {
+        // A frame whose payload continues in a second chunk.
+        let payload_len = 16usize;
+        let mut first = Vec::new();
+        first.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        first.extend_from_slice(
+            &((ENVELOPE_SIZE + TTP_HDR_SIZE + payload_len) as u32).to_le_bytes(),
+        );
+        let mut hdr = vec![0u8; TTP_HDR_SIZE];
+        hdr[0..4].copy_from_slice(&0x52u32.to_be_bytes()); // magic
+        hdr[4..8].copy_from_slice(&1u32.to_be_bytes()); // seq
+        hdr[12..16].copy_from_slice(&0xc62u32.to_be_bytes()); // op
+        hdr[20..24].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        first.extend_from_slice(&hdr);
+
+        // A type-0x01 TLV field of size 4 — the exact bytes `01 00 00 00 04`.
+        let tail: [u8; 16] = [
+            0x01, 0x00, 0x00, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0x77,
+        ];
+
+        let mut p = Parser::new();
+        assert!(p.feed(&first).unwrap().is_empty(), "frame is incomplete");
+        let frames = p.feed(&tail).unwrap();
+        assert_eq!(frames.len(), 1, "the frame should complete");
+        assert_eq!(
+            frames[0].payload,
+            tail.to_vec(),
+            "eight bytes of real payload were eaten as a continuation envelope"
+        );
+    }
+
+    /// A genuine continuation envelope is still stripped.
+    #[test]
+    fn a_real_continuation_envelope_is_still_stripped() {
+        let payload_len = 12usize;
+        let mut first = Vec::new();
+        first.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        first.extend_from_slice(
+            &((ENVELOPE_SIZE + TTP_HDR_SIZE + payload_len) as u32).to_le_bytes(),
+        );
+        let mut hdr = vec![0u8; TTP_HDR_SIZE];
+        hdr[0..4].copy_from_slice(&0x52u32.to_be_bytes());
+        hdr[4..8].copy_from_slice(&1u32.to_be_bytes());
+        hdr[12..16].copy_from_slice(&0xc62u32.to_be_bytes());
+        hdr[20..24].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        first.extend_from_slice(&hdr);
+        first.extend_from_slice(&[0xaa; 4]); // first 4 payload bytes
+
+        // Continuation: envelope whose length INCLUDES itself, carrying the
+        // remaining 8 payload bytes.
+        let mut cont = Vec::new();
+        cont.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        cont.extend_from_slice(&((ENVELOPE_SIZE + 8) as u32).to_le_bytes());
+        cont.extend_from_slice(&[0xbb; 8]);
+
+        let mut p = Parser::new();
+        assert!(p.feed(&first).unwrap().is_empty());
+        let frames = p.feed(&cont).unwrap();
+        assert_eq!(frames.len(), 1);
+        let mut want = vec![0xaa; 4];
+        want.extend_from_slice(&[0xbb; 8]);
+        assert_eq!(
+            frames[0].payload, want,
+            "the envelope should have been stripped"
+        );
+    }
+
+    /// The guard must not accept an envelope claiming more than the frame needs.
+    #[test]
+    fn a_continuation_claiming_more_than_the_frame_needs_is_refused() {
+        assert!(!looks_like_continuation(
+            &[0x01, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00],
+            4
+        ));
+        // Length smaller than the envelope itself: the TLV false positive.
+        assert!(!looks_like_continuation(
+            &[0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00],
+            64
+        ));
+        // A well-formed one is accepted.
+        assert!(looks_like_continuation(
+            &[0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00],
+            64
+        ));
+    }
     use super::*;
     use crate::frame::{ENVELOPE_SIZE, TTP_HDR_SIZE, TTP_MAGIC_NOTIFY, TTP_MAGIC_RSP};
 

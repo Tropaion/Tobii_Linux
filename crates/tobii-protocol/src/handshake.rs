@@ -43,11 +43,25 @@ fn resp_fields(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
 }
 
 /// First `size==4` field's u32 value, or 0 if none.
+///
+/// Prefer [`resp_first_u32_opt`] where the difference between "the device said
+/// zero" and "nothing parsed" matters — for `realm_type` it decides whether
+/// authentication happens at all.
 pub(crate) fn resp_first_u32(data: &[u8]) -> u32 {
+    resp_first_u32_opt(data).unwrap_or(0)
+}
+
+/// First `size==4` field's u32 value, or `None` if the response has none.
+///
+/// The distinction this exists for: `realm_type == 0` means *no authentication
+/// required*, and a reply the loose field walk cannot parse also produced 0 —
+/// so a truncated, corrupted or simply unexpected query-realm response was
+/// indistinguishable from the device saying "come straight in". The handshake
+/// would then skip authentication and fail later, somewhere less informative.
+pub(crate) fn resp_first_u32_opt(data: &[u8]) -> Option<u32> {
     resp_fields(data)
         .find(|(size, _)| *size == 4)
         .map(|(_, b)| u32::from_be_bytes(b.try_into().unwrap()))
-        .unwrap_or(0)
 }
 
 /// The `index`-th `size==4` field's u32 value, or 0 if out of range.
@@ -168,10 +182,22 @@ impl Handshake {
                 }
                 State::AwaitQueryRealm => match self.resp.take() {
                     Some(r) => {
-                        // resp_first_u32 returns 0 (== no realm) on a short buffer.
-                        self.realm_type = resp_first_u32(&r);
-                        self.state = State::BuildOpenRealm;
-                        continue;
+                        // A query-realm reply with no readable u32 is NOT the
+                        // same as `realm_type = 0`. Zero means "no
+                        // authentication required", so treating an unparseable
+                        // reply as zero silently skips authentication and fails
+                        // later, somewhere that says much less about why.
+                        match resp_first_u32_opt(&r) {
+                            Some(t) => {
+                                self.realm_type = t;
+                                self.state = State::BuildOpenRealm;
+                                continue;
+                            }
+                            None => {
+                                self.state = State::Failed;
+                                return HandshakeAction::Failed;
+                            }
+                        }
                     }
                     None => return HandshakeAction::Recv,
                 },
@@ -271,6 +297,43 @@ mod resp_tests {
     fn first_u32_is_zero_when_none() {
         let p = vec![0x00, 0x00];
         assert_eq!(resp_first_u32(&p), 0);
+    }
+
+    /// `realm_type == 0` means "no authentication required", so a reply the
+    /// field walk cannot parse must NOT read as zero — that silently skips
+    /// authentication and fails later, somewhere far less informative.
+    #[test]
+    fn an_unparseable_query_realm_reply_fails_rather_than_skipping_auth() {
+        // A real reply: prefix, then a 4-byte field holding the realm type.
+        let good = [0x00, 0x00, 0x02, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(
+            resp_first_u32_opt(&good),
+            Some(0),
+            "the device really said 0"
+        );
+
+        // Nothing a field walk can read: not the same thing at all.
+        for junk in [
+            &[][..],
+            &[0x00][..],
+            &[0x00, 0x00][..],
+            &[0x00, 0x00, 0x02][..],
+        ] {
+            assert_eq!(resp_first_u32_opt(junk), None, "{junk:?}");
+        }
+
+        // And the handshake must refuse rather than proceed unauthenticated.
+        let mut hs = Handshake::new(0x500);
+        // Walk to AwaitQueryRealm: hello -> response, query-realm -> response.
+        assert!(matches!(hs.poll(), HandshakeAction::Send(_)));
+        hs.on_response(&[0x00, 0x00]);
+        assert!(matches!(hs.poll(), HandshakeAction::Send(_)));
+        hs.on_response(&[0x00, 0x00, 0x02]); // truncated: no readable u32
+        assert_eq!(
+            hs.poll(),
+            HandshakeAction::Failed,
+            "an unreadable realm reply must not be read as `no auth needed`"
+        );
     }
 
     #[test]

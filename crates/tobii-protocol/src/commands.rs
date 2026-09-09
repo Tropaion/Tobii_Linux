@@ -98,19 +98,27 @@ pub fn parse_stream_catalog(payload: &[u8]) -> Vec<StreamEntry> {
     out
 }
 
-/// Parse an `enabled_eye` GET response — the value is the trailing big-endian
-/// `u32` of the scalar element.
+/// Parse an `enabled_eye` GET response.
+///
+/// The payload is the ordinary shape: a 2-byte prefix, then one type-`0x02`
+/// field of size 4 holding the wire value. Hardware-captured, and confirmed
+/// again from the committed replay session:
+///
+/// ```text
+/// 0000  02  00000004  00000003      prefix, type 2, size 4, value 3 = Both
+/// ```
+///
+/// **Parsed structurally**, which it previously was not: it used to read the
+/// last four bytes of whatever slice it was handed, with no check that the
+/// bytes were a field of the right type or size, or that they came from this
+/// response at all. That will read the tail of an unrelated reply as an eye
+/// selection — `parse_enabled_eye(&[0, 0, 0, 2])` returned `Some(Right)` from
+/// four bare bytes with no TLV structure whatsoever. Going through `Reader`
+/// means a reply that is not this reply is rejected instead of interpreted.
 pub fn parse_enabled_eye(payload: &[u8]) -> Option<EnabledEye> {
-    if payload.len() < 4 {
-        return None;
-    }
-    let n = payload.len();
-    let v = u32::from_be_bytes([
-        payload[n - 4],
-        payload[n - 3],
-        payload[n - 2],
-        payload[n - 1],
-    ]);
+    let mut r = Reader::new(payload);
+    r.skip(2); // the 2-byte payload prefix every response carries
+    let v = r.read_u32().ok()?;
     EnabledEye::from_wire(v)
 }
 
@@ -303,6 +311,30 @@ mod tests {
             parse_enabled_eye(&set_enabled_eye_payload(EnabledEye::Left)),
             Some(EnabledEye::Left)
         );
+    }
+
+    /// It used to read the last four bytes of ANY slice, so the tail of an
+    /// unrelated response parsed as an eye selection. Four bare bytes with no
+    /// TLV structure returned `Some(Right)`.
+    #[test]
+    fn a_reply_that_is_not_an_enabled_eye_response_is_refused() {
+        // Four bare bytes: no prefix, no type, no size.
+        assert_eq!(parse_enabled_eye(&[0, 0, 0, 2]), None);
+        // Right shape, wrong field type (1 rather than 2).
+        assert_eq!(
+            parse_enabled_eye(&[0, 0, 0x01, 0, 0, 0, 4, 0, 0, 0, 3]),
+            None
+        );
+        // Right type, wrong declared size.
+        assert_eq!(
+            parse_enabled_eye(&[0, 0, 0x02, 0, 0, 0, 8, 0, 0, 0, 3]),
+            None
+        );
+        // A plausible tail hiding at the end of a longer, unrelated payload.
+        let unrelated = [0u8, 0, 0x02, 0, 0, 0, 4, 0, 0, 0, 99, 0, 0, 0, 2];
+        assert_eq!(parse_enabled_eye(&unrelated), None, "99 is not a valid eye");
+        assert_eq!(parse_enabled_eye(&[]), None);
+        assert_eq!(parse_enabled_eye(&[0, 0]), None);
     }
 
     #[test]
