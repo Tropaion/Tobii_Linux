@@ -34,6 +34,10 @@ fn main() -> ExitCode {
             args.iter().any(|a| a == "--eyes"),
         ),
         (Some("update"), _) => update(&args),
+        // Returns its own exit code rather than a CmdResult: the whole point is
+        // to be transparent to whatever launched it, and a launcher reads the
+        // status of the thing it launched.
+        (Some("game"), _) => return game(&args),
         (Some("headpose"), Some("--model-status")) => model_status(),
         (Some("headpose"), Some("--fetch-model")) => fetch_model(&args),
         (Some("headpose"), Some("--check-update")) => check_model_update(),
@@ -63,6 +67,7 @@ fn main() -> ExitCode {
                 "usage:\n  \
                  tobii update [--install]\n  \
                  tobii stream [--json] [--eyes]\n  \
+                 tobii game -- <command> [args...]\n  \
                  tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE]\n  \
                  tobii headpose --check [--calibrate-pitch [SECS]]\n  \
                  tobii headpose --model-status\n  \
@@ -98,6 +103,103 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Run a command with the tracker held on for as long as it lives.
+///
+/// ```text
+/// tobii game -- %command%          # in Steam's launch options
+/// tobii game -- ./MyGame.x86_64
+/// ```
+///
+/// # Why this exists rather than a switch in the GUI
+///
+/// The tracker is only on while something asks for it, and a game cannot ask:
+/// it speaks opentrack or TrackIR, not this program's socket. Something has to
+/// hold the claim for the game's lifetime and let go afterwards, and the thing
+/// that knows exactly how long a game runs is the process that started it.
+///
+/// Wrapping is also the one integration point every launcher already has.
+/// Steam substitutes `%command%`, Lutris and Heroic have a wrapper field, and a
+/// shell script needs no support at all — so this works without asking any of
+/// them to know what a Tobii is.
+///
+/// # It never stops the game from starting
+///
+/// If the hub is not running there is no socket to connect to, and that is a
+/// warning, not a failure. A user whose game refuses to launch because an eye
+/// tracker daemon is down would rightly remove the wrapper and never put it
+/// back; head tracking is worth less than the game starting.
+fn game(args: &[String]) -> ExitCode {
+    let Some(cmd) = command_after_separator(args) else {
+        eprintln!(
+            "usage: tobii game -- <command> [args...]\n\n\
+             Runs the command with the eye tracker held on, and releases it when\n\
+             the command exits. In Steam, set the launch options to:\n\n    \
+             tobii game -- %command%"
+        );
+        return ExitCode::from(2);
+    };
+
+    // The name is what the hub shows when asked why the tracker is on, so it is
+    // the program being run rather than "tobii game".
+    let name = std::path::Path::new(&cmd[0])
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cmd[0].clone());
+
+    // Held for exactly as long as the child lives. Dropping it is what releases
+    // the tracker, so it is deliberately still in scope below the wait.
+    let client = match tobii_ipc::Client::connect(tobii_ipc::subs::POSE, &name) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "note: could not reach the Tobii hub ({e}); starting {name} anyway, \
+                 without head tracking. Open the hub and relaunch to get it."
+            );
+            None
+        }
+    };
+
+    let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
+    // Explicit, and after the wait: this is the line that puts the tracker out.
+    drop(client);
+
+    match status {
+        Ok(s) => ExitCode::from(exit_code_of(s)),
+        Err(e) => {
+            eprintln!("error: could not run {}: {e}", cmd[0]);
+            ExitCode::from(127)
+        }
+    }
+}
+
+/// The command after `--`, or `None` if there is not one.
+///
+/// A separator is required rather than taking the rest of the line, because
+/// `tobii game --rate 60 thing` should be an error rather than an attempt to
+/// execute `--rate`. Everything after the FIRST `--` is the command, including
+/// any further `--`, which belong to the game.
+fn command_after_separator(args: &[String]) -> Option<Vec<String>> {
+    let at = args.iter().position(|a| a == "--")?;
+    let rest = &args[at + 1..];
+    (!rest.is_empty()).then(|| rest.to_vec())
+}
+
+/// A child's exit status as a process exit code.
+///
+/// A killed child has no exit code, and reporting 0 for one would tell a
+/// launcher the game finished cleanly when it crashed. The shell's convention —
+/// 128 plus the signal — is what every wrapper around it already produces.
+fn exit_code_of(status: std::process::ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        return code as u8;
+    }
+    match status.signal() {
+        Some(sig) => 128u8.saturating_add(sig as u8),
+        None => 1,
     }
 }
 
@@ -2307,6 +2409,44 @@ mod tests {
         for bad in ["0", "-30", "nan", "inf", "", "fast"] {
             assert!(parse_rate(bad).is_err(), "`{bad}` must be rejected");
         }
+    }
+
+    /// A separator is required. `tobii game --rate 60 thing` must be a usage
+    /// error, not an attempt to execute `--rate`.
+    #[test]
+    fn the_command_is_what_follows_the_separator() {
+        assert_eq!(
+            command_after_separator(&args(&["tobii", "game", "--", "prog", "-x"])),
+            Some(vec!["prog".to_string(), "-x".to_string()])
+        );
+        // Further separators belong to the game, not to us.
+        assert_eq!(
+            command_after_separator(&args(&["tobii", "game", "--", "prog", "--", "-y"])),
+            Some(vec!["prog".to_string(), "--".to_string(), "-y".to_string()])
+        );
+        // Nothing to run.
+        assert_eq!(command_after_separator(&args(&["tobii", "game"])), None);
+        assert_eq!(
+            command_after_separator(&args(&["tobii", "game", "--"])),
+            None
+        );
+        assert_eq!(
+            command_after_separator(&args(&["tobii", "game", "prog"])),
+            None,
+            "without a separator there is no command"
+        );
+    }
+
+    /// A killed game must not report success. Telling a launcher the game
+    /// finished cleanly when it was killed hides every crash.
+    #[test]
+    fn a_killed_child_does_not_look_like_a_clean_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(0)), 0);
+        // Raw wait status: low byte is the signal for a killed child.
+        let killed = std::process::ExitStatus::from_raw(9);
+        assert_ne!(exit_code_of(killed), 0, "SIGKILL must not read as success");
+        assert_eq!(exit_code_of(killed), 137, "the shell's 128 + signal");
     }
 
     /// `tobii headpose` shipped in v0.1.0 as plain head pose to opentrack. The

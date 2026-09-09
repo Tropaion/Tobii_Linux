@@ -19,6 +19,8 @@ tobii-diagnostics = { path = "../tobii-diagnostics" }
 # tobii-headpose with default-features off, so this crate's own `onnx` feature
 # still decides whether tract-onnx compiles.
 tobii-output = { path = "../tobii-output" }
+# For `tobii game`: hold the hub's tracking socket open for a child process.
+tobii-ipc = { path = "../tobii-ipc" }
 tobii-update = { path = "../tobii-update" }
 tobii-headpose = { path = "../tobii-headpose", default-features = false }
 

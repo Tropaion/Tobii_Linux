@@ -367,6 +367,30 @@ resting state, not a fault.
 A useful consequence: while the hub is unfocused it holds no USB session, so
 `tobii headpose` can claim the device for a game without closing the hub first.
 
+### Head tracking in a game
+
+The tracker is only on while something asks for it, and a game cannot ask — it
+speaks opentrack or TrackIR, not this program's socket. So wrap the game:
+
+```sh
+tobii game -- %command%        # Steam: paste this into Launch Options
+tobii game -- ./MyGame.x86_64  # or anywhere else
+```
+
+The hub must be running (it is, if you closed its window rather than quitting).
+The tracker comes on when the game starts and goes dark a few seconds after it
+exits — measured on the wrapper above: **0 USB file descriptors held before, 1
+while the game runs, 0 again afterwards.**
+
+`tobii game` is transparent to whatever launched it: it exits with the game's own
+exit code, reports a killed game as 128 + the signal rather than as success, and
+**never stops the game starting**. With no hub running it prints a note and runs
+the game anyway — head tracking is worth less than the game launching.
+
+Steam's `%command%`, Lutris's and Heroic's wrapper fields, and a plain shell
+script all work with no further support, which is why this is a wrapper rather
+than a setting.
+
 ### Closing the window does not quit
 
 Pressing **X** minimises the hub to the taskbar and leaves it running. That is
