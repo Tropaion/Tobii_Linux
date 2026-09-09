@@ -3,7 +3,7 @@
 #
 #   scripts/build.sh                 # check dependencies, build everything
 #   scripts/build.sh --lean          # the CLI only, without the neural backend
-#   scripts/build.sh --install       # build, then copy into ~/.local/bin
+#   scripts/build.sh --install       # build, install, add to the app menu
 #   scripts/build.sh --install /usr/local/bin
 #   scripts/build.sh --udev          # also install the udev rule (needs sudo)
 #   scripts/build.sh --check         # only check dependencies, build nothing
@@ -200,6 +200,42 @@ if [[ $do_install -eq 1 ]]; then
             echo "  ${dim}bash:  echo 'export PATH=\"$install_dir:\$PATH\"' >> ~/.bashrc${reset}"
             ;;
     esac
+
+    # The application menu entry. Installed per-user under XDG_DATA_HOME so this
+    # needs no root; only the GUI has anything to show, so it is skipped for a
+    # --lean build.
+    if [[ $lean -eq 0 ]]; then
+        data="${XDG_DATA_HOME:-$HOME/.local/share}"
+        apps="$data/applications"
+        icons="$data/icons/hicolor/scalable/apps"
+        mkdir -p "$apps" "$icons"
+        cp assets/com.tobiilinux.Configuration.desktop "$apps/"
+        cp assets/com.tobiilinux.Configuration.svg "$icons/"
+
+        # Without this the entry can take minutes to appear, or not appear until
+        # the next login — which reads as "the install did not work".
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database "$apps" 2>/dev/null || true
+        fi
+        if command -v gtk4-update-icon-cache >/dev/null 2>&1; then
+            gtk4-update-icon-cache -qtf "$data/icons/hicolor" 2>/dev/null || true
+        elif command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -qtf "$data/icons/hicolor" 2>/dev/null || true
+        fi
+        echo "  $apps/com.tobiilinux.Configuration.desktop"
+
+        # The entry runs a bare `tobii-gtk`, so it only works if the launcher
+        # can find it. A desktop launcher does not read the user's shell
+        # profile, so ~/.local/bin being on an interactive PATH proves nothing.
+        if [[ "$install_dir" != "/usr/bin" && "$install_dir" != "/usr/local/bin" ]]; then
+            echo
+            echo "  ${dim}The menu entry runs \`tobii-gtk\` from PATH. Desktop launchers do not"
+            echo "  read your shell profile, but most honour ~/.config/environment.d and"
+            echo "  systemd's user environment; if the entry does nothing, either install"
+            echo "  to /usr/local/bin or run:${reset}"
+            echo "  ${dim}systemctl --user import-environment PATH${reset}"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------- udev

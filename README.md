@@ -53,36 +53,153 @@ inspired by the original Tobii Experience UI.
   (Wayland `layer-shell`).
 - **Accuracy diagnostic** (`tobii-gtk --accuracy`) — a 39-target sweep reporting
   error per target, per angle band and per eye, with a diagnosis.
+- **The tracker runs only when something needs it.** Its infrared illuminators
+  are on for exactly as long as a USB session is open, so the session is opened
+  only while a consumer wants data — the hub *while its window has focus*,
+  the gaze overlay while it is shown, a calibration or setup flow while it runs
+  — and closed three seconds after the last one lets go. A hub left open in the
+  background leaves the LEDs dark, and leaves the device free for
+  `tobii headpose` to claim for a game.
+- **Start menu entry and optional autostart.** `scripts/build.sh --install`
+  adds a desktop entry; *Start when I log in* runs `tobii-gtk --background`,
+  which keeps the tracker's configuration applied without opening a window and
+  without turning the tracker on. Launching the app again raises the hub rather
+  than starting a second copy.
 - **Updates** — the hub checks for a new release at launch and can show the
   changelog and install it. Nothing is downloaded without a click. The check can
   be switched off. See [Updates](#updates) for what installing one trusts.
+
+## Installation
+
+There are no distribution packages yet, so this is built from source. The whole
+process is four commands, and `scripts/build.sh` checks the dependencies before
+it starts so a missing package is named in the first second rather than as a
+wall of linker errors five minutes in.
+
+<details open>
+<summary><b>Arch, CachyOS, Manjaro, EndeavourOS</b></summary>
+
+```sh
+sudo pacman -S --needed base-devel git rustup gtk4 gtk4-layer-shell libusb pkgconf
+rustup default stable            # skip if you already have a Rust toolchain
+git clone https://github.com/Tropaion/Tobii_Linux.git && cd Tobii_Linux
+scripts/build.sh --install --udev
+```
+</details>
+
+<details>
+<summary><b>Debian 13+, Ubuntu 24.10+, Pop!_OS, Linux Mint</b></summary>
+
+```sh
+sudo apt install build-essential git curl pkg-config \
+     libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if you have no Rust
+git clone https://github.com/Tropaion/Tobii_Linux.git && cd Tobii_Linux
+scripts/build.sh --install --udev
+```
+
+`libgtk4-layer-shell-dev` is only in Debian 13 (trixie) and Ubuntu 24.10 or
+newer. On an older release, either build it from
+[the upstream project](https://github.com/wmww/gtk4-layer-shell), or skip the
+GUI and build just the command-line tool:
+
+```sh
+sudo apt install build-essential git pkg-config libusb-1.0-0-dev
+scripts/build.sh --lean --install --udev
+```
+
+Ubuntu's `rustc` is often too old; the rustup line above is the reliable route.
+</details>
+
+<details>
+<summary><b>Fedora, RHEL, Rocky, Alma</b></summary>
+
+```sh
+sudo dnf install gcc git rust cargo pkgconf-pkg-config \
+     gtk4-devel gtk4-layer-shell-devel libusb1-devel
+git clone https://github.com/Tropaion/Tobii_Linux.git && cd Tobii_Linux
+scripts/build.sh --install --udev
+```
+
+On RHEL and its rebuilds, `gtk4-layer-shell-devel` comes from
+[EPEL](https://docs.fedoraproject.org/en-US/epel/); without it, use
+`scripts/build.sh --lean` for the command-line tool only.
+</details>
+
+<details>
+<summary><b>openSUSE Tumbleweed / Leap</b></summary>
+
+```sh
+sudo zypper install gcc git rust cargo pkg-config \
+     gtk4-devel gtk4-layer-shell-devel libusb-1_0-devel
+git clone https://github.com/Tropaion/Tobii_Linux.git && cd Tobii_Linux
+scripts/build.sh --install --udev
+```
+</details>
+
+<details>
+<summary><b>NixOS</b></summary>
+
+```sh
+nix-shell -p gcc pkg-config gtk4 gtk4-layer-shell libusb1 cargo rustc
+git clone https://github.com/Tropaion/Tobii_Linux.git && cd Tobii_Linux
+cargo build --release
+```
+
+The udev rule belongs in your configuration rather than being copied into
+`/etc`, since NixOS manages that directory:
+
+```nix
+services.udev.extraRules = builtins.readFile ./assets/99-tobii.rules;
+```
+</details>
+
+<details>
+<summary><b>Any other distribution</b></summary>
+
+You need a C compiler, `pkg-config`, a stable Rust toolchain
+([rustup](https://rustup.rs)), and the **development** packages for **GTK 4**,
+**gtk4-layer-shell** and **libusb 1.0**. Then:
+
+```sh
+scripts/build.sh --check     # names anything still missing
+scripts/build.sh --install --udev
+```
+
+The GUI is the only thing that needs GTK; `scripts/build.sh --lean` builds the
+command-line tool with neither GTK package.
+</details>
+
+`--install` puts `tobii` and `tobii-gtk` in `~/.local/bin`; pass a directory to
+choose another (`scripts/build.sh --install /usr/local/bin`). `--udev` installs
+the device rule described below, which needs `sudo`. Leave both off to just
+build into `target/release/`.
+
+`--install` also adds **Tobii Eye Tracker** to your application menu.
+
+**After installing, re-plug the Eye Tracker 5** so the udev rule takes effect,
+then run `tobii-gtk` or pick it from the menu.
 
 ## Requirements
 
 - **Rust** (stable, edition 2021) — e.g. via [rustup](https://rustup.rs).
 - A **Tobii Eye Tracker 5** (USB `2104:0313`).
 - System libraries: **GTK 4**, **`gtk4-layer-shell`** (for the gaze overlay),
-  and **libusb 1.0** + **pkg-config**.
-  - Arch / CachyOS: `sudo pacman -S --needed gtk4 gtk4-layer-shell libusb pkgconf`
-  - Debian / Ubuntu: `sudo apt install libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev pkg-config`
+  and **libusb 1.0** + **pkg-config**. The GUI needs all of them; the CLI needs
+  only libusb.
 - `curl` or `wget`, and `tar`, for fetching the head-pose model and updates.
 - A **Wayland** session is recommended (the gaze overlay uses `layer-shell`).
 
 ## Build
 
-```sh
-scripts/build.sh
-```
-
-Checks that everything it needs is installed — naming what is missing and the
-command to install it for your distribution — then builds in release mode. A
-missing GTK development package otherwise fails several minutes in, as hundreds
-of linker errors about undefined symbols.
+`scripts/build.sh` is the Installation section's build step on its own, and
+takes the same options:
 
 ```sh
-scripts/build.sh --check            # only check dependencies
+scripts/build.sh                    # check dependencies, build everything
+scripts/build.sh --check            # only check dependencies, build nothing
 scripts/build.sh --lean             # CLI only, without the neural backend
-scripts/build.sh --install          # build, then install into ~/.local/bin
+scripts/build.sh --install [DIR]    # build, then install (default ~/.local/bin)
 scripts/build.sh --udev             # also install the udev rule
 ```
 
@@ -100,16 +217,15 @@ yet.
 
 ## Device access (one-time)
 
-Install the udev rule so the tracker is usable without root:
+Already done if you ran `scripts/build.sh --udev`. By hand:
 
 ```sh
 sudo cp assets/99-tobii.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 ```
 
-(`scripts/build.sh --udev` does the same.)
-
-Then (re-)plug the Eye Tracker 5.
+Then (re-)plug the Eye Tracker 5. Without this the device is only reachable as
+root, and the tracker reports no eyes at all.
 
 ## Usage
 
@@ -119,8 +235,17 @@ Then (re-)plug the Eye Tracker 5.
 cargo run --release -p tobii-gtk
 ```
 
+Or pick **Tobii Eye Tracker** from your application menu, once
+`scripts/build.sh --install` has added it.
+
 The hub shows connection status, the live instrument panel, and the settings:
-improve calibration, head tracking, preview my gaze, select eyes, change screen.
+improve calibration, head tracking, preview my gaze, select eyes, change screen,
+start at login, check for updates.
+
+```sh
+tobii-gtk --background   # no window; keeps the tracker configured (see below)
+tobii-gtk --version
+```
 
 ### Head tracking for games
 
@@ -150,12 +275,53 @@ which is how the sign conventions were confirmed on hardware.
 Run `tobii` with no arguments for the full list, including the protocol
 diagnostics (`streams`, `log`, `dump-stream`, `camera`, `cal-blob`, `cal-points`).
 
+## When the tracker is on
+
+The ET5's infrared illuminators are lit for as long as a USB session is open, so
+this program keeps one open only while something actually wants data:
+
+| Holds the tracker on | For how long |
+|---|---|
+| The hub window | while it has **focus** |
+| Preview my gaze | while the overlay is shown |
+| Calibration, display setup, the accuracy diagnostic | while the flow is running |
+| A queued setting (e.g. select eyes) | until it has been applied |
+
+Three seconds after the last of those lets go, the session closes and the LEDs
+go out. The linger is not arbitrary: closing the session makes the ET5 reboot,
+and the next connect has to re-apply the display area, the eye selection and the
+calibration blob, so alt-tabbing away and back should not pay for that twice.
+
+The hub says **Tracker off** when nothing is asking for it. That is the normal
+resting state, not a fault.
+
+A useful consequence: while the hub is unfocused it holds no USB session, so
+`tobii headpose` can claim the device for a game without closing the hub first.
+
+### Start at login
+
+*Start when I log in* in the hub writes an XDG autostart entry that runs
+`tobii-gtk --background`: no window, and — because nothing is asking for data —
+no tracker either. It exists so the tracker's saved display area and calibration
+are re-applied as soon as anything wants them, which matters because **the ET5
+wipes both every time it reboots**.
+
+Launching the application again, from the menu or the command line, raises the
+hub belonging to that background process rather than starting a second copy.
+
+To turn it off: the same switch, or delete
+`~/.config/autostart/com.tobiilinux.Configuration.desktop`. Turning it off in
+GNOME Tweaks or KDE's Autostart page is also honoured — the switch reads their
+`Hidden=true` / `X-GNOME-Autostart-enabled=false` rather than fighting it.
+
 ## Configuration
 
 Stored under `$XDG_CONFIG_HOME/tobii-linux/` (default `~/.config/tobii-linux/`):
 `config.toml` (display geometry), `calibration.bin`, `enabled_eye`,
 `headpose_pitch_offset`, `update_check`, and `models/` (the fetched head-pose
-model).
+model). The autostart entry, if enabled, is
+`~/.config/autostart/com.tobiilinux.Configuration.desktop`; the menu entry and
+icon go under `~/.local/share/`.
 
 > **Note:** the ET5 wipes its display area *and* its calibration every time it
 > reboots — which it does on every session close — so the driver **re-applies

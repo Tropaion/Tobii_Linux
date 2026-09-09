@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Tobii Eye Tracker
+GenericName=Eye Tracker Configuration
+Comment=Set up and calibrate a Tobii Eye Tracker 5
+Keywords=eye;tracker;tobii;gaze;calibration;head;tracking;
+# No path: the launcher resolves it on PATH, so this entry works whether the
+# binaries were installed into ~/.local/bin or /usr/local/bin.
+Exec=tobii-gtk
+Icon=com.tobiilinux.Configuration
+Terminal=false
+# Must match APP_ID in crates/tobii-gtk/src/lib.rs, or the shell cannot match
+# the window to this entry — the taskbar then shows a generic icon and the
+# "pin to dock" it offers points at nothing.
+StartupWMClass=com.tobiilinux.Configuration
+StartupNotify=true
+Categories=Settings;HardwareSettings;

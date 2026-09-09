@@ -6,6 +6,7 @@
 
 pub mod accuracy;
 pub mod align;
+pub mod autostart;
 pub mod calibrate_flow;
 pub mod calibration_area;
 pub mod device;
@@ -169,7 +170,61 @@ pub fn run() -> glib::ExitCode {
     }
     let app = builder.build();
     app.connect_startup(|_| load_css());
-    app.connect_activate(build_ui);
+
+    // The device thread, started once. In background mode it exists before any
+    // window does; otherwise the first activation creates it.
+    let session: Rc<RefCell<Option<Session>>> = Rc::new(RefCell::new(None));
+    // The hub window, while it is open.
+    let hub: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    // What keeps the process alive with no window, in background mode.
+    let holder: Rc<RefCell<Option<gtk::gio::ApplicationHoldGuard>>> = Rc::new(RefCell::new(None));
+
+    if autostart::background_mode() {
+        let session = session.clone();
+        let holder = holder.clone();
+        app.connect_startup(move |app| {
+            // No window, so nothing would otherwise keep the main loop running.
+            *holder.borrow_mut() = Some(app.hold());
+            // The device thread starts, but the tracker does not: `Demand` is
+            // empty, so no USB session is opened and the illuminators stay off
+            // until something actually asks for data.
+            *session.borrow_mut() = Some(device::spawn());
+        });
+    }
+
+    {
+        let session = session.clone();
+        let hub = hub.clone();
+        app.connect_activate(move |app| {
+            // A second launch — from the menu, the dock, `tobii-gtk` again —
+            // hands off to this instance and lands here. Raise the hub that
+            // already exists rather than building a second one.
+            if let Some(w) = hub.borrow().as_ref() {
+                w.present();
+                return;
+            }
+            let s = session.borrow_mut().take().unwrap_or_else(device::spawn);
+            if let Some(w) = build_hub(app, s) {
+                *hub.borrow_mut() = Some(w);
+            }
+        });
+    }
+    {
+        // When the hub is closed, forget it — so the next activation builds a
+        // new one instead of presenting a destroyed window. In background mode
+        // the process stays alive for the next time; otherwise the last window
+        // closing ends it, as usual.
+        let hub = hub.clone();
+        app.connect_window_removed(move |_, w| {
+            let is_hub = hub
+                .borrow()
+                .as_ref()
+                .is_some_and(|h| h.upcast_ref::<gtk::Window>() == w);
+            if is_hub {
+                *hub.borrow_mut() = None;
+            }
+        });
+    }
     // GApplication also parses argv itself and aborts on any option it does
     // not recognise, so our own flags have to be withheld from it.
     // `accuracy_mode` reads them straight from the environment instead.
@@ -179,8 +234,42 @@ pub fn run() -> glib::ExitCode {
 
 /// Flags this binary handles itself, which must never reach GTK's parser.
 fn is_our_flag(arg: &str) -> bool {
-    matches!(arg, "--accuracy" | "--version" | "-V")
+    matches!(arg, "--accuracy" | "--version" | "-V" | "--background")
 }
+
+/// What the status line says for a device state.
+///
+/// "Idle" is not an error and must not read like one: it is the normal state of
+/// a hub sitting in the background with the tracker deliberately switched off,
+/// and a user who sees "Disconnected" there will go looking for a fault that
+/// does not exist.
+pub fn status_text(status: &device::ConnStatus) -> &'static str {
+    match status {
+        device::ConnStatus::Connected => "Connected",
+        device::ConnStatus::Connecting => "Connecting…",
+        device::ConnStatus::Idle => "Tracker off",
+        device::ConnStatus::Error(_) => "Disconnected",
+    }
+}
+
+/// Keep the tracker running for as long as `win` exists.
+///
+/// Every flow that needs live data runs in its own window, and the hub's own
+/// claim is released the moment it loses focus to one of them — so each flow
+/// has to ask for the tracker itself, for exactly as long as it is on screen.
+fn hold_while_open(demand: &device::Demand, win: &impl IsA<gtk::Window>, reason: &'static str) {
+    let guard = RefCell::new(Some(demand.hold(reason)));
+    win.as_ref().connect_destroy(move |_| {
+        *guard.borrow_mut() = None;
+    });
+}
+
+/// The device thread and the handles onto it.
+type Session = (
+    std::sync::Arc<std::sync::Mutex<device::DeviceState>>,
+    std::sync::mpsc::Sender<device::DeviceCommand>,
+    device::Demand,
+);
 
 /// Whether to run the gaze-accuracy diagnostic instead of the hub.
 pub(crate) fn accuracy_mode() -> bool {
@@ -284,13 +373,29 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
 /// width and the panel's margins were checked. Exposing the real constructor
 /// rather than a probe-only twin means there is nothing here that only test
 /// scaffolding calls.
+/// Build the hub with its own device thread.
+///
+/// Kept for callers that just want a hub; `run` uses [`build_hub`] so it can
+/// share one device thread with the background session.
 pub fn build_ui(app: &Application) {
-    let (state, cmd_tx) = device::spawn();
+    build_hub(app, device::spawn());
+}
+
+/// Build the hub over an existing device thread.
+///
+/// Returns the hub window, or `None` when `--accuracy` took over and there is
+/// no hub to return.
+pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindow> {
+    let (state, cmd_tx, demand) = session;
     // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
     // needs the device thread, so it branches here rather than in `run`.
     if accuracy_mode() {
+        // The diagnostic drives the tracker for its whole run, and nothing else
+        // is open to ask for it, so the claim is held for the life of the
+        // process rather than tied to a window.
+        std::mem::forget(demand.hold("the accuracy diagnostic"));
         accuracy::launch(app, state);
-        return;
+        return None;
     }
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
@@ -514,8 +619,10 @@ pub fn build_ui(app: &Application) {
     {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
+        let demand = demand.clone();
         b_setup.connect_clicked(move |_| {
-            setup_flow::launch(&app, cmd_tx.clone());
+            let win = setup_flow::launch(&app, cmd_tx.clone());
+            hold_while_open(&demand, &win, "display setup");
         });
     }
 
@@ -526,11 +633,17 @@ pub fn build_ui(app: &Application) {
         let app = app.clone();
         let state = state.clone();
         let overlay_win = overlay_win.clone();
+        let demand = demand.clone();
         sw_preview.connect_state_set(move |_sw, on| {
             let mut ow = overlay_win.borrow_mut();
             if on {
                 if ow.is_none() {
-                    *ow = Some(overlay::show(&app, state.clone()));
+                    let w = overlay::show(&app, state.clone());
+                    // The overlay is the one consumer that is useful precisely
+                    // when the hub is not focused, so it must ask for the
+                    // tracker in its own right.
+                    hold_while_open(&demand, &w, "the gaze preview");
+                    *ow = Some(w);
                 }
             } else if let Some(w) = ow.take() {
                 w.close();
@@ -586,6 +699,7 @@ pub fn build_ui(app: &Application) {
         let state = state.clone();
         let cmd_tx = cmd_tx.clone();
         let sw_preview = sw_preview.clone();
+        let demand = demand.clone();
         b_cal.connect_clicked(move |btn| {
             // The gaze preview is a layer-shell surface on the Overlay layer,
             // which composites ABOVE a fullscreen window — the user would end
@@ -599,6 +713,7 @@ pub fn build_ui(app: &Application) {
             btn.set_sensitive(false);
             // The hub's entry is "Improve calibration": refine what is there.
             let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone(), true);
+            hold_while_open(&demand, &win, "calibration");
             let btn = btn.clone();
             win.connect_close_request(move |_| {
                 btn.set_sensitive(true);
@@ -643,6 +758,12 @@ pub fn build_ui(app: &Application) {
         &b_setup,
     ));
     right.append(&section(
+        "Start when I log in",
+        "Keeps the tracker set up from login, so it works in games and other apps without \
+         opening this window first. The tracker itself stays off until something asks for it.",
+        &autostart_switch(),
+    ));
+    right.append(&section(
         "Check for updates",
         "Asks GitHub for the latest release when this window opens. It's the only thing this \
          program does on the network without being asked. Nothing is downloaded until you \
@@ -680,6 +801,7 @@ pub fn build_ui(app: &Application) {
         let cmd_tx = cmd_tx.clone();
         let sw_preview = sw_preview.clone();
         let banner = banner.clone();
+        let demand = demand.clone();
         banner_recal.connect_clicked(move |btn| {
             // Same reasoning as `b_cal`: the gaze-preview overlay would poison
             // the recalibration's own samples.
@@ -691,6 +813,7 @@ pub fn build_ui(app: &Application) {
             // The banner fires when the existing calibration is no longer
             // trusted, so seeding from it would be self-defeating.
             let win = calibrate_flow::launch(&app, state.clone(), cmd_tx.clone(), false);
+            hold_while_open(&demand, &win, "calibration");
             let btn = btn.clone();
             win.connect_close_request(move |_| {
                 btn.set_sensitive(true);
@@ -821,6 +944,9 @@ pub fn build_ui(app: &Application) {
     let tick_app = app.clone();
     let tick_window = window.clone();
     let tick_cmd_tx = cmd_tx.clone();
+    // A forced flow opens without the user clicking anything, so it has to ask
+    // for the tracker itself just like the flows the buttons open.
+    let tick_demand = demand.clone();
     let tick_banner = banner.clone();
     let tick_banner_label = banner_label.clone();
     let tick_breakpoint = breakpoint.take();
@@ -841,7 +967,7 @@ pub fn build_ui(app: &Application) {
         };
         let conn = matches!(snap.status, device::ConnStatus::Connected);
         connected.set(conn);
-        status_label.set_text(if conn { "Connected" } else { "Disconnected" });
+        status_label.set_text(status_text(&snap.status));
         status_dot.queue_draw();
         // Evaluate the calibration state machine once per fresh `Connected`
         // transition (reset on disconnect so a later reconnect — e.g. moved to
@@ -871,7 +997,12 @@ pub fn build_ui(app: &Application) {
                         &cal_evaluated,
                         {
                             let cmd_tx = tick_cmd_tx.clone();
-                            move |app| setup_flow::launch(app, cmd_tx.clone())
+                            let demand = tick_demand.clone();
+                            move |app| {
+                                let w = setup_flow::launch(app, cmd_tx.clone());
+                                hold_while_open(&demand, &w, "display setup");
+                                w
+                            }
                         },
                     ),
                     tobii_config::CalAction::ForceCalibration => launch_forced(
@@ -882,8 +1013,16 @@ pub fn build_ui(app: &Application) {
                         {
                             let state = state.clone();
                             let cmd_tx = tick_cmd_tx.clone();
+                            let demand = tick_demand.clone();
                             move |app| {
-                                calibrate_flow::launch(app, state.clone(), cmd_tx.clone(), false)
+                                let w = calibrate_flow::launch(
+                                    app,
+                                    state.clone(),
+                                    cmd_tx.clone(),
+                                    false,
+                                );
+                                hold_while_open(&demand, &w, "calibration");
+                                w
                             }
                         },
                     ),
@@ -960,7 +1099,48 @@ pub fn build_ui(app: &Application) {
         glib::ControlFlow::Continue
     });
 
+    // The tracker runs while you are looking at the hub, and not otherwise.
+    //
+    // Focus rather than visibility: a hub left open on another workspace, or
+    // behind a game, is not being read, and a bar of infrared LEDs glowing
+    // under the monitor all day is the single most irritating thing a device
+    // like this can do. `Demand`'s three-second linger absorbs the focus
+    // flicker of opening a dialog, and every flow that needs the tracker
+    // without the hub focused — calibration, setup, the gaze overlay — holds
+    // its own claim.
+    let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
+    {
+        let demand = demand.clone();
+        let focus_hold = focus_hold.clone();
+        window.connect_is_active_notify(move |w| {
+            if w.is_active() {
+                let mut h = focus_hold.borrow_mut();
+                if h.is_none() {
+                    *h = Some(demand.hold("the hub window"));
+                }
+            } else {
+                *focus_hold.borrow_mut() = None;
+            }
+        });
+    }
+    // Presenting does not always deliver an is-active notification — on Wayland
+    // it depends on the compositor granting focus — so the first claim is taken
+    // here rather than waited for. If focus never arrives, the notify handler
+    // drops it.
+    *focus_hold.borrow_mut() = Some(demand.hold("the hub window"));
+    // Releasing on close matters as much as taking it: a hub closed while
+    // focused would otherwise leave a claim behind for the life of the process,
+    // which in background mode is until logout.
+    {
+        let focus_hold = focus_hold.clone();
+        window.connect_close_request(move |_| {
+            *focus_hold.borrow_mut() = None;
+            glib::Propagation::Proceed
+        });
+    }
+
     window.present();
+    Some(window)
 }
 
 /// Open a flow the user cannot skip (missing display setup or calibration):
@@ -1009,6 +1189,40 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
         }
     });
     banner.set_visible(true);
+}
+
+/// The switch for starting the hub at login.
+///
+/// Writing the entry can fail — a read-only home directory, a full disk — and a
+/// switch that silently slides back is worse than one that says why, so the
+/// failure is put in the tooltip and the switch is returned to where it was.
+fn autostart_switch() -> Switch {
+    let sw = Switch::new();
+    sw.set_valign(Align::Center);
+    sw.set_active(autostart::is_enabled());
+    sw.set_tooltip_text(Some(
+        "Runs this program in the background at login, with no window.",
+    ));
+    sw.connect_state_set(|sw, on| {
+        match autostart::set_enabled(on) {
+            Ok(()) => {
+                sw.set_tooltip_text(Some(if on {
+                    "Runs this program in the background at login, with no window."
+                } else {
+                    "Not started at login."
+                }));
+                glib::Propagation::Proceed
+            }
+            Err(e) => {
+                eprintln!("could not change the start-at-login setting: {e}");
+                sw.set_tooltip_text(Some(&format!("Could not save this setting: {e}")));
+                // Refuse the change rather than showing a state that is not
+                // what is on disk.
+                glib::Propagation::Stop
+            }
+        }
+    });
+    sw
 }
 
 /// The switch that turns the launch-time release check on and off.

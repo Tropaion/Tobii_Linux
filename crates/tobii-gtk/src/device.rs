@@ -2,6 +2,7 @@
 //! snapshot for the UI, and applies `DeviceCommand`s. `device_tick` (one
 //! iteration) is generic over `Transport` so it is unit-tested without hardware.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -17,11 +18,97 @@ const CAMERA_STREAM: u16 = 0x501;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ConnStatus {
+    /// Nothing needs the tracker, so it is not opened at all.
+    ///
+    /// The default, because a freshly started process has not yet been asked
+    /// for anything. See [`Demand`].
     #[default]
+    Idle,
     Connecting,
     Connected,
     Error(String),
 }
+
+/// Reference-counted reasons to keep the eye tracker running.
+///
+/// The tracker's infrared illuminators are on for as long as a USB session is
+/// open, and a bar of IR LEDs glowing at you from under the monitor all day is
+/// exactly the kind of thing that makes people unplug a device. So the session
+/// is opened only while something actually wants data, and closed again when
+/// nothing does.
+///
+/// Every consumer takes a [`DemandGuard`] and holds it for as long as it needs
+/// frames: the hub while its window has focus, the gaze overlay while it is
+/// shown, a calibration or setup flow while it runs. Dropping the last guard
+/// closes the session, which the ET5 answers by rebooting — which is also why
+/// the display area, eye selection and calibration are re-applied on every
+/// connect.
+///
+/// A second, unplanned benefit: while nothing in the hub wants the tracker, the
+/// USB device is free, so `tobii headpose` can claim it for a game without the
+/// hub having to be closed first.
+#[derive(Clone, Default)]
+pub struct Demand {
+    held: Arc<Mutex<BTreeMap<&'static str, usize>>>,
+}
+
+impl Demand {
+    pub fn new() -> Demand {
+        Demand::default()
+    }
+
+    /// Ask for the tracker, until the returned guard is dropped.
+    ///
+    /// `reason` is shown to the user when they ask why the tracker is on, so it
+    /// should read as a phrase in a sentence: "head tracking", "the gaze
+    /// preview".
+    pub fn hold(&self, reason: &'static str) -> DemandGuard {
+        *self.held.lock().unwrap().entry(reason).or_insert(0) += 1;
+        DemandGuard {
+            held: Arc::clone(&self.held),
+            reason,
+        }
+    }
+
+    /// Whether anything currently wants the tracker.
+    pub fn active(&self) -> bool {
+        !self.held.lock().unwrap().is_empty()
+    }
+
+    /// What is keeping the tracker on, for the user to read.
+    pub fn reasons(&self) -> Vec<&'static str> {
+        self.held.lock().unwrap().keys().copied().collect()
+    }
+}
+
+/// One consumer's claim on the tracker. Releases it when dropped.
+pub struct DemandGuard {
+    held: Arc<Mutex<BTreeMap<&'static str, usize>>>,
+    reason: &'static str,
+}
+
+impl Drop for DemandGuard {
+    fn drop(&mut self) {
+        let mut held = self.held.lock().unwrap();
+        if let Some(n) = held.get_mut(self.reason) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(self.reason);
+            }
+        }
+    }
+}
+
+/// How long the session stays open after the last consumer lets go.
+///
+/// Closing costs more than it looks: the ET5 reboots on session close, so the
+/// next connect has to re-apply the display area, the eye selection and the
+/// calibration blob before any data flows. Without a linger, alt-tabbing away
+/// from the hub and back would pay that twice, and clicking through the hub's
+/// own dialogs — each of which briefly moves focus — would thrash it. Three
+/// seconds is long enough to cover both and short enough that the LEDs go out
+/// while the user is still looking at them.
+const LINGER: Duration = Duration::from_secs(3);
 
 /// Hands out process-unique calibration session tokens. The UI mints one per
 /// `CalBegin` and only trusts a `CalPhase` that carries it back (see
@@ -235,6 +322,154 @@ pub enum DeviceCommand {
     CalAbort,
 }
 
+/// Apply one command from the UI.
+///
+/// Split out of [`device_tick`] so a command that arrived while the tracker was
+/// off — when there was no connection to apply it to — can be applied once one
+/// is open, by the same code and in the same order.
+///
+/// Returns whether the head-pose worker should be rebuilt.
+fn apply_command<T: Transport>(
+    conn: &mut Connection<T>,
+    state: &Mutex<DeviceState>,
+    cmd: DeviceCommand,
+) -> bool {
+    let mut reload_head = false;
+    match cmd {
+        DeviceCommand::SetDisplayArea(c) => {
+            let _ = conn.set_display_area(&c);
+        }
+        DeviceCommand::PitchCalibrate { secs, token } => {
+            calibrate_pitch(conn, state, secs, token);
+        }
+        DeviceCommand::ReloadHeadModel => reload_head = true,
+        DeviceCommand::SetEnabledEye(e) => {
+            let _ = conn.set_enabled_eye(e);
+            let _ = tobii_config::save_enabled_eye(e);
+            state.lock().unwrap().enabled_eye = Some(e);
+        }
+        DeviceCommand::CalBegin { improve, token } => {
+            state.lock().unwrap().calibration = CalPhase::begin(token);
+            // Deliberately does NOT touch enabled_eye. The original never
+            // does during calibration: `CalibrationStart` is hardcoded to
+            // both eyes and the configured selection is used only to pick
+            // which eye's gaze drives dot focus, host-side. Writing it here
+            // mutated persistent device state as a side effect of opening
+            // a calibration.
+
+            // Retrieve whatever calibration is currently active on the
+            // device BEFORE clearing it, so a successful start+clear below
+            // can be re-seeded with it. This is what makes "Improve
+            // calibration" (the hub's manual recalibration path)
+            // meaningfully different from a from-scratch calibration: new
+            // points refine the existing calibration instead of replacing
+            // it outright. An empty/failed retrieve just means there was
+            // nothing to improve on (e.g. a true first-ever calibration) —
+            // proceed as a plain fresh session in that case, exactly as
+            // before this change.
+            let previous_blob = improve
+                .then(|| conn.retrieve_calibration().ok())
+                .flatten()
+                .filter(|b| tobii_usb::is_plausible_calibration(&b.0));
+
+            // Pessimistic: a request fails on a wall-clock deadline, which
+            // is NOT proof the device ignored it — it may have entered the
+            // realm while the ack was lost or late. Record "possibly open"
+            // *before* issuing `start`, so the abort path always tries to
+            // close it. A stale `true` costs one redundant stop; a `false`
+            // with an open realm strands the device in calibration mode.
+            state.lock().unwrap().cal_session_open = true;
+            let r = conn
+                .start_calibration()
+                .and_then(|()| conn.clear_calibration())
+                .map_err(|e| e.to_string());
+
+            // Seeding from the previous calibration is an optimisation, not
+            // a precondition: failing to seed just makes this a from-scratch
+            // session, which is a perfectly good calibration. Keeping it in
+            // the chain above made an unusable stored blob abort the whole
+            // flow — every attempt failing instantly with "can't detect your
+            // eyes", which is not remotely what went wrong.
+            if r.is_ok() {
+                if let Some(blob) = &previous_blob {
+                    if let Err(e) = conn.apply_calibration(&blob.0) {
+                        eprintln!("note: starting from scratch, not seeding ({e})");
+                    }
+                }
+            }
+            match r {
+                // Only now is the session really open for point collection.
+                Ok(()) => state.lock().unwrap().calibration.on_started(),
+                Err(e) => state.lock().unwrap().calibration.on_finish(Err(e)),
+            }
+        }
+        DeviceCommand::CalCollect { x, y } => {
+            let r = conn
+                .add_calibration_point(x, y, tobii_protocol::calibration::CAL_EYE_BOTH)
+                .map_err(|e| e.to_string());
+            state.lock().unwrap().calibration.on_collect(r);
+        }
+        DeviceCommand::CalDiscard { x, y } => {
+            if let Err(e) = conn.discard_calibration_point(x, y) {
+                eprintln!("warning: could not discard calibration point ({e})");
+            }
+        }
+        DeviceCommand::CalComputeGroup => {
+            // A failure here is fatal to the session: the model is now in
+            // an unknown state and collecting more points onto it would
+            // produce a calibration nobody can reason about.
+            if let Err(e) = conn.compute_and_apply_calibration() {
+                state
+                    .lock()
+                    .unwrap()
+                    .calibration
+                    .on_finish(Err(e.to_string()));
+            }
+        }
+        DeviceCommand::CalFinish { mode } => {
+            let (r, stop_acked) = finish_calibration(conn, &mode);
+            let mut s = state.lock().unwrap();
+            // Issuing a stop is not the same as the realm closing: only an
+            // acked stop proves that. If the ack was lost, leave the flag
+            // set so a later abort retries the stop.
+            if stop_acked {
+                s.cal_session_open = false;
+            }
+            s.calibration.on_finish(r);
+        }
+        DeviceCommand::CalAbort => {
+            // Only stop a realm that is actually open: after a successful
+            // finish (which already stopped) a second stop may go
+            // unanswered and would burn a whole request deadline here.
+            // `cal_session_open` — not `calibration.active` — is the honest
+            // predicate: `active` is also false after CalBegin's start
+            // succeeded but clear failed, exactly when a stop is required.
+            if state.lock().unwrap().cal_session_open {
+                // Clear the flag only on an acked stop (see `CalFinish`).
+                if conn.stop_calibration().is_ok() {
+                    state.lock().unwrap().cal_session_open = false;
+                }
+                // `CalBegin` issues a destructive `clear`, and nothing else
+                // puts the calibration back — without this an aborted or
+                // failed session would leave the tracker uncalibrated for
+                // the rest of the USB session. Having no saved blob is
+                // normal (first ever run), not an error.
+                match tobii_config::load_calibration() {
+                    Ok(Some((blob, _meta))) => {
+                        if let Err(e) = conn.apply_calibration(&blob) {
+                            eprintln!("warning: could not restore calibration ({e})");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("warning: could not load saved calibration ({e})"),
+                }
+            }
+            state.lock().unwrap().calibration = CalPhase::default();
+        }
+    }
+    reload_head
+}
+
 /// One iteration: apply any queued commands, then read one transport chunk.
 ///
 /// See [`Tick`] for what the return value distinguishes. The thread loop uses
@@ -248,138 +483,7 @@ pub fn device_tick<T: Transport>(
 ) -> Tick {
     let mut reload_head = false;
     while let Ok(cmd) = cmd_rx.try_recv() {
-        match cmd {
-            DeviceCommand::SetDisplayArea(c) => {
-                let _ = conn.set_display_area(&c);
-            }
-            DeviceCommand::PitchCalibrate { secs, token } => {
-                calibrate_pitch(conn, state, secs, token);
-            }
-            DeviceCommand::ReloadHeadModel => reload_head = true,
-            DeviceCommand::SetEnabledEye(e) => {
-                let _ = conn.set_enabled_eye(e);
-                let _ = tobii_config::save_enabled_eye(e);
-                state.lock().unwrap().enabled_eye = Some(e);
-            }
-            DeviceCommand::CalBegin { improve, token } => {
-                state.lock().unwrap().calibration = CalPhase::begin(token);
-                // Deliberately does NOT touch enabled_eye. The original never
-                // does during calibration: `CalibrationStart` is hardcoded to
-                // both eyes and the configured selection is used only to pick
-                // which eye's gaze drives dot focus, host-side. Writing it here
-                // mutated persistent device state as a side effect of opening
-                // a calibration.
-
-                // Retrieve whatever calibration is currently active on the
-                // device BEFORE clearing it, so a successful start+clear below
-                // can be re-seeded with it. This is what makes "Improve
-                // calibration" (the hub's manual recalibration path)
-                // meaningfully different from a from-scratch calibration: new
-                // points refine the existing calibration instead of replacing
-                // it outright. An empty/failed retrieve just means there was
-                // nothing to improve on (e.g. a true first-ever calibration) —
-                // proceed as a plain fresh session in that case, exactly as
-                // before this change.
-                let previous_blob = improve
-                    .then(|| conn.retrieve_calibration().ok())
-                    .flatten()
-                    .filter(|b| tobii_usb::is_plausible_calibration(&b.0));
-
-                // Pessimistic: a request fails on a wall-clock deadline, which
-                // is NOT proof the device ignored it — it may have entered the
-                // realm while the ack was lost or late. Record "possibly open"
-                // *before* issuing `start`, so the abort path always tries to
-                // close it. A stale `true` costs one redundant stop; a `false`
-                // with an open realm strands the device in calibration mode.
-                state.lock().unwrap().cal_session_open = true;
-                let r = conn
-                    .start_calibration()
-                    .and_then(|()| conn.clear_calibration())
-                    .map_err(|e| e.to_string());
-
-                // Seeding from the previous calibration is an optimisation, not
-                // a precondition: failing to seed just makes this a from-scratch
-                // session, which is a perfectly good calibration. Keeping it in
-                // the chain above made an unusable stored blob abort the whole
-                // flow — every attempt failing instantly with "can't detect your
-                // eyes", which is not remotely what went wrong.
-                if r.is_ok() {
-                    if let Some(blob) = &previous_blob {
-                        if let Err(e) = conn.apply_calibration(&blob.0) {
-                            eprintln!("note: starting from scratch, not seeding ({e})");
-                        }
-                    }
-                }
-                match r {
-                    // Only now is the session really open for point collection.
-                    Ok(()) => state.lock().unwrap().calibration.on_started(),
-                    Err(e) => state.lock().unwrap().calibration.on_finish(Err(e)),
-                }
-            }
-            DeviceCommand::CalCollect { x, y } => {
-                let r = conn
-                    .add_calibration_point(x, y, tobii_protocol::calibration::CAL_EYE_BOTH)
-                    .map_err(|e| e.to_string());
-                state.lock().unwrap().calibration.on_collect(r);
-            }
-            DeviceCommand::CalDiscard { x, y } => {
-                if let Err(e) = conn.discard_calibration_point(x, y) {
-                    eprintln!("warning: could not discard calibration point ({e})");
-                }
-            }
-            DeviceCommand::CalComputeGroup => {
-                // A failure here is fatal to the session: the model is now in
-                // an unknown state and collecting more points onto it would
-                // produce a calibration nobody can reason about.
-                if let Err(e) = conn.compute_and_apply_calibration() {
-                    state
-                        .lock()
-                        .unwrap()
-                        .calibration
-                        .on_finish(Err(e.to_string()));
-                }
-            }
-            DeviceCommand::CalFinish { mode } => {
-                let (r, stop_acked) = finish_calibration(conn, &mode);
-                let mut s = state.lock().unwrap();
-                // Issuing a stop is not the same as the realm closing: only an
-                // acked stop proves that. If the ack was lost, leave the flag
-                // set so a later abort retries the stop.
-                if stop_acked {
-                    s.cal_session_open = false;
-                }
-                s.calibration.on_finish(r);
-            }
-            DeviceCommand::CalAbort => {
-                // Only stop a realm that is actually open: after a successful
-                // finish (which already stopped) a second stop may go
-                // unanswered and would burn a whole request deadline here.
-                // `cal_session_open` — not `calibration.active` — is the honest
-                // predicate: `active` is also false after CalBegin's start
-                // succeeded but clear failed, exactly when a stop is required.
-                if state.lock().unwrap().cal_session_open {
-                    // Clear the flag only on an acked stop (see `CalFinish`).
-                    if conn.stop_calibration().is_ok() {
-                        state.lock().unwrap().cal_session_open = false;
-                    }
-                    // `CalBegin` issues a destructive `clear`, and nothing else
-                    // puts the calibration back — without this an aborted or
-                    // failed session would leave the tracker uncalibrated for
-                    // the rest of the USB session. Having no saved blob is
-                    // normal (first ever run), not an error.
-                    match tobii_config::load_calibration() {
-                        Ok(Some((blob, _meta))) => {
-                            if let Err(e) = conn.apply_calibration(&blob) {
-                                eprintln!("warning: could not restore calibration ({e})");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("warning: could not load saved calibration ({e})"),
-                    }
-                }
-                state.lock().unwrap().calibration = CalPhase::default();
-            }
-        }
+        reload_head |= apply_command(conn, state, cmd);
     }
     // Read one transport chunk and publish every gaze + camera frame in it (the
     // camera stream co-occurs with gaze, so read them together rather than via
@@ -640,11 +744,56 @@ pub struct Tick {
 
 /// Spawn the device thread. It handshakes, then loops `device_tick`; on any
 /// connection failure it records the error and retries after a short delay.
-pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
+pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
     let state = Arc::new(Mutex::new(DeviceState::default()));
     let (tx, rx) = channel::<DeviceCommand>();
+    let demand = Demand::new();
     let thread_state = Arc::clone(&state);
-    std::thread::spawn(move || loop {
+    let thread_demand = demand.clone();
+    std::thread::spawn(move || {
+        // Commands that arrived while the tracker was off. They are not
+        // dropped: "select left eye only" typed into an idle hub has to take
+        // effect, so a queued command is itself a reason to open the session.
+        let mut pending: Vec<DeviceCommand> = Vec::new();
+        loop {
+            // Nothing wants the tracker: do not open it. This is the whole
+            // point of `Demand` — an idle hub leaves the illuminators dark and
+            // the USB device free for `tobii headpose`.
+            while !thread_demand.active() && pending.is_empty() {
+                while let Ok(cmd) = rx.try_recv() {
+                    pending.push(cmd);
+                }
+                if !pending.is_empty() {
+                    break;
+                }
+                {
+                    let mut st = thread_state.lock().unwrap();
+                    if !matches!(st.status, ConnStatus::Idle) {
+                        *st = DeviceState {
+                            status: ConnStatus::Idle,
+                            ..DeviceState::default()
+                        };
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            device_session(&thread_state, &thread_demand, &rx, &mut pending);
+        }
+    });
+    (state, tx, demand)
+}
+
+/// One connection, from open to close.
+///
+/// Returns as soon as the connection is gone — because it failed, because the
+/// device went quiet, or because nothing wants the tracker any more.
+fn device_session(
+    thread_state: &Arc<Mutex<DeviceState>>,
+    demand: &Demand,
+    rx: &Receiver<DeviceCommand>,
+    pending: &mut Vec<DeviceCommand>,
+) {
+    {
         thread_state.lock().unwrap().status = ConnStatus::Connecting;
         match UsbTransport::open().and_then(Connection::connect) {
             Ok(mut conn) => {
@@ -692,8 +841,28 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 // One model, one worker, for the life of the connection.
                 let mut head = HeadWorker::spawn(thread_state.clone());
                 let mut quiet_since = Instant::now();
+                // Anything queued while the tracker was off is applied now that
+                // there is a connection to apply it to.
+                for cmd in pending.drain(..) {
+                    if apply_command(&mut conn, thread_state, cmd) {
+                        head = HeadWorker::spawn(thread_state.clone());
+                    }
+                }
+                // When the last consumer let go. `None` while something still
+                // wants the tracker.
+                let mut idle_since: Option<Instant> = None;
                 loop {
-                    let tick = device_tick(&mut conn, &thread_state, &rx, head.as_ref());
+                    if demand.active() {
+                        idle_since = None;
+                    } else {
+                        let since = *idle_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= LINGER {
+                            // Dropping `conn` closes the session, which the ET5
+                            // answers by rebooting — and the illuminators go out.
+                            break;
+                        }
+                    }
+                    let tick = device_tick(&mut conn, thread_state, rx, head.as_ref());
                     if tick.reload_head {
                         // Dropping the old worker closes its channel, so its
                         // thread ends after the frame it is on.
@@ -713,12 +882,11 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>) {
                 }
             }
             Err(e) => {
-                set_error(&thread_state, &e);
+                set_error(thread_state, &e);
                 std::thread::sleep(Duration::from_millis(750));
             }
         }
-    });
-    (state, tx)
+    }
 }
 
 fn set_error(state: &Mutex<DeviceState>, e: &UsbError) {
@@ -831,6 +999,94 @@ fn now_unix_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The whole point of `Demand`: nothing asked, nothing opened. If this ever
+    /// reports active with no guards held, the tracker's illuminators come on
+    /// at login and stay on until logout.
+    #[test]
+    fn nothing_wants_the_tracker_until_something_asks() {
+        let d = Demand::new();
+        assert!(!d.active(), "a fresh Demand must not open the tracker");
+        assert!(d.reasons().is_empty());
+
+        let g = d.hold("the hub window");
+        assert!(d.active());
+        assert_eq!(d.reasons(), vec!["the hub window"]);
+
+        drop(g);
+        assert!(!d.active(), "the last guard going must close the session");
+        assert!(d.reasons().is_empty());
+    }
+
+    /// Guards nest. The hub holding one while a calibration flow holds another
+    /// must not let the first one released close the tracker under the second.
+    #[test]
+    fn the_tracker_stays_on_until_every_consumer_has_let_go() {
+        let d = Demand::new();
+        let hub = d.hold("the hub window");
+        let cal = d.hold("calibration");
+        let overlay = d.hold("the gaze preview");
+        assert_eq!(d.reasons().len(), 3);
+
+        drop(hub);
+        assert!(d.active(), "two consumers still want it");
+        drop(cal);
+        assert!(d.active(), "the overlay still wants it");
+        drop(overlay);
+        assert!(!d.active());
+    }
+
+    /// Two claims for the same reason — two calibration windows, or a flow
+    /// reopened before the old one finished being torn down — must be counted,
+    /// not collapsed. Collapsing them means the first close turns the tracker
+    /// off under the second.
+    #[test]
+    fn two_claims_for_the_same_reason_are_counted_separately() {
+        let d = Demand::new();
+        let a = d.hold("calibration");
+        let b = d.hold("calibration");
+        assert_eq!(d.reasons(), vec!["calibration"], "shown once");
+
+        drop(a);
+        assert!(d.active(), "the second claim is still held");
+        drop(b);
+        assert!(!d.active());
+    }
+
+    /// Guards are handed to GTK closures that can be dropped on any thread the
+    /// main loop happens to finalise them on, and the device thread reads
+    /// `active()` continuously.
+    #[test]
+    fn demand_is_safe_to_hold_and_release_from_several_threads() {
+        let d = Demand::new();
+        let outer = d.hold("the hub window");
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let d = d.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let _g = d.hold(if i % 2 == 0 {
+                        "calibration"
+                    } else {
+                        "display setup"
+                    });
+                    assert!(d.active(), "our own guard is held");
+                }
+            }));
+        }
+        // The device thread's view, running concurrently.
+        for _ in 0..2_000 {
+            assert!(d.active(), "the outer guard is never released");
+            let _ = d.reasons();
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(d.reasons(), vec!["the hub window"], "all inner guards gone");
+        drop(outer);
+        assert!(!d.active());
+    }
+
     use super::*;
 
     use std::collections::VecDeque;

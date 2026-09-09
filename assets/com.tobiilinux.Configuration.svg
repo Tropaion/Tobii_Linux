@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The tracker seen head-on: the dark bar, and the eye it is looking for.
+
+  Deliberately legible at 16px, where an icon spends most of its life in a
+  taskbar. That rules out fine detail: at that size the only things that survive
+  are the silhouette, one strong contrast, and the accent dot. The accent is the
+  same amber the hub spends on its one call to action.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a444e"/>
+      <stop offset="1" stop-color="#1b2027"/>
+    </linearGradient>
+  </defs>
+
+  <!-- The sensor bar. Rounded like the hub's cards. -->
+  <rect x="4" y="20" width="56" height="24" rx="10" fill="url(#bar)"/>
+  <rect x="4" y="20" width="56" height="24" rx="10" fill="none"
+        stroke="#4b5561" stroke-width="1.5"/>
+
+  <!-- The eye: an almond of two arcs, centred on the bar. -->
+  <path d="M14 32 C 21 22, 43 22, 50 32 C 43 42, 21 42, 14 32 Z"
+        fill="#0e1216" stroke="#8a949d" stroke-width="1.6" stroke-linejoin="round"/>
+
+  <!-- Iris and pupil. -->
+  <circle cx="32" cy="32" r="7.5" fill="#f2b134"/>
+  <circle cx="32" cy="32" r="3.4" fill="#0e1216"/>
+  <!-- Catch-light: the one thing that reads as "this is an eye" at 16px. -->
+  <circle cx="34.6" cy="29.4" r="1.5" fill="#ffffff" opacity="0.9"/>
+
+  <!-- The two infrared illuminators, at the ends of the bar. -->
+  <circle cx="9.5" cy="32" r="2.2" fill="#2b333d"/>
+  <circle cx="54.5" cy="32" r="2.2" fill="#2b333d"/>
+</svg>
