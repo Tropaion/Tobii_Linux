@@ -74,10 +74,33 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// How deeply arrays and objects may nest.
+///
+/// Without a limit, `value` -> `array` -> `value` recurses once per opening
+/// bracket, so a reply of nothing but `[[[[...` overflows the stack and aborts
+/// the process — and this parser runs on the reply to an unauthenticated GET
+/// made automatically at every launch. A few kilobytes of brackets was enough.
+/// A GitHub releases listing nests four deep; 64 leaves room for a format
+/// change and still fails long before the stack does.
+pub const MAX_DEPTH: usize = 64;
+
+/// Largest document this will parse, in bytes.
+///
+/// A releases page with twenty entries is a few hundred kilobytes. The cap is
+/// on the same footing as the depth limit: an answer this program did not ask
+/// for should not be able to decide how much memory it uses.
+pub const MAX_LEN: usize = 8 * 1024 * 1024;
+
 /// Parse one JSON document. Trailing whitespace is allowed, trailing data is not.
 pub fn parse(text: &str) -> Result<Value, ParseError> {
     let b = text.as_bytes();
-    let mut p = Parser { b, i: 0 };
+    if b.len() > MAX_LEN {
+        return Err(ParseError {
+            at: 0,
+            what: "the document is too large to parse",
+        });
+    }
+    let mut p = Parser { b, i: 0, depth: 0 };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -90,6 +113,8 @@ pub fn parse(text: &str) -> Result<Value, ParseError> {
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    /// How many arrays and objects are open at this point.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -134,11 +159,22 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Enter a nested container, refusing to go deeper than [`MAX_DEPTH`].
+    fn push(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.err("nested too deeply"));
+        }
+        Ok(())
+    }
+
     fn object(&mut self) -> Result<Value, ParseError> {
+        self.push()?;
         self.i += 1; // '{'
         let mut map = BTreeMap::new();
         self.ws();
         if self.eat(b'}') {
+            self.depth -= 1;
             return Ok(Value::Object(map));
         }
         loop {
@@ -159,6 +195,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.eat(b'}') {
+                self.depth -= 1;
                 return Ok(Value::Object(map));
             }
             return Err(self.err("expected ',' or '}'"));
@@ -166,10 +203,12 @@ impl<'a> Parser<'a> {
     }
 
     fn array(&mut self) -> Result<Value, ParseError> {
+        self.push()?;
         self.i += 1; // '['
         let mut out = Vec::new();
         self.ws();
         if self.eat(b']') {
+            self.depth -= 1;
             return Ok(Value::Array(out));
         }
         loop {
@@ -180,6 +219,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.eat(b']') {
+                self.depth -= 1;
                 return Ok(Value::Array(out));
             }
             return Err(self.err("expected ',' or ']'"));
@@ -362,6 +402,41 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?} should not parse");
         }
+    }
+
+    /// The one that could take the program down. `value` recurses into
+    /// `array`, so before the depth limit a reply of nothing but opening
+    /// brackets overflowed the stack — and stack overflow in Rust is an abort,
+    /// not a panic, so it could not be caught. This runs on a reply fetched
+    /// automatically at launch, so the crash needed no user action at all.
+    #[test]
+    fn a_deeply_nested_reply_is_refused_instead_of_overflowing_the_stack() {
+        let deep = "[".repeat(200_000) + &"]".repeat(200_000);
+        let e = parse(&deep).expect_err("200k deep must be refused");
+        assert_eq!(e.what, "nested too deeply");
+
+        // The limit is on nesting depth, not on length: a long flat document
+        // and one nested right up to the limit both still parse.
+        let flat = format!("[{}]", vec!["1"; 50_000].join(","));
+        assert_eq!(parse(&flat).unwrap().as_array().len(), 50_000);
+        let at_limit = "[".repeat(MAX_DEPTH) + &"]".repeat(MAX_DEPTH);
+        assert!(parse(&at_limit).is_ok(), "{MAX_DEPTH} deep is allowed");
+        let over = "[".repeat(MAX_DEPTH + 1) + &"]".repeat(MAX_DEPTH + 1);
+        assert!(parse(&over).is_err(), "one deeper is not");
+    }
+
+    /// Depth is unwound on the way out, so a document that opens and closes
+    /// many containers in sequence is not mistaken for a deep one.
+    #[test]
+    fn sibling_containers_do_not_accumulate_depth() {
+        let siblings = format!("[{}]", vec!["[[1]]"; 1_000].join(","));
+        assert!(parse(&siblings).is_ok(), "siblings nest 3 deep, not 3000");
+    }
+
+    #[test]
+    fn an_oversized_document_is_refused_before_it_is_walked() {
+        let huge = format!("\"{}\"", "x".repeat(MAX_LEN));
+        assert!(parse(&huge).is_err());
     }
 
     #[test]
