@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/tobii-protocol", "crates/tobii-usb", "crates/tobii-cli", "crates/tobii-config", "crates/tobii-diagnostics", "crates/tobii-gtk", "crates/tobii-headpose", "crates/tobii-recap", "crates/tobii-update"]
+members = ["crates/tobii-protocol", "crates/tobii-usb", "crates/tobii-cli", "crates/tobii-config", "crates/tobii-diagnostics", "crates/tobii-gtk", "crates/tobii-headpose", "crates/tobii-ipc", "crates/tobii-output", "crates/tobii-recap", "crates/tobii-update"]
+
+# The Wine-side bridge (`bridge/`) is a separate workspace: it targets
+# x86_64-pc-windows-gnu, and `cargo clippy --workspace --all-targets` — a hard
+# gate here — would otherwise try to compile its winapi code for the host.
+exclude = ["bridge"]
 
 [workspace.package]
 # One version for the whole workspace: it is what a release is tagged with and

@@ -78,7 +78,7 @@ fn calibration_meta_path() -> PathBuf {
 /// a truncated file that [`read_opt`] cannot tell from a good one — this
 /// matters both for the calibration blob (re-applied to the device on every
 /// connect) and for its metadata sidecar.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

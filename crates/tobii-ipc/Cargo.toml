@@ -1,0 +1,11 @@
+[package]
+name = "tobii-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local IPC between the tobii daemon and its clients (GUI, CLI, game output)."
+
+# Deliberately dependency-free, including on the other workspace crates. This is
+# the transport; what travels over it stays opaque, so payloads are `Vec<u8>`
+# and clients decode them with whatever crate already owns that format.
+[dependencies]

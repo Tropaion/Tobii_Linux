@@ -1516,6 +1516,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-ipc"
+version = "0.1.0"
+
+[[package]]
+name = "tobii-output"
+version = "0.1.0"
+dependencies = [
+ "tobii-config",
+ "tobii-headpose",
+ "tobii-protocol",
+]
+
+[[package]]
 name = "tobii-protocol"
 version = "0.1.0"
 

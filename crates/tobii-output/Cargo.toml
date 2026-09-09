@@ -1,0 +1,14 @@
+[package]
+name = "tobii-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Routes ET5 head pose and gaze to game-facing sinks (opentrack, the Wine bridge)."
+
+[dependencies]
+tobii-protocol = { path = "../tobii-protocol" }
+# No `onnx`: this crate needs only `HeadPose` and the opentrack encoder, and
+# the Wine bridge depends on it by path — leaving defaults on would
+# cross-compile tract-onnx's tree to x86_64-pc-windows-gnu for nothing.
+tobii-headpose = { path = "../tobii-headpose", default-features = false }
+tobii-config = { path = "../tobii-config" }
