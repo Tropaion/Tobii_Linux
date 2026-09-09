@@ -59,8 +59,12 @@ pub fn to_opentrack_datagram(p: &HeadPose) -> [u8; DATAGRAM_LEN] {
         p.roll_deg,
     ];
     let mut out = [0u8; DATAGRAM_LEN];
-    for (slot, value) in out.chunks_exact_mut(8).zip(values) {
-        slot.copy_from_slice(&value.to_le_bytes());
+    // `as_chunks_mut` gives `&mut [u8; 8]` slots, so each field is written into
+    // a fixed-size array rather than a slice that only happens to be 8 long.
+    let (slots, rest) = out.as_chunks_mut::<8>();
+    debug_assert!(rest.is_empty(), "the datagram is a whole number of doubles");
+    for (slot, value) in slots.iter_mut().zip(values) {
+        *slot = value.to_le_bytes();
     }
     out
 }

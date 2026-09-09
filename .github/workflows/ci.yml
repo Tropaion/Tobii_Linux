@@ -50,13 +50,19 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # No toolchain named here: rust-toolchain.toml pins the version and its
+      # components, so CI and a contributor's machine run the same clippy and
+      # the same rustfmt. They did not, once, and CI failed on its first run
+      # over a lint the maintainer's toolchain was too old to see.
       - name: Install the Rust toolchain
         run: |
           set -eux
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable \
-                       --component rustfmt --component clippy
+            | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
 
       - name: Report versions
         run: |
@@ -71,7 +77,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-trixie-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-trixie-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-trixie-
 
       # Formatting first: it is the fastest to run and the least interesting to

@@ -1,0 +1,21 @@
+# The toolchain this project is built and checked with.
+#
+# Pinned, because CI runs `clippy -D warnings` and `cargo fmt --check` — and
+# both of those change meaning when the toolchain moves underneath them. On a
+# floating `stable`, a new clippy release turns every open pull request red
+# without anybody changing a line, and a new rustfmt reformats files the last
+# commit had just formatted correctly.
+#
+# That is not hypothetical here: this pin was added after CI failed on its very
+# first run, on a lint (`chunks_exact_to_as_chunks`) that the maintainer's local
+# toolchain — one release behind — could not see. The README tells contributors
+# they can run the three CI commands locally; this is what makes that true.
+#
+# rustup reads this file automatically, so `cargo test` in this directory uses
+# the pinned toolchain and installs it on first use. To move it: change the
+# version, run the three commands, and fix whatever the new clippy has learned
+# to notice, in its own commit.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

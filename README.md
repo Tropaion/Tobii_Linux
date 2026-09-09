@@ -465,6 +465,12 @@ They pass on `main`; running them before you push saves a round trip. CI runs
 them in the same Debian 13 container the releases are built in, so a pull
 request is also compiled against the GTK version releases use.
 
+`rust-toolchain.toml` pins the compiler, and rustup honours it automatically, so
+your `clippy` and `rustfmt` are the same ones CI runs — `-D warnings` and
+`fmt --check` are otherwise a moving target that turns pull requests red without
+anyone changing a line. If your Rust came from your distribution rather than
+rustup it may be too old to build this at all; rustup is the reliable route.
+
 **What CI cannot check:** anything needing the tracker itself. The accuracy
 figure, the head-pose sign conventions and the tracker-on behaviour above were
 all measured on hardware by hand, and the `Status` section says which claims

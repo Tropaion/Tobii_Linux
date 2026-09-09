@@ -81,12 +81,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The pinned toolchain from rust-toolchain.toml, so a release is built
+      # with the same compiler the checks ran under.
       - name: Install the Rust toolchain
         run: |
           set -eux
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+            | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
 
       # The same script a maintainer would run locally, so there is one
       # definition of what a release archive is. It builds, refuses on a

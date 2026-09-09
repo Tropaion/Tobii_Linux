@@ -63,13 +63,13 @@ impl Sha256 {
             self.compress(&block);
             self.buffered = 0;
         }
-        let mut chunks = data.chunks_exact(64);
-        for c in &mut chunks {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(c);
-            self.compress(&block);
+        // `as_chunks` rather than `chunks_exact`: it yields `&[u8; 64]`
+        // directly, so the block goes straight to `compress` instead of being
+        // copied into a temporary array first.
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
+            self.compress(block);
         }
-        let rest = chunks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
         self.buffered = rest.len();
     }
@@ -156,6 +156,52 @@ pub fn hex_digest(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cross-checked against coreutils, not just against the three vectors
+    /// everybody quotes. This is the primitive that decides whether a
+    /// downloaded release archive is the one the checksums describe, so "it
+    /// passes the famous test vectors" is a low bar: the interesting failures
+    /// are at the block and padding boundaries (55, 56, 64, 119, 120 bytes),
+    /// which the standard vectors do not reach.
+    ///
+    /// Skipped rather than failed where `sha256sum` is absent, so a minimal
+    /// container does not report a hashing bug it cannot have observed.
+    #[test]
+    fn agrees_with_sha256sum_at_every_length_around_the_block_boundaries() {
+        use std::io::Write;
+        let probe = std::process::Command::new("sha256sum")
+            .arg("--version")
+            .output();
+        if probe.is_err() {
+            eprintln!("skipping: sha256sum is not installed");
+            return;
+        }
+        let mut checked = 0;
+        for len in (0..=200usize).chain([255, 256, 257, 1000, 65_536]) {
+            // Not all one byte: a constant input hides byte-order mistakes.
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let mut child = std::process::Command::new("sha256sum")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("sha256sum runs");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(&data)
+                .expect("wrote the input");
+            let out = child.wait_with_output().expect("sha256sum finished");
+            let expected = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .expect("a digest")
+                .to_string();
+            assert_eq!(hex_digest(&data), expected, "length {len}");
+            checked += 1;
+        }
+        assert!(checked > 200, "the loop should have run");
+    }
 
     #[test]
     fn matches_the_standard_vectors() {
