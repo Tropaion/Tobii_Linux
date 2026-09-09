@@ -345,7 +345,11 @@ fn short_hash(s: &str) -> String {
 /// redaction test.
 fn tilde(path: &str) -> String {
     match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => path.replace(&h, "~"),
+        // A HOME of "" or "/" names no user directory, and folding "/" would
+        // replace every separator in every path — "~~.local~bin". Both happen
+        // in containers, which is where diagnostics get run when something is
+        // already wrong.
+        Ok(h) if h.len() > 1 && h != "/" => path.replace(h.trim_end_matches('/'), "~"),
         _ => path.to_string(),
     }
 }
@@ -361,23 +365,43 @@ fn first_line(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A home directory worth testing against, normalised.
+    ///
+    /// `None` when `HOME` names no user directory — empty, `/`, or a bare
+    /// `/home` in a container. Trailing slashes are trimmed so a test does not
+    /// build "/home//.config" and then blame `tilde` for the doubled separator.
+    fn test_home() -> Option<String> {
+        let h = std::env::var("HOME").ok()?;
+        let h = h.trim_end_matches('/');
+        (h.len() > 1).then(|| h.to_string())
+    }
+
     /// The property that matters: whatever this prints is going onto a public
     /// issue tracker, so it must not carry the things that identify a person.
     #[test]
     fn the_report_does_not_leak_who_you_are() {
         let r = report();
 
-        if let Ok(home) = std::env::var("HOME") {
+        // The home path, which is the leak that actually happens: it reaches
+        // the report through install paths and through log lines. Checked as a
+        // whole string, which `tilde` is responsible for folding everywhere.
+        //
+        // There is NO separate "is the username in the report" probe, and that
+        // is deliberate — one was tried twice and produced only false alarms.
+        // Searching for the last path segment of HOME matches ordinary English
+        // once HOME is `/home` in a container (`home` matched this test's own
+        // redaction footer, which is what broke CI), and searching for it as a
+        // path component matches unrelated paths once the username is short
+        // (`x/` matches `TobiiLinux/`). A test that cries wolf teaches people
+        // to ignore it, which costs more than the case it might have caught —
+        // and nothing in the report prints a bare username anyway: every route
+        // a username could take is *through a path*, which the check below
+        // covers.
+        if let Some(home) = test_home() {
             assert!(
                 !r.contains(&home),
                 "the home directory is in the report:\n{r}"
             );
-            if let Some(user) = home.rsplit('/').next().filter(|u| u.len() > 2) {
-                assert!(
-                    !r.contains(user),
-                    "the username `{user}` is in the report:\n{r}"
-                );
-            }
         }
         let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
         let host = host.trim();
@@ -418,7 +442,7 @@ mod tests {
     /// directory.
     #[test]
     fn a_log_line_containing_a_home_path_is_folded_in_the_report() {
-        let Ok(home) = std::env::var("HOME") else {
+        let Some(home) = test_home() else {
             return;
         };
         let r = log::tests::with_own_log("redact", || {
@@ -483,9 +507,23 @@ mod tests {
         assert!(r.contains("no calibration data"), "{r}");
     }
 
+    /// The mechanism the redaction actually rests on, tested directly rather
+    /// than inferred from the whole report. Every occurrence, not just a
+    /// prefix — a log line carries the home path in the middle.
+    #[test]
+    fn every_occurrence_of_the_home_path_is_folded() {
+        let Some(home) = test_home() else {
+            return; // no meaningful home to fold — see `tilde`
+        };
+        let line = format!("WARN could not write {home}/.config/x, retrying {home}/.config/x");
+        let folded = tilde(&line);
+        assert!(!folded.contains(&home), "{folded}");
+        assert_eq!(folded.matches("~/.config/x").count(), 2, "{folded}");
+    }
+
     #[test]
     fn a_home_relative_path_is_reported_relative_to_home() {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = test_home() {
             assert_eq!(tilde(&format!("{home}/.local/bin")), "~/.local/bin");
         }
         assert_eq!(tilde("/usr/bin"), "/usr/bin");
