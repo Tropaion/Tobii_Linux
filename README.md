@@ -71,12 +71,25 @@ inspired by the original Tobii Experience UI.
 ## Build
 
 ```sh
-cargo build --release
+scripts/build.sh
 ```
 
-The neural head-pose backend is on by default and brings a sizeable dependency
-tree (`tract`, ~110 crates). The **CLI** can be built without it — 5 DOF head
-tracking, everything else unchanged:
+Checks that everything it needs is installed — naming what is missing and the
+command to install it for your distribution — then builds in release mode. A
+missing GTK development package otherwise fails several minutes in, as hundreds
+of linker errors about undefined symbols.
+
+```sh
+scripts/build.sh --check            # only check dependencies
+scripts/build.sh --lean             # CLI only, without the neural backend
+scripts/build.sh --install          # build, then install into ~/.local/bin
+scripts/build.sh --udev             # also install the udev rule
+```
+
+Plain `cargo build --release` works too. The neural head-pose backend is on by
+default and brings a sizeable dependency tree (`tract`, ~110 crates); the
+**CLI** can be built without it — 5 DOF head tracking, everything else
+unchanged, and a 1 MB binary instead of 32 MB:
 
 ```sh
 cargo build --release -p tobii-cli --no-default-features
@@ -93,6 +106,8 @@ Install the udev rule so the tracker is usable without root:
 sudo cp assets/99-tobii.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 ```
+
+(`scripts/build.sh --udev` does the same.)
 
 Then (re-)plug the Eye Tracker 5.
 
