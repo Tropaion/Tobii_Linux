@@ -124,7 +124,27 @@ round trips.
 
 It is written to be read before it is sent: no calibration data, the monitor id
 hashed (it is derived from the EDID serial), and no username, home path or
-hostname. There is a test that fails if any of those appear in the output.
+hostname. There is a test that fails if any of those appear in the output — and
+it earned its keep: it caught `tilde()` folding a home path only at the *start*
+of a string, so a path in the middle of a log line went into the report intact.
+
+### The log
+
+There is no logging framework here — no `log`, no `tracing` — for the same
+reason SHA-256 and JSON are hand-rolled: a driver installable from source pays
+for every crate in its tree. `tobii_diagnostics::log::warn` writes three places
+at once: stderr (so nothing that was visible in a terminal stops being), a
+60-line ring in memory, and a 128 KB-capped file at
+`$XDG_STATE_HOME/tobii-linux/tobii.log`.
+
+The reason it exists: **a hub launched from the application menu has its stderr
+wired to the journal or to `/dev/null`.** Every warning the GUI produced —
+"could not apply saved calibration" being the one that matters most — was
+written somewhere the user would never look, so a bug report arrived saying
+"tracking is bad" with no way to recover what the program already knew.
+
+`TOBII_LOG_FILE` overrides the path, which is also how this crate's own tests
+avoid flooding the real log.
 
 Issue forms are under `.github/ISSUE_TEMPLATE/`. Blank issues are disabled so
 the bug form cannot be bypassed by accident, with links out to Discussions for

@@ -1,5 +1,9 @@
-//! `tobii debug` — everything an issue report needs, and nothing that
-//! identifies you.
+//! The report `tobii debug` prints and the hub's **Copy diagnostics** button
+//! copies — everything an issue report needs, and nothing that identifies you.
+//!
+//! Shared by both binaries on purpose: a GUI that produced a different report
+//! from the CLI would mean triage depending on which one the reporter happened
+//! to run.
 //!
 //! # Why this is text you paste, not a file you attach
 //!
@@ -27,6 +31,8 @@
 //!
 //! The report ends with a line saying all of this, so the person pasting it can
 //! see what they are agreeing to rather than having to trust the tool.
+
+pub mod log;
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -81,12 +87,43 @@ pub fn report() -> String {
     let _ = writeln!(o, "  {:<16} {}", "update check", update_check());
     let _ = writeln!(o, "  {:<16} {}", "head-pose model", head_model());
 
+    let tail = recent_log();
+    if tail.is_empty() {
+        let _ = writeln!(o, "\nrecent log     (empty — nothing has been logged yet)");
+    } else {
+        let _ = writeln!(o, "\nrecent log ({} lines, newest last)", tail.len());
+        for line in &tail {
+            let _ = writeln!(o, "  {line}");
+        }
+    }
+
     let _ = writeln!(
         o,
         "\nredacted: username, home path, hostname, monitor serial (hashed above).\n\
          no calibration data is included — only when it was made and how."
     );
     o
+}
+
+/// The last few log lines, from this process and from the file.
+///
+/// Both, because they answer different questions: the ring buffer has what THIS
+/// process just did, and the file has what the *hub* did — which is the half a
+/// user cannot see, since a GUI launched from the menu writes its stderr to the
+/// journal or to nothing.
+///
+/// Paths are folded to `~` here rather than when written, so a local reader
+/// still sees real paths in the file itself.
+fn recent_log() -> Vec<String> {
+    const KEEP: usize = 15;
+    let mut lines = log::tail_file(KEEP);
+    for l in log::recent(KEEP) {
+        if !lines.contains(&l) {
+            lines.push(l);
+        }
+    }
+    let start = lines.len().saturating_sub(KEEP);
+    lines[start..].iter().map(|l| tilde(l)).collect()
 }
 
 /// How this copy was installed, which decides who should update it.
@@ -294,13 +331,21 @@ fn short_hash(s: &str) -> String {
     format!("{}…", &full[..8])
 }
 
-/// Replace the home directory with `~`.
+/// Replace the home directory with `~`, wherever it appears.
 ///
 /// Both for privacy and because it makes two reports comparable: `~/.local/bin`
 /// is the same fact on every machine, `/home/someone/.local/bin` is not.
+///
+/// **Every occurrence, not just a prefix.** This used to be `starts_with` plus
+/// `replacen(.., 1)`, which is right for a bare path and wrong for everything
+/// else the report now carries: a log line reads
+/// `2026-… WARN could not write /home/someone/.config/…`, where the home path
+/// is in the middle. It went into the report verbatim, in the one feature whose
+/// entire purpose is not publishing that. Caught by this module's own
+/// redaction test.
 fn tilde(path: &str) -> String {
     match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && path.starts_with(&h) => path.replacen(&h, "~", 1),
+        Ok(h) if !h.is_empty() => path.replace(&h, "~"),
         _ => path.to_string(),
     }
 }
@@ -348,17 +393,61 @@ mod tests {
         }
     }
 
+    /// The point of the whole logging module: a warning the HUB wrote must
+    /// reach a report the CLI produces, because they are separate processes and
+    /// the hub's warnings are the ones a user cannot otherwise see — a GUI
+    /// launched from the application menu writes stderr to the journal or to
+    /// nothing.
+    #[test]
+    fn a_warning_from_another_process_reaches_the_report() {
+        // The ring buffer is per-process, so this covers the in-process half;
+        // the file half is what carries it across, and `recent_log` reads both.
+        let r = log::tests::with_own_log("report", || {
+            log::warn("test: a warning that must show up in the report");
+            report()
+        });
+        assert!(
+            r.contains("a warning that must show up in the report"),
+            "the log tail is missing from the report:\n{r}"
+        );
+        assert!(r.contains("recent log"), "{r}");
+    }
+
+    /// Log lines go into the report, so they get the same redaction as
+    /// everything else — a warning naming a path must not publish a home
+    /// directory.
+    #[test]
+    fn a_log_line_containing_a_home_path_is_folded_in_the_report() {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let r = log::tests::with_own_log("redact", || {
+            log::warn(&format!(
+                "test: could not write {home}/.config/tobii-linux/x"
+            ));
+            report()
+        });
+        assert!(
+            !r.contains(&home),
+            "the home path leaked through the log:\n{r}"
+        );
+        assert!(r.contains("~/.config/tobii-linux/x"), "{r}");
+    }
+
     /// It has to be pasteable into a GitHub issue form, which is the only place
     /// it can actually be required. A wall of text is not.
     #[test]
     fn the_report_is_small_enough_to_paste() {
         let r = report();
+        // The fixed part is ~35 lines; the log tail adds at most KEEP more.
+        // Both together still paste into an issue form without scrolling being
+        // a problem, which is the actual requirement.
         assert!(
-            r.lines().count() < 45,
+            r.lines().count() < 60,
             "{} lines is too long to paste",
             r.lines().count()
         );
-        assert!(r.len() < 4096, "{} bytes is too long to paste", r.len());
+        assert!(r.len() < 8192, "{} bytes is too long to paste", r.len());
     }
 
     /// Every section a triager needs, so a report can be read at a glance and

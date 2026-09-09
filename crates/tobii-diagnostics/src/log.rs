@@ -1,0 +1,296 @@
+//! A log the user can actually send you.
+//!
+//! # Why this exists at all
+//!
+//! Every warning in this program used to be an `eprintln!`, which is fine for
+//! `tobii stream` in a terminal and useless for the GUI: a hub launched from the
+//! application menu has its stderr wired to the session journal or to
+//! `/dev/null`, so *"warning: could not apply saved calibration"* — the single
+//! most useful sentence a user could quote — is written to somewhere they will
+//! never look. A bug report then arrives saying "tracking is bad", with no way
+//! to recover what the program already knew.
+//!
+//! So warnings go three places at once: stderr (unchanged, for people running
+//! from a terminal), a small ring buffer in memory, and a capped file under
+//! `$XDG_STATE_HOME`. [`crate::report`] prints the tail, which is what makes it
+//! worth attaching to an issue.
+//!
+//! # Deliberately not a logging framework
+//!
+//! No `log`, no `tracing`, no levels beyond warn/info, no filtering, no
+//! subscriber to configure. This exists to answer one question — "what did the
+//! program complain about before it went wrong?" — and the same
+//! dependency-avoidance reasoning as the hand-rolled SHA-256 and JSON applies:
+//! a driver that must be installable from source pays for every crate in its
+//! tree. If this ever needs spans or structured fields, that is the moment to
+//! take the dependency, not before.
+//!
+//! # What is not written here
+//!
+//! The log ends up on a public issue tracker via [`crate::report`], so nothing
+//! goes in that would not survive that. In particular the home path is folded to
+//! `~` on the way *out*, not on the way in, so a local reader still sees real
+//! paths in the file itself.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// How many lines the in-memory buffer keeps.
+///
+/// Enough to cover a connect, a failure and a retry; short enough that pasting
+/// it into an issue stays reasonable.
+pub const RING: usize = 60;
+
+/// How large the log file may grow before the oldest half is dropped.
+///
+/// A cap rather than rotation: a second file to find is a second file nobody
+/// sends. 128 KB is thousands of warnings and still trivial to open.
+pub const MAX_FILE_BYTES: u64 = 128 * 1024;
+
+/// The most recent lines, for [`crate::report`].
+///
+/// Kept in memory as well as on disk so a report is still useful when the state
+/// directory is unwritable — which is exactly the kind of broken setup somebody
+/// files an issue about.
+static RECENT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// `$XDG_STATE_HOME/tobii-linux/tobii.log`, falling back to
+/// `~/.local/state/tobii-linux/tobii.log`.
+///
+/// State, not config and not cache: the XDG spec puts logs in state, and it is
+/// the one of the three that is neither backed up as settings nor deleted as
+/// disposable.
+pub fn log_path() -> PathBuf {
+    // An explicit override wins. Useful to a packager pointing the log
+    // somewhere else, to anyone debugging two instances at once — and it is
+    // what lets this module's own tests use a file of their own instead of
+    // flooding the real one.
+    if let Some(p) = std::env::var_os("TOBII_LOG_FILE").filter(|v| !v.is_empty()) {
+        return PathBuf::from(p);
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            home.join(".local").join("state")
+        });
+    base.join("tobii-linux").join("tobii.log")
+}
+
+/// Record a warning: stderr, memory, and the file.
+pub fn warn(msg: &str) {
+    write_line("WARN", msg);
+}
+
+/// Record something worth having in a bug report but not worth alarming anyone.
+pub fn info(msg: &str) {
+    write_line("INFO", msg);
+}
+
+fn write_line(level: &str, msg: &str) {
+    // One line, however many the message has: a multi-line entry breaks the
+    // tail count and the paste.
+    // Runs of line breaks collapse to ONE space: `\r\n` is two characters and
+    // would otherwise leave a double space in the middle of a sentence.
+    let mut flat = String::with_capacity(msg.len());
+    let mut last_was_break = false;
+    for c in msg.chars() {
+        if c == '\n' || c == '\r' {
+            if !last_was_break {
+                flat.push(' ');
+            }
+            last_was_break = true;
+        } else {
+            flat.push(c);
+            last_was_break = false;
+        }
+    }
+    let line = format!("{} {level} {}", stamp(), flat.trim());
+
+    // stderr first and unconditionally, so nothing that used to be visible in a
+    // terminal stops being visible.
+    eprintln!("{}", flat.trim());
+
+    if let Ok(mut r) = RECENT.lock() {
+        r.push(line.clone());
+        let len = r.len();
+        if len > RING {
+            r.drain(..len - RING);
+        }
+    }
+
+    // Best-effort: a program that cannot write its log must still run.
+    let _ = append(&line);
+}
+
+fn append(line: &str) -> std::io::Result<()> {
+    let path = log_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Trim before appending rather than after, so the file never exceeds the
+    // cap even briefly.
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let keep: Vec<&str> = text.lines().skip(text.lines().count() / 2).collect();
+            let _ = std::fs::write(
+                &path,
+                format!("[older entries dropped]\n{}\n", keep.join("\n")),
+            );
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{line}")
+}
+
+/// The most recent lines, oldest first.
+pub fn recent(max: usize) -> Vec<String> {
+    let Ok(r) = RECENT.lock() else {
+        return Vec::new();
+    };
+    let start = r.len().saturating_sub(max);
+    r[start..].to_vec()
+}
+
+/// The tail of the log FILE, for a process that did not write it.
+///
+/// The hub and the CLI are separate processes with separate ring buffers, so a
+/// report produced by `tobii debug` would otherwise show nothing the GUI logged
+/// — which is the case that matters most, since the GUI's warnings are the ones
+/// a user cannot see.
+pub fn tail_file(max: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(log_path()) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max);
+    lines[start..].iter().map(|s| s.to_string()).collect()
+}
+
+/// A UTC timestamp, `YYYY-MM-DD HH:MM:SS`.
+///
+/// Hand-rolled from the epoch rather than taking a date crate for one line, the
+/// same trade the JSON and SHA-256 code makes. Civil-time conversion by Howard
+/// Hinnant's `civil_from_days`.
+fn stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// The log is process-global — one ring buffer and one file — so tests that
+    /// write to it cannot run beside each other: one test's filler becomes
+    /// another's missing line. This serialises them and points the file
+    /// somewhere disposable.
+    pub(crate) static LOG_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn with_own_log<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = LOG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("tobii-log-test-{tag}.log"));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var("TOBII_LOG_FILE", &path);
+        if let Ok(mut r) = RECENT.lock() {
+            r.clear();
+        }
+        let out = f();
+        std::env::remove_var("TOBII_LOG_FILE");
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    #[test]
+    fn a_warning_is_kept_in_memory_and_shows_up_in_the_tail() {
+        let r = with_own_log("kept", || {
+            warn("test: the tracker could not be opened");
+            recent(RING)
+        });
+        assert!(
+            r.iter()
+                .any(|l| l.contains("the tracker could not be opened")),
+            "{r:?}"
+        );
+        assert!(r.last().unwrap().contains("WARN"));
+    }
+
+    /// A multi-line message would otherwise break the tail count and the paste.
+    #[test]
+    fn a_multiline_message_becomes_one_line() {
+        let last = with_own_log("multiline", || {
+            warn("test: first\nsecond\r\nthird");
+            recent(1).pop().expect("a line")
+        });
+        assert!(!last.contains('\n'), "{last}");
+        assert!(last.contains("first second third"), "{last}");
+    }
+
+    #[test]
+    fn the_ring_keeps_only_the_most_recent_lines() {
+        let r = with_own_log("ring", || {
+            for i in 0..RING * 2 {
+                info(&format!("test: filler {i}"));
+            }
+            recent(RING * 2)
+        });
+        assert!(r.len() <= RING, "the ring grew to {}", r.len());
+        assert!(
+            r.last()
+                .unwrap()
+                .contains(&format!("filler {}", RING * 2 - 1)),
+            "the newest line should survive"
+        );
+    }
+
+    #[test]
+    fn the_timestamp_looks_like_a_timestamp() {
+        let s = stamp();
+        assert_eq!(s.len(), 19, "{s}");
+        assert!(s.starts_with("20"), "{s}");
+        assert_eq!(s.chars().filter(|c| *c == '-').count(), 2, "{s}");
+        assert_eq!(s.chars().filter(|c| *c == ':').count(), 2, "{s}");
+    }
+
+    #[test]
+    fn the_log_path_follows_xdg_state() {
+        // The override is process-global, so this takes the same lock as the
+        // tests that set it.
+        let _guard = LOG_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("TOBII_LOG_FILE");
+        let p = log_path();
+        assert!(p.ends_with("tobii-linux/tobii.log"), "{}", p.display());
+        assert!(
+            p.to_string_lossy().contains("state"),
+            "logs belong in XDG_STATE_HOME: {}",
+            p.display()
+        );
+
+        // And the override wins when it is set.
+        std::env::set_var("TOBII_LOG_FILE", "/tmp/somewhere-else.log");
+        assert_eq!(log_path(), PathBuf::from("/tmp/somewhere-else.log"));
+        std::env::remove_var("TOBII_LOG_FILE");
+    }
+}

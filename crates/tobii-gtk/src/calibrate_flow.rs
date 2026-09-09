@@ -451,7 +451,7 @@ fn update_ui(phase: &Phase, instr: &Label, w: &FlowWidgets) {
 /// message, but the actual error must not be silently discarded.
 fn done_phase(res: Result<(), String>) -> Phase {
     if let Err(e) = &res {
-        eprintln!("calibration failed: {e}");
+        tobii_diagnostics::log::warn(&format!("calibration failed: {e}"));
     }
     Phase::Done(res)
 }

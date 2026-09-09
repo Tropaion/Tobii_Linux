@@ -393,7 +393,9 @@ fn apply_command<T: Transport>(
             if r.is_ok() {
                 if let Some(blob) = &previous_blob {
                     if let Err(e) = conn.apply_calibration(&blob.0) {
-                        eprintln!("note: starting from scratch, not seeding ({e})");
+                        tobii_diagnostics::log::warn(&format!(
+                            "note: starting from scratch, not seeding ({e})"
+                        ));
                     }
                 }
             }
@@ -411,7 +413,9 @@ fn apply_command<T: Transport>(
         }
         DeviceCommand::CalDiscard { x, y } => {
             if let Err(e) = conn.discard_calibration_point(x, y) {
-                eprintln!("warning: could not discard calibration point ({e})");
+                tobii_diagnostics::log::warn(&format!(
+                    "warning: could not discard calibration point ({e})"
+                ));
             }
         }
         DeviceCommand::CalComputeGroup => {
@@ -457,11 +461,15 @@ fn apply_command<T: Transport>(
                 match tobii_config::load_calibration() {
                     Ok(Some((blob, _meta))) => {
                         if let Err(e) = conn.apply_calibration(&blob) {
-                            eprintln!("warning: could not restore calibration ({e})");
+                            tobii_diagnostics::log::warn(&format!(
+                                "warning: could not restore calibration ({e})"
+                            ));
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!("warning: could not load saved calibration ({e})"),
+                    Err(e) => tobii_diagnostics::log::warn(&format!(
+                        "warning: could not load saved calibration ({e})"
+                    )),
                 }
             }
             state.lock().unwrap().calibration = CalPhase::default();
@@ -570,7 +578,7 @@ impl HeadWorker {
             Ok(m) => m,
             Err(tobii_headpose::onnx::OnnxError::ModelMissing(_)) => return None,
             Err(e) => {
-                eprintln!("head pose: {e}");
+                tobii_diagnostics::log::warn(&format!("head pose: {e}"));
                 return None;
             }
         };
@@ -845,7 +853,9 @@ fn device_session(
                     // OP_CAL_APPLY is disasm-derived and runs on every connect;
                     // don't let a rejection pass silently as bad tracking.
                     if let Err(e) = conn.apply_calibration(&blob) {
-                        eprintln!("warning: could not apply saved calibration ({e})");
+                        tobii_diagnostics::log::warn(&format!(
+                            "warning: could not apply saved calibration ({e})"
+                        ));
                     }
                 }
                 // Subscribe to one eye-camera for the hub preview (best-effort:
@@ -936,10 +946,10 @@ fn device_session(
                 // the command is dropped in silence that watcher waits forever
                 // on a token that can never arrive.
                 if !pending.is_empty() {
-                    eprintln!(
+                    tobii_diagnostics::log::warn(&format!(
                         "warning: could not reach the tracker to apply {} queued command(s) ({e})",
                         pending.len()
-                    );
+                    ));
                     for cmd in pending.drain(..) {
                         fail_queued_command(thread_state, cmd, &e);
                     }
@@ -978,7 +988,7 @@ fn finish_calibration<T: Transport>(
             .ok()
             .flatten()
             .map(|(b, _)| b.len());
-        eprintln!(
+        tobii_diagnostics::log::warn(&format!(
             "calibration: compute {:?}, blob {} bytes{}{}",
             compute_took,
             blob.0.len(),
@@ -992,7 +1002,7 @@ fn finish_calibration<T: Transport>(
             } else {
                 ""
             }
-        );
+        ));
         if blob.0.is_empty() {
             // Persisting an empty blob would re-apply nothing on every connect
             // and silently mask that the calibration was never stored.

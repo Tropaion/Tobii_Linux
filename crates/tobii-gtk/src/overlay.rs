@@ -53,7 +53,7 @@ pub fn show(app: &Application, state: Arc<Mutex<DeviceState>>) -> ApplicationWin
             if !checked.replace(true) {
                 if let Some(geo) = crate::primary_monitor().map(|m| m.geometry()) {
                     if (geo.width() - w).abs() > 1 || (geo.height() - h).abs() > 1 {
-                        eprintln!(
+                        tobii_diagnostics::log::warn(&format!(
                             "gaze overlay: drawing into {w}x{h} but the monitor is {}x{} — \
                              every dot will be off by up to ({}, {}) px. Something is \
                              reserving screen space (a panel/taskbar).",
@@ -61,7 +61,7 @@ pub fn show(app: &Application, state: Arc<Mutex<DeviceState>>) -> ApplicationWin
                             geo.height(),
                             geo.width() - w,
                             geo.height() - h,
-                        );
+                        ));
                     }
                 }
             }

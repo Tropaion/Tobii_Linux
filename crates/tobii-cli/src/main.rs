@@ -1,8 +1,6 @@
 //! `tobii` CLI. Subcommands: `stream`, `headpose`, `setup`, `display get|set`,
 //! `calibrate`.
 
-mod diagnostics;
-
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::ExitCode;
@@ -901,7 +899,7 @@ fn camera_both(args: &[String]) -> CmdResult {
 /// issue forms have no file-upload field at all. `--file` is for anyone who
 /// would rather send a file.
 fn debug_report(args: &[String]) -> CmdResult {
-    let text = diagnostics::report();
+    let text = tobii_diagnostics::report();
     match flag_value(args, "--file") {
         Some(path) => {
             std::fs::write(path, &text)?;

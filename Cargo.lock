@@ -1469,6 +1469,7 @@ name = "tobii-cli"
 version = "0.1.0"
 dependencies = [
  "tobii-config",
+ "tobii-diagnostics",
  "tobii-headpose",
  "tobii-protocol",
  "tobii-update",
@@ -1483,12 +1484,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "tobii-config",
+ "tobii-headpose",
+ "tobii-update",
+]
+
+[[package]]
 name = "tobii-gtk"
 version = "0.1.0"
 dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "tobii-config",
+ "tobii-diagnostics",
  "tobii-headpose",
  "tobii-protocol",
  "tobii-update",

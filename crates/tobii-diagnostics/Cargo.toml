@@ -1,0 +1,15 @@
+[package]
+name = "tobii-diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The report `tobii debug` prints, and the log it reads from."
+
+[dependencies]
+tobii-config = { path = "../tobii-config" }
+tobii-update = { path = "../tobii-update" }
+# `model_store` is not behind the `onnx` feature, so the 110-crate tract tree is
+# not pulled in just to say whether a model file is present.
+tobii-headpose = { path = "../tobii-headpose", default-features = false }

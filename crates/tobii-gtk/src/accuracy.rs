@@ -811,7 +811,7 @@ fn finish(
     eye_mode: Option<tobii_protocol::EnabledEye>,
 ) {
     if measurements.is_empty() {
-        eprintln!("accuracy check: no targets completed");
+        tobii_diagnostics::log::warn("accuracy check: no targets completed");
         return;
     }
     let d = diagnose(measurements, band);
@@ -896,7 +896,7 @@ fn finish(
     }
     match std::fs::write(&path, csv) {
         Ok(()) => println!("raw data: {}", path.display()),
-        Err(e) => eprintln!("could not write {}: {e}", path.display()),
+        Err(e) => tobii_diagnostics::log::warn(&format!("could not write {}: {e}", path.display())),
     }
 }
 

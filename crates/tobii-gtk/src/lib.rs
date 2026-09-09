@@ -718,7 +718,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
                 // the queued command is dropped when the connect fails and
                 // nothing else ever writes it.
                 if let Err(e) = tobii_config::save_enabled_eye(eye) {
-                    eprintln!("could not save the eye selection: {e}");
+                    tobii_diagnostics::log::warn(&format!("could not save the eye selection: {e}"));
                 }
                 let _ = cmd_tx.send(device::DeviceCommand::SetEnabledEye(eye));
             }
@@ -880,6 +880,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
 
     let header = gtk::Box::new(Orientation::Horizontal, 12);
     header.append(&title);
+    header.append(&diagnostics_button());
     title.set_hexpand(true);
     header.append(&status_bar);
 
@@ -1243,6 +1244,65 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
     banner.set_visible(true);
 }
 
+/// The small button that puts a bug report on the clipboard.
+///
+/// In the header rather than buried in the settings column, because the moment
+/// somebody wants it is the moment something is visibly wrong — and because a
+/// GUI launched from the application menu has no terminal, so this is the only
+/// way most users can retrieve what the program has been complaining about.
+///
+/// One click copies; the label then says so and goes back after a few seconds,
+/// since a clipboard write is otherwise completely invisible. Right-clicking —
+/// or copying with no clipboard, which happens on a bare compositor — falls
+/// back to writing a file and saying where it went.
+fn diagnostics_button() -> gtk::Button {
+    let btn = crate::widget::button("⃝ Copy diagnostics");
+    btn.add_css_class("quiet");
+    btn.set_halign(Align::Start);
+    btn.set_tooltip_text(Some(
+        "Copy the report an issue asks for: versions, libraries, what is \
+         configured, and the recent log. No calibration data, and your username, \
+         home path and monitor serial are left out.",
+    ));
+    btn.connect_clicked(move |b| {
+        let text = tobii_diagnostics::report();
+        // `set_text` reports nothing, so whether the clipboard took it is not
+        // observable from here. The file is: it is written every time, and it
+        // is what the label reports, because a clipboard lasts only until the
+        // next copy — and somebody collecting a bug report is usually about to
+        // copy something else.
+        b.display().clipboard().set_text(&text);
+        let msg = match write_report_file(&text) {
+            Some(path) => format!("Copied · also saved to {path}"),
+            None => "Copied to the clipboard".to_string(),
+        };
+        crate::widget::set_button_text(b, &msg);
+        let b2 = b.clone();
+        glib::timeout_add_local_once(Duration::from_secs(6), move || {
+            crate::widget::set_button_text(&b2, "⃝ Copy diagnostics");
+        });
+    });
+    btn
+}
+
+/// Also drop the report next to the log, so it survives the clipboard.
+///
+/// A clipboard lasts until the next copy, and somebody collecting a bug report
+/// is usually about to copy something else. Returns the path, shortened for
+/// display.
+fn write_report_file(text: &str) -> Option<String> {
+    let path = tobii_diagnostics::log::log_path().with_file_name("diagnostics.txt");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(&path, text).ok()?;
+    let shown = path.display().to_string();
+    Some(match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && shown.starts_with(&h) => shown.replacen(&h, "~", 1),
+        _ => shown,
+    })
+}
+
 /// The switch for starting the hub at login.
 ///
 /// Writing the entry can fail — a read-only home directory, a full disk — and a
@@ -1266,7 +1326,9 @@ fn autostart_switch() -> Switch {
                 glib::Propagation::Proceed
             }
             Err(e) => {
-                eprintln!("could not change the start-at-login setting: {e}");
+                tobii_diagnostics::log::warn(&format!(
+                    "could not change the start-at-login setting: {e}"
+                ));
                 sw.set_tooltip_text(Some(&format!("Could not save this setting: {e}")));
                 // Refuse the change rather than showing a state that is not
                 // what is on disk.
@@ -1299,7 +1361,7 @@ fn update_check_switch() -> Switch {
     sw.set_tooltip_text(Some("Takes effect the next time this window opens."));
     sw.connect_state_set(|_, on| {
         if let Err(e) = tobii_config::save_update_check(on) {
-            eprintln!("could not save the update-check setting: {e}");
+            tobii_diagnostics::log::warn(&format!("could not save the update-check setting: {e}"));
         }
         glib::Propagation::Proceed
     });
