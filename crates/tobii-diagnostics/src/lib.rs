@@ -514,6 +514,58 @@ fn tilde(path: &str) -> String {
     for home in home_spellings() {
         out = out.replace(&home, "~");
     }
+    fold_home_shaped(&out)
+}
+
+/// Fold anything *shaped* like a home directory, whoever it belongs to.
+///
+/// [`home_spellings`] can only fold homes it can name, and there are cases
+/// where it can name none of them: `su - other` leaves `HOME=/root` with no
+/// `SUDO_USER` to resolve, a container can have a passwd file that does not
+/// describe the host, and a log line written by an earlier run carries whatever
+/// the home was *then*.
+///
+/// That is not hypothetical, and it is not confined to install paths. The log
+/// tail goes into the report verbatim, and a warning reads
+/// `could not write /home/someone/.config/tobii-linux/x`. Found by a test that
+/// points `$HOME` at /root and asserts the real home does not come out: it
+/// failed intermittently, depending on whether the machine's real log happened
+/// to contain a path at that moment. [`safe_path`] covers the install line and
+/// nothing else, because a log line is free text with no last-two-components
+/// to fall back to.
+///
+/// So this folds by shape: `/home/<name>` and `/var/home/<name>` (the ostree
+/// layout) become `~`, whoever `<name>` is. Folding another user's home to `~`
+/// is not strictly accurate — but the report's purpose is to name nobody, and
+/// an inaccurate `~` names nobody while an accurate `/home/someone` does.
+fn fold_home_shaped(text: &str) -> String {
+    const PREFIXES: [&str; 2] = ["/var/home/", "/home/"];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    'outer: while !rest.is_empty() {
+        for prefix in PREFIXES {
+            if let Some(at) = rest.find(prefix) {
+                let after = &rest[at + prefix.len()..];
+                // The user name is up to the next separator. A path that is
+                // exactly "/home/" with nothing after it names nobody.
+                let end = after
+                    .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+                    .unwrap_or(after.len());
+                if end == 0 {
+                    // "/home//..." — no name to fold. Copy past it and go on.
+                    out.push_str(&rest[..at + prefix.len()]);
+                    rest = after;
+                    continue 'outer;
+                }
+                out.push_str(&rest[..at]);
+                out.push('~');
+                rest = &after[end..];
+                continue 'outer;
+            }
+        }
+        out.push_str(rest);
+        break;
+    }
     out
 }
 
@@ -587,15 +639,29 @@ mod tests {
     /// `None` when `HOME` names no user directory — empty, `/`, or a bare
     /// `/home` in a container. Trailing slashes are trimmed so a test does not
     /// build "/home//.config" and then blame `tilde` for the doubled separator.
+    /// The lock every test in this module that touches `$HOME` must hold.
+    ///
+    /// One of them *writes* it — `a_home_that_is_not_where_the_binary_lives…`
+    /// points HOME at /root — and `$HOME` is process-global, so a sibling
+    /// reading it concurrently gets /root and fails for a reason that has
+    /// nothing to do with what it is testing. It is the log tests' lock rather
+    /// than a second one: two locks over the same global is a deadlock waiting
+    /// for somebody to take them in the other order. A `std::sync::Mutex` is
+    /// NOT reentrant, so a test that also calls `log::tests::with_own_log` —
+    /// which takes this same lock — must not call this as well.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        log::tests::LOG_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn test_home() -> Option<String> {
         let h = std::env::var("HOME").ok()?;
         let h = h.trim_end_matches('/');
         (h.len() > 1).then(|| h.to_string())
     }
 
-    /// The property that matters: whatever this prints is going onto a public
-    /// issue tracker, so it must not carry the things that identify a person.
-    /// The leak the test above could not see, because the test and the bug
+    /// The leak the sibling test could not see, because that test and the bug
     /// shared an assumption.
     ///
     /// `the_report_does_not_leak_who_you_are` compares the report against the
@@ -616,11 +682,7 @@ mod tests {
     /// asserts the real path still does not come out.
     #[test]
     fn a_home_that_is_not_where_the_binary_lives_still_does_not_leak() {
-        // `$HOME` is process-global. This takes the same lock the log tests
-        // use so it cannot race a sibling reading it.
-        let _guard = log::tests::LOG_TEST
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _env = env_lock();
         let Some(real) = test_home() else {
             return; // no home to leak
         };
@@ -652,8 +714,11 @@ mod tests {
         );
     }
 
+    /// The property that matters: whatever this prints is going onto a public
+    /// issue tracker, so it must not carry the things that identify a person.
     #[test]
     fn the_report_does_not_leak_who_you_are() {
+        let _env = env_lock();
         let r = report();
 
         // The home path, which is the leak that actually happens: it reaches
@@ -716,15 +781,21 @@ mod tests {
     /// directory.
     #[test]
     fn a_log_line_containing_a_home_path_is_folded_in_the_report() {
-        let Some(home) = test_home() else {
-            return;
-        };
-        let r = log::tests::with_own_log("redact", || {
+        // `$HOME` is read INSIDE the closure, not before it. `with_own_log`
+        // is what takes the env lock, so reading it out here races the sibling
+        // test that points HOME at /root — which made this fail about one run
+        // in four, with a log line naming /root and an assertion blaming the
+        // fold. No `env_lock()` of its own: it is the same mutex, and
+        // std::sync::Mutex is not reentrant.
+        let Some((home, r)) = log::tests::with_own_log("redact", || {
+            let home = test_home()?;
             log::warn(&format!(
                 "test: could not write {home}/.config/tobii-linux/x"
             ));
-            report()
-        });
+            Some((home, report()))
+        }) else {
+            return;
+        };
         assert!(
             !r.contains(&home),
             "the home path leaked through the log:\n{r}"
@@ -786,6 +857,7 @@ mod tests {
     /// prefix — a log line carries the home path in the middle.
     #[test]
     fn every_occurrence_of_the_home_path_is_folded() {
+        let _env = env_lock();
         let Some(home) = test_home() else {
             return; // no meaningful home to fold — see `tilde`
         };
@@ -795,8 +867,38 @@ mod tests {
         assert_eq!(folded.matches("~/.config/x").count(), 2, "{folded}");
     }
 
+    /// The fold that does not need to know whose home it is.
+    ///
+    /// `home_spellings` can only fold homes it can name, and `su - other`,
+    /// a container with a foreign passwd file, and a log line written by an
+    /// earlier run all defeat it.
+    #[test]
+    fn a_home_shaped_path_is_folded_whoever_it_belongs_to() {
+        let _env = env_lock();
+        assert_eq!(tilde("/home/someone-else/.config/x"), "~/.config/x");
+        // The ostree layout, which Silverblue, Kinoite, Bluefin and Bazzite
+        // all ship.
+        assert_eq!(tilde("/var/home/someone/.local/bin"), "~/.local/bin");
+        // In the middle of a sentence, which is where log lines put it.
+        assert_eq!(
+            tilde("WARN could not write /home/bob/.config/tobii-linux/x — giving up"),
+            "WARN could not write ~/.config/tobii-linux/x — giving up"
+        );
+        // Twice in one line.
+        assert_eq!(tilde("/home/a/x -> /home/b/y"), "~/x -> ~/y");
+        // Nothing that is not a home.
+        assert_eq!(tilde("/usr/bin"), "/usr/bin");
+        assert_eq!(tilde("/homework/notes"), "/homework/notes");
+        // A name with no path after it still folds.
+        assert_eq!(tilde("/home/bob"), "~");
+        // Degenerate input must terminate and not eat the string.
+        assert_eq!(tilde("/home/"), "/home/");
+        assert_eq!(tilde(""), "");
+    }
+
     #[test]
     fn a_home_relative_path_is_reported_relative_to_home() {
+        let _env = env_lock();
         if let Some(home) = test_home() {
             assert_eq!(tilde(&format!("{home}/.local/bin")), "~/.local/bin");
         }

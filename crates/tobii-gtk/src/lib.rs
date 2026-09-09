@@ -101,11 +101,14 @@ button.spin-btn { min-width: 26px; padding: 2px 10px; }
 /* Also the save/copy pair in the settings popover, which are plain buttons —
    hence both selectors: a GtkMenuButton wraps its own button node, a
    GtkButton is one. */
+/* Outlined, not borderless. The same lesson as `button.quiet` above: a border
+   that only appears on hover leaves the control looking like decoration until
+   you happen to touch it, and these two have no caption to give it away. */
 menubutton.icon-btn > button, button.icon-btn {
     min-width: 30px; min-height: 30px; padding: 4px;
-    background-color: transparent; border-color: transparent; color: #8a949d; }
+    background-color: transparent; border-color: #2b333c; color: #8a949d; }
 menubutton.icon-btn > button:hover, button.icon-btn:hover {
-    background-color: #1e242b; border-color: #2b333c; color: #e8ecef; }
+    background-color: #1e242b; border-color: #3a444f; color: #e8ecef; }
 menubutton.icon-btn > button:checked, button.icon-btn:active {
     background-color: #1e242b; border-color: #3a444f; color: #e8ecef; }
 
@@ -1306,6 +1309,9 @@ fn settings_button() -> gtk::MenuButton {
     // is aligned within the space its anchor allows rather than being centred
     // in it.
     popover.set_halign(Align::End);
+    // A few pixels of air under the cogwheel. Flush against the button the
+    // panel reads as part of it rather than as something it opened.
+    popover.set_offset(0, 8);
 
     let btn = gtk::MenuButton::new();
     btn.add_css_class("icon-btn");
@@ -1476,8 +1482,8 @@ fn diagnostics_row() -> gtk::Box {
     let save = icon_button(
         "document-save-symbolic",
         "🖫",
-        "Save the report to a file, to attach it to a bug report.\n\nIt goes next \
-         to the log, in your state directory.",
+        "Save the report to a file, to attach it to a bug report.\n\nAsks you \
+         where to put it.",
     );
     let copy = icon_button(
         "edit-copy-symbolic",
@@ -1487,22 +1493,52 @@ fn diagnostics_row() -> gtk::Box {
          and your username, home path and monitor serial are left out or hashed.",
     );
 
-    {
-        let say = say.clone();
-        save.connect_clicked(move |_| {
-            let text = tobii_diagnostics::report();
-            match write_report_file(&text) {
-                Some(path) => say(format!("Saved to {path}")),
-                None => {
-                    // Not silent: the one thing worse than failing to write the
-                    // file is saying nothing and letting somebody go looking
-                    // for it.
-                    tobii_diagnostics::log::warn("could not write the diagnostics file");
-                    say("Could not write the file — see the log".to_string());
-                }
+    save.connect_clicked(move |b| {
+        // Built before the dialog opens, not after it closes: the report
+        // describes the state of the program, and that state should be the one
+        // the user was looking at when they asked for it, not whatever it is
+        // however long they spend choosing a folder.
+        let text = tobii_diagnostics::report();
+        let window = b.root().and_downcast::<gtk::Window>();
+
+        let dialog = gtk::FileDialog::new();
+        dialog.set_title("Save the diagnostics report");
+        dialog.set_initial_name(Some("tobii-diagnostics.txt"));
+        // Somewhere the user will find it again. The state directory is where
+        // this used to write without asking, and it is not a place anybody
+        // browses to.
+        if let Some(home) = std::env::var_os("HOME") {
+            dialog.set_initial_folder(Some(&gtk::gio::File::for_path(home)));
+        }
+        let parent = window.clone();
+        dialog.save(window.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+            // Cancelling is an answer, not a failure: the dialog reports a
+            // DISMISSED error for it, and telling somebody their deliberate
+            // cancel "failed" is noise.
+            let Ok(file) = res else { return };
+            let Some(path) = file.path() else { return };
+            if let Err(e) = std::fs::write(&path, &text) {
+                // Loud, because the file the user just named is not there and
+                // nothing else would say so. The popover has closed by now —
+                // the dialog took the focus — so the status line under the
+                // buttons would never be seen.
+                tobii_diagnostics::log::warn(&format!(
+                    "could not write the diagnostics report to {}: {e}",
+                    path.display()
+                ));
+                let alert = gtk::AlertDialog::builder()
+                    .message("The report could not be saved")
+                    .detail(format!("{}: {e}", path.display()))
+                    .build();
+                alert.show(parent.as_ref());
+            } else {
+                tobii_diagnostics::log::info(&format!(
+                    "diagnostics report saved to {}",
+                    path.display()
+                ));
             }
         });
-    }
+    });
     {
         let say = say.clone();
         copy.connect_clicked(move |b| {
@@ -1552,23 +1588,6 @@ fn icon_button(icon: &str, glyph: &str, tooltip: &str) -> gtk::Button {
         btn.set_child(Some(&label));
     }
     btn
-}
-/// Also drop the report next to the log, so it survives the clipboard.
-///
-/// A clipboard lasts until the next copy, and somebody collecting a bug report
-/// is usually about to copy something else. Returns the path, shortened for
-/// display.
-fn write_report_file(text: &str) -> Option<String> {
-    let path = tobii_diagnostics::log::log_path().with_file_name("diagnostics.txt");
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
-    std::fs::write(&path, text).ok()?;
-    let shown = path.display().to_string();
-    Some(match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && shown.starts_with(&h) => shown.replacen(&h, "~", 1),
-        _ => shown,
-    })
 }
 
 /// The switch for starting the hub at login.
