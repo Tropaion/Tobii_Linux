@@ -471,11 +471,32 @@ your `clippy` and `rustfmt` are the same ones CI runs — `-D warnings` and
 anyone changing a line. If your Rust came from your distribution rather than
 rustup it may be too old to build this at all; rustup is the reliable route.
 
-**What CI cannot check:** anything needing the tracker itself. The accuracy
-figure, the head-pose sign conventions and the tracker-on behaviour above were
-all measured on hardware by hand, and the `Status` section says which claims
-those are. If you change the protocol layer or the device thread, say in the
-pull request what you tested against a real ET5.
+### Testing the protocol without a tracker
+
+Most of what "needs an ET5" does not, once a session has been recorded:
+
+```sh
+tobii record                    # writes crates/tobii-usb/tests/captures/session.tobiicap
+cargo test -p tobii-usb --test replay
+```
+
+`tobii record` wraps the USB transport and writes every frame, both directions,
+to a line-oriented hex file. The replay tests drive the driver against exactly
+the replies the device gave and assert on **what the driver sends** — which is
+where the reverse engineering lives. A changed op code, a reordered handshake or
+a payload encoded differently fails the byte comparison with a hex diff naming
+the frame. (Verified by changing `OP_SUBSCRIBE` from `0x4c4` to `0x4c5`: caught,
+pointing at the one byte.)
+
+A capture is a **photograph, not a specification**. It proves the code still
+does what it did when the recording was taken, not that the device still does —
+a firmware change would invalidate the fixture silently. Re-record after one.
+
+**What still cannot be checked without hardware:** the 12.1 mm accuracy figure,
+whether the tracker physically detects eyes, and whether the illuminators go
+dark. Those were measured by hand, and the `Status` section says which claims
+they are. If you change the protocol layer or the device thread, say in the pull
+request what you tested against a real ET5.
 
 ## Credits & license
 

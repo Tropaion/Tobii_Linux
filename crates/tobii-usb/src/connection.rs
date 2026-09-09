@@ -94,6 +94,14 @@ impl<T: Transport> Connection<T> {
         &self.transport
     }
 
+    /// Take the transport back, consuming the connection.
+    ///
+    /// For `RecordTransport`, which has to be unwrapped at the end of a session
+    /// to get the capture out of it.
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
     /// Override how long [`Connection::request`] waits for a response.
     pub fn set_request_timeout(&mut self, t: Duration) {
         self.request_timeout = t;

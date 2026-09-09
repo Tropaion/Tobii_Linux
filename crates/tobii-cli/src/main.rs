@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         (Some("log"), _) => device_log(&args),
         (Some("probe-stream"), _) => probe_stream(&args),
         (Some("dump-stream"), _) => dump_stream(&args),
+        (Some("record"), _) => record_session(&args),
         (Some("camera"), Some("both")) => camera_both(&args),
         (Some("camera"), _) => camera(&args),
         (Some("setup"), _) => setup(),
@@ -66,6 +67,7 @@ fn main() -> ExitCode {
                  tobii headpose --model-status\n  \
                  tobii headpose --fetch-model [--agree]\n  \
                  tobii headpose --check-update\n  \
+                 tobii record [FILE]\n  \
                  tobii headpose --remove-model\n  \
                  tobii headpose --install-model <FILE>\n  \
                  tobii columns\n  \
@@ -886,6 +888,121 @@ fn camera_both(args: &[String]) -> CmdResult {
         }
     }
     Ok(())
+}
+
+/// Record a real session to a capture file, for replay in tests.
+///
+/// The point is regression testing without hardware: everything this driver
+/// knows about the ET5 was learned by watching a real one, and none of that
+/// knowledge is checked by anything unless a tracker is plugged in. A recorded
+/// session lets CI assert that the driver still sends the same frames, in the
+/// same order, given the same replies.
+///
+/// The session recorded here is deliberately the *boring* one — connect,
+/// re-apply the saved display area, read the eye selection, subscribe to gaze,
+/// take some frames, unsubscribe. That is the path every single run of this
+/// program takes, so it is the path worth pinning.
+///
+/// Re-record after a firmware update, or after any protocol change that is
+/// meant to alter the conversation: a capture is a photograph of what happened
+/// once, not a specification.
+fn record_session(args: &[String]) -> CmdResult {
+    let path = std::path::PathBuf::from(
+        args.get(2)
+            .cloned()
+            .unwrap_or_else(|| "crates/tobii-usb/tests/captures/session.tobiicap".to_string()),
+    );
+    let frames: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
+
+    eprintln!("recording a session to {} ...", path.display());
+    let transport = tobii_usb::RecordTransport::new(UsbTransport::open()?)
+        .with_note("connect, display area, enabled eye, gaze subscribe, gaze frames, unsubscribe")
+        .header("recorded-at", &now_rfc3339())
+        .header("device", "2104:0313")
+        .header("driver-version", env!("CARGO_PKG_VERSION"));
+
+    let mut conn = Connection::connect(transport)?;
+    // The same things the GUI's device thread does on every connect. The ET5
+    // wipes its display area on reboot, so this is not an optional extra — it
+    // is what makes the tracker work at all, and therefore the path most worth
+    // pinning.
+    //
+    // The corners come from this machine's config, which a replay test cannot
+    // know, so they are written into a header. The test reads them back and
+    // drives the same call, and the recorded frame then compares byte for byte
+    // on any machine.
+    let mut corners_header = String::new();
+    if let Ok(Some(setup)) = tobii_config::load() {
+        let c = setup.to_corners();
+        let _ = conn.set_display_area(&c);
+        let nums: Vec<String> =
+            c.tl.iter()
+                .chain(c.tr.iter())
+                .chain(c.bl.iter())
+                .map(|v| format!("{v}"))
+                .collect();
+        corners_header = nums.join(" ");
+    } else {
+        eprintln!("  no display area configured — the recording will not cover applying one");
+    }
+    let eye = conn.get_enabled_eye()?;
+    eprintln!("  enabled eye: {eye:?}");
+
+    conn.subscribe_stream(tobii_protocol::frame::STREAM_GAZE)?;
+    eprintln!("  subscribed; collecting {frames} gaze frames (look at the screen)...");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut got = 0usize;
+    while got < frames && Instant::now() < deadline {
+        if conn.next_gaze().is_some() {
+            got += 1;
+        }
+    }
+    eprintln!("  {got} gaze frames");
+    let _ = conn.unsubscribe_stream(tobii_protocol::frame::STREAM_GAZE);
+
+    let mut capture = conn.into_transport().into_capture();
+    if !corners_header.is_empty() {
+        capture
+            .headers
+            .push(("display-area".to_string(), corners_header));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    tobii_usb::capture::save(&capture, &path)?;
+    if got == 0 {
+        eprintln!(
+            "warning: no gaze frames were captured — the recording still covers the \
+             handshake, but nothing in it exercises gaze decoding."
+        );
+    }
+    Ok(())
+}
+
+/// The current time, as the subset of RFC 3339 a header needs.
+///
+/// Hand-rolled from the epoch rather than pulling in a date crate for one
+/// timestamp, the same trade the JSON and SHA-256 code in this workspace make.
+/// Civil-time conversion by the usual days-from-epoch algorithm.
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 fn camera(args: &[String]) -> CmdResult {
