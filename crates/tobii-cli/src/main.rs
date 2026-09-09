@@ -1104,27 +1104,11 @@ fn record_session(args: &[String]) -> CmdResult {
 
 /// The current time, as the subset of RFC 3339 a header needs.
 ///
-/// Hand-rolled from the epoch rather than pulling in a date crate for one
-/// timestamp, the same trade the JSON and SHA-256 code in this workspace make.
-/// Civil-time conversion by the usual days-from-epoch algorithm.
+/// The civil-time arithmetic is the log's: every log line is stamped with the
+/// same six numbers, and hand-rolling it — the same trade the JSON and SHA-256
+/// code in this workspace make — is worth doing once, not twice.
 fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let (y, m, d, h, mi, s) = tobii_diagnostics::log::utc_now();
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 

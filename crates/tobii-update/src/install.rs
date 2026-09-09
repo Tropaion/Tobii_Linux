@@ -439,10 +439,32 @@ fn updater_for(query_tool: &str) -> &str {
     }
 }
 
+/// Most of a child's output this will read, per pipe.
+///
+/// Bounded: a package manager — or a downloaded binary — that printed a
+/// gigabyte would otherwise be read into memory in full.
+const MAX_CHILD_OUTPUT: u64 = 256 * 1024;
+
+/// Drain a finished child's pipe, up to [`MAX_CHILD_OUTPUT`] bytes.
+fn read_capped<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    if let Some(r) = pipe {
+        let _ = r.take(MAX_CHILD_OUTPUT).read_to_end(&mut buf);
+    }
+    buf
+}
+
 /// Wait for a child, killing it if it outstays `limit`.
 ///
-/// The same 25 ms `try_wait` loop [`probe`] uses, factored out so both callers
-/// are bounded by construction rather than by remembering to be.
+/// The 25 ms `try_wait` loop every subprocess in this file needs, written once
+/// so all three callers are bounded by construction rather than by remembering
+/// to be. It used to say exactly that while `probe` kept its own copy.
+///
+/// The pipes are read *after* the child has exited, rather than with
+/// `wait_with_output`, which waits for the pipe to close — a probed binary that
+/// spawned a child holding it open would hang there, past the deadline that was
+/// supposed to bound this.
 fn wait_bounded(
     mut child: std::process::Child,
     limit: std::time::Duration,
@@ -452,17 +474,10 @@ fn wait_bounded(
         match child.try_wait() {
             Err(e) => return Err(format!("it could not be run: {e}")),
             Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut o) = child.stdout.take() {
-                    use std::io::Read;
-                    // Bounded: a manager that printed a gigabyte would
-                    // otherwise be read into memory in full.
-                    let _ = o.by_ref().take(256 * 1024).read_to_end(&mut stdout);
-                }
                 return Ok(std::process::Output {
                     status,
-                    stdout,
-                    stderr: Vec::new(),
+                    stdout: read_capped(child.stdout.take()),
+                    stderr: read_capped(child.stderr.take()),
                 });
             }
             Ok(None) => {
@@ -942,42 +957,15 @@ fn is_text_file_busy(e: &std::io::Error) -> bool {
 /// bytes are about to be installed and run anyway, and this way it happens
 /// while the old binary is still in place.
 fn probe(path: &Path) -> Result<(), String> {
-    let mut child = spawn_probe(path)?;
-
-    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Err(e) => return Err(format!("it could not be run: {e}")),
-            Ok(Some(status)) => {
-                if status.success() {
-                    return Ok(());
-                }
-                // Read the pipe directly rather than `wait_with_output`, which
-                // waits for the pipe to close — and a probed binary that
-                // spawned a child holding it open would hang here, past the
-                // deadline that was supposed to bound this whole function.
-                let mut detail = String::new();
-                if let Some(err) = child.stderr.take() {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    let _ = err.take(8 * 1024).read_to_end(&mut buf);
-                    detail = String::from_utf8_lossy(&buf).trim().to_string();
-                }
-                if detail.is_empty() {
-                    detail = format!("it exited with {status}");
-                }
-                return Err(detail.lines().take(3).collect::<Vec<_>>().join("; "));
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("it did not answer --version and was stopped".to_string());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-        }
+    let out = wait_bounded(spawn_probe(path)?, PROBE_TIMEOUT)?;
+    if out.status.success() {
+        return Ok(());
     }
+    let mut detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if detail.is_empty() {
+        detail = format!("it exited with {}", out.status);
+    }
+    Err(detail.lines().take(3).collect::<Vec<_>>().join("; "))
 }
 
 /// The version the installed binaries report, asked of one of them.
@@ -1175,11 +1163,8 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         assert!(w.contains("cannot be written to"), "{w}");
     }
 
-    /// Asked of the package managers, not guessed from the path. A file no
-    /// package owns — a tarball install, a build tree — must come back `None`,
-    /// or the updater would refuse to update the copies it exists for.
     /// A killed or panicking install left up to 73 MB in the install directory
-    /// under a pid-stamped name no later run ever looked at again.
+    /// under a pid-stamped name no later run ever revisited.
     #[test]
     fn scratch_from_a_dead_run_is_swept_and_this_run_s_is_not() {
         let s = Scratch::new("sweep");
@@ -1218,6 +1203,9 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         );
     }
 
+    /// Asked of the package managers, not guessed from the path. A file no
+    /// package owns — a tarball install, a build tree — must come back `None`,
+    /// or the updater would refuse to update the copies it exists for.
     #[test]
     fn a_file_no_package_owns_is_not_reported_as_package_managed() {
         // Takes the PATH lock: the stub tests below repoint `PATH` at a fake

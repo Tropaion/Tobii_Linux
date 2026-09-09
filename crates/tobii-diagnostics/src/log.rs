@@ -210,11 +210,22 @@ pub fn tail_file(max: usize) -> Vec<String> {
 }
 
 /// A UTC timestamp, `YYYY-MM-DD HH:MM:SS`.
+fn stamp() -> String {
+    let (y, m, d, h, mi, s) = utc_now();
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// The current UTC time as `(year, month, day, hour, minute, second)`.
 ///
 /// Hand-rolled from the epoch rather than taking a date crate for one line, the
 /// same trade the JSON and SHA-256 code makes. Civil-time conversion by Howard
 /// Hinnant's `civil_from_days`.
-fn stamp() -> String {
+///
+/// Public because the CLI needs the same six numbers for the RFC 3339 header on
+/// a capture file. Sixteen lines of leap-year and era arithmetic that nobody can
+/// eyeball for correctness is exactly the thing not to keep two copies of — and
+/// it had two, written the same day in two crates.
+pub fn utc_now() -> (i64, i64, i64, i64, i64, i64) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -231,7 +242,7 @@ fn stamp() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+    (y, m, d, h, mi, s)
 }
 
 #[cfg(test)]

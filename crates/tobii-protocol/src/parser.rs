@@ -107,11 +107,6 @@ impl Parser {
         self.acc.len()
     }
 
-    /// Reset the accumulator (e.g. after reconnect).
-    pub fn reset(&mut self) {
-        self.acc.clear();
-    }
-
     /// Feed a USB chunk; returns any complete frames it produced.
     /// On a framing error the accumulator is reset and the error returned.
     ///

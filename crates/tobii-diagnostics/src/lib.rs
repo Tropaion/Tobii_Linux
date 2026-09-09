@@ -259,20 +259,14 @@ fn safe_path(dir: &std::path::Path) -> String {
     if folded.starts_with('~') || SYSTEM.iter().any(|p| folded.starts_with(p)) {
         return folded;
     }
-    let tail: Vec<&std::ffi::OsStr> = dir
+    let mut tail: Vec<String> = dir
         .iter()
         .rev()
         .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .map(|c| c.to_string_lossy().into_owned())
         .collect();
-    let joined = tail
-        .iter()
-        .map(|c| c.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("…/{joined}")
+    tail.reverse();
+    format!("…/{}", tail.join("/"))
 }
 
 fn distro() -> String {

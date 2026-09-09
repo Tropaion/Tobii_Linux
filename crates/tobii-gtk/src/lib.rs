@@ -652,13 +652,9 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     instrument.set_vexpand(true);
     instrument.append(&eye_title);
     instrument.append(&area);
-    let rule = gtk::Box::new(Orientation::Horizontal, 0);
-    rule.add_css_class("hairline");
-    instrument.append(&rule);
+    instrument.append(&hairline());
     instrument.append(&readout);
-    let rule2 = gtk::Box::new(Orientation::Horizontal, 0);
-    rule2.add_css_class("hairline");
-    instrument.append(&rule2);
+    instrument.append(&hairline());
     instrument.append(&cam_title);
     instrument.append(&cam_area);
     let left = instrument;
@@ -1244,20 +1240,6 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     Some(window)
 }
 
-/// Open a flow the user cannot skip (missing display setup or calibration):
-/// disable the hub while it is open, and re-enable once it closes. Mirrors the
-/// existing `b_cal`/`b_setup` single-flow-at-a-time pattern, but disables the
-/// whole hub window rather than a single button, since a forced flow has no
-/// button of its own to anchor to.
-///
-/// `forced_flow_open` is set for the lifetime of the window, so the tick's
-/// `decide()` evaluation does not re-enter while a forced flow is already up
-/// (e.g. a disconnect/reconnect glitch mid-setup). On close, `cal_evaluated`
-/// is also reset so `decide()` re-runs on the very next tick while still
-/// connected — this is what chains ForceSetup -> ForceCalibration within one
-/// session (a fresh install has neither display config nor a calibration, and
-/// completing setup must not wait for a reconnect before calibration is
-/// forced too).
 /// Everything `decide()` reads, gathered in one place.
 ///
 /// Called from the connection tick and again when a forced flow closes, so the
@@ -1274,6 +1256,20 @@ fn evaluate_calibration_state() -> tobii_config::CalAction {
     tobii_config::decide(display_configured, cal.as_ref(), active.as_deref(), fp)
 }
 
+/// Open a flow the user cannot skip (missing display setup or calibration):
+/// disable the hub while it is open, and re-enable once it closes. Mirrors the
+/// existing `b_cal`/`b_setup` single-flow-at-a-time pattern, but disables the
+/// whole hub window rather than a single button, since a forced flow has no
+/// button of its own to anchor to.
+///
+/// `forced_flow_open` is set for the lifetime of the window, so the tick's
+/// `decide()` evaluation does not re-enter while a forced flow is already up
+/// (e.g. a disconnect/reconnect glitch mid-setup). On close, `cal_evaluated`
+/// is also reset so `decide()` re-runs on the very next tick while still
+/// connected — this is what chains ForceSetup -> ForceCalibration within one
+/// session (a fresh install has neither display config nor a calibration, and
+/// completing setup must not wait for a reconnect before calibration is
+/// forced too).
 fn launch_forced(
     app: &Application,
     window: &ApplicationWindow,
@@ -1325,17 +1321,6 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
     banner.set_visible(true);
 }
 
-/// The small button that puts a bug report on the clipboard.
-///
-/// In the header rather than buried in the settings column, because the moment
-/// somebody wants it is the moment something is visibly wrong — and because a
-/// GUI launched from the application menu has no terminal, so this is the only
-/// way most users can retrieve what the program has been complaining about.
-///
-/// One click copies; the label then says so and goes back after a few seconds,
-/// since a clipboard write is otherwise completely invisible. Right-clicking —
-/// or copying with no clipboard, which happens on a bare compositor — falls
-/// back to writing a file and saying where it went.
 /// The cogwheel in the header, and the settings that are not about tracking.
 ///
 /// # Why these three, and why not in the rack
@@ -1607,23 +1592,20 @@ fn diagnostics_row() -> gtk::Box {
             }
         });
     });
-    {
-        let say = say.clone();
-        copy.connect_clicked(move |b| {
-            // `set_text` reports nothing, so whether the clipboard took it is
-            // not observable from here. Saying "copied" is the best this can
-            // honestly do.
-            b.display()
-                .clipboard()
-                .set_text(&tobii_diagnostics::report());
-            // "while this window is open" is the honest half. A Wayland
-            // clipboard selection belongs to the process that set it: close the
-            // hub and the selection goes with it, so a user who copies, closes
-            // the hub and then pastes into a browser gets nothing. Save is the
-            // button that survives.
-            say("Copied — paste it before closing this window".to_string());
-        });
-    }
+    copy.connect_clicked(move |b| {
+        // `set_text` reports nothing, so whether the clipboard took it is
+        // not observable from here. Saying "copied" is the best this can
+        // honestly do.
+        b.display()
+            .clipboard()
+            .set_text(&tobii_diagnostics::report());
+        // "while this window is open" is the honest half. A Wayland
+        // clipboard selection belongs to the process that set it: close the
+        // hub and the selection goes with it, so a user who copies, closes
+        // the hub and then pastes into a browser gets nothing. Save is the
+        // button that survives.
+        say("Copied — paste it before closing this window".to_string());
+    });
 
     let buttons = gtk::Box::new(Orientation::Horizontal, 6);
     buttons.append(&save);
@@ -1644,22 +1626,18 @@ fn diagnostics_row() -> gtk::Box {
 /// GTK's icon lookup falls back to a "missing image" square rather than to
 /// nothing, so an unchecked name leaves a broken tile rather than a plain one.
 fn icon_button(icon: &str, glyph: &str, tooltip: &str) -> gtk::Button {
-    let btn = gtk::Button::new();
+    // The glyph fallback is built by `widget::button`, which is the one place
+    // that knows how much vertical slack a tall glyph's ink needs here.
+    // `set_icon_name` replaces that child when the theme does have the icon.
+    let btn = crate::widget::button(glyph);
+    if gtk::gdk::Display::default().is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(icon))
+    {
+        btn.set_icon_name(icon);
+    }
     btn.add_css_class("quiet");
     btn.add_css_class("icon-btn");
     btn.set_valign(Align::Center);
     btn.set_tooltip_text(Some(tooltip));
-    let has = gtk::gdk::Display::default()
-        .is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(icon));
-    if has {
-        btn.set_icon_name(icon);
-    } else {
-        let label = Label::new(Some(glyph));
-        // The same vertical slack `widget::button` gives every glyph here.
-        label.set_margin_top(2);
-        label.set_margin_bottom(2);
-        btn.set_child(Some(&label));
-    }
     btn
 }
 
