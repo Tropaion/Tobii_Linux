@@ -41,7 +41,11 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            # The header comment, however long it is. A stored line range
+            # goes stale the first time a line is added above it — this one
+            # said 2,17 against a header that had grown, and cut the last
+            # sentence in half.
+            awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"
             exit 0
             ;;
         *)
@@ -97,7 +101,7 @@ need_command() {
 # The pkg-config module name is not always the name people call the library.
 # gtk4-layer-shell installs `gtk4-layer-shell-0.pc`, so probing for
 # "gtk4-layer-shell" reports it missing on a machine where it is installed and
-# the build works. Each entry is "what to probe|what to call it".
+# the build works.
 need_module() {
     # The module to probe and, optionally, what to call it in the output — two
     # plain arguments, like `need_command` above. It used to pack both into one
@@ -212,7 +216,10 @@ if [[ $lean -eq 0 ]]; then
 fi
 say "$run_cli stream" "# decoded gaze samples"
 say "$run_cli headpose --fetch-model" "# optional: adds pitch (6 DOF)"
-if [[ $do_udev -eq 0 && ! -e /etc/udev/rules.d/60-tobii.rules ]]; then
+# Not when --install ran: install-payload.sh already said this, and saying it
+# twice in one run reads as two different problems. This is the seam the
+# delegation introduced.
+if [[ $do_install -eq 0 && $do_udev -eq 0 && ! -e /etc/udev/rules.d/60-tobii.rules ]]; then
     echo
     echo "  ${bold}The udev rule is not installed${reset}, so the tracker needs root."
     echo "  ${dim}scripts/build.sh --udev${reset}   or   ${dim}sudo cp assets/60-tobii.rules /etc/udev/rules.d/${reset}"

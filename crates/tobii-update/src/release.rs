@@ -10,7 +10,6 @@ use crate::{REPO_NAME, REPO_OWNER};
 pub struct Asset {
     pub name: String,
     pub url: String,
-    pub size: u64,
 }
 
 /// A published release, as much of it as this program cares about.
@@ -110,13 +109,16 @@ pub fn parse_releases(text: &str) -> Result<Option<Release>, CheckError> {
             .array("assets")
             .iter()
             .filter_map(|a| {
+                // `size` is deliberately not read. GitHub sends it and it
+                // looks useful, but nothing bounds a download by it: the cap is
+                // `net::MAX_DOWNLOAD`, enforced by curl's `--max-filesize`, by
+                // `run()`'s capped read, and by `finish()`'s metadata check —
+                // none of which trust a number the server chose. A field that is
+                // parsed and stored but never read reads like a guard that
+                // exists.
                 Some(Asset {
                     name: a.str("name")?.to_string(),
                     url: a.str("browser_download_url")?.to_string(),
-                    size: match a.get("size") {
-                        Some(Value::Number(n)) if *n >= 0.0 => *n as u64,
-                        _ => 0,
-                    },
                 })
             })
             .collect();
@@ -259,7 +261,6 @@ mod tests {
         let a = r
             .archive_for("x86_64-unknown-linux-gnu")
             .expect("the linux archive");
-        assert_eq!(a.size, 4096);
         assert!(a.url.ends_with(".tar.gz"));
         assert!(r.archive_for("aarch64-unknown-linux-gnu").is_none());
         assert_eq!(r.checksums().map(|a| a.name.as_str()), Some("SHA256SUMS"));
@@ -311,7 +312,6 @@ mod tests {
                 .map(|(n, u)| Asset {
                     name: n.to_string(),
                     url: u.to_string(),
-                    size: 0,
                 })
                 .collect(),
             html_url: "https://example.invalid/r".into(),

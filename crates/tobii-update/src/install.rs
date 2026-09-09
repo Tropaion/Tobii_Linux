@@ -811,8 +811,11 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
 
 /// How many times to retry a spawn that failed with `ETXTBSY`.
 ///
-/// See [`spawn_probe`]. Six tries with 20 ms between them covers a window that
-/// is over as soon as the other thread's `execve` completes.
+/// See [`spawn_probe`]. Six tries, backing off 20 ms at a time — 20, 40, 60,
+/// 80, 100, 120 ms — cover a window that is over as soon as the other thread's
+/// `execve` completes. The figure is the measured budget for the race this
+/// exists to survive, so a doc that said "20 ms between them" was inviting
+/// somebody to tune the constant against the wrong number.
 const ETXTBSY_TRIES: usize = 6;
 
 /// Start the probe, retrying the one failure that is not the binary's fault.

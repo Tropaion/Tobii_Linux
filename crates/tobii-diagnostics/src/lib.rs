@@ -517,15 +517,14 @@ fn report_salt() -> Vec<u8> {
     // never returns, and a diagnostics button that hangs the hub forever would
     // be a worse bug than the one this salt fixes.
     let mut fresh = [0u8; 32];
-    let filled = std::fs::File::open("/dev/urandom")
+    if std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut fresh))
-        .is_ok();
-    let fresh = fresh.to_vec();
-    if filled {
+        .is_ok()
+    {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(&path, &fresh).is_ok() {
+        if std::fs::write(&path, fresh).is_ok() {
             // Readable only by its owner: it is the only thing standing between
             // a published report and the serial behind it.
             #[cfg(unix)]
@@ -533,7 +532,7 @@ fn report_salt() -> Vec<u8> {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             }
-            return fresh;
+            return fresh.to_vec();
         }
     }
     Vec::new()

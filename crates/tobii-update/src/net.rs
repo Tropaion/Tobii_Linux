@@ -20,7 +20,10 @@
 //!
 //! * every URL must be `https://` on a GitHub host, checked before it is used;
 //! * the URL is passed after `--`, never as a bare final argument;
-//! * **every** redirect hop is checked the same way, on both backends;
+//! * on the **wget** backend every redirect hop goes through the same
+//!   [`is_trusted`] check as the original URL; on the **curl** backend curl
+//!   follows the chain itself, so only the *scheme* of a hop is pinned, by
+//!   `--proto-redir =https`;
 //! * every request has a timeout, and every download a size cap.
 //!
 //! # curl is used when it exists; wget is not a fallback for failure

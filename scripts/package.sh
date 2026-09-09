@@ -163,9 +163,6 @@ fi
 
 # --------------------------------------------------------------------- the deb
 
-deb_root="$work/deb"
-mkdir -p "$deb_root"
-cp -a "$payload/." "$deb_root/"
 
 ctl="$work/control-dir"
 mkdir -p "$ctl"
@@ -215,10 +212,10 @@ chmod 755 "$ctl/postinst"
 # way it can go wrong — no `md5sum`, an unreadable file, xargs splitting the
 # list — into an empty or partial manifest that dpkg accepts without complaint,
 # so `dpkg -V` would verify nothing and say so by saying nothing.
-( cd "$deb_root" && find . -type f -printf '%P\0' | sort -z \
+( cd "$payload" && find . -type f -printf '%P\0' | sort -z \
     | xargs -0 md5sum > "$ctl/md5sums" )
 if [[ ! -s "$ctl/md5sums" ]] \
-   || [[ "$(wc -l < "$ctl/md5sums")" -ne "$(find "$deb_root" -type f ! -path "*/DEBIAN/*" | wc -l)" ]]; then
+   || [[ "$(wc -l < "$ctl/md5sums")" -ne "$(find "$payload" -type f | wc -l)" ]]; then
     echo "md5sums does not cover every file in the package" >&2
     exit 1
 fi
@@ -227,7 +224,7 @@ fi
 # `debian-binary` must come first or dpkg refuses the file.
 printf '2.0\n' > "$work/debian-binary"
 tar --owner=root --group=root --numeric-owner -czf "$work/control.tar.gz" -C "$ctl" .
-tar --owner=root --group=root --numeric-owner -czf "$work/data.tar.gz" -C "$deb_root" .
+tar --owner=root --group=root --numeric-owner -czf "$work/data.tar.gz" -C "$payload" .
 deb="$dist/tobii-linux_${version}_${deb_arch}.deb"
 rm -f "$deb"
 ( cd "$work" && ar rc "$deb" debian-binary control.tar.gz data.tar.gz )

@@ -200,15 +200,18 @@ pub fn run() -> glib::ExitCode {
     let session: Rc<RefCell<Option<Session>>> = Rc::new(RefCell::new(None));
     // The hub window, while it is open.
     let hub: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
-    // What keeps the process alive with no window, in background mode.
-    let holder: Rc<RefCell<Option<gtk::gio::ApplicationHoldGuard>>> = Rc::new(RefCell::new(None));
-
     if autostart::background_mode() {
         let session = session.clone();
-        let holder = holder.clone();
         app.connect_startup(move |app| {
             // No window, so nothing would otherwise keep the main loop running.
-            *holder.borrow_mut() = Some(app.hold());
+            //
+            // Leaked rather than stored. It was an
+            // `Rc<RefCell<Option<ApplicationHoldGuard>>>` that was written once
+            // and never read back or cleared — ceremony around a value that
+            // must simply never drop. `mem::forget` is already this file's
+            // idiom for a claim held for the life of the process (see the
+            // accuracy diagnostic below).
+            std::mem::forget(app.hold());
             // The device thread starts, but the tracker does not: `Demand` is
             // empty, so no USB session is opened and the illuminators stay off
             // until something actually asks for data.

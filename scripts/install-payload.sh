@@ -107,9 +107,9 @@ fi
 # there quietly making the tighter rule pointless.
 rule="$assets/60-tobii.rules"
 legacy=/etc/udev/rules.d/99-tobii.rules
-if [[ -e /etc/udev/rules.d/60-tobii.rules && ! -e "$legacy" ]]; then
-    :
-elif [[ ! -f "$rule" ]]; then
+# Already installed with no stale copy to remove, or no rule to install:
+# either way there is nothing to do.
+if [[ -e /etc/udev/rules.d/60-tobii.rules && ! -e "$legacy" ]] || [[ ! -f "$rule" ]]; then
     :
 elif [[ "$udev" == "no" ]]; then
     echo
