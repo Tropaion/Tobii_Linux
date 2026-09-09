@@ -23,10 +23,17 @@ impl Version {
             .strip_prefix('v')
             .or_else(|| t.strip_prefix('V'))
             .unwrap_or(t);
-        let (nums, pre) = match t.split_once(['-', '+']) {
+        // Build metadata (`+abc`) is not part of precedence, so it is dropped
+        // rather than folded into the pre-release tail: `1.0.0+a` and
+        // `1.0.0+b` are the same release, and neither is a pre-release.
+        let t = t.split_once('+').map_or(t, |(v, _)| v);
+        let (nums, pre) = match t.split_once('-') {
             Some((n, p)) => (n, p.to_string()),
             None => (t, String::new()),
         };
+        if nums.is_empty() {
+            return None;
+        }
         let mut it = nums.split('.');
         let major = it.next()?.parse().ok()?;
         let minor = it.next().map_or(Some(0), |s| s.parse().ok())?;
@@ -61,7 +68,7 @@ impl Version {
         match (self.pre.is_empty(), other.pre.is_empty()) {
             (true, false) => true,  // release beats pre-release
             (false, true) => false, // pre-release never beats a release
-            _ => self.pre > other.pre,
+            _ => cmp_pre(&self.pre, &other.pre) == std::cmp::Ordering::Greater,
         }
     }
 }
@@ -73,6 +80,63 @@ impl std::fmt::Display for Version {
             write!(f, "-{}", self.pre)?;
         }
         Ok(())
+    }
+}
+
+/// Compare two pre-release tails the way semver says to.
+///
+/// A plain string compare gets this wrong the moment a series reaches ten:
+/// `"rc10" < "rc9"`, so `1.0.0-rc10` would never be offered to somebody running
+/// `1.0.0-rc9`. The rule is to compare dot-separated identifiers one at a time,
+/// numerically where both are numeric, and to treat a numeric identifier as
+/// lower than an alphanumeric one. `rc.9` vs `rc.10` then orders correctly; so
+/// does the `rc9`/`rc10` spelling this project actually uses, because the
+/// trailing digits are split off and compared as numbers.
+fn cmp_pre(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.split('.');
+    let mut bi = b.split('.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            // Fewer identifiers wins, when everything before them was equal.
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => match cmp_ident(x, y) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            },
+        }
+    }
+}
+
+/// Compare one identifier, splitting a trailing number off an alphabetic stem.
+///
+/// Semver proper would compare `rc9` and `rc10` as opaque strings, since
+/// neither is wholly numeric. This project spells its pre-releases that way
+/// though, so the stem is compared as text and the trailing digits as a number
+/// — which agrees with semver wherever semver has an opinion and gets `rc10`
+/// right where semver would not.
+fn cmp_ident(a: &str, b: &str) -> std::cmp::Ordering {
+    let split = |s: &str| {
+        let stem = s.trim_end_matches(|c: char| c.is_ascii_digit());
+        let digits = &s[stem.len()..];
+        (stem.to_string(), digits.parse::<u64>().ok())
+    };
+    let (a_stem, a_num) = split(a);
+    let (b_stem, b_num) = split(b);
+    if a_stem != b_stem {
+        // A wholly numeric identifier ranks below an alphanumeric one.
+        return match (a_stem.is_empty(), b_stem.is_empty()) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a_stem.cmp(&b_stem),
+        };
+    }
+    match (a_num, b_num) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
     }
 }
 
@@ -117,6 +181,39 @@ mod tests {
         assert!(v("1.2.0").is_newer_than(&v("1.2.0-rc1")));
         assert!(v("1.2.0-rc2").is_newer_than(&v("1.2.0-rc1")));
         assert!(v("1.2.1-rc1").is_newer_than(&v("1.2.0")));
+    }
+
+    /// The bug a string compare hides until the tenth candidate: `"rc10"`
+    /// sorts before `"rc9"`, so the release everyone was waiting for would
+    /// never be offered to anyone running rc9.
+    #[test]
+    fn prerelease_numbers_compare_as_numbers() {
+        assert!(v("1.0.0-rc10").is_newer_than(&v("1.0.0-rc9")));
+        assert!(!v("1.0.0-rc9").is_newer_than(&v("1.0.0-rc10")));
+        assert!(v("1.0.0-rc.10").is_newer_than(&v("1.0.0-rc.9")));
+        assert!(v("1.0.0-beta2").is_newer_than(&v("1.0.0-beta1")));
+        // Different stems still compare as text, alpha before beta before rc.
+        assert!(v("1.0.0-beta1").is_newer_than(&v("1.0.0-alpha9")));
+        assert!(v("1.0.0-rc1").is_newer_than(&v("1.0.0-beta9")));
+        assert!(!v("1.0.0-rc1").is_newer_than(&v("1.0.0-rc1")));
+    }
+
+    /// Semver: a numeric identifier ranks below an alphanumeric one, and a
+    /// shorter run of identifiers below a longer one that starts the same.
+    #[test]
+    fn prerelease_ordering_follows_semver_where_semver_has_an_opinion() {
+        assert!(v("1.0.0-alpha").is_newer_than(&v("1.0.0-1")));
+        assert!(v("1.0.0-alpha.1").is_newer_than(&v("1.0.0-alpha")));
+        assert!(!v("1.0.0-alpha").is_newer_than(&v("1.0.0-alpha.1")));
+    }
+
+    /// Build metadata is not a pre-release and does not affect precedence.
+    #[test]
+    fn build_metadata_is_ignored_rather_than_read_as_a_prerelease() {
+        assert_eq!(v("1.2.3+build7").pre, "", "+ is metadata, not a tail");
+        assert!(!v("1.2.3+a").is_newer_than(&v("1.2.3+b")));
+        assert!(!v("1.2.3").is_newer_than(&v("1.2.3+b")));
+        assert!(v("1.2.3+a").is_newer_than(&v("1.2.3-rc1")));
     }
 
     #[test]
