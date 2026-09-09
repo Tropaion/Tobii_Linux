@@ -55,15 +55,19 @@ pinned; see [[Architecture-Decisions]] §18.
 | Crate | Tests | Shape |
 |---|---|---|
 | `tobii-protocol` | 80 | Inline unit tests over captured real frames |
-| `tobii-usb` | 50 | 41 unit + 6 replay (see below) |
+| `tobii-usb` | 51 | 43 unit + 8 replay (see below) |
 | `tobii-config` | 53 | Unit; SHA-256 cross-checked against coreutils |
 | `tobii-headpose` | 93 (+7 ignored) | The ignored ones need the 13 MB model |
-| `tobii-update` | 61 | 51 unit + 8 install end-to-end |
-| `tobii-diagnostics` | 13 | The report and the log; a test fails if it leaks a home path |
+| `tobii-update` | 67 | 59 unit + 8 install end-to-end |
+| `tobii-diagnostics` | 17 | The report and the log; a test fails if it leaks a home path |
 | `tobii-cli` | 9 | Argument parsing and text helpers |
 | `tobii-gtk` | 191 | Inline; pure logic split out from widget code |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
-| **Total** | **582** | |
+| **Total** | **593** | |
+
+Counted with `cargo test -p <crate>`, not from memory: this table said "41 unit
++ 6 replay" for `tobii-usb` long after both numbers had moved, which is the
+failure mode of every hand-maintained count.
 
 There are almost no integration-test directories: the convention is inline
 `#[cfg(test)]` modules next to the code, with pure logic deliberately factored
@@ -82,8 +86,20 @@ cargo test -p tobii-usb --test replay
 Two captures, because they want different things. `session.tobiicap` is a few
 hundred short lines, so a re-recording produces a diff a human can read — which
 is why the format is line-oriented hex at all. `calibration.tobiicap` is 1.5 MB
-of one 32,000-character line and is opaque on purpose: it exists to exercise
-reassembly of a response larger than the 16 KB read buffer.
+whose payload is a handful of enormous lines, and is opaque on purpose: it
+exists to exercise reassembly of a response larger than the 16 KB read buffer.
+
+**A capture you record is your own eye model.** `--calibration` retrieves the
+calibration blob the tracker computed from your eyes, and the header carries the
+display geometry it was recorded with. The committed fixture is the
+maintainer's. If you re-record and open a pull request, that is what you are
+publishing — which is fine, and worth knowing first. `tobii debug` deliberately
+contains no calibration data for the same reason.
+
+`tobii record` refuses rather than damaging a fixture: an unknown `--flag` is an
+error (a typo'd `--calibraton` used to record a plain session straight over
+`session.tobiicap`), a frame count passed to `--calibration` is an error, and a
+failed calibration retrieve writes nothing at all.
 
 `tobii record` wraps the USB transport and writes every frame, both directions,
 to a line-oriented hex file with headers. The replay tests drive the driver

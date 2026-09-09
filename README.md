@@ -326,6 +326,8 @@ which is how the sign conventions were confirmed on hardware.
 ./target/release/tobii display get|set            # read / re-apply display area
 ./target/release/tobii enabled-eye [both|left|right]
 ./target/release/tobii update [--install]         # check for a new release
+./target/release/tobii debug                      # the report an issue asks for
+./target/release/tobii record [--calibration]     # re-record a replay fixture
 ./target/release/tobii --version                  # what this build reports
 ```
 
@@ -357,7 +359,9 @@ A useful consequence: while the hub is unfocused it holds no USB session, so
 
 ### Start at login
 
-*Start when I log in* in the hub writes an XDG autostart entry that runs
+*Start when I log in* — behind the cogwheel in the hub's header, with the other
+settings that are about the program rather than the tracker — writes an XDG
+autostart entry that runs
 `tobii-gtk --background`: no window, and — because nothing is asking for data —
 no tracker either. It exists so the tracker's saved display area and calibration
 are re-applied as soon as anything wants them, which matters because **the ET5
@@ -445,6 +449,7 @@ A Cargo workspace of focused crates:
 | `tobii-config`   | Display geometry, EDID detection, persistence, SHA-256. |
 | `tobii-headpose` | Head pose: the geometric fallback, the ONNX backend, the model store, opentrack output. |
 | `tobii-update`   | Release checking, download integrity, and installation with rollback. |
+| `tobii-diagnostics` | The `tobii debug` report and the log it quotes. |
 | `tobii-cli`      | The `tobii` command-line tool. |
 | `tobii-gtk`      | The GTK4 hub, guided flows and gaze overlay. |
 | `tobii-recap`    | Decodes a usbmon pcap capture into a readable TTP op catalog. |

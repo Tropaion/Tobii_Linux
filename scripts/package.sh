@@ -252,6 +252,13 @@ depends=('gtk4' 'gtk4-layer-shell' 'libusb')
 makedepends=('rust' 'pkgconf')
 optdepends=('curl: fetching the head-pose model and updates')
 source=("\$pkgname-\$pkgver.tar.gz::\$url/archive/refs/tags/v\$pkgver.tar.gz")
+# SKIP, deliberately. GitHub generates this tarball on demand and its bytes
+# have not been stable across GitHub's own tooling changes, so a pinned digest
+# breaks the PKGBUILD for everyone the day that happens — which is worse than an
+# absent one, because it looks like a compromised download. The trade is
+# recorded in docs/wiki/Quality-and-Risks.md section 11.1a: this channel verifies
+# nothing about what it downloads. Use the .tar.gz release if you want a
+# checksum; it ships SHA256SUMS.
 sha256sums=('SKIP')
 
 build() {

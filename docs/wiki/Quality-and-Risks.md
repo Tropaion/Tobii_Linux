@@ -67,6 +67,40 @@ compute the real value from data already on the wire; it is not yet wired up.
 did when recorded, not that the device still does. A firmware change would
 invalidate it silently and the tests would stay green.
 
+### 11.1a Packaging
+
+The release notes point here as "the full list", and until v0.1.0 this section
+had nothing about packaging at all.
+
+**The `.rpm` is the least-tested artifact.** `package.sh` skips it where there
+is no `rpmbuild`, which is most developer machines — so the spec is written on a
+machine that cannot read the package it produces. That is not theoretical: the
+spec carried `AutoReqProv: no` for its whole life, which switches off the
+`libc.so.6(GLIBC_x.y)` and soname requirements rpm derives from the ELF, and
+nothing local could have noticed. `release.yml` now opens both finished packages
+and fails if those declarations are missing, which is the only check that runs
+where the packages are actually built.
+
+**Nobody has installed any of them.** The `.deb` has been unpacked and read
+field by field, the PKGBUILD parses under real `makepkg --printsrcinfo`, and CI
+checks their declared dependencies — but no `apt install` or `dnf install` has
+been run on a clean machine of the distribution it targets.
+
+**The `.deb`'s `Depends` is hand-written.** `dpkg-shlibdeps` is the tool for
+this and is not used, so the list is a judgement about what GTK pulls in
+transitively rather than a derivation from the binaries. The glibc floor is
+derived (from `objdump`), the rest is not.
+
+**The PKGBUILD's `sha256sums` is `SKIP`.** GitHub's generated source tarballs
+have not been byte-stable across their own tooling changes, and a pinned digest
+that breaks is worse than an absent one — but it does mean the source-build
+channel verifies nothing about what it downloads.
+
+**The binaries ship unstripped**, about 2.2 MB of symbol table each. Deliberate:
+release builds carry no debug info, so the symbol table is the only thing that
+makes a panic in a bug report name a function rather than an address, and this
+project asks people to paste panics.
+
 ### 11.2 Confirmed defects
 
 Found by review and reproduced. Fixed ones are kept here with what they were,
@@ -153,6 +187,11 @@ because the reasoning is worth more than the tidiness.
   `release.yml` itself *and* of the updater's download-and-install path against
   a real release. `ci.yml` has run (and failed once, usefully, on a clippy lint
   the maintainer's toolchain was too old to see).
+- **A review agent has twice modified the tree it was told to read.** One
+  deleted a security guard and ran `rm -rf` on a tests directory; another left a
+  stray git repository in the scratch directory that a later `git add -A` picked
+  up. Every review prompt since carries an explicit read-only constraint, and
+  the working tree is checked before a release is cut.
 
 ---
 

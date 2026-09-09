@@ -37,7 +37,7 @@ How the software is put together, for anyone changing it.
 
 | Page | Covers |
 |------|--------|
-| [[Architecture]] | §1–5: goals, constraints, context, solution strategy, the eight crates and the three threads |
+| [[Architecture]] | §1–5: goals, constraints, context, solution strategy, the nine crates and the three threads |
 | [[Runtime-View]] | §6–7: six scenarios traced through the real code, and how a release is built and delivered |
 | [[Architecture-Decisions]] | §8–9: cross-cutting concepts, and the ~24 decisions that are expensive to reverse |
 | [[Quality-and-Risks]] | §10–12: measured numbers with their sources, known defects, untested surfaces, glossary |
