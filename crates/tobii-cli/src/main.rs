@@ -2,12 +2,12 @@
 //! `calibrate`.
 
 use std::io::Write;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use tobii_config::DisplaySetup;
-use tobii_headpose::{opentrack, pose_from_sample, PoseFilter};
+use tobii_headpose::pose_from_sample;
 use tobii_protocol::frame::{OP_GAZE_NOTIFY, OP_GET_DISPLAY_AREA};
 use tobii_protocol::gaze::present;
 use tobii_protocol::{DisplayCorners, EnabledEye};
@@ -1435,10 +1435,13 @@ fn stream(json: bool, eyes: bool) -> CmdResult {
     }
 }
 
-/// opentrack's default "UDP over network" endpoint.
-const DEFAULT_UDP_ADDR: &str = "127.0.0.1:4242";
-/// Datagrams per second when `--rate` is not given.
-const DEFAULT_RATE_HZ: f64 = 60.0;
+/// opentrack's default "UDP over network" endpoint, and the send rate when
+/// `--rate` is not given.
+///
+/// Re-exported from `tobii-output` rather than declared again: both were
+/// duplicated here with the same values, and a default that disagrees between
+/// the command and the config file is a bug nobody would look for.
+use tobii_output::games::DEFAULT_OPENTRACK_ADDR as DEFAULT_UDP_ADDR;
 /// How often the human-readable status line is printed to stderr.
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 /// How long tracking must stay lost before the smoothing filter is reset. A
@@ -1752,13 +1755,55 @@ fn calibrate_pitch_zero(
     Err("this build has no head-pose model support".into())
 }
 
+/// Narrow the config to what the user actually asked for.
+///
+/// See the comment inside: `OutputConfig::default()` is right for a configured
+/// machine and wrong as a silent upgrade of a shipped command.
+fn apply_games_opt_in(cfg: &mut tobii_output::games::OutputConfig, args: &[String]) {
+    let opted_in = cfg.enabled || args.iter().any(|a| a == "--extended-view");
+    if !opted_in {
+        cfg.extended_view.enabled = false;
+        cfg.bridge_port = None;
+    }
+    if args.iter().any(|a| a == "--no-extended-view") {
+        cfg.extended_view.enabled = false;
+    }
+}
+
 fn headpose(args: &[String]) -> CmdResult {
-    let addr = parse_udp_addr(flag_value(args, "--udp").unwrap_or(DEFAULT_UDP_ADDR))?;
-    let rate_hz = match flag_value(args, "--rate") {
-        Some(raw) => parse_rate(raw)?,
-        None => DEFAULT_RATE_HZ,
-    };
-    let send_interval = Duration::from_secs_f64(1.0 / rate_hz);
+    // Settings come from games.toml; the flags override this run without
+    // writing anything. That order matters: a user who has configured Extended
+    // View and a bridge port should get them from `tobii headpose` too, not
+    // only from the hub — this command used to ignore the file entirely and
+    // send a bare opentrack datagram.
+    let mut cfg = tobii_output::games::load_output_config();
+    if let Some(raw) = flag_value(args, "--udp") {
+        // Parsed here rather than trusted: the same validation the flag had
+        // before, so an unparseable address is still refused up front.
+        cfg.opentrack = Some(parse_udp_addr(raw)?.to_string());
+    } else if cfg.opentrack.is_none() {
+        cfg.opentrack = Some(DEFAULT_UDP_ADDR.to_string());
+    }
+    if let Some(raw) = flag_value(args, "--rate") {
+        cfg.rate_hz = parse_rate(raw)?;
+    }
+    // WHAT v0.1.0 SHIPPED STAYS WHAT THIS DOES BY DEFAULT.
+    //
+    // `OutputConfig::default()` has Extended View on and a bridge port set,
+    // which is right for a machine somebody has configured for games — but with
+    // no games.toml on disk those defaults apply to everyone, and `tobii
+    // headpose` shipped in v0.1.0 as plain head pose to opentrack. Adopting the
+    // file's defaults wholesale would have silently added gaze steering to a
+    // running game and bound a second UDP socket for a bridge that is not even
+    // merged yet.
+    //
+    // So the richer path is opt-in: the games master switch turned on in the
+    // config, or `--extended-view` for one run. `--no-extended-view` still
+    // forces it off, which is the quickest way to tell a gaze problem from a
+    // head-tracking one.
+    apply_games_opt_in(&mut cfg, args);
+    let addr = parse_udp_addr(cfg.opentrack.as_deref().unwrap_or(DEFAULT_UDP_ADDR))?;
+    let rate_hz = cfg.rate_hz;
     // `--check` prints the model's rotation beside the geometry's instead of the
     // normal status line. It is the experiment that settles the sign
     // conventions: turn your head one axis at a time and the two must move
@@ -1772,8 +1817,15 @@ fn headpose(args: &[String]) -> CmdResult {
             .unwrap_or(10)
     });
 
-    // Bind an ephemeral local port; opentrack only ever receives from us.
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    // Every sink the config asks for, throttled by the Router rather than by a
+    // hand-rolled interval here. `OpentrackUdp` binds the ephemeral local port
+    // this used to bind itself; a configured `bridge_port` adds the FreeTrack
+    // bridge sink, which this command could not reach at all before.
+    let mut router = tobii_output::Router::new(cfg.rate_hz);
+    router.add(Box::new(tobii_output::sinks::OpentrackUdp::new(addr)?));
+    if let Some(port) = cfg.bridge_port {
+        router.add(Box::new(tobii_output::sinks::BridgeUdp::new(port)?));
+    }
 
     let mut model = open_model(&model_choice(args));
 
@@ -1796,6 +1848,12 @@ fn headpose(args: &[String]) -> CmdResult {
     }
 
     eprintln!("sending head pose to {addr} at {rate_hz:.0} Hz (Ctrl-C to stop)");
+    if cfg.extended_view.enabled {
+        eprintln!("extended view is on — your gaze steers the view as well as your head");
+    }
+    if let Some(port) = cfg.bridge_port {
+        eprintln!("also sending to the FreeTrack bridge on port {port}");
+    }
     if model.is_none() {
         eprintln!(
             "note: pitch is always 0 — two eye positions cannot express it. \
@@ -1803,10 +1861,17 @@ fn headpose(args: &[String]) -> CmdResult {
         );
     }
 
-    let mut filter = PoseFilter::default();
+    // The compose sequence lives in tobii-output now, so this command and the
+    // hub cannot disagree about when Extended View contributes, what a blink
+    // does, or when the smoothing state is stale.
+    let mut pipeline = tobii_output::pipeline::FramePipeline::new(&cfg);
+    let corners = tobii_config::load().ok().flatten().map(|s| s.to_corners());
     let now = Instant::now();
-    let (mut last_send, mut last_status) = (now, now);
-    let mut last_tracked: Option<Instant> = None;
+    let mut last_status = now;
+    // The most recent composed frame, for the status line. It replaces reading
+    // the filter's internal state: what the status should report is what was
+    // actually sent, which is the frame, not the smoother.
+    let mut last_frame: Option<tobii_output::TrackingFrame> = None;
     let mut samples_since_status = 0u32;
     let mut sends_since_status = 0u32;
     let mut frames_since_status = 0u32;
@@ -1830,29 +1895,18 @@ fn headpose(args: &[String]) -> CmdResult {
                         .as_ref()
                         .filter(|(_, at)| at.elapsed() < TRACKING_LOSS_RESET)
                         .map(|(m, _)| m);
-                    let fused = fuse_pose(eyes, fresh);
-                    match fused {
-                        Some(raw) => {
-                            last_tracked = Some(Instant::now());
-                            let pose = filter.update(raw);
-                            if last_send.elapsed() >= send_interval {
-                                socket.send_to(&opentrack::to_opentrack_datagram(&pose), addr)?;
-                                last_send = Instant::now();
-                                sends_since_status += 1;
-                            }
-                        }
-                        None => {
-                            // Tracking lost. Stop sending rather than emitting a
-                            // synthetic pose: opentrack simply holds its last
-                            // value, which is far less jarring in game than a
-                            // snap to zero.
-                            let lost_for = last_tracked.map(|t| t.elapsed());
-                            if lost_for.is_none_or(|d| d >= TRACKING_LOSS_RESET) {
-                                filter.reset();
-                                last_tracked = None;
-                            }
-                        }
+                    // The model's pose wins where there is one; the pipeline
+                    // falls back to the geometric pose otherwise. Tracking loss
+                    // stops the send rather than emitting a synthetic pose —
+                    // `Router::offer` returns `TrackingLost` and writes nothing,
+                    // because opentrack holding its last value is far less
+                    // jarring in game than a snap to zero.
+                    let at = Instant::now();
+                    let frame = pipeline.offer(&sample, fuse_pose(eyes, fresh), &cfg, corners, at);
+                    if matches!(router.offer(&frame, at), tobii_output::Emitted::Sent) {
+                        sends_since_status += 1;
                     }
+                    last_frame = Some(frame);
                 }
                 op if op == u32::from(CAMERA_STREAM) => {
                     frames_since_status += 1;
@@ -1872,12 +1926,15 @@ fn headpose(args: &[String]) -> CmdResult {
             );
             if check {
                 print_check_line(
-                    filter.current(),
+                    last_frame.as_ref().and_then(|f| f.pose),
                     last_model.as_ref().map(|(m, _)| m),
                     &rates,
                 );
             } else {
-                match (last_tracked.is_some(), filter.current()) {
+                match (
+                    last_frame.as_ref().is_some_and(|f| f.pose.is_some()),
+                    last_frame.as_ref().and_then(|f| f.pose),
+                ) {
                     (true, Some(p)) => {
                         let pitch = match last_model {
                             Some(_) => format!("{:>6.1}°", p.pitch_deg),
@@ -2227,7 +2284,7 @@ mod tests {
     #[test]
     fn default_udp_address_is_opentracks_usual_port() {
         let addr = parse_udp_addr(DEFAULT_UDP_ADDR).expect("default address parses");
-        assert_eq!(addr.port(), opentrack::DEFAULT_PORT);
+        assert_eq!(addr.port(), tobii_headpose::opentrack::DEFAULT_PORT);
         assert!(addr.ip().is_loopback());
     }
 
@@ -2252,9 +2309,60 @@ mod tests {
         }
     }
 
+    /// `tobii headpose` shipped in v0.1.0 as plain head pose to opentrack. The
+    /// config's defaults have Extended View on and a bridge port set, so
+    /// reading the file without this narrowing would have added gaze steering
+    /// to a running game and bound a second socket, for everyone, on upgrade.
     #[test]
-    fn default_rate_yields_a_sane_send_interval() {
-        let interval = Duration::from_secs_f64(1.0 / DEFAULT_RATE_HZ);
+    fn headpose_keeps_its_shipped_behaviour_unless_asked_otherwise() {
+        use tobii_output::games::OutputConfig;
+        let plain = args(&["tobii", "headpose"]);
+
+        // No config, no flags: exactly what v0.1.0 did.
+        let mut c = OutputConfig::default();
+        assert!(
+            c.extended_view.enabled && c.bridge_port.is_some(),
+            "premise"
+        );
+        apply_games_opt_in(&mut c, &plain);
+        assert!(!c.extended_view.enabled, "gaze must not steer by default");
+        assert_eq!(c.bridge_port, None, "no second socket by default");
+
+        // Opted in for one run.
+        let mut c = OutputConfig::default();
+        apply_games_opt_in(&mut c, &args(&["tobii", "headpose", "--extended-view"]));
+        assert!(c.extended_view.enabled);
+        assert_eq!(
+            c.bridge_port,
+            Some(tobii_output::games::DEFAULT_BRIDGE_PORT)
+        );
+
+        // Opted in permanently, in the config.
+        let mut c = OutputConfig {
+            enabled: true,
+            ..OutputConfig::default()
+        };
+        apply_games_opt_in(&mut c, &plain);
+        assert!(c.extended_view.enabled);
+
+        // And the escape hatch still wins over both.
+        let mut c = OutputConfig {
+            enabled: true,
+            ..OutputConfig::default()
+        };
+        apply_games_opt_in(&mut c, &args(&["tobii", "headpose", "--no-extended-view"]));
+        assert!(!c.extended_view.enabled, "--no-extended-view must win");
+    }
+
+    /// The send interval belongs to `Router` now, so what this command still
+    /// owns is the default it hands over. A rate that produced an interval
+    /// longer than the status line's own period would print "0 sent/s" while
+    /// working correctly.
+    #[test]
+    fn the_default_rate_is_sane_for_the_router_to_throttle_at() {
+        let rate = tobii_output::games::OutputConfig::default().rate_hz;
+        assert!(rate > 0.0 && rate.is_finite(), "{rate}");
+        let interval = Duration::from_secs_f64(1.0 / rate);
         assert!(interval > Duration::ZERO && interval < STATUS_INTERVAL);
     }
 }

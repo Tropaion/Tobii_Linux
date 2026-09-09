@@ -42,8 +42,15 @@ pub struct OutputConfig {
     /// Whether the daemon emits game output at all.
     ///
     /// Off by default: a background service that starts steering games the
-    /// moment it is installed would be a surprise. `tobii headpose` ignores
-    /// this — running that command *is* the opt-in.
+    /// moment it is installed would be a surprise.
+    ///
+    /// `tobii headpose` reads it too, and this comment used to say it did not.
+    /// Running the command is indeed the opt-in for *sending head pose* — that
+    /// is all it did in v0.1.0 — but not for gaze steering the view or for a
+    /// second socket to the FreeTrack bridge, which is what these defaults turn
+    /// on. Somebody who upgrades and runs the same command they always have
+    /// gets the same thing they always got, until they turn this on or pass
+    /// `--extended-view`.
     pub enabled: bool,
     /// Frames per second delivered to sinks. Sampling and smoothing still run
     /// at the device's full rate; this throttles only the wire.

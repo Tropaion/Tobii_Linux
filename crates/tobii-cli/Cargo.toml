@@ -14,6 +14,11 @@ tobii-usb = { path = "../tobii-usb" }
 tobii-protocol = { path = "../tobii-protocol" }
 tobii-config = { path = "../tobii-config" }
 tobii-diagnostics = { path = "../tobii-diagnostics" }
+# Zero new external crates: tobii-output's only dependencies are tobii-config,
+# tobii-headpose and tobii-protocol, all of which are already here. It takes
+# tobii-headpose with default-features off, so this crate's own `onnx` feature
+# still decides whether tract-onnx compiles.
+tobii-output = { path = "../tobii-output" }
 tobii-update = { path = "../tobii-update" }
 tobii-headpose = { path = "../tobii-headpose", default-features = false }
 
