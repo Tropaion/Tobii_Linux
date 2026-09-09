@@ -157,6 +157,10 @@ jobs:
       contents: write
 
     steps:
+      # Needed for docs/releases/<tag>.md below — this job would otherwise have
+      # only the downloaded artifacts and no repository at all.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: release-artifacts
@@ -169,15 +173,29 @@ jobs:
       # shows every user, and they are worth a human's eyes before they are
       # published — publishing is one click in the GitHub UI. It also means a
       # mistaken tag can be deleted without anyone's updater ever seeing it.
+      # The hand-written notes, when there are any. These are the changelog
+      # every user's updater shows them, so a list of commit subjects is a poor
+      # substitute — `--generate-notes` is the fallback, not the intent.
       - name: Create a draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          gh release create "$TAG" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" \
-            --draft \
-            --generate-notes
+          notes="docs/releases/${TAG}.md"
+          if [ -f "$notes" ]; then
+            echo "using $notes"
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --draft \
+              --notes-file "$notes"
+          else
+            echo "::warning::no $notes — falling back to generated notes"
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --draft \
+              --generate-notes
+          fi
           echo "::notice::Draft release $TAG created. Review the notes and publish it."
