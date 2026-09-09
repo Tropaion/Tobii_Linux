@@ -1,6 +1,7 @@
 //! Asking GitHub what the latest release is.
 
 use crate::json::{self, Value};
+use crate::net;
 use crate::version::Version;
 use crate::{REPO_NAME, REPO_OWNER};
 
@@ -47,6 +48,15 @@ pub enum CheckError {
     Malformed(String),
 }
 
+impl From<net::NetError> for CheckError {
+    fn from(e: net::NetError) -> Self {
+        match e {
+            net::NetError::NoFetcher => CheckError::NoFetcher,
+            other => CheckError::Fetch(other.to_string()),
+        }
+    }
+}
+
 impl std::fmt::Display for CheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -62,60 +72,13 @@ impl std::fmt::Display for CheckError {
 
 impl std::error::Error for CheckError {}
 
-/// Fetch `url` as text with `curl`, falling back to `wget`.
-///
-/// The same shape as the head-pose model store's fetcher, and for the same
-/// reason: one HTTPS GET does not justify linking an HTTP stack and its
-/// transitive tree into a driver.
-pub(crate) fn get(url: &str) -> Result<Vec<u8>, CheckError> {
-    let attempts: [(&str, Vec<&str>); 2] = [
-        (
-            "curl",
-            vec![
-                "-sL",
-                "--fail",
-                "-H",
-                "Accept: application/vnd.github+json",
-                "-H",
-                "User-Agent: tobii-linux",
-                url,
-            ],
-        ),
-        ("wget", vec!["-q", "-O", "-", url]),
-    ];
-    let mut found_any = false;
-    let mut last = String::new();
-    for (prog, args) in attempts {
-        match std::process::Command::new(prog).args(&args).output() {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                found_any = true;
-                last = e.to_string();
-            }
-            Ok(out) if out.status.success() => return Ok(out.stdout),
-            Ok(out) => {
-                found_any = true;
-                last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                if last.is_empty() {
-                    last = format!("exit status {}", out.status);
-                }
-            }
-        }
-    }
-    if found_any {
-        Err(CheckError::Fetch(last))
-    } else {
-        Err(CheckError::NoFetcher)
-    }
-}
-
 /// The newest published release, or `None` when the project has none yet.
 ///
 /// Drafts and pre-releases are skipped: a draft is not public and a
 /// pre-release is not something to push at somebody who did not opt in.
 pub fn latest() -> Result<Option<Release>, CheckError> {
     let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases?per_page=20");
-    let body = get(&url)?;
+    let body = net::get(&url)?;
     let text = String::from_utf8_lossy(&body);
     parse_releases(&text)
 }
@@ -177,19 +140,45 @@ pub fn parse_releases(text: &str) -> Result<Option<Release>, CheckError> {
 /// What a check found.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Check {
-    /// Nothing published is newer than this build.
+    /// Nothing published is newer than this build, or nothing installable is.
     UpToDate,
-    /// A newer release exists.
+    /// A newer release exists, with a build for this machine.
     Newer(Box<Release>),
+    /// A newer release exists but publishes no build for this machine.
+    ///
+    /// Kept separate from `Newer` because the two need different words: an
+    /// "Update" button that can only ever fail is worse than no button. This
+    /// says what happened and points at the releases page.
+    NotForThisTarget { version: Version, url: String },
 }
 
 /// Compare the latest release with the running build.
+///
+/// A release is only offered when it actually carries something installable
+/// here: an archive named for this target triple, and the checksums to tell a
+/// complete download from a truncated one. Without that test, a project that
+/// publishes only x86-64 builds showed an aarch64 user a banner at every launch
+/// that could never do anything.
 pub fn check() -> Result<Check, CheckError> {
     let running = Version::current();
-    match latest()? {
-        Some(r) if r.version.is_newer_than(&running) => Ok(Check::Newer(Box::new(r))),
-        _ => Ok(Check::UpToDate),
+    let Some(r) = latest()? else {
+        return Ok(Check::UpToDate);
+    };
+    if !r.version.is_newer_than(&running) {
+        return Ok(Check::UpToDate);
     }
+    let triple = crate::install::Target::triple();
+    if r.archive_for(&triple).is_none() || r.checksums().is_none() {
+        return Ok(Check::NotForThisTarget {
+            version: r.version.clone(),
+            url: if r.html_url.is_empty() {
+                crate::releases_url()
+            } else {
+                r.html_url.clone()
+            },
+        });
+    }
+    Ok(Check::Newer(Box::new(r)))
 }
 
 #[cfg(test)]
@@ -261,6 +250,20 @@ mod tests {
         let json = r#"[{"tag_name":"nightly","draft":false,"prerelease":false,
                         "body":"","assets":[]}]"#;
         assert_eq!(parse_releases(json).unwrap(), None);
+    }
+
+    /// An asset name is only a name — it must be a plain file name before it
+    /// is joined onto a directory, and `archive_for` is where the name that
+    /// gets downloaded is chosen.
+    #[test]
+    fn an_archive_is_matched_by_the_full_triple_not_a_prefix() {
+        let r = parse_releases(LISTING).unwrap().unwrap();
+        // `x86_64-unknown-linux-gnu` must not be satisfied by a musl archive.
+        assert!(r.archive_for("x86_64-unknown-linux-musl").is_none());
+        assert!(
+            r.archive_for("").is_some(),
+            "an empty triple matches anything"
+        );
     }
 
     #[test]

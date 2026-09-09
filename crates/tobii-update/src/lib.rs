@@ -27,6 +27,7 @@
 
 pub mod install;
 pub mod json;
+pub mod net;
 pub mod release;
 pub mod version;
 
