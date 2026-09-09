@@ -132,6 +132,15 @@ pub enum InstallError {
         manager: String,
         package: String,
     },
+    /// A package manager could not be asked whether it owns this copy.
+    ///
+    /// Deliberately fatal. The alternative — treating a failed query as "nobody
+    /// owns it" — reaches the swap through the check *failing*, which is the
+    /// one way [`InstallError::PackageManaged`] can be bypassed by accident.
+    OwnerUnknown {
+        manager: String,
+        why: String,
+    },
     /// The swap failed and the previous binaries were put back.
     RolledBack {
         detail: String,
@@ -190,9 +199,21 @@ impl std::fmt::Display for InstallError {
             InstallError::PackageManaged { manager, package } => write!(
                 f,
                 "this copy was installed by {manager}, as the package {package}. \
-                 Update it with {manager} rather than from here — overwriting a \
+                 Update it with {} rather than from here — overwriting a \
                  package-managed file leaves the package database wrong, and the next \
-                 upgrade would revert the change."
+                 upgrade would revert the change.",
+                // The tool that ANSWERED is not the tool a user updates with:
+                // `dpkg -S` is how you ask, `apt` is how you upgrade. Telling
+                // somebody to "update it with dpkg" is advice they cannot act
+                // on.
+                updater_for(manager)
+            ),
+            InstallError::OwnerUnknown { manager, why } => write!(
+                f,
+                "{manager} could not be asked whether it owns this copy ({why}), so the \
+                 update was not installed. Overwriting a package-managed file leaves the \
+                 package database wrong, and this cannot rule that out. Fix {manager}, or \
+                 update through your package manager."
             ),
             InstallError::NotWritable(p) => write!(
                 f,
@@ -259,65 +280,201 @@ pub fn is_build_tree(dir: &Path) -> bool {
     ) && matches!(parts.next().and_then(|s| s.to_str()), Some("target"))
 }
 
-/// Which package manager owns `path`, and as what package.
+/// Which package manager owns a file, if any — or that we could not tell.
 ///
-/// Asked of the package managers themselves rather than guessed from the path.
-/// `/usr/bin` is not reliably package-managed and `/usr/local/bin` is not
-/// reliably not; the only authority on whether dpkg owns a file is dpkg.
+/// # Why the third answer exists
 ///
-/// Returns `None` when nothing claims the file — an unpacked tarball, a
-/// `cargo install`, a build tree — which is the case this updater is for.
-pub fn package_owner(path: &Path) -> Option<(String, String)> {
-    let p = path.to_str()?;
-    /// A package manager, the query that asks it who owns a file, and how to
-    /// read the package name out of what it prints.
+/// This used to return `Option`, and treated any non-zero exit as "nobody owns
+/// it". That is one of three things a non-zero exit can mean. Reproduced with a
+/// stub `dpkg` behaving like a broken database (`exit 2`, "unable to open
+/// database"): `package_owner` returned `None`, which is the answer that lets
+/// [`install_release`] fall through and overwrite a packaged binary — the exact
+/// outcome [`InstallError::PackageManaged`] exists to prevent, arrived at
+/// because the check failed rather than because it passed.
+///
+/// So a failure the manager did not choose is [`Ownership::Unknown`], and the
+/// caller refuses. Refusing costs a message; proceeding costs a package
+/// database that describes files which are no longer there.
+///
+/// # Why there is a deadline
+///
+/// `Command::output()` waits forever. Measured with a stub `dpkg` that sleeps
+/// an hour: the call never returned and had to be killed from outside. Both
+/// callers make that fatal — [`install_release`] runs on a thread holding a
+/// `GApplication` hold that is only released on a terminal result, and
+/// `tobii-diagnostics` calls this from the GTK main thread when the settings
+/// popover's save or copy button is pressed. A package manager blocked on an
+/// NFS stall or a stale lock would freeze the hub for the life of the process.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ownership {
+    /// A package manager claims the file.
+    Package { manager: String, package: String },
+    /// Every manager that is installed ran and disclaimed it.
+    None,
+    /// At least one manager could not be asked, or failed in a way it does not
+    /// use for "no match". Treated as ownership, because the alternative is
+    /// overwriting a packaged file on the strength of a broken query.
+    Unknown { manager: String, why: String },
+}
+
+/// How long any one package-manager query may take.
+///
+/// These are local database lookups that normally answer in tens of
+/// milliseconds — measured here at 114 ms for a miss, worst of the three. Two
+/// seconds is far outside that and still short enough not to be felt.
+const OWNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub fn package_owner(path: &Path) -> Ownership {
+    let Some(p) = path.to_str() else {
+        return Ownership::None;
+    };
+    /// A package manager, the query that asks it who owns a file, how to read
+    /// the package name out of what it prints, and the exit code it uses for
+    /// "no package owns this".
     struct Query<'a> {
         prog: &'static str,
-        args: [&'a str; 2],
+        args: Vec<&'a str>,
         name_from: fn(&str) -> Option<String>,
+        no_match: i32,
     }
 
     let queries = [
-        // dpkg prints "tobii-linux: /usr/bin/tobii".
+        // dpkg prints "tobii-linux: /usr/bin/tobii". It can also print
+        // "diversion by <pkg> from: /usr/bin/tobii", where the first
+        // colon-separated field is the words "diversion by <pkg> from" — which
+        // the naive split takes for a package name. Exit 1 is "no path found",
+        // exit 2 is a real error.
         Query {
             prog: "dpkg",
-            args: ["-S", p],
-            name_from: |o| Some(o.lines().next()?.split(':').next()?.trim().to_string()),
+            args: vec!["-S", p],
+            name_from: |o| {
+                let line = o.lines().find(|l| !l.starts_with("diversion "))?;
+                Some(line.split(':').next()?.trim().to_string())
+            },
+            no_match: 1,
         },
-        // rpm prints the NEVRA, "tobii-linux-0.1.0-1.x86_64".
+        // `--queryformat`, so this is the package NAME. Plain `rpm -qf` prints
+        // the whole NEVRA — "tobii-linux-0.1.0-1.x86_64" — which is not what
+        // you type at dnf and reads like a filename in the refusal message.
+        // Exit 1 is "not owned by any package".
         Query {
             prog: "rpm",
-            args: ["-qf", p],
+            args: vec!["-qf", "--queryformat", "%{NAME}\\n", p],
             name_from: |o| Some(o.lines().next()?.trim().to_string()),
+            no_match: 1,
         },
         // `-Qoq` prints the bare package name and nothing else. NOT `-Qo`,
         // whose output is a prose sentence — and a LOCALIZED one: on a German
         // system it reads "/usr/bin/ls ist in coreutils 9.11-2.1 enthalten",
         // where the first whitespace token is the path, not the package. Any
         // parse of that sentence is a parse of the user's language settings.
+        // Verified on this machine: a miss exits 1.
         Query {
             prog: "pacman",
-            args: ["-Qoq", p],
+            args: vec!["-Qoq", p],
             name_from: |o| Some(o.lines().next()?.trim().to_string()),
+            no_match: 1,
         },
     ];
     for q in queries {
-        let Ok(out) = std::process::Command::new(q.prog)
-            .args(q.args)
+        let spawned = std::process::Command::new(q.prog)
+            .args(&q.args)
             .stdin(std::process::Stdio::null())
-            .output()
-        else {
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(child) = spawned else {
             continue; // that package manager is not installed here
         };
-        if !out.status.success() {
-            continue; // it ran and does not own the file
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(pkg) = (q.name_from)(&stdout).filter(|s| !s.is_empty()) {
-            return Some((q.prog.to_string(), pkg));
+        let out = match wait_bounded(child, OWNER_TIMEOUT) {
+            Ok(out) => out,
+            Err(why) => {
+                return Ownership::Unknown {
+                    manager: q.prog.to_string(),
+                    why,
+                }
+            }
+        };
+        match out.status.code() {
+            Some(0) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(pkg) = (q.name_from)(&stdout).filter(|s| !s.is_empty()) {
+                    return Ownership::Package {
+                        manager: q.prog.to_string(),
+                        package: pkg,
+                    };
+                }
+                // Exit 0 and nothing parseable: it answered, and we cannot read
+                // the answer. That is not "nobody owns it".
+                return Ownership::Unknown {
+                    manager: q.prog.to_string(),
+                    why: "it succeeded but printed nothing we could read".into(),
+                };
+            }
+            Some(c) if c == q.no_match => continue, // it ran and disclaims the file
+            Some(c) => {
+                return Ownership::Unknown {
+                    manager: q.prog.to_string(),
+                    why: format!("it exited with {c}"),
+                }
+            }
+            // Killed by a signal.
+            None => {
+                return Ownership::Unknown {
+                    manager: q.prog.to_string(),
+                    why: "it was killed".into(),
+                }
+            }
         }
     }
-    None
+    Ownership::None
+}
+
+/// The command a person actually updates with, given the one that answered.
+fn updater_for(query_tool: &str) -> &str {
+    match query_tool {
+        "dpkg" => "apt",
+        "rpm" => "dnf",
+        other => other, // pacman asks and upgrades with the same command
+    }
+}
+
+/// Wait for a child, killing it if it outstays `limit`.
+///
+/// The same 25 ms `try_wait` loop [`probe`] uses, factored out so both callers
+/// are bounded by construction rather than by remembering to be.
+fn wait_bounded(
+    mut child: std::process::Child,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Err(e) => return Err(format!("it could not be run: {e}")),
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut o) = child.stdout.take() {
+                    use std::io::Read;
+                    // Bounded: a manager that printed a gigabyte would
+                    // otherwise be read into memory in full.
+                    let _ = o.by_ref().take(256 * 1024).read_to_end(&mut stdout);
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("it did not answer within {limit:?}"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
 }
 
 /// Whether a new file can be created in `dir`.
@@ -398,8 +555,23 @@ pub fn install_release(
     // Asked before writability, because the two failures need opposite advice:
     // "you need permission" invites `sudo`, which is exactly the wrong thing to
     // do to a package-managed file.
-    if let Some((manager, package)) = package_owner(&dir.join(BINARIES[0])) {
-        return Err(InstallError::PackageManaged { manager, package });
+    //
+    // BOTH binaries, not just the first. A package can own one and not the
+    // other — a half-replaced install, a distribution that splits the CLI from
+    // the GUI — and overwriting the owned one is the damage this gate exists to
+    // prevent, whichever of the two it is.
+    for name in BINARIES {
+        match package_owner(&dir.join(name)) {
+            Ownership::Package { manager, package } => {
+                return Err(InstallError::PackageManaged { manager, package })
+            }
+            // Could not tell. Refuse: the alternative is overwriting a packaged
+            // file on the strength of a query that failed.
+            Ownership::Unknown { manager, why } => {
+                return Err(InstallError::OwnerUnknown { manager, why })
+            }
+            Ownership::None => {}
+        }
     }
     if !is_writable(&dir) {
         return Err(InstallError::NotWritable(dir));
@@ -941,11 +1113,151 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
     /// or the updater would refuse to update the copies it exists for.
     #[test]
     fn a_file_no_package_owns_is_not_reported_as_package_managed() {
+        // Takes the PATH lock: the stub tests below repoint `PATH` at a fake
+        // dpkg, and this one asks the REAL package managers. Without the lock
+        // it intermittently gets a stub's answer.
+        let _guard = PATH_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let s = Scratch::new("owner");
         let loose = s.path().join("tobii");
         std::fs::write(&loose, b"not from a package").unwrap();
-        assert_eq!(package_owner(&loose), None);
-        assert_eq!(package_owner(&s.path().join("does-not-exist")), None);
+        assert_eq!(package_owner(&loose), Ownership::None);
+        assert_eq!(
+            package_owner(&s.path().join("does-not-exist")),
+            Ownership::None
+        );
+    }
+
+    /// `package_owner` against stub package managers.
+    ///
+    /// Two of the three output parsers had never parsed anything, and the
+    /// refusal path had never run: every existing test stayed on the "nobody
+    /// owns it" branch or built an `InstallError` by hand. These put a fake
+    /// `dpkg`/`rpm`/`pacman` first on `PATH` and drive the real function.
+    ///
+    /// `PATH` is process-global, so they serialise on one lock.
+    static PATH_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_stub<T>(prog: &str, script: &str, f: impl FnOnce() -> T) -> T {
+        let guard = PATH_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("tobii-stub-{prog}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(prog);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old = std::env::var_os("PATH");
+        // ONLY the stub directory: the real dpkg/rpm/pacman must not be
+        // reachable, or the machine running the test decides the outcome.
+        std::env::set_var("PATH", &dir);
+        let out = f();
+        match old {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+        out
+    }
+
+    #[test]
+    fn dpkg_naming_the_package_is_a_refusal() {
+        let o = with_stub("dpkg", "echo 'tobii-linux: /usr/bin/tobii'; exit 0", || {
+            package_owner(Path::new("/usr/bin/tobii"))
+        });
+        assert_eq!(
+            o,
+            Ownership::Package {
+                manager: "dpkg".into(),
+                package: "tobii-linux".into()
+            }
+        );
+    }
+
+    /// dpkg answers a diverted path with a line whose first colon-field is the
+    /// words "diversion by <pkg> from" — which the naive `split(':').next()`
+    /// took for a package name, so the refusal named a package called
+    /// "diversion by tobii-linux from".
+    #[test]
+    fn a_dpkg_diversion_line_is_not_read_as_a_package_name() {
+        let o = with_stub(
+            "dpkg",
+            "echo 'diversion by other-pkg from: /usr/bin/tobii'; \
+             echo 'tobii-linux: /usr/bin/tobii'; exit 0",
+            || package_owner(Path::new("/usr/bin/tobii")),
+        );
+        assert_eq!(
+            o,
+            Ownership::Package {
+                manager: "dpkg".into(),
+                package: "tobii-linux".into()
+            }
+        );
+    }
+
+    /// A broken database exits non-zero for a reason that is not "no match".
+    /// Reading that as "nobody owns it" is how a packaged binary gets
+    /// overwritten by a check that FAILED rather than passed.
+    #[test]
+    fn a_package_manager_that_errors_is_not_read_as_nobody_owns_it() {
+        let o = with_stub(
+            "dpkg",
+            "echo 'dpkg-query: error: unable to open database' >&2; exit 2",
+            || package_owner(Path::new("/usr/bin/tobii")),
+        );
+        assert!(
+            matches!(o, Ownership::Unknown { ref manager, .. } if manager == "dpkg"),
+            "{o:?}"
+        );
+    }
+
+    /// Its own no-match code still means no match.
+    #[test]
+    fn dpkgs_no_match_exit_code_means_nobody_owns_it() {
+        let o = with_stub("dpkg", "exit 1", || {
+            package_owner(Path::new("/usr/bin/tobii"))
+        });
+        assert_eq!(o, Ownership::None);
+    }
+
+    /// `Command::output()` waits forever, and both callers make that fatal —
+    /// the GUI's install thread holds a `GApplication` hold, and the
+    /// diagnostics report is built on the GTK main thread.
+    #[test]
+    fn a_package_manager_that_hangs_is_killed_rather_than_waited_for() {
+        let started = std::time::Instant::now();
+        let o = with_stub("dpkg", "sleep 3600", || {
+            package_owner(Path::new("/usr/bin/tobii"))
+        });
+        assert!(
+            matches!(o, Ownership::Unknown { .. }),
+            "a hung manager must not read as unowned: {o:?}"
+        );
+        assert!(
+            started.elapsed() < OWNER_TIMEOUT * 3,
+            "it waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The refusal has to be actionable: `dpkg -S` is how you ask, `apt` is how
+    /// you upgrade, and "update it with dpkg" is advice nobody can follow.
+    #[test]
+    fn the_refusal_names_the_command_that_updates_not_the_one_that_answered() {
+        let msg = InstallError::PackageManaged {
+            manager: "dpkg".into(),
+            package: "tobii-linux".into(),
+        }
+        .to_string();
+        assert!(msg.contains("apt"), "{msg}");
+        let msg = InstallError::PackageManaged {
+            manager: "rpm".into(),
+            package: "tobii-linux".into(),
+        }
+        .to_string();
+        assert!(msg.contains("dnf"), "{msg}");
     }
 
     #[test]

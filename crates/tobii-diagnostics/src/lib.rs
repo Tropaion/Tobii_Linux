@@ -140,8 +140,18 @@ fn install_kind() -> String {
     let Ok(dir) = tobii_update::install::install_dir() else {
         return "unknown".into();
     };
-    if let Some((mgr, pkg)) = tobii_update::install::package_owner(&dir.join("tobii")) {
-        return format!("package `{pkg}` via {mgr}");
+    use tobii_update::install::Ownership;
+    match tobii_update::install::package_owner(&dir.join("tobii")) {
+        Ownership::Package { manager, package } => {
+            return format!("package `{package}` via {manager}")
+        }
+        // Worth printing rather than hiding: it is also why the updater will
+        // refuse, so a report that omitted it would not explain the refusal
+        // the user is filing an issue about.
+        Ownership::Unknown { manager, why } => {
+            return format!("unknown — {manager} could not be asked ({why})")
+        }
+        Ownership::None => {}
     }
     if tobii_update::install::is_build_tree(&dir) {
         return format!("build tree ({})", safe_path(&dir));
