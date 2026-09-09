@@ -223,6 +223,15 @@ pub struct DeviceState {
     /// from the eye origins, rotation from the model. `None` until a model is
     /// installed AND a frame it was confident about has arrived.
     pub head_pose: Option<tobii_headpose::HeadPose>,
+    /// When [`Self::head_pose`]'s ROTATION was last actually measured.
+    ///
+    /// The model returning nothing holds the previous rotation rather than
+    /// snapping to zero, which is right for the hub's readout — a head that
+    /// briefly cannot be found should not make the drawing jump — and wrong for
+    /// a game, where it means a camera stuck at an angle from a minute ago. The
+    /// readout shows low confidence through `head_sigma`; game output needs a
+    /// clock, so this is it.
+    pub head_pose_at: Option<Instant>,
     /// The model's confidence for that pose — lower is better; see
     /// `tobii_headpose::onnx::SIGMA_MAX`. `None` when the pose is geometric.
     pub head_sigma: Option<f32>,
@@ -505,6 +514,7 @@ pub fn device_tick<T: Transport>(
     state: &Mutex<DeviceState>,
     cmd_rx: &Receiver<DeviceCommand>,
     head: Option<&HeadWorker>,
+    games: Option<&mut crate::outputs::GameOutput>,
 ) -> Tick {
     let mut reload_head = false;
     while let Ok(cmd) = cmd_rx.try_recv() {
@@ -516,6 +526,7 @@ pub fn device_tick<T: Transport>(
     let notifications = conn.read_notifications();
     let saw_traffic = notifications.saw_traffic;
     let mut got = false;
+    let mut games = games;
     for (op, payload) in notifications {
         match op {
             OP_GAZE_NOTIFY => {
@@ -529,13 +540,31 @@ pub fn device_tick<T: Transport>(
                         .is_none()
                         .then(|| tobii_headpose::pose_from_sample(&g))
                         .flatten();
-                    let mut s = state.lock().unwrap();
-                    s.eye_view = Some(s.eye_history.update(&g));
-                    s.latest_gaze = Some(g);
-                    s.status = ConnStatus::Connected;
-                    if head.is_none() {
-                        s.head_pose = geometric;
-                        s.head_sigma = None;
+                    let now = Instant::now();
+                    // The pose game output should act on, decided while the
+                    // lock is held and used after it is dropped. A rotation the
+                    // model has merely been HOLDING is not offered: see
+                    // `outputs::pose_is_fresh`.
+                    let for_games = {
+                        let mut s = state.lock().unwrap();
+                        s.eye_view = Some(s.eye_history.update(&g));
+                        s.latest_gaze = Some(g.clone());
+                        s.status = ConnStatus::Connected;
+                        if head.is_none() {
+                            s.head_pose = geometric;
+                            s.head_pose_at = geometric.map(|_| now);
+                            s.head_sigma = None;
+                        }
+                        crate::outputs::pose_is_fresh(s.head_pose_at, now)
+                            .then_some(s.head_pose)
+                            .flatten()
+                    };
+                    // Routed from HERE, on the sample that produced it, rather
+                    // than from a timer re-reading the state mutex: a poll
+                    // re-samples a ~30 Hz source at its own cadence and turns
+                    // every frame into a decision about which one it missed.
+                    if let Some(out) = games.as_deref_mut() {
+                        out.offer(&g, for_games, now);
                     }
                 }
                 got = true;
@@ -613,6 +642,10 @@ impl HeadWorker {
                 match pose {
                     Some(m) => {
                         s.head_pose = fuse(eyes, Some(&m), RotationSource::Model);
+                        // A measured rotation: this is the only place the stamp
+                        // is refreshed, so holding a rotation below does not
+                        // make it look fresh.
+                        s.head_pose_at = Some(Instant::now());
                         s.head_sigma = Some(m.sigma);
                     }
                     None => {
@@ -903,6 +936,15 @@ fn device_session(
                 // since `read_notifications` already blocks for up to a second.
                 // One model, one worker, for the life of the connection.
                 let mut head = HeadWorker::spawn(thread_state.clone());
+
+                // Game output, rebuilt per connection rather than once at
+                // startup. The tracker only opens when something asks for it,
+                // so "the next connect" is the next time anybody could be
+                // watching — which makes toggling the games switch take effect
+                // without restarting the hub, and re-reads the display corners
+                // that Extended View needs after a screen change.
+                let mut games = crate::outputs::GameOutput::for_session();
+
                 let mut quiet_since = Instant::now();
                 // Anything queued while the tracker was off is applied now that
                 // there is a connection to apply it to.
@@ -925,7 +967,8 @@ fn device_session(
                             break;
                         }
                     }
-                    let tick = device_tick(&mut conn, thread_state, rx, head.as_ref());
+                    let tick =
+                        device_tick(&mut conn, thread_state, rx, head.as_ref(), games.as_mut());
                     if tick.reload_head {
                         // Dropping the old worker closes its channel, so its
                         // thread ends after the frame it is on.
@@ -1258,7 +1301,7 @@ mod tests {
         let mut conn = connected(vec![inbound(TTP_MAGIC_NOTIFY, 0, 0x500, &gaze_payload())]);
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
-        assert!(device_tick(&mut conn, &state, &rx, None).published);
+        assert!(device_tick(&mut conn, &state, &rx, None, None).published);
         let g = state
             .lock()
             .unwrap()
@@ -1273,7 +1316,7 @@ mod tests {
         let mut conn = connected(vec![]);
         let state = Mutex::new(DeviceState::default());
         let (_tx, rx) = channel::<DeviceCommand>();
-        assert!(!device_tick(&mut conn, &state, &rx, None).published);
+        assert!(!device_tick(&mut conn, &state, &rx, None, None).published);
     }
 
     #[test]
@@ -1329,7 +1372,7 @@ mod tests {
         let (tx, rx) = channel::<DeviceCommand>();
         tx.send(DeviceCommand::CalCollect { x: 0.5, y: 0.5 })
             .unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         assert_eq!(state.lock().unwrap().calibration.collected, 1);
     }
 
@@ -1367,7 +1410,7 @@ mod tests {
             token: 99,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         let s = state.lock().unwrap();
         assert_eq!(s.calibration.token, 99, "UI's token is echoed back");
         assert!(s.calibration.active);
@@ -1400,7 +1443,7 @@ mod tests {
             token: 1,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         assert!(sent_op(&conn, 0x456), "retrieved blob was re-applied");
         let s = state.lock().unwrap();
         assert!(s.calibration.started, "start+clear+reapply all acked");
@@ -1426,7 +1469,7 @@ mod tests {
             token: 1,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         let s = state.lock().unwrap();
         assert!(s.calibration.started, "session must open anyway");
         assert!(
@@ -1456,7 +1499,7 @@ mod tests {
             token: 5,
         })
         .unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         {
             let s = state.lock().unwrap();
             assert!(!s.calibration.active, "on_finish cleared active");
@@ -1472,7 +1515,7 @@ mod tests {
         // assertions below deliberately do not depend on that, but the coupling
         // is real and this test would be better with a config seam.
         tx.send(DeviceCommand::CalAbort).unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         assert!(sent_op(&conn, 0x3fc), "CAL_STOP was sent");
         // The mock never acks that stop, so the realm may well still be open:
         // the flag must STAY set so a later abort retries it. Clearing on a
@@ -1511,7 +1554,7 @@ mod tests {
             s.cal_session_open = false;
         }
         tx.send(DeviceCommand::CalAbort).unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         assert!(!sent_op(&conn, 0x3fc), "no redundant CAL_STOP");
         assert_eq!(state.lock().unwrap().calibration, CalPhase::default());
     }
@@ -1529,7 +1572,7 @@ mod tests {
             },
         ))
         .unwrap();
-        device_tick(&mut conn, &state, &rx, None);
+        device_tick(&mut conn, &state, &rx, None, None);
         // A SET_DISPLAY_AREA (op 0x5a0) frame was sent (5th send after 4 handshake sends).
         assert_eq!(
             &conn.transport().sent.last().unwrap()[20..24],

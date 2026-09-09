@@ -23,5 +23,7 @@ tobii-update = { path = "../tobii-update" }
 # The socket the hub serves tracking data on. NOT tobii-output: this commit is
 # the demand seam alone, with no router, no sinks and no frames.
 tobii-ipc = { path = "../tobii-ipc" }
+# The routing layer: Extended View, the sinks, and the shared compose pipeline.
+tobii-output = { path = "../tobii-output" }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
 gtk4-layer-shell = "0.8"

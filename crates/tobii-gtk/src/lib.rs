@@ -14,7 +14,7 @@ pub mod eye_preview;
 pub mod eyeview;
 pub mod focus;
 pub mod head_model;
-mod outputs;
+pub mod outputs;
 pub mod overlay;
 pub mod particles;
 pub mod screen_pick;

@@ -1504,6 +1504,7 @@ dependencies = [
  "tobii-diagnostics",
  "tobii-headpose",
  "tobii-ipc",
+ "tobii-output",
  "tobii-protocol",
  "tobii-update",
  "tobii-usb",

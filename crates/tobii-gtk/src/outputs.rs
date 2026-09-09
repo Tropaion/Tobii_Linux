@@ -125,6 +125,112 @@ impl Holds {
     }
 }
 
+/// How stale a measured rotation may be before game output stops trusting it.
+///
+/// The model returning nothing holds the previous rotation, which keeps the
+/// hub's drawing steady through a moment where the head cannot be found. A game
+/// camera is different: a held rotation is indistinguishable from a real one,
+/// so after a second the pose is dropped and the pipeline falls back to the
+/// geometric one, which at least tracks the eyes that are actually there.
+const HEAD_POSE_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Whether a measured rotation is recent enough for a game to act on.
+pub(crate) fn pose_is_fresh(at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    at.is_some_and(|t| now.saturating_duration_since(t) < HEAD_POSE_MAX_AGE)
+}
+
+/// The hub's own game output: compose a frame per gaze sample, route it to the
+/// configured sinks.
+///
+/// Built per CONNECTION rather than once at startup. The tracker only opens when
+/// something asks for it, so the next connect is the next moment anybody could
+/// be watching — which makes toggling the games switch take effect without
+/// restarting the hub, and re-reads the display corners Extended View needs
+/// after a screen change.
+pub struct GameOutput {
+    cfg: tobii_output::games::OutputConfig,
+    router: tobii_output::Router,
+    pipeline: tobii_output::pipeline::FramePipeline,
+    corners: Option<tobii_protocol::DisplayCorners>,
+}
+
+impl GameOutput {
+    /// The output for this session, or `None` if game output is switched off.
+    ///
+    /// Off is the default, deliberately: a hub that started steering games the
+    /// moment it was installed would be a surprise, and the illuminator rule
+    /// says nothing about who is allowed to consume the data.
+    pub fn for_session() -> Option<GameOutput> {
+        let cfg = tobii_output::games::load_output_config();
+        if !cfg.enabled {
+            return None;
+        }
+        Self::from_config(cfg)
+    }
+
+    /// The same, from a config given rather than read.
+    ///
+    /// Split out so a test can point the sinks at a socket it owns: what is
+    /// worth asserting is that a datagram actually leaves, and that cannot be
+    /// checked against whatever `games.toml` happens to say on the machine
+    /// running the test.
+    fn from_config(cfg: tobii_output::games::OutputConfig) -> Option<GameOutput> {
+        let mut router = tobii_output::Router::new(cfg.rate_hz);
+        if let Some(spec) = &cfg.opentrack {
+            match spec
+                .parse()
+                .map_err(|e| format!("{e}"))
+                .and_then(|a| tobii_output::sinks::OpentrackUdp::new(a).map_err(|e| format!("{e}")))
+            {
+                Ok(s) => router.add(Box::new(s)),
+                // A sink that cannot be opened is named and skipped. Refusing
+                // the whole session because one endpoint is bad would take the
+                // hub's tracking down with it.
+                Err(e) => tobii_diagnostics::log::warn(&format!(
+                    "game output: could not open the opentrack sink at {spec} ({e})"
+                )),
+            }
+        }
+        if let Some(port) = cfg.bridge_port {
+            match tobii_output::sinks::BridgeUdp::new(port) {
+                Ok(s) => router.add(Box::new(s)),
+                Err(e) => tobii_diagnostics::log::warn(&format!(
+                    "game output: could not open the bridge sink on port {port} ({e})"
+                )),
+            }
+        }
+        if router.sink_count() == 0 {
+            tobii_diagnostics::log::warn(
+                "game output is on but no sink could be opened; nothing will receive it",
+            );
+            return None;
+        }
+        tobii_diagnostics::log::info(&format!(
+            "game output on, sending to: {}",
+            router.sink_names().join(", ")
+        ));
+        Some(GameOutput {
+            pipeline: tobii_output::pipeline::FramePipeline::new(&cfg),
+            corners: tobii_config::load().ok().flatten().map(|s| s.to_corners()),
+            cfg,
+            router,
+        })
+    }
+
+    /// Compose and route one sample.
+    pub fn offer(
+        &mut self,
+        sample: &tobii_protocol::GazeSample,
+        pose: Option<tobii_headpose::HeadPose>,
+        now: std::time::Instant,
+    ) {
+        let frame = self
+            .pipeline
+            .offer(sample, pose, &self.cfg, self.corners, now);
+        self.router.offer(&frame, now);
+    }
+}
+
 /// Serve the hub's socket for as long as the process lives.
 ///
 /// Returns without starting anything if the socket cannot be bound. That is a
@@ -349,6 +455,98 @@ mod tests {
         });
         assert!(dark, "the tracker must go out when the client goes away");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A rotation the model has merely been HOLDING must not reach a game.
+    ///
+    /// When the model cannot find a head it keeps the last rotation rather than
+    /// snapping to zero — right for the hub's drawing, wrong for a camera,
+    /// where a held angle is indistinguishable from a real one and the view
+    /// simply stops responding while looking like it is working.
+    #[test]
+    fn a_held_rotation_stops_being_offered_to_games_after_a_second() {
+        let now = std::time::Instant::now();
+        assert!(!pose_is_fresh(None, now), "no measurement at all");
+        assert!(pose_is_fresh(Some(now), now), "measured right now");
+        assert!(
+            pose_is_fresh(Some(now - Duration::from_millis(999)), now),
+            "just inside the bound: a brief loss must not drop the pose"
+        );
+        assert!(
+            !pose_is_fresh(Some(now - HEAD_POSE_MAX_AGE), now),
+            "at the bound it is stale"
+        );
+        assert!(
+            !pose_is_fresh(Some(now - Duration::from_secs(60)), now),
+            "a minute-old rotation is not a head position"
+        );
+    }
+
+    /// A datagram actually leaves.
+    ///
+    /// Everything else here asserts a decision; this asserts the consequence.
+    /// The chain is long — config, Router, FramePipeline, the opentrack sink,
+    /// a UDP socket — and each link is tested in its own crate, but nothing
+    /// until now checked that the hub wires them into something a game receives.
+    #[test]
+    fn a_tracked_sample_reaches_a_real_socket_as_an_opentrack_datagram() {
+        use std::net::UdpSocket;
+        use tobii_output::games::OutputConfig;
+
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind a listener");
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let cfg = OutputConfig {
+            enabled: true,
+            opentrack: Some(addr.to_string()),
+            // Only the one sink, so the assertion below is about this socket.
+            bridge_port: None,
+            ..OutputConfig::default()
+        };
+        let mut out = GameOutput::from_config(cfg).expect("a router with one sink");
+
+        // A sample the tracker would produce with both eyes visible.
+        let mut sample = tobii_protocol::GazeSample {
+            timestamp_us: 1,
+            validity_l: 0,
+            validity_r: 0,
+            eye_origin_l_mm: [-32.0, 0.0, 600.0],
+            eye_origin_r_mm: [32.0, 0.0, 600.0],
+            ..Default::default()
+        };
+        sample.present_mask = tobii_protocol::gaze::present::EYE_ORIGIN_L
+            | tobii_protocol::gaze::present::EYE_ORIGIN_R
+            | tobii_protocol::gaze::present::VALIDITY_L
+            | tobii_protocol::gaze::present::VALIDITY_R;
+
+        out.offer(&sample, None, std::time::Instant::now());
+
+        let mut buf = [0u8; 128];
+        let n = listener
+            .recv(&mut buf)
+            .expect("a datagram should have arrived");
+        assert_eq!(n, 48, "an opentrack datagram is six f64");
+
+        // And it carries the position the eye origins imply, not zeroes.
+        let z = f64::from_le_bytes(buf[16..24].try_into().unwrap());
+        assert!(
+            z.abs() > 1.0,
+            "the datagram should carry a real distance, got {z}"
+        );
+    }
+
+    /// Game output is off unless it has been turned on. A hub that started
+    /// steering games the moment it was installed would be a surprise, and the
+    /// illuminator rule says nothing about who may consume the data.
+    #[test]
+    fn game_output_is_off_until_it_is_switched_on() {
+        assert!(
+            !tobii_output::games::OutputConfig::default().enabled,
+            "the default must be off, or `for_session` opens sockets nobody asked for"
+        );
     }
 
     /// The reason text is a literal, never the client's own name — that name
