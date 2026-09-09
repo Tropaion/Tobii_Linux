@@ -14,7 +14,7 @@ What is measured, what is assumed, and what is known to be wrong. Background in
 
 | Property | Measured | Where |
 |---|---|---|
-| Gaze accuracy, 49" 32:9 panel, within ±28° | **12.1 mm** mean error (≈0.30° at 750 mm) | measured after the calibration op-code fix |
+| Gaze accuracy, 49" 32:9 panel, within ±28° | **12.1 mm** mean error (≈0.92° at 750 mm) | measured after the calibration op-code fix |
 | Before the op-code fix | **80 mm** | same panel — every calibration before 2026-08-15 was a silent no-op |
 | Head-pose yaw vs geometry | slope **+1.03**, r = **0.998** | `tobii headpose --check` on hardware |
 | Head-pose roll vs geometry | slope **+0.96**, r = **0.990** | same |
@@ -96,7 +96,9 @@ have not been byte-stable across their own tooling changes, and a pinned digest
 that breaks is worse than an absent one — but it does mean the source-build
 channel verifies nothing about what it downloads.
 
-**The binaries ship unstripped**, about 2.2 MB of symbol table each. Deliberate:
+**The binaries ship unstripped**, about 9 MB of symbol table each — a 34 MB
+binary strips to 25 MB (measured with `strip` on both, September 2026).
+Deliberate:
 release builds carry no debug info, so the symbol table is the only thing that
 makes a panic in a bug report name a function rather than an address, and this
 project asks people to paste panics.

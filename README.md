@@ -20,11 +20,14 @@ inspired by the original Tobii Experience UI.
   computed and applied on the device after each group, then persisted and
   re-applied on every connect.
   Measured accuracy on a 49" 32:9 panel: **12.1 mm** mean error within the
-  device's usable ±28°, or about 0.30° at 750 mm.
+  device's usable ±28° — about 0.92° at a 750 mm viewing distance.
 - **Display setup** — a fullscreen guided flow: drag two lines onto the marks at
   the ends of the tracker and the screen geometry is derived, seeded from your
-  monitor's EDID. Curved panels are handled (arc→chord width plus a gaze
-  correction; the device itself can only be told about a flat plane).
+  monitor's EDID. Curved panels: the device is told the EDID **arc** width — it
+  only accepts a flat plane, and sending the chord makes that plane too narrow
+  and compresses gaze toward the edges — and the per-user calibration absorbs
+  the curve. No runtime gaze correction is applied; one was written and then
+  disproved on hardware.
 - **Select eyes to detect** — both, left only, or right only.
 
 ### Head tracking
@@ -62,9 +65,11 @@ inspired by the original Tobii Experience UI.
   `tobii headpose` to claim for a game.
 - **Start menu entry and optional autostart.** `scripts/build.sh --install`
   adds a desktop entry; *Start when I log in* runs `tobii-gtk --background`,
-  which keeps the tracker's configuration applied without opening a window and
-  without turning the tracker on. Launching the app again raises the hub rather
-  than starting a second copy.
+  which keeps the program resident with no window, so the hub opens instantly
+  and launching the app again raises it rather than starting a second copy. It
+  does **not** turn the tracker on, and does not apply anything to it: nothing
+  asks for data until you open a window, which is the point of the standby
+  behaviour below.
 - **Updates** — the hub checks for a new release at launch and can show the
   changelog and install it. Nothing is downloaded without a click. The check can
   be switched off. See [Updates](#updates) for what installing one trusts.
@@ -94,7 +99,8 @@ cd tobii-linux-*/ && ./install.sh          # ~/.local/bin, menu entry, udev rule
 
 sudo apt install ./tobii-linux_*.deb       # Debian, Ubuntu, Mint, Pop!_OS
 sudo dnf install ./tobii-linux-*.rpm       # Fedora, RHEL, openSUSE
-makepkg -si                                # Arch, with the release's PKGBUILD
+# Arch: download PKGBUILD *and* tobii-linux.install into the same directory
+makepkg -si
 ```
 
 `install.sh` copies the two binaries, adds the application-menu entry, and asks

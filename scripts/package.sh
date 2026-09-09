@@ -194,6 +194,18 @@ cat > "$ctl/postinst" <<'EOF'
 #!/bin/sh
 set -e
 if [ "$1" = configure ]; then
+    # The pre-v0.1.0 rule, if it is still there.
+    #
+    # It was called 99-tobii.rules and said MODE="0666". Because 99- sorts AFTER
+    # 60-, its mode assignment wins — so a machine that installed this project
+    # before v0.1.0 and now installs a package keeps an infrared camera readable by
+    # every local process, while the release notes announce the rule as hardened to
+    # 0660. The tarball installer removes it; every other channel has to as well, or
+    # three of the four documented install paths silently do not deliver the fix.
+    if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
+        rm -f /etc/udev/rules.d/99-tobii.rules
+        echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
+    fi
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload >/dev/null 2>&1 || true
         udevadm trigger >/dev/null 2>&1 || true
@@ -248,6 +260,10 @@ license=('GPL-3.0-only')
 depends=('gtk4' 'gtk4-layer-shell' 'libusb')
 makedepends=('rust' 'pkgconf')
 optdepends=('curl: fetching the head-pose model and updates')
+# The only post-install hook makepkg offers. Without it the Arch channel is the
+# one that never removes the pre-v0.1.0 99-tobii.rules, whose MODE="0666" wins
+# over this rule because 99- sorts after 60-.
+install=tobii-linux.install
 source=("\$pkgname-\$pkgver.tar.gz::\$url/archive/refs/tags/v\$pkgver.tar.gz")
 # SKIP, deliberately. GitHub generates this tarball on demand and its bytes
 # have not been stable across GitHub's own tooling changes, so a pinned digest
@@ -280,6 +296,26 @@ package() {
     install -Dm644 README.md "\$pkgdir/usr/share/doc/\$pkgname/README.md"
     install -Dm644 LICENSE   "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
 }
+EOF
+
+# makepkg reads this beside the PKGBUILD; both have to be downloaded together.
+cat > "$dist/tobii-linux.install" <<'EOF'
+_tobii_post() {
+    # The pre-v0.1.0 rule was called 99-tobii.rules and said MODE="0666".
+    # Because 99- sorts AFTER 60-, its mode assignment wins — so a machine that
+    # installed this project before v0.1.0 would keep an infrared camera
+    # readable by every local process while the release notes announce the rule
+    # as hardened to 0660.
+    if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
+        rm -f /etc/udev/rules.d/99-tobii.rules
+        echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
+    fi
+    udevadm control --reload >/dev/null 2>&1 || true
+    udevadm trigger >/dev/null 2>&1 || true
+    echo "Re-plug the Eye Tracker 5 so the udev rule takes effect."
+}
+post_install() { _tobii_post; }
+post_upgrade() { _tobii_post; }
 EOF
 echo "  PKGBUILD"
 
@@ -323,6 +359,18 @@ cp -a %{_sourcedir}/payload/. %{buildroot}/
 %doc /usr/share/doc/tobii-linux/*
 
 %post
+# The pre-v0.1.0 rule, if it is still there.
+#
+# It was called 99-tobii.rules and said MODE="0666". Because 99- sorts AFTER
+# 60-, its mode assignment wins — so a machine that installed this project
+# before v0.1.0 and now installs a package keeps an infrared camera readable by
+# every local process, while the release notes announce the rule as hardened to
+# 0660. The tarball installer removes it; every other channel has to as well, or
+# three of the four documented install paths silently do not deliver the fix.
+if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
+    rm -f /etc/udev/rules.d/99-tobii.rules
+    echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
+fi
 udevadm control --reload >/dev/null 2>&1 || :
 udevadm trigger >/dev/null 2>&1 || :
 EOF

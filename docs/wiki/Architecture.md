@@ -27,7 +27,7 @@ Tobii software installed. The USB protocol was reverse-engineered clean-room.
 
 1. **The tracker works.** Gaze streaming and calibration accurate enough to be
    used, not merely demonstrated. Measured: **12.1 mm** mean error on a 49" 32:9
-   panel within the device's usable ±28°, ≈0.30° at 750 mm.
+   panel within the device's usable ±28°, ≈0.92° at 750 mm.
 2. **It behaves like a well-made desktop application.** It does not surprise the
    user: no unexpected network traffic, no device left running, no window
    appearing uninvited, no claim in the UI that the code cannot back.
@@ -120,20 +120,24 @@ Five decisions that shape everything else. Each is expanded in
 
 ### Level 1 — the workspace
 
-Eight crates, one acyclic dependency graph, ~29,800 lines.
+Nine crates, one acyclic dependency graph, ~33,600 lines. Counts measured with
+`find crates -name '*.rs' | xargs wc -l`, September 2026 — every figure in this
+diagram had gone stale before, which is what a hand-maintained count does.
 
 ```
-                    tobii-protocol  (3,130)  no dependencies at all
+                    tobii-protocol  (3,437)  no dependencies at all
                      ▲    ▲     ▲
         ┌────────────┘    │     └──────────────┐
-   tobii-usb (1,873)  tobii-config (1,827)  tobii-recap (1,379)
+   tobii-usb (2,281)  tobii-config (1,856)  tobii-recap (1,600)
         ▲                ▲     ▲
         │      ┌─────────┘     └──────────┐
-        │  tobii-headpose (4,559)   tobii-update (2,805)
+        │  tobii-headpose (4,559)   tobii-update (3,647)
         │      ▲                          ▲
+        │      │              tobii-diagnostics (1,334)
+        │      │                          ▲
         └──────┴──────────┬───────────────┘
                           │
-          tobii-cli (2,153)   tobii-gtk (12,094)
+          tobii-cli (2,272)   tobii-gtk (12,619)
 ```
 
 | Crate | Responsibility | Notable |
@@ -143,8 +147,9 @@ Eight crates, one acyclic dependency graph, ~29,800 lines.
 | `tobii-config` | Display geometry (including curved panels), EDID, persistence, SHA-256. | Every write is atomic; a truncated `config.toml` presents as a tracker that has stopped working. |
 | `tobii-headpose` | 5-DOF geometric pose, the ONNX 6-DOF backend, the model store, opentrack output. | The two paths are fused, not alternatives: position from the eyes, rotation from the model. |
 | `tobii-update` | Release checking, download integrity, installation with rollback. | All network access funnels through `net.rs`. No signature — see [[Quality-and-Risks]]. |
+| `tobii-diagnostics` | The `tobii debug` report, its redaction, and the log the report quotes. | Its own tests fail if a home path, hostname or raw monitor id reaches the output. |
 | `tobii-cli` | The `tobii` binary: user commands *and* the protocol diagnostics used to do the reverse engineering. | Single file, hand-rolled argument matching. |
-| `tobii-gtk` | The hub, the guided flows, the overlay, and the one device thread. | 40% of the workspace. |
+| `tobii-gtk` | The hub, the guided flows, the overlay, and the one device thread. | 38% of the workspace. |
 | `tobii-recap` | Decodes a usbmon pcap into a TTP op catalog. | Offline tool; how the protocol was mapped in the first place. |
 
 ### Level 2 — the pieces that carry the design

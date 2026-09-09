@@ -150,7 +150,8 @@ releases the device when unfocused.
    fusion is the point — two eye origins cannot express pitch, because nodding
    rotates the head about the line through them and leaves both origins where
    they were.
-7. Encode nine `f64` little-endian into the opentrack datagram and send.
+7. Encode six `f64` little-endian into the opentrack datagram and send — x, y, z,
+   yaw, pitch, roll, which is 48 bytes, as `datagram_is_exactly_48_bytes` pins.
    `TRANSLATION_SCALE = 0.1` converts millimetres to the centimetres opentrack's
    `data[]` expects.
 
@@ -188,7 +189,7 @@ sequence from §6.1, which is why an unplug/replug is invisible to the user.
 ```
    Developer machine                     GitHub Actions
    ─────────────────                     ──────────────
-   scripts/build.sh                      ci.yml     — fmt, clippy, 558 tests
+   scripts/build.sh                      ci.yml     — fmt, clippy, 593 tests
      ├── checks deps, names what's         (debian:trixie container,
      │   missing per distro                 pinned toolchain 1.98.0)
      ├── cargo build --release

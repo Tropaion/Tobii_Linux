@@ -31,7 +31,8 @@ use tobii_protocol::gaze::present;
 /// points spread across the screen with edge-aligned coordinates (not an inset
 /// grid — these are the exact values from ground truth).
 ///
-/// These are deliberately **not** run through `tobii_config::correct_gaze_x`,
+/// These are deliberately **not** curvature-corrected (there is no such
+/// function any more — one existed and was disproved on hardware),
 /// even on a curved screen: during calibration the device's flat-plane model is
 /// the reference frame both sides agree on, and pre-distorting the stimulus
 /// would bake an unvalidated correction into the calibration itself. The

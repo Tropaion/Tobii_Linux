@@ -1055,25 +1055,13 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
             if conn {
                 if !cal_evaluated.get() && !forced_flow_open.get() {
                     cal_evaluated.set(true);
-                    let setup = tobii_config::load().ok().flatten();
-                    let display_configured = setup.is_some();
-                    let fp = setup.map(|s| s.fingerprint()).unwrap_or(0);
-                    let cal = tobii_config::load_calibration()
-                        .ok()
-                        .flatten()
-                        .and_then(|(_, m)| m);
-                    let active = device::active_monitor_id();
-                    match tobii_config::decide(
-                        display_configured,
-                        cal.as_ref(),
-                        active.as_deref(),
-                        fp,
-                    ) {
+                    match evaluate_calibration_state() {
                         tobii_config::CalAction::ForceSetup => launch_forced(
                             &tick_app,
                             &tick_window,
                             &forced_flow_open,
                             &cal_evaluated,
+                            tobii_config::CalAction::ForceSetup,
                             {
                                 let cmd_tx = tick_cmd_tx.clone();
                                 let demand = tick_demand.clone();
@@ -1089,6 +1077,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
                             &tick_window,
                             &forced_flow_open,
                             &cal_evaluated,
+                            tobii_config::CalAction::ForceCalibration,
                             {
                                 let state = state.clone();
                                 let cmd_tx = tick_cmd_tx.clone();
@@ -1249,11 +1238,28 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
 /// session (a fresh install has neither display config nor a calibration, and
 /// completing setup must not wait for a reconnect before calibration is
 /// forced too).
+/// Everything `decide()` reads, gathered in one place.
+///
+/// Called from the connection tick and again when a forced flow closes, so the
+/// two cannot ask the question differently.
+fn evaluate_calibration_state() -> tobii_config::CalAction {
+    let setup = tobii_config::load().ok().flatten();
+    let display_configured = setup.is_some();
+    let fp = setup.map(|s| s.fingerprint()).unwrap_or(0);
+    let cal = tobii_config::load_calibration()
+        .ok()
+        .flatten()
+        .and_then(|(_, m)| m);
+    let active = device::active_monitor_id();
+    tobii_config::decide(display_configured, cal.as_ref(), active.as_deref(), fp)
+}
+
 fn launch_forced(
     app: &Application,
     window: &ApplicationWindow,
     forced_flow_open: &Rc<Cell<bool>>,
     cal_evaluated: &Rc<Cell<bool>>,
+    launched_for: tobii_config::CalAction,
     open: impl FnOnce(&Application) -> ApplicationWindow,
 ) {
     window.set_sensitive(false);
@@ -1265,7 +1271,23 @@ fn launch_forced(
     win.connect_close_request(move |_| {
         hub.set_sensitive(true);
         forced_flow_open.set(false);
-        cal_evaluated.set(false);
+        // Re-open only if the answer has CHANGED.
+        //
+        // This used to reset the gate unconditionally, so the next 33 ms tick
+        // re-ran `decide()` — and when the user had *cancelled* rather than
+        // completed, it got the same answer and put the same window straight
+        // back up, with the hub disabled behind it. There is no way out of that
+        // except killing the process.
+        //
+        // The reset exists for a reason worth keeping: completing setup makes
+        // `decide()` return ForceCalibration, which is how the two chain within
+        // one session instead of waiting for a reconnect. Comparing the answers
+        // keeps the chain and drops the loop — a cancel leaves the answer where
+        // it was, so the gate stays latched until the next connection, which is
+        // the disconnect branch's job.
+        if evaluate_calibration_state() != launched_for {
+            cal_evaluated.set(false);
+        }
         glib::Propagation::Proceed
     });
 }
@@ -1375,8 +1397,17 @@ fn settings_list() -> gtk::Box {
 
     list.append(&settings_row(
         "Start when I log in",
-        "Keeps the tracker set up from login, so it works in games and other apps without \
-         opening this window first. The tracker itself stays off until something asks for it.",
+        // What this actually does, which is less than it used to claim. It said
+        // "keeps the tracker set up from login, so it works in games and other
+        // apps without opening this window first" — and that cannot be true
+        // alongside the standby behaviour: `--background` opens no window, so
+        // nothing ever takes a `Demand` hold, so the device is never opened and
+        // the saved display area and calibration are never applied to anything.
+        // A game does not need it either; `tobii headpose` opens the device and
+        // re-applies the display area itself.
+        "Starts this program at login with no window, so the hub opens instantly \
+         and a second launch raises it instead of starting another copy. The \
+         tracker itself stays off until something asks for it.",
         &autostart_switch(),
     ));
     list.append(&hairline());

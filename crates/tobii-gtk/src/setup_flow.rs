@@ -479,11 +479,22 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
         initial.height_mm = m.height_mm;
     }
     let setup = Rc::new(RefCell::new(initial));
-    let phase = Rc::new(Cell::new(if chosen.borrow().is_some() {
-        Phase::Align
-    } else {
-        Phase::ScreenPick
-    }));
+    // An EMPTY monitor list must not land on the picker: the page would show a
+    // heading, no buttons and no way forward, and the hub forces this flow — so
+    // the only way out was to kill the process. Not exotic: every
+    // /sys/class/drm/*/edid that is not the active connector reads back 0 bytes,
+    // and a machine can have none that read at all (NVIDIA's proprietary driver
+    // without nvidia-drm.modeset=1, a virtual or nested session, no
+    // /sys/class/drm at all). Align handles `chosen == None` already: its status
+    // line says "Could not detect your monitor. Measure the screen glass..." and
+    // the advanced form takes the numbers by hand.
+    let phase = Rc::new(Cell::new(
+        if chosen.borrow().is_some() || monitors.is_empty() {
+            Phase::Align
+        } else {
+            Phase::ScreenPick
+        },
+    ));
 
     let win = gtk::ApplicationWindow::builder()
         .application(app)

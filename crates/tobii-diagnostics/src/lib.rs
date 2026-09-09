@@ -78,18 +78,53 @@ pub fn report() -> String {
     let _ = writeln!(o, "  {:<16} {}", format!("usb {VID}:{PID}"), usb_present());
     let _ = writeln!(o, "  {:<16} {}", "udev rule", udev_rule());
 
+    // Under sudo this whole block would be a lie, so it does not get printed.
+    //
+    // `config_path()` resolves $XDG_CONFIG_HOME then $HOME, and sudo's
+    // `env_reset` drops the XDG variables and sets HOME=/root — so every loader
+    // looks in /root, finds nothing, and the report states that absence as a
+    // confident diagnosis. Measured:
+    //
+    //   $ env -u XDG_CONFIG_HOME HOME=/root SUDO_USER=me tobii debug
+    //     display area     NOT CONFIGURED — the tracker reports no eyes without it
+    //     calibration      none saved
+    //     head-pose model  not installed …
+    //
+    // — six false statements, on a machine where all six are configured. And
+    // this is a flow the tool invites: the same report tells people the tracker
+    // "needs root" without the udev rule. Reading the invoking user's config
+    // instead would make the report describe a configuration this process is
+    // not using, which is a different kind of wrong; saying nothing is the only
+    // honest answer.
     let _ = writeln!(o, "\nconfiguration");
-    let _ = writeln!(o, "  {:<16} {}", "display area", display_area());
-    // Established once and used twice: the monitor line marks itself when the
-    // hash is unsalted, and the footer must not promise a redaction that did
-    // not happen.
-    let salted = !report_salt().is_empty();
-    let _ = writeln!(o, "  {:<16} {}", "monitor", monitor(salted));
-    let _ = writeln!(o, "  {:<16} {}", "calibration", calibration());
-    let _ = writeln!(o, "  {:<16} {}", "enabled eye", enabled_eye());
-    let _ = writeln!(o, "  {:<16} {}", "pitch offset", pitch_offset());
-    let _ = writeln!(o, "  {:<16} {}", "update check", update_check());
-    let _ = writeln!(o, "  {:<16} {}", "head-pose model", head_model());
+    let elevated = invoking_user();
+    let salted = if let Some(user) = &elevated {
+        let _ = writeln!(
+            o,
+            "  NOT READ — running under sudo as {user}, so every loader looked in {}\n  \
+             instead of that user's home. Every line here would read \"not configured\":\n  \
+             truthfully about that home, falsely about the machine. Run `tobii debug`\n  \
+             WITHOUT sudo to get this section.",
+            // Folded: sudo usually leaves HOME=/root, which names nobody, but
+            // `sudo -u other` does not — and this report is pasted in public.
+            tilde(&std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+        );
+        let _ = writeln!(o, "  {:<16} {}", "update check", update_check());
+        false
+    } else {
+        let _ = writeln!(o, "  {:<16} {}", "display area", display_area());
+        // Established once and used twice: the monitor line marks itself when
+        // the hash is unsalted, and the footer must not promise a redaction
+        // that did not happen.
+        let salted = !report_salt().is_empty();
+        let _ = writeln!(o, "  {:<16} {}", "monitor", monitor(salted));
+        let _ = writeln!(o, "  {:<16} {}", "calibration", calibration());
+        let _ = writeln!(o, "  {:<16} {}", "enabled eye", enabled_eye());
+        let _ = writeln!(o, "  {:<16} {}", "pitch offset", pitch_offset());
+        let _ = writeln!(o, "  {:<16} {}", "update check", update_check());
+        let _ = writeln!(o, "  {:<16} {}", "head-pose model", head_model());
+        salted
+    };
 
     let tail = recent_log();
     // Say when the log is not the program's own. `TOBII_LOG_FILE` points the
@@ -122,7 +157,9 @@ pub fn report() -> String {
         o,
         "\nredacted: username, home path, hostname, monitor serial ({}).\n\
          no calibration data is included — only when it was made and how.",
-        if salted {
+        if elevated.is_some() {
+            "no monitor id was read at all"
+        } else if salted {
             "salted hash above"
         } else {
             "hashed above, but see the warning on that line"
@@ -657,6 +694,22 @@ fn home_spellings() -> Vec<String> {
     all.sort_by_key(|s| std::cmp::Reverse(s.len()));
     all.dedup();
     all
+}
+
+/// The user who invoked `sudo`/`pkexec`, when this is running elevated AND the
+/// home directory moved with it.
+///
+/// The point is not "am I root" but "is `$HOME` somebody else's" — that is what
+/// makes every configuration lookup answer about the wrong home. `sudo -E`
+/// keeps the caller's environment, so the loaders look in the right place and
+/// the section is worth printing; a real root login is not somebody else's home
+/// either.
+fn invoking_user() -> Option<String> {
+    let user = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty() && u != "root")?;
+    let home = std::env::var("HOME").unwrap_or_default();
+    (home != passwd_home(user.clone()).unwrap_or_default()).then_some(user)
 }
 
 /// A user's home directory, read out of `/etc/passwd`.

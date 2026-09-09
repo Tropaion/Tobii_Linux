@@ -9,16 +9,26 @@
 //! # Why the autostarted process has no window
 //!
 //! The entry runs `tobii-gtk --background`, which starts the device thread and
-//! nothing else. That is not a cosmetic choice: the ET5 **wipes its display
-//! area and its calibration every time it reboots**, which it does whenever the
-//! session closes, so something has to re-apply them on connect or the tracker
-//! reports no eyes at all. Running at login is what makes the tracker work
-//! before anything asks it to.
+//! nothing else. Throwing a settings window at somebody every time they log in
+//! would be a bad trade for the little this buys. Launching `tobii-gtk` again —
+//! from the menu, the dock, anywhere — hands off to the running instance and
+//! raises the hub, because `GApplication` is single-instance.
 //!
-//! Throwing a settings window at somebody every time they log in would be a bad
-//! trade for that. Launching `tobii-gtk` again — from the menu, the dock,
-//! anywhere — hands off to the running instance and raises the hub, because
-//! `GApplication` is single-instance.
+//! # What it does NOT do, despite what this used to say
+//!
+//! This module claimed that running at login is "what makes the tracker work
+//! before anything asks it to", because the ET5 wipes its display area and
+//! calibration on every reboot and something must re-apply them. That was true
+//! before the standby behaviour landed and is false now, and the two cannot
+//! both hold: `--background` opens no window, every `Demand` hold in this crate
+//! belongs to a window, and the device thread refuses to open a session while
+//! the demand is empty. So the background process connects to nothing and
+//! applies nothing.
+//!
+//! Nor does a game need it to: `tobii headpose` opens the device itself and
+//! re-applies the display area immediately after connecting. What is left is
+//! worth having but smaller — the program is resident, so the hub opens
+//! instantly and a second launch raises it.
 
 use std::io;
 use std::path::PathBuf;
@@ -95,7 +105,7 @@ pub fn entry_text(exec: &str) -> String {
          Type=Application\n\
          Version=1.5\n\
          Name=Tobii Eye Tracker\n\
-         Comment=Keep the eye tracker configured from login\n\
+         Comment=Keep the Tobii hub ready in the background\n\
          Exec={exec} --background\n\
          Icon=com.tobiilinux.Configuration\n\
          Terminal=false\n\

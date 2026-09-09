@@ -34,7 +34,9 @@ pub struct DisplaySetup {
     /// `0.0` means a flat screen — the default, and what every pre-curvature
     /// config on disk parses as. Curvature is cylindrical with a vertical axis,
     /// bulging away from the viewer. It never changes what we send the device
-    /// (which only accepts a plane); it drives [`crate::correct_gaze_x`].
+    /// (which only accepts a plane). It is recorded but not otherwise used: a
+    /// runtime gaze correction was written against it and then disproved on
+    /// hardware, because a per-user calibration already absorbs the curve.
     pub curvature_radius_mm: f64,
 }
 
