@@ -99,7 +99,12 @@ impl Capture {
     pub fn to_text(&self) -> String {
         let mut s = format!("# tobii-capture {FORMAT_VERSION}\n");
         for (k, v) in &self.headers {
-            s.push_str(&format!("# {k} {v}\n"));
+            // Header values are folded to one line. A value containing a
+            // newline would otherwise emit a second line that `parse` reads as
+            // an event — so a note with a line break silently injected frames
+            // into the capture that the device never sent, and a leading
+            // non-ASCII character on the continuation line used to panic.
+            s.push_str(&format!("# {} {}\n", one_line(k), one_line(v)));
         }
         for e in &self.events {
             let (marker, bytes) = match e {
@@ -149,12 +154,25 @@ impl Capture {
                     .push((key.to_string(), value.trim().to_string()));
                 continue;
             }
-            let (marker, hex) = line.split_at(1);
-            let bytes = from_hex(hex.trim()).ok_or(CaptureError::BadHex { line: i + 1 })?;
-            match marker {
-                ">" => out.events.push(Event::Sent(bytes)),
-                "<" => out.events.push(Event::Received(bytes)),
+            // Matched on the first CHARACTER, not a byte split. `split_at(1)`
+            // panics when byte 1 is not a char boundary, so any line beginning
+            // with a multi-byte character — an umlaut in a hand-added note, a
+            // stray BOM, a typographic dash — aborted the process instead of
+            // returning `BadLine`, which is the variant that exists for exactly
+            // this. The format is meant to be read and edited by hand, so
+            // non-ASCII in it is a mistake to report, not a crash to suffer.
+            let mut chars = line.chars();
+            let marker = chars.next();
+            let hex = chars.as_str();
+            let bytes = match marker {
+                Some('>') | Some('<') => {
+                    from_hex(hex.trim()).ok_or(CaptureError::BadHex { line: i + 1 })?
+                }
                 _ => return Err(CaptureError::BadLine { line: i + 1 }),
+            };
+            match marker {
+                Some('>') => out.events.push(Event::Sent(bytes)),
+                _ => out.events.push(Event::Received(bytes)),
             }
         }
         if !saw_magic {
@@ -202,6 +220,15 @@ impl std::fmt::Display for CaptureError {
 }
 
 impl std::error::Error for CaptureError {}
+
+/// A header key or value, with anything that would end the line removed.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
 
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -486,6 +513,46 @@ mod tests {
         assert_eq!(out.sent(), vec![&[1u8, 2][..]]);
         assert_eq!(out.received(), vec![&[9u8, 8, 7][..]]);
         assert_eq!(out.header("note"), Some("test"));
+    }
+
+    /// `split_at(1)` panics when byte 1 is not a char boundary, so a capture
+    /// with a non-ASCII first character on any line aborted the process instead
+    /// of returning `BadLine`. The format exists to be read and edited by hand,
+    /// so non-ASCII in it is a mistake to report, not a crash to suffer.
+    #[test]
+    fn a_line_starting_with_a_multibyte_character_errors_rather_than_panicking() {
+        for bad in [
+            "# tobii-capture 1\nÄnderung: hand-added note\n",
+            "# tobii-capture 1\né 00\n",
+            "# tobii-capture 1\n\u{feff}< 00\n", // a stray BOM on a later line
+            "# tobii-capture 1\n😀\n",
+            "# tobii-capture 1\n— dash\n",
+        ] {
+            match Capture::parse(bad) {
+                Err(CaptureError::BadLine { .. }) | Err(CaptureError::BadHex { .. }) => {}
+                other => panic!("expected a clean error, got {other:?}"),
+            }
+        }
+        // And a well-formed capture still parses.
+        assert!(Capture::parse("# tobii-capture 1\n> 00ff\n< 01\n").is_ok());
+    }
+
+    /// A newline in a header value used to emit a second line that `parse` read
+    /// as an event — injecting frames the device never sent.
+    #[test]
+    fn a_newline_in_a_header_cannot_inject_events() {
+        let mut c = Capture::default();
+        c.headers
+            .push(("note".into(), "first line\n> deadbeef\nsecond".into()));
+        c.events.push(Event::Sent(vec![0x01]));
+
+        let back = Capture::parse(&c.to_text()).expect("round trip");
+        assert_eq!(back.events.len(), 1, "an event was injected by a header");
+        assert_eq!(back.events[0], Event::Sent(vec![0x01]));
+        assert!(
+            back.header("note").is_some_and(|n| !n.contains('\n')),
+            "the header should be folded to one line"
+        );
     }
 
     #[test]

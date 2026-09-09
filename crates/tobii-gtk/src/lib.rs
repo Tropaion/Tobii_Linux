@@ -716,6 +716,16 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
         let seeding = eye_seeding.clone();
         cb.connect_toggled(move |c| {
             if c.is_active() && !seeding.get() {
+                // Saved HERE, at the point of choice, not in the device thread
+                // where the command is applied. A preference belongs to the
+                // user, not to whether the tracker happens to be reachable:
+                // persisting it only on a successful apply meant that choosing
+                // an eye with the tracker unplugged was lost permanently, since
+                // the queued command is dropped when the connect fails and
+                // nothing else ever writes it.
+                if let Err(e) = tobii_config::save_enabled_eye(eye) {
+                    eprintln!("could not save the eye selection: {e}");
+                }
                 let _ = cmd_tx.send(device::DeviceCommand::SetEnabledEye(eye));
             }
         });

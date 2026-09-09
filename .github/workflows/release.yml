@@ -86,6 +86,11 @@ jobs:
       - name: Install the Rust toolchain
         run: |
           set -eux
+          # `set -o pipefail` matters here: without it the exit status is sh's,
+          # so a failed download pipes an empty script into a shell that exits 0
+          # and the step goes green with no rustup installed. The failure then
+          # surfaces later as "cargo: command not found".
+          set -o pipefail
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -118,6 +123,14 @@ jobs:
               worst="$need"
             fi
           done
+          # Measuring nothing is a failure, not a pass. If objdump is absent,
+          # the binaries are missing, or the grep finds no versioned symbols,
+          # `worst` stays empty and the comparison below would let ANY build
+          # through — the one outcome this gate exists to prevent.
+          if [ -z "$worst" ]; then
+            echo "::error::could not determine the glibc floor — refusing to publish a release nobody has checked" >&2
+            exit 1
+          fi
           echo "archive floor: glibc $worst (limit $MAX_GLIBC)"
           if [ "$(printf '%s\n%s\n' "$worst" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
             echo "::error::this build needs glibc $worst, above the $MAX_GLIBC limit — it would not start for most users" >&2

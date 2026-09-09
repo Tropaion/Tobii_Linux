@@ -783,6 +783,36 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
     (state, tx, demand)
 }
 
+/// Tell whoever is waiting that a queued command will never run.
+///
+/// Only the commands that hand out a token need this: the rest are settings,
+/// which are already on disk and get re-applied on the next connect. A watcher
+/// polling `DeviceState` for its token has no other way to learn the command
+/// died with the connection attempt.
+fn fail_queued_command(state: &Mutex<DeviceState>, cmd: DeviceCommand, e: &UsbError) {
+    match cmd {
+        DeviceCommand::PitchCalibrate { token, .. } => {
+            let mut s = state.lock().unwrap();
+            s.pitch_cal = PitchCal {
+                token,
+                active: false,
+                secs_left: 0,
+                samples: 0,
+                result: Some(Err(format!("the tracker could not be opened: {e}"))),
+            };
+        }
+        DeviceCommand::CalBegin { token, .. } => {
+            let mut s = state.lock().unwrap();
+            s.calibration = CalPhase::begin(token);
+            s.calibration
+                .on_finish(Err(format!("the tracker could not be opened: {e}")));
+        }
+        // Settings and the head-model reload carry no token and are recovered
+        // from disk on the next connect.
+        _ => {}
+    }
+}
+
 /// One connection, from open to close.
 ///
 /// Returns as soon as the connection is gone — because it failed, because the
@@ -893,16 +923,26 @@ fn device_session(
                 // pinning the status to "Disconnected". One such command
                 // permanently defeated the demand gate.
                 //
-                // Dropping is right rather than merely convenient: everything
-                // that can be queued is also re-applied from saved config on
-                // the next successful connect, so nothing is actually lost.
+                // Dropping is right rather than merely convenient: a setting
+                // is written to disk where it is CHOSEN, so it is re-applied
+                // from saved config on the next successful connect. (That was
+                // not true when this drop was introduced — the eye selection
+                // was persisted inside `apply_command`, so dropping the command
+                // lost it permanently. It is saved by the UI now.)
+                //
+                // What must NOT simply vanish is a command some part of the UI
+                // is waiting on. A pitch calibration or a calibration session
+                // hands out a token and then watches `DeviceState` for it; if
+                // the command is dropped in silence that watcher waits forever
+                // on a token that can never arrive.
                 if !pending.is_empty() {
                     eprintln!(
-                        "warning: could not reach the tracker to apply {} queued setting(s) ({e}); \
-                         they will be applied from saved config on the next connect",
+                        "warning: could not reach the tracker to apply {} queued command(s) ({e})",
                         pending.len()
                     );
-                    pending.clear();
+                    for cmd in pending.drain(..) {
+                        fail_queued_command(thread_state, cmd, &e);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(750));
             }

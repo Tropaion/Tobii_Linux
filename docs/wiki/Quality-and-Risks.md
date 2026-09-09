@@ -67,27 +67,46 @@ compute the real value from data already on the wire; it is not yet wired up.
 did when recorded, not that the device still does. A firmware change would
 invalidate it silently and the tests would stay green.
 
-### 11.2 Confirmed defects, not yet fixed
+### 11.2 Confirmed defects
 
-Found by review and reproduced. Listed because an undocumented known bug is
-worse than a documented one.
+Found by review and reproduced. Fixed ones are kept here with what they were,
+because the reasoning is worth more than the tidiness.
 
-- **The parser's continuation-envelope heuristic has a false positive.**
-  `Parser::feed` strips 8 bytes whenever a frame is in flight and the chunk
-  starts with `01 00 00 00`, without validating the candidate envelope's length.
-  That byte pattern is also a legitimate type-0x01 TLV field header, and any
-  camera pixel run that lands on a transfer boundary that way.
+**Fixed:**
+
+- ~~The parser's continuation-envelope heuristic false-positived~~ — `feed`
+  stripped 8 bytes whenever a frame was in flight and the chunk began
+  `01 00 00 00`, which is also a legitimate type-0x01 TLV field header and turns
+  up in camera pixel data. The envelope's own length field is checked now.
+- ~~`parse_enabled_eye` did no structural parsing~~ — it read the last four
+  bytes of any slice, so `[0,0,0,2]` returned `Some(Right)`. It goes through
+  `Reader` now.
+- ~~`write_atomic` did not `fsync`~~ — rename gives atomicity of *visibility*,
+  not durability of *content*. The temp file is synced before the rename and the
+  directory after it.
+- ~~`Capture::parse` panicked on a non-ASCII line~~ — `split_at(1)` aborts when
+  byte 1 is not a char boundary, so a hand-added note with an umlaut killed the
+  process instead of returning `BadLine`.
+- ~~A dropped queued command lost the eye selection permanently~~ — it was
+  persisted inside `apply_command`, so choosing an eye with the tracker
+  unplugged never reached disk. The UI saves it at the point of choice now, and
+  a dropped command that a UI is waiting on publishes a failure rather than
+  stranding it on a token that never arrives.
+
+**Open:**
+
 - **A failed query-realm parse is indistinguishable from "no authentication
   required."** `resp_first_u32` returns 0 both when it finds a zero and when it
-  finds nothing, and realm_type 0 means skip auth.
-- **`parse_enabled_eye` does no structural parsing** — it reads the last four
-  bytes of any slice. It will interpret the tail of an unrelated response.
+  finds nothing, and 0 means skip auth. Making the unreadable case *fail* was
+  tried and the replay harness caught it breaking every connection: the real
+  reply uses the 5-byte TLV framing while `resp_fields` walks a 4-byte one, so
+  it finds nothing and the 0 default is what makes the handshake work. The
+  walker is the real defect; it is left alone because the only reply with
+  content we have is that one, and changing an unvalidated parser on a single
+  capture is how this project has hurt itself before.
 - **Three parallel TLV decoders** live in `tobii-protocol` (`tlv.rs`,
   `handshake.rs`, `camera.rs`). A hardening applied to one does not reach the
-  others.
-- **`write_atomic` does not `fsync`.** Rename gives atomicity of *visibility*,
-  not durability of *content* across a power loss. Claim crash-safety only at
-  that precision.
+  others — see the entry above for what that costs.
 - **The stale calibration fixture.** `testdata/real-calibration.blob` predates
   the calibration op-code fix.
 - **Stale confidence markers.** At least one op is rated [UNCONFIRMED] in
@@ -127,9 +146,11 @@ worse than a documented one.
 - **Hardware claims cannot be re-verified by CI.** The accuracy figure, the sign
   conventions and the tracker-on behaviour were measured by hand. If they
   regress, nothing will say so.
-- **The release workflow has run, the release path has not.** The repository has
-  no tags, so the first tag is the first real execution of the download and
-  install path against a real release.
+- **Neither the release workflow nor the release path has ever run.** The
+  repository has no tags, so the first tag will be the first execution of
+  `release.yml` itself *and* of the updater's download-and-install path against
+  a real release. `ci.yml` has run (and failed once, usefully, on a clippy lint
+  the maintainer's toolchain was too old to see).
 
 ---
 
@@ -147,7 +168,7 @@ worse than a documented one.
 | **Demand** | The reference count on the USB session. While it is zero the tracker is off and the device is free for another process. |
 | **Linger** | The 3 s after the last `DemandGuard` drops before the session closes. |
 | **Present bit vs validity** | A present bit means the column was sent, **not** that the data is good. A no-eyes frame carries eye origins present and set to `[0,0,0]` with validity 4. Gate on both. |
-| **opentrack datagram** | Nine little-endian `f64`: x, y, z in centimetres, then yaw, pitch, roll in degrees. |
+| **opentrack datagram** | **Six** little-endian `f64` (48 bytes): x, y, z in centimetres, then yaw, pitch, roll in degrees. |
 | **Capture** | A recorded USB session (`tobii record`) replayed in tests. A photograph, not a specification. |
 
 ---
