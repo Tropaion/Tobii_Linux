@@ -775,6 +775,12 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
     let demand = Demand::new();
     let thread_state = Arc::clone(&state);
     let thread_demand = demand.clone();
+
+    // The socket other programs get tracking data from. Started here rather
+    // than from the GUI because this is where the `Demand` is constructed, and
+    // a connected client IS a demand — see `crate::outputs`. Nothing published
+    // yet; this is the seam alone.
+    crate::outputs::spawn(demand.clone(), Arc::clone(&state));
     std::thread::spawn(move || {
         // Commands that arrived while the tracker was off. They are not
         // dropped: "select left eye only" typed into an idle hub has to take

@@ -109,6 +109,13 @@ pub enum StatusCode {
     Error,
     /// Another client holds the device lease, so nothing is being published.
     Leased,
+    /// Nothing is asking for the tracker, so it is deliberately not open.
+    ///
+    /// Distinct from [`StatusCode::Connecting`], and the distinction is the
+    /// whole standby model: a client that cannot tell "off on purpose" from
+    /// "trying to open" renders "Connecting…" forever while the tracker sits
+    /// dark by design, and its user files a bug about a hang.
+    Idle,
 }
 
 impl StatusCode {
@@ -119,6 +126,7 @@ impl StatusCode {
             StatusCode::Connected => 1,
             StatusCode::Error => 2,
             StatusCode::Leased => 3,
+            StatusCode::Idle => 4,
         }
     }
 
@@ -132,6 +140,7 @@ impl StatusCode {
             0 => StatusCode::Connecting,
             1 => StatusCode::Connected,
             3 => StatusCode::Leased,
+            4 => StatusCode::Idle,
             _ => StatusCode::Error,
         }
     }
@@ -179,9 +188,29 @@ mod tests {
             StatusCode::Connected,
             StatusCode::Error,
             StatusCode::Leased,
+            StatusCode::Idle,
         ] {
             assert_eq!(StatusCode::from_wire(s.to_wire()), s);
         }
+    }
+
+    /// `Idle` must not collide with an existing code, or an older client would
+    /// silently render "off on purpose" as something else.
+    #[test]
+    fn idle_has_a_wire_byte_of_its_own() {
+        let all = [
+            StatusCode::Connecting,
+            StatusCode::Connected,
+            StatusCode::Error,
+            StatusCode::Leased,
+            StatusCode::Idle,
+        ];
+        let mut seen: Vec<u8> = all.iter().map(|s| s.to_wire()).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "two statuses share a wire byte");
+        assert_eq!(StatusCode::Idle.to_wire(), 4, "appended, not renumbered");
     }
 
     /// A client that cannot understand the daemon's state must not display a

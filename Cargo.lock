@@ -1502,6 +1502,7 @@ dependencies = [
  "tobii-config",
  "tobii-diagnostics",
  "tobii-headpose",
+ "tobii-ipc",
  "tobii-protocol",
  "tobii-update",
  "tobii-usb",
