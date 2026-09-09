@@ -344,7 +344,21 @@ fn apply_command<T: Transport>(
         }
         DeviceCommand::ReloadHeadModel => reload_head = true,
         DeviceCommand::SetEnabledEye(e) => {
-            let _ = conn.set_enabled_eye(e);
+            // Not discarded. Both failures here present to the user as "I
+            // selected one eye and it still tracks both", with nothing anywhere
+            // saying why — and the radios re-seed from the device on the next
+            // connection, so a silent failure quietly moves the selection back
+            // and that looks like the setting not sticking.
+            match conn.set_enabled_eye(e) {
+                Ok(true) => {}
+                Ok(false) => tobii_diagnostics::log::warn(&format!(
+                    "the tracker did not acknowledge the eye selection ({e:?}); it may still \
+                     be detecting both"
+                )),
+                Err(err) => tobii_diagnostics::log::warn(&format!(
+                    "could not set the eye selection ({e:?}): {err}"
+                )),
+            }
             // NOT saved here. The UI writes the preference where the user
             // chooses it, so it survives the tracker being unreachable; writing
             // it again on the way to the device would mean two places that can

@@ -443,7 +443,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
     // "Select eyes to detect": guard against echoing our own seeding as a user
-    // change, and seed the radios from the device only once (on first connect).
+    // change, and seed the radios from the device once per connection.
     let eye_seeding = Rc::new(Cell::new(false));
     let eye_seeded = Rc::new(Cell::new(false));
     // Gate for the once-per-connection `decide()` evaluation (force/recommend
@@ -1110,6 +1110,15 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
                 }
             } else {
                 cal_evaluated.set(false);
+                // Re-seed on the next connection, like `cal_evaluated`. This
+                // latch used to be set once for the life of the hub, so a value
+                // that changed while the tracker was away — a failed re-apply,
+                // another program, a firmware reset — left the radios showing
+                // the old one until the window was closed and reopened. The
+                // saved preference cannot be lost by re-seeding: it is written
+                // at the point of choice and re-applied on every connect, so
+                // what the device reports afterwards is that preference.
+                eye_seeded.set(false);
             }
             // Seed the eye-selection radios once from the device's current value.
             if conn && !eye_seeded.get() {

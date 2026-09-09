@@ -161,7 +161,14 @@ fn install_kind() -> String {
         return "unknown".into();
     };
     use tobii_update::install::Ownership;
-    match tobii_update::install::package_owner(&dir.join("tobii")) {
+    // Asked once per process. Three subprocess spawns dominate the cost of
+    // building this report — measured at ~120 ms, on the GTK main thread when
+    // the settings popover's save or copy button is pressed — and the answer
+    // cannot change while the program runs: it is a property of how this binary
+    // was installed, and installing over a running binary is what the updater
+    // refuses to do.
+    static OWNER: std::sync::OnceLock<Ownership> = std::sync::OnceLock::new();
+    match OWNER.get_or_init(|| tobii_update::install::package_owner(&dir.join("tobii"))) {
         Ownership::Package { manager, package } => {
             return format!("package `{package}` via {manager}")
         }
