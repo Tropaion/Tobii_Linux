@@ -445,6 +445,9 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     }
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    // Set by the Quit item, and only by it. See the close handler: pressing X
+    // minimises rather than exits, so something has to tell the two apart.
+    let really_quitting = Rc::new(Cell::new(false));
     // "Select eyes to detect": guard against echoing our own seeding as a user
     // change, and seed the radios from the device once per connection.
     let eye_seeding = Rc::new(Cell::new(false));
@@ -920,7 +923,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     title.set_hexpand(true);
     header.append(&title);
     header.append(&status_bar);
-    header.append(&settings_button());
+    header.append(&settings_button(&really_quitting));
 
     // One margin all round, so the frame of background around the content is
     // even. Anything else reads as a mistake at the corners.
@@ -1047,6 +1050,21 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
                     _ => {}
                 }
             }
+            // Nothing below this line is worth doing for a window nobody can
+            // see, and now that closing MINIMISES rather than exits, that is a
+            // state the hub sits in for hours while a game plays. Everything
+            // above it still runs: the claim has to be released when the window
+            // stops being active, which is the whole reason the tracker goes
+            // dark when you minimise.
+            //
+            // `is_suspended` rather than `is_minimized`: GTK sets it for any
+            // reason the surface is not visible to the user — minimised, fully
+            // occluded, on another workspace — which is exactly the set of
+            // states where redrawing a readout is wasted work.
+            if tick_window.is_suspended() {
+                return glib::ControlFlow::Continue;
+            }
+
             // Re-check the layout breakpoint. `notify::default-width` misses some
             // ways a window changes size (tiling, maximising), and this costs one
             // integer compare — `apply` returns immediately when nothing changed.
@@ -1208,7 +1226,34 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
         let focus_hold = focus_hold.clone();
         let overlay_win = overlay_win.clone();
         let tick_id = tick_id.clone();
-        window.connect_close_request(move |_| {
+        let quitting = really_quitting.clone();
+        window.connect_close_request(move |w| {
+            // PRESSING X MINIMISES; it does not exit.
+            //
+            // The tracker's data has to keep reaching a game while the user is
+            // playing, and configuring it means opening this window — so the
+            // program that owns the device cannot be one that dies when its
+            // window is dismissed. Closing therefore parks it in the taskbar,
+            // where it is visible and one click from coming back, instead of
+            // vanishing into a process list.
+            //
+            // Nothing else is needed to keep the process alive: the window is
+            // never destroyed, so `GApplication` still has one and does not
+            // exit. And the tracker still goes dark, because the claim below is
+            // polled from `is_active()` on the 33 ms tick and a minimised
+            // window is not active — the illuminators are out within a frame or
+            // two of the click, without this handler doing anything about it.
+            //
+            // The gaze overlay is deliberately NOT closed here. It has its own
+            // switch and its own claim; if the user left it on, something
+            // genuinely wants data and the tracker is right to stay lit.
+            if !quitting.get() {
+                w.minimize();
+                return glib::Propagation::Stop;
+            }
+
+            // From here down: an actual quit, from the Quit item.
+            //
             // 1. The tracker claim. A hub closed while focused would otherwise
             //    leave one behind for the life of the process — which in
             //    background mode is until logout, i.e. the illuminators never
@@ -1336,9 +1381,9 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 /// A `Popover`, not a second window: it is anchored to the button that opened
 /// it, it closes on click-away, and it needs no title bar, no size negotiation
 /// and no place in the window list for what is three rows of content.
-fn settings_button() -> gtk::MenuButton {
+fn settings_button(quitting: &Rc<Cell<bool>>) -> gtk::MenuButton {
     let popover = gtk::Popover::new();
-    popover.set_child(Some(&settings_list()));
+    popover.set_child(Some(&settings_list(quitting)));
     popover.set_position(gtk::PositionType::Bottom);
     popover.set_has_arrow(false);
     // Right edge flush with the cogwheel's, not centred under it. A popover is
@@ -1387,7 +1432,7 @@ fn settings_button() -> gtk::MenuButton {
 }
 
 /// The contents of that popover.
-fn settings_list() -> gtk::Box {
+fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
     let list = gtk::Box::new(Orientation::Vertical, 4);
     // An explicit width rather than one negotiated from the longest sentence.
     // `set_max_width_chars` is a hint about where a label may wrap, not a cap
@@ -1426,8 +1471,44 @@ fn settings_list() -> gtk::Box {
     list.append(&hairline());
 
     list.append(&diagnostics_row());
+    list.append(&hairline());
+    list.append(&quit_row(quitting));
 
     list
+}
+
+/// The way out, since the window's own X no longer is one.
+///
+/// A program that keeps running after you close its window has to say where
+/// its exit went, and this is where somebody looks for it. The description is
+/// not decoration: without it, the only way to discover that X minimises is to
+/// press X.
+fn quit_row(quitting: &Rc<Cell<bool>>) -> gtk::Box {
+    let btn = crate::widget::button("Quit");
+    btn.add_css_class("quiet");
+    btn.set_tooltip_text(Some(
+        "Exit completely. Games stop receiving head tracking until this is \
+         started again.",
+    ));
+    let quitting = quitting.clone();
+    btn.connect_clicked(move |b| {
+        // The flag is what tells the hub's close handler that this is a real
+        // exit rather than the X button, so it tears down instead of
+        // minimising. Closing the window rather than calling `app.quit()`
+        // directly keeps ONE teardown path — the claim, the overlay and the
+        // tick are all released there, and a second exit route would be a
+        // second place to forget one of them.
+        quitting.set(true);
+        if let Some(w) = b.root().and_downcast::<gtk::Window>() {
+            w.close();
+        }
+    });
+    settings_row(
+        "Quit",
+        "Closing the window only minimises it, so games keep getting head \
+         tracking while you play. This exits for real.",
+        &btn,
+    )
 }
 
 /// One row of the settings popover: a title, why it exists, and its control.

@@ -367,6 +367,25 @@ resting state, not a fault.
 A useful consequence: while the hub is unfocused it holds no USB session, so
 `tobii headpose` can claim the device for a game without closing the hub first.
 
+### Closing the window does not quit
+
+Pressing **X** minimises the hub to the taskbar and leaves it running. That is
+deliberate: only one process can claim the tracker over USB, so the program that
+owns the device has to be the same one that feeds a game — and configuring it
+means opening this window. A hub that died when you dismissed it would take the
+game's head tracking with it.
+
+The tracker still goes dark. The claim on the device is polled from whether the
+window is active, so minimising drops it within a frame; measured on a minimised
+hub: **no USB file descriptors and no GPU file descriptors held**. If you left
+*Preview my gaze* on, that has its own claim and the tracker stays on, which is
+correct — something is asking for data.
+
+Launching the app again — from the menu, the dock, or `tobii-gtk` — raises the
+existing window rather than starting a second copy.
+
+**To exit for real**, use *Quit* in the cogwheel menu.
+
 ### Start at login
 
 *Start when I log in* — behind the cogwheel in the hub's header, with the other
