@@ -17,3 +17,4 @@ target/
 .claude/settings.local.json
 # Release artifacts built by scripts/release.sh
 dist/
+/dist/

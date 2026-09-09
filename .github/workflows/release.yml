@@ -77,7 +77,8 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential binutils ca-certificates curl git pkg-config \
-            libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev
+            libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev \
+            rpm
 
       - uses: actions/checkout@v4
 
@@ -104,6 +105,13 @@ jobs:
       # binaries (the same probe the updater uses), and writes SHA256SUMS.
       - name: Build the release archive
         run: scripts/release.sh "$VERSION"
+
+      # The .deb, the .rpm and the PKGBUILD, from the SAME binaries the tarball
+      # ships — package.sh unpacks the archive rather than reaching into
+      # target/, so the two channels cannot diverge. It also rewrites
+      # SHA256SUMS to cover everything in dist/.
+      - name: Build the distribution packages
+        run: scripts/package.sh "$VERSION"
 
       # release.sh reports the floor; this makes it a gate. Without it, a
       # container image bump could silently narrow every future release and

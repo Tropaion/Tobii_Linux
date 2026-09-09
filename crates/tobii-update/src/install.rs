@@ -122,6 +122,16 @@ pub enum InstallError {
     },
     /// The directory the binaries live in cannot be written to.
     NotWritable(PathBuf),
+    /// This copy was installed by a package manager, which owns it.
+    ///
+    /// Not a permissions problem, and emphatically not something to solve by
+    /// re-running as root: writing over a `dpkg`- or `pacman`-owned file leaves
+    /// the package database describing a file that is no longer there, and the
+    /// next upgrade of the package silently reverts the update anyway.
+    PackageManaged {
+        manager: String,
+        package: String,
+    },
     /// The swap failed and the previous binaries were put back.
     RolledBack {
         detail: String,
@@ -176,6 +186,13 @@ impl std::fmt::Display for InstallError {
                  installed and nothing was changed:\n  {detail}\nThis usually means the \
                  release was built against newer system libraries than this machine has. \
                  Building from source will work."
+            ),
+            InstallError::PackageManaged { manager, package } => write!(
+                f,
+                "this copy was installed by {manager}, as the package {package}. \
+                 Update it with {manager} rather than from here — overwriting a \
+                 package-managed file leaves the package database wrong, and the next \
+                 upgrade would revert the change."
             ),
             InstallError::NotWritable(p) => write!(
                 f,
@@ -240,6 +257,67 @@ pub fn is_build_tree(dir: &Path) -> bool {
         parts.next().and_then(|s| s.to_str()),
         Some("release" | "debug")
     ) && matches!(parts.next().and_then(|s| s.to_str()), Some("target"))
+}
+
+/// Which package manager owns `path`, and as what package.
+///
+/// Asked of the package managers themselves rather than guessed from the path.
+/// `/usr/bin` is not reliably package-managed and `/usr/local/bin` is not
+/// reliably not; the only authority on whether dpkg owns a file is dpkg.
+///
+/// Returns `None` when nothing claims the file — an unpacked tarball, a
+/// `cargo install`, a build tree — which is the case this updater is for.
+pub fn package_owner(path: &Path) -> Option<(String, String)> {
+    let p = path.to_str()?;
+    /// A package manager, the query that asks it who owns a file, and how to
+    /// read the package name out of what it prints.
+    struct Query<'a> {
+        prog: &'static str,
+        args: [&'a str; 2],
+        name_from: fn(&str) -> Option<String>,
+    }
+
+    let queries = [
+        // dpkg prints "tobii-linux: /usr/bin/tobii".
+        Query {
+            prog: "dpkg",
+            args: ["-S", p],
+            name_from: |o| Some(o.lines().next()?.split(':').next()?.trim().to_string()),
+        },
+        // rpm prints the NEVRA, "tobii-linux-0.1.0-1.x86_64".
+        Query {
+            prog: "rpm",
+            args: ["-qf", p],
+            name_from: |o| Some(o.lines().next()?.trim().to_string()),
+        },
+        // `-Qoq` prints the bare package name and nothing else. NOT `-Qo`,
+        // whose output is a prose sentence — and a LOCALIZED one: on a German
+        // system it reads "/usr/bin/ls ist in coreutils 9.11-2.1 enthalten",
+        // where the first whitespace token is the path, not the package. Any
+        // parse of that sentence is a parse of the user's language settings.
+        Query {
+            prog: "pacman",
+            args: ["-Qoq", p],
+            name_from: |o| Some(o.lines().next()?.trim().to_string()),
+        },
+    ];
+    for q in queries {
+        let Ok(out) = std::process::Command::new(q.prog)
+            .args(q.args)
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            continue; // that package manager is not installed here
+        };
+        if !out.status.success() {
+            continue; // it ran and does not own the file
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(pkg) = (q.name_from)(&stdout).filter(|s| !s.is_empty()) {
+            return Some((q.prog.to_string(), pkg));
+        }
+    }
+    None
 }
 
 /// Whether a new file can be created in `dir`.
@@ -317,6 +395,12 @@ pub fn install_release(
     }
 
     let dir = install_dir()?;
+    // Asked before writability, because the two failures need opposite advice:
+    // "you need permission" invites `sudo`, which is exactly the wrong thing to
+    // do to a package-managed file.
+    if let Some((manager, package)) = package_owner(&dir.join(BINARIES[0])) {
+        return Err(InstallError::PackageManaged { manager, package });
+    }
     if !is_writable(&dir) {
         return Err(InstallError::NotWritable(dir));
     }
@@ -828,6 +912,40 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
             let work = Path::new("/tmp/work");
             assert_eq!(work.join("/etc/passwd"), Path::new("/etc/passwd"));
         }
+    }
+
+    /// The distinction that decides what advice the user gets. A
+    /// package-managed install must NOT be told it needs permission, because
+    /// that invites `sudo`, and writing over a dpkg- or pacman-owned file
+    /// leaves the package database describing a file that is no longer there.
+    #[test]
+    fn a_package_managed_install_is_told_to_use_its_package_manager() {
+        let e = InstallError::PackageManaged {
+            manager: "pacman".into(),
+            package: "tobii-linux".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("pacman"), "{msg}");
+        assert!(msg.contains("tobii-linux"), "{msg}");
+        // The one thing it must never suggest.
+        assert!(!msg.to_lowercase().contains("sudo"), "{msg}");
+        assert!(!msg.contains("permission"), "{msg}");
+
+        // And the permissions message stays about permissions.
+        let w = InstallError::NotWritable(PathBuf::from("/usr/bin")).to_string();
+        assert!(w.contains("cannot be written to"), "{w}");
+    }
+
+    /// Asked of the package managers, not guessed from the path. A file no
+    /// package owns — a tarball install, a build tree — must come back `None`,
+    /// or the updater would refuse to update the copies it exists for.
+    #[test]
+    fn a_file_no_package_owns_is_not_reported_as_package_managed() {
+        let s = Scratch::new("owner");
+        let loose = s.path().join("tobii");
+        std::fs::write(&loose, b"not from a package").unwrap();
+        assert_eq!(package_owner(&loose), None);
+        assert_eq!(package_owner(&s.path().join("does-not-exist")), None);
     }
 
     #[test]
