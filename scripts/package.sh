@@ -86,9 +86,41 @@ install -m 644 assets/com.tobiilinux.Configuration.desktop \
 install -m 644 assets/com.tobiilinux.Configuration.svg \
                "$payload/usr/share/icons/hicolor/scalable/apps/"
 install -m 644 README.md LICENSE "$payload/usr/share/doc/tobii-linux/" 2>/dev/null || true
-# The udev rule is the whole practical advantage of packaging this: without it
-# the tracker is only reachable as root, and a package can put it in place where
-# a tarball cannot.
+
+# Debian Policy 12.5 makes /usr/share/doc/<pkg>/copyright a *must*, and lintian
+# reports its absence as an error — a package with none is one an archive would
+# reject. Machine-readable DEP-5, and it points at
+# /usr/share/common-licenses/GPL-3 rather than embedding the text: Policy
+# requires the reference for a license Debian already ships, and the full text
+# is beside it in LICENSE anyway. rpm's %doc glob picks the file up too, which
+# costs nothing and keeps the two payloads identical.
+cat > "$payload/usr/share/doc/tobii-linux/copyright" <<'COPYRIGHT'
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: tobii-linux
+Upstream-Contact: https://github.com/Tropaion/Tobii_Linux/issues
+Source: https://github.com/Tropaion/Tobii_Linux
+
+Files: *
+Copyright: 2026 Fabian Plaimauer
+License: GPL-3.0-only
+
+License: GPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU General Public License version 3 as published by the Free
+ Software Foundation.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ .
+ On Debian systems the full text of the GNU General Public License version 3 can
+ be found in /usr/share/common-licenses/GPL-3; a copy also ships beside this file
+ as LICENSE.
+COPYRIGHT
+chmod 644 "$payload/usr/share/doc/tobii-linux/copyright"
+# Without the udev rule the tracker is only reachable as root. A package puts it
+# in place as part of the install; the tarball ships the same rule and an
+# install.sh that offers to copy it, so neither channel leaves a user stuck.
 install -m 644 assets/99-tobii.rules "$payload/usr/lib/udev/rules.d/99-tobii.rules"
 
 installed_kb="$(du -sk "$payload" | cut -f1)"

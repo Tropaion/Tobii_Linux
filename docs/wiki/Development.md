@@ -16,6 +16,12 @@ scripts/build.sh --install  # + install to ~/.local/bin and the app menu
 scripts/build.sh --udev     # + install the device rule
 ```
 
+`--install` and `--udev` both hand off to `scripts/install-payload.sh`, which is
+also what the `install.sh` inside a release tarball runs. One definition of what
+"installed" means, so a source install and a release install cannot drift — the
+archive used to ship no installer at all, and the notes told people to unpack it
+into `~/.local/bin`, which unpacks a versioned directory rather than binaries.
+
 The dependency check exists because a missing GTK development package does not
 fail with "GTK is missing" — it fails several minutes in with hundreds of linker
 errors about undefined symbols.
@@ -228,8 +234,19 @@ Collected from the source and from bugs that actually happened.
 
 Bump `[workspace.package] version`, commit, then `git tag v0.2.0 && git push
 origin v0.2.0`. CI builds in a Debian 13 container, enforces the glibc floor,
-verifies the checksums and publishes a **draft** — the release notes are the
-changelog every user's updater shows them, so a human sees them first.
+checks that the `.deb` and `.rpm` actually *declare* it, verifies the checksums
+and publishes a **draft** — the release notes are the changelog every user's
+updater shows them, so a human sees them first.
+
+That package check is in CI rather than in `package.sh` because most developer
+machines have no `rpmbuild`, so the spec's dependencies cannot be read where
+they are written. That is exactly how `AutoReqProv: no` sat in the spec silently
+declaring no glibc requirement at all.
+
+`release.sh` builds with `--remap-path-prefix`, so no build machine's absolute
+paths reach the published binaries (there were ~500 per binary) and a panic in a
+bug report names `crates/…` instead. `[profile.release] trim-paths` is the
+proper answer and should replace it — it is still unstable in Cargo 1.98.
 
 Never cut a release from a developer machine. The build host *is* the
 compatibility floor; see [[Runtime-View]] §7.

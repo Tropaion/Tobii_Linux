@@ -71,10 +71,46 @@ inspired by the original Tobii Experience UI.
 
 ## Installation
 
-There are no distribution packages yet, so this is built from source. The whole
-process is four commands, and `scripts/build.sh` checks the dependencies before
-it starts so a missing package is named in the first second rather than as a
-wall of linker errors five minutes in.
+Two ways, and the choice is really one question: **do you want the built-in
+updater, or do you want your system to own this?**
+
+| | Get it | Updated by |
+|---|---|---|
+| **A release** — `.tar.gz`, `.deb`, `.rpm` or a `PKGBUILD` | [Releases](https://github.com/Tropaion/Tobii_Linux/releases) | the built-in updater (`.tar.gz` only) or your package manager |
+| **From source** | the steps below | `git pull` and rebuild |
+
+The prebuilt binaries are built in a Debian 13 container, so they need **glibc
+2.41 or newer**; on an older distribution, build from source. The `.deb`/`.rpm`
+declare that floor, so your package manager refuses rather than installing
+something that cannot start.
+
+<details>
+<summary><b>Installing a release</b></summary>
+
+```sh
+# the tar.gz — the only one the built-in updater can update
+tar -xzf tobii-linux-*.tar.gz
+cd tobii-linux-*/ && ./install.sh          # ~/.local/bin, menu entry, udev rule
+
+sudo apt install ./tobii-linux_*.deb       # Debian, Ubuntu, Mint, Pop!_OS
+sudo dnf install ./tobii-linux-*.rpm       # Fedora, RHEL, openSUSE
+makepkg -si                                # Arch, with the release's PKGBUILD
+```
+
+`install.sh` copies the two binaries, adds the application-menu entry, and asks
+before using `sudo` for the udev rule. The packages do all of that as part of
+installing, into `/usr/bin` — which is also why the built-in updater declines to
+touch them and points you at your package manager instead.
+
+**Re-plug the Eye Tracker 5 afterwards** so the udev rule takes effect.
+</details>
+
+### From source
+
+Works on any distribution and builds against your own GTK. The whole process is
+four commands, and `scripts/build.sh` checks the dependencies before it starts
+so a missing package is named in the first second rather than as a wall of
+linker errors five minutes in.
 
 <details open>
 <summary><b>Arch, CachyOS, Manjaro, EndeavourOS</b></summary>

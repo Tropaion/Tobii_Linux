@@ -176,81 +176,19 @@ for b in "${built[@]}"; do
     fi
 done
 
-# ------------------------------------------------------------------- install
+# ------------------------------------------------------- install (and udev)
+#
+# Delegated, so a source install and a release-tarball install are literally the
+# same steps — install-payload.sh also ships inside the archive.
 
-if [[ $do_install -eq 1 ]]; then
+if [[ $do_install -eq 1 || $do_udev -eq 1 ]]; then
     echo
-    echo "${bold}Installing into $install_dir${reset}"
-    mkdir -p "$install_dir"
-    for b in "${built[@]}"; do
-        # Not `cp` onto a running binary: that writes through the inode and can
-        # kill a process executing from it. Write beside it and rename, which
-        # replaces the directory entry and leaves the running process on the old
-        # inode — the same thing the in-app updater does.
-        tmp="$install_dir/.$b.new-$$"
-        cp "target/release/$b" "$tmp"
-        chmod 755 "$tmp"
-        mv -f "$tmp" "$install_dir/$b"
-        echo "  $install_dir/$b"
-    done
-
-    case ":${PATH}:" in
-        *":$install_dir:"*) ;;
-        *)
-            echo
-            echo "  ${bold}Note:${reset} $install_dir is not in your PATH."
-            echo "  ${dim}fish:  fish_add_path $install_dir${reset}"
-            echo "  ${dim}bash:  echo 'export PATH=\"$install_dir:\$PATH\"' >> ~/.bashrc${reset}"
-            ;;
-    esac
-
-    # The application menu entry. Installed per-user under XDG_DATA_HOME so this
-    # needs no root; only the GUI has anything to show, so it is skipped for a
-    # --lean build.
-    if [[ $lean -eq 0 ]]; then
-        data="${XDG_DATA_HOME:-$HOME/.local/share}"
-        apps="$data/applications"
-        icons="$data/icons/hicolor/scalable/apps"
-        mkdir -p "$apps" "$icons"
-        cp assets/com.tobiilinux.Configuration.desktop "$apps/"
-        cp assets/com.tobiilinux.Configuration.svg "$icons/"
-
-        # Without this the entry can take minutes to appear, or not appear until
-        # the next login — which reads as "the install did not work".
-        if command -v update-desktop-database >/dev/null 2>&1; then
-            update-desktop-database "$apps" 2>/dev/null || true
-        fi
-        if command -v gtk4-update-icon-cache >/dev/null 2>&1; then
-            gtk4-update-icon-cache -qtf "$data/icons/hicolor" 2>/dev/null || true
-        elif command -v gtk-update-icon-cache >/dev/null 2>&1; then
-            gtk-update-icon-cache -qtf "$data/icons/hicolor" 2>/dev/null || true
-        fi
-        echo "  $apps/com.tobiilinux.Configuration.desktop"
-
-        # The entry runs a bare `tobii-gtk`, so it only works if the launcher
-        # can find it. A desktop launcher does not read the user's shell
-        # profile, so ~/.local/bin being on an interactive PATH proves nothing.
-        if [[ "$install_dir" != "/usr/bin" && "$install_dir" != "/usr/local/bin" ]]; then
-            echo
-            echo "  ${dim}The menu entry runs \`tobii-gtk\` from PATH. Desktop launchers do not"
-            echo "  read your shell profile, but most honour ~/.config/environment.d and"
-            echo "  systemd's user environment; if the entry does nothing, either install"
-            echo "  to /usr/local/bin or run:${reset}"
-            echo "  ${dim}systemctl --user import-environment PATH${reset}"
-        fi
-    fi
-fi
-
-# ---------------------------------------------------------------------- udev
-
-if [[ $do_udev -eq 1 ]]; then
-    echo
-    echo "${bold}Installing the udev rule${reset}"
-    echo "${dim}Needed once, so the tracker is usable without root.${reset}"
-    sudo cp assets/99-tobii.rules /etc/udev/rules.d/
-    sudo udevadm control --reload
-    sudo udevadm trigger
-    echo "  installed — re-plug the Eye Tracker 5 for it to take effect"
+    args=("$install_dir" "target/release" "assets")
+    if [[ $do_udev -eq 1 ]]; then args+=(--udev); else args+=(--no-udev); fi
+    if [[ $lean -eq 1 ]]; then args+=(--lean); fi
+    # --udev without --install means the rule and nothing else.
+    if [[ $do_install -eq 0 ]]; then args+=(--no-bins); fi
+    bash scripts/install-payload.sh "${args[@]}"
 fi
 
 # ----------------------------------------------------------------------- next

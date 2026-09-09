@@ -55,6 +55,25 @@ triple="${2:-${arch}-unknown-linux-gnu}"
 name="tobii-linux-${version}-${triple}"
 
 echo "building $name"
+
+# Keep the build machine's absolute paths out of the published binaries.
+# Panic locations carry the source path of whatever crate raised them, so a
+# plain release build embeds ~500 paths under the builder's
+# $CARGO_HOME/registry. Measured on this workspace: 495 in `tobii`, 532 in
+# `tobii-gtk`. It is a privacy leak for anyone who builds and shares a binary,
+# it is dead weight in something people download, and the remapped form is
+# *better* in a bug report — a panic reads `crates/tobii-usb/src/lib.rs:123`
+# rather than a path unique to one machine.
+#
+# Not `[profile.release] trim-paths`, which does exactly this and is the right
+# answer the moment it is available: it is still unstable in the pinned Cargo
+# 1.98 and refuses to build. Checked, not assumed.
+#
+# This changes RUSTFLAGS, so it invalidates the build cache — which is correct
+# for a release: a release must not be assembled from objects compiled with
+# different flags.
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry=/cargo/registry --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/git=/cargo/git --remap-path-prefix=$root=."
+
 if [[ "$triple" == "${arch}-unknown-linux-gnu" ]]; then
     cargo build --release --locked
     bindir="target/release"
@@ -104,6 +123,29 @@ for bin in tobii tobii-gtk; do
     fi
 done
 cp README.md LICENSE "$dist/$name/" 2>/dev/null || true
+
+# Everything needed to actually install this, not just to run it. Without the
+# udev rule in the archive a tarball user has no way to get one short of
+# cloning the repository, and the tracker is root-only until they do; without
+# the desktop entry there is no menu item. The archive's `install.sh` is a
+# two-line wrapper around the same script `build.sh --install` runs.
+mkdir -p "$dist/$name/assets"
+cp assets/99-tobii.rules \
+   assets/com.tobiilinux.Configuration.desktop \
+   assets/com.tobiilinux.Configuration.svg "$dist/$name/assets/"
+cp scripts/install-payload.sh "$dist/$name/assets/"
+cat > "$dist/$name/install.sh" <<'INSTALLER'
+#!/usr/bin/env bash
+# Install this release. Everything lands in your home directory except the udev
+# rule, which needs sudo and which the script asks about before using it.
+#
+#   ./install.sh                 # into ~/.local/bin
+#   ./install.sh /usr/local/bin  # somewhere else (may need sudo)
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec bash "$here/assets/install-payload.sh" "${1:-$HOME/.local/bin}" "$here" "$here/assets"
+INSTALLER
+chmod 755 "$dist/$name/install.sh" "$dist/$name/assets/install-payload.sh"
 
 tar -czf "$dist/$name.tar.gz" -C "$dist" "$name"
 rm -rf "${dist:?}/$name"
