@@ -34,6 +34,7 @@ pub use setup::{
     arc_from_chord, chord_from_arc, plane_width_from_edid, tracking_coverage, Coverage,
     DisplaySetup, TRACKING_FAR_MM, USABLE_GAZE_DEG,
 };
+pub use store::write_atomic;
 pub use store::{
     calibration_path, config_path, enabled_eye_path, load, load_calibration, load_calibration_from,
     load_enabled_eye, load_from, load_pitch_offset, load_setup_monitor_id, pitch_offset_path, save,
