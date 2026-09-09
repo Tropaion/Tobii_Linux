@@ -31,6 +31,22 @@ relative to the repo root.
 
 ## Contents
 
+### Architecture (arc42)
+
+How the software is put together, for anyone changing it.
+
+| Page | Covers |
+|------|--------|
+| [[Architecture]] | §1–5: goals, constraints, context, solution strategy, the eight crates and the three threads |
+| [[Runtime-View]] | §6–7: six scenarios traced through the real code, and how a release is built and delivered |
+| [[Architecture-Decisions]] | §8–9: cross-cutting concepts, and the ~24 decisions that are expensive to reverse |
+| [[Quality-and-Risks]] | §10–12: measured numbers with their sources, known defects, untested surfaces, glossary |
+| [[Development]] | Build, the three CI checks, the test suite, testing the protocol with no tracker, conventions and traps |
+
+### The protocol
+
+The reverse-engineered ET5 USB protocol.
+
 | Page | Covers |
 |------|--------|
 | [[USB-Transport]] | Device id, bulk endpoints, the USB envelope, reassembly, session open/close & reboot behavior |
