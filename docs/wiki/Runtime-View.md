@@ -200,7 +200,7 @@ sequence from §6.1, which is why an unplug/replug is invisible to the user.
    ~/.local/bin/{tobii,tobii-gtk}
    ~/.config/tobii-linux/…                        │
    ~/.config/autostart/…  (optional)              │  tobii update --install
-   /etc/udev/rules.d/99-tobii.rules  ◄────────────┘  or the hub's banner
+   /etc/udev/rules.d/60-tobii.rules  ◄────────────┘  or the hub's banner
 ```
 
 **Why the container matters.** The machine a binary is compiled on *is* its

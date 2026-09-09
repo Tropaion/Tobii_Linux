@@ -130,7 +130,7 @@ cp README.md LICENSE "$dist/$name/" 2>/dev/null || true
 # the desktop entry there is no menu item. The archive's `install.sh` is a
 # two-line wrapper around the same script `build.sh --install` runs.
 mkdir -p "$dist/$name/assets"
-cp assets/99-tobii.rules \
+cp assets/60-tobii.rules \
    assets/com.tobiilinux.Configuration.desktop \
    assets/com.tobiilinux.Configuration.svg "$dist/$name/assets/"
 cp scripts/install-payload.sh "$dist/$name/assets/"

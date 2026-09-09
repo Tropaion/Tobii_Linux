@@ -212,8 +212,8 @@ if [[ $lean -eq 0 ]]; then
 fi
 say "$run_cli stream" "# decoded gaze samples"
 say "$run_cli headpose --fetch-model" "# optional: adds pitch (6 DOF)"
-if [[ $do_udev -eq 0 && ! -e /etc/udev/rules.d/99-tobii.rules ]]; then
+if [[ $do_udev -eq 0 && ! -e /etc/udev/rules.d/60-tobii.rules ]]; then
     echo
     echo "  ${bold}The udev rule is not installed${reset}, so the tracker needs root."
-    echo "  ${dim}scripts/build.sh --udev${reset}   or   ${dim}sudo cp assets/99-tobii.rules /etc/udev/rules.d/${reset}"
+    echo "  ${dim}scripts/build.sh --udev${reset}   or   ${dim}sudo cp assets/60-tobii.rules /etc/udev/rules.d/${reset}"
 fi

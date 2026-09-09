@@ -186,7 +186,7 @@ The udev rule belongs in your configuration rather than being copied into
 `/etc`, since NixOS manages that directory:
 
 ```nix
-services.udev.extraRules = builtins.readFile ./assets/99-tobii.rules;
+services.udev.extraRules = builtins.readFile ./assets/60-tobii.rules;
 ```
 </details>
 
@@ -256,12 +256,33 @@ yet.
 Already done if you ran `scripts/build.sh --udev`. By hand:
 
 ```sh
-sudo cp assets/99-tobii.rules /etc/udev/rules.d/
+sudo cp assets/60-tobii.rules /etc/udev/rules.d/
+sudo rm -f /etc/udev/rules.d/99-tobii.rules   # if you installed a pre-v0.1.0 copy
 sudo udevadm control --reload && sudo udevadm trigger
 ```
 
 Then (re-)plug the Eye Tracker 5. Without this the device is only reachable as
 root, and the tracker reports no eyes at all.
+
+The rule grants access through `uaccess`: systemd-logind puts an ACL on the
+device for whoever is logged in at the seat. **The `60-` in the name is
+load-bearing** — udev reads rule files in lexical order and
+`73-seat-late.rules` is what acts on the `uaccess` tag, so the pre-v0.1.0
+`99-tobii.rules` set it too late to have any effect and granted access only
+through a world-readable `MODE="0666"`. A leftover copy still overrides the new
+rule's mode, which is why the line above deletes it; `tobii debug` says so if
+one is present.
+
+### If the tracker still needs root
+
+`uaccess` needs systemd-logind. Without it there is no ACL and `MODE="0660"`
+leaves the device to root. Give a group access instead — pick one your user is
+already in (`id -nG`), often `plugdev` on Debian-family systems:
+
+```sh
+sudo sed -i 's/MODE="0660"/MODE="0660", GROUP="plugdev"/' /etc/udev/rules.d/60-tobii.rules
+sudo udevadm control --reload && sudo udevadm trigger
+```
 
 ## Usage
 

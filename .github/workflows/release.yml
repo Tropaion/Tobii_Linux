@@ -99,6 +99,21 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
+      # The tests, before anything is built for publication.
+      #
+      # ci.yml runs these on every push to main and every pull request, but a
+      # TAG is not either of those: it can point at a commit that never went
+      # through main, at one whose CI run was still queued, or at one whose CI
+      # run went red. Nothing downstream of here would notice — the archive
+      # would build, the glibc gate would pass, and the draft would be waiting
+      # with a broken binary in it. Running them here costs a couple of minutes
+      # against a release that is cut a handful of times a year.
+      - name: The three checks, on the tagged commit
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
       # The same script a maintainer would run locally, so there is one
       # definition of what a release archive is. It builds, refuses on a
       # version mismatch, reports the glibc floor, runs `--version` on both

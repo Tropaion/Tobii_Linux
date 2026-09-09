@@ -99,8 +99,15 @@ fi
 # Without the rule the tracker is only usable as root, which presents as
 # "nothing works" rather than as a permissions problem. It is the one step that
 # needs sudo, so it is the one step that announces itself.
-rule="$assets/99-tobii.rules"
-if [[ -e /etc/udev/rules.d/99-tobii.rules ]]; then
+# The old name is still checked for. Until v0.1.0 this rule was called
+# 99-tobii.rules, which is too late in udev's lexical order for
+# 73-seat-late.rules to act on its `uaccess` tag — so it granted access only
+# through MODE="0666". A leftover copy still wins on mode, undoing the point of
+# the new one, so it is removed alongside the install rather than left to sit
+# there quietly making the tighter rule pointless.
+rule="$assets/60-tobii.rules"
+legacy=/etc/udev/rules.d/99-tobii.rules
+if [[ -e /etc/udev/rules.d/60-tobii.rules && ! -e "$legacy" ]]; then
     :
 elif [[ ! -f "$rule" ]]; then
     :
@@ -130,6 +137,10 @@ else
     fi
     if [[ "$udev" != "no" ]]; then
         sudo cp "$rule" /etc/udev/rules.d/
+        if [[ -e "$legacy" ]]; then
+            sudo rm -f "$legacy"
+            echo "  removed $legacy (the old rule, which overrode the new one's mode)"
+        fi
         sudo udevadm control --reload
         sudo udevadm trigger
         echo "  installed — ${bold}re-plug the Eye Tracker 5${reset} for it to take effect"

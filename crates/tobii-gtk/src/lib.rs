@@ -98,12 +98,15 @@ button.quiet:hover { background-color: #1e242b; border-color: #3a444f;
 button.spin-btn { min-width: 26px; padding: 2px 10px; }
 /* The header cogwheel. Square, borderless until touched: it sits beside the
    connection status, where a filled button would read as an action to take. */
-menubutton.icon-btn > button {
+/* Also the save/copy pair in the settings popover, which are plain buttons —
+   hence both selectors: a GtkMenuButton wraps its own button node, a
+   GtkButton is one. */
+menubutton.icon-btn > button, button.icon-btn {
     min-width: 30px; min-height: 30px; padding: 4px;
     background-color: transparent; border-color: transparent; color: #8a949d; }
-menubutton.icon-btn > button:hover {
+menubutton.icon-btn > button:hover, button.icon-btn:hover {
     background-color: #1e242b; border-color: #2b333c; color: #e8ecef; }
-menubutton.icon-btn > button:checked {
+menubutton.icon-btn > button:checked, button.icon-btn:active {
     background-color: #1e242b; border-color: #3a444f; color: #e8ecef; }
 
 /* --- the settings popover ----------------------------------------------- */
@@ -1294,10 +1297,15 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 fn settings_button() -> gtk::MenuButton {
     let popover = gtk::Popover::new();
     popover.set_child(Some(&settings_list()));
-    // Under the cogwheel and flush with the right edge, so the panel does not
-    // hang off the side of the window on a narrow one.
     popover.set_position(gtk::PositionType::Bottom);
     popover.set_has_arrow(false);
+    // Right edge flush with the cogwheel's, not centred under it. A popover is
+    // centred on its anchor by default, and the cogwheel is the last thing in
+    // the header — so half of a 330px panel hung off the side of the window.
+    // `halign` on the popover itself is what GTK4 offers for this; the widget
+    // is aligned within the space its anchor allows rather than being centred
+    // in it.
+    popover.set_halign(Align::End);
 
     let btn = gtk::MenuButton::new();
     btn.add_css_class("icon-btn");
@@ -1363,18 +1371,7 @@ fn settings_list() -> gtk::Box {
     ));
     list.append(&hairline());
 
-    // The report is an action, not a setting, so it gets the row to itself
-    // rather than a switch on the right.
-    let diag = diagnostics_button();
-    diag.set_halign(Align::Fill);
-    diag.set_margin_top(4);
-    let diag_box = gtk::Box::new(Orientation::Vertical, 0);
-    diag_box.set_margin_start(8);
-    diag_box.set_margin_end(8);
-    diag_box.set_margin_top(4);
-    diag_box.set_margin_bottom(4);
-    diag_box.append(&diag);
-    list.append(&diag_box);
+    list.append(&diagnostics_row());
 
     list
 }
@@ -1422,36 +1419,140 @@ fn hairline() -> gtk::Box {
     h
 }
 
-fn diagnostics_button() -> gtk::Button {
-    let btn = crate::widget::button("⃝ Copy diagnostics");
-    btn.add_css_class("quiet");
-    btn.set_halign(Align::Start);
-    btn.set_tooltip_text(Some(
-        "Copy the report an issue asks for: versions, libraries, what is \
-         configured, and the recent log. No calibration data, and your username, \
-         home path and monitor serial are left out.",
-    ));
-    btn.connect_clicked(move |b| {
-        let text = tobii_diagnostics::report();
-        // `set_text` reports nothing, so whether the clipboard took it is not
-        // observable from here. The file is: it is written every time, and it
-        // is what the label reports, because a clipboard lasts only until the
-        // next copy — and somebody collecting a bug report is usually about to
-        // copy something else.
-        b.display().clipboard().set_text(&text);
-        let msg = match write_report_file(&text) {
-            Some(path) => format!("Copied · also saved to {path}"),
-            None => "Copied to the clipboard".to_string(),
-        };
-        crate::widget::set_button_text(b, &msg);
-        let b2 = b.clone();
-        glib::timeout_add_local_once(Duration::from_secs(6), move || {
-            crate::widget::set_button_text(&b2, "⃝ Copy diagnostics");
+/// The diagnostics row: save it, or copy it.
+///
+/// # Why two buttons and not one
+///
+/// This was one wide button that did both — it copied to the clipboard and
+/// wrote a file, and reported the file path in its own label. That conflates
+/// two different intentions. Somebody about to paste into a GitHub issue wants
+/// the clipboard and nothing on disk; somebody being asked for the report in a
+/// forum thread wants a file they can attach. Doing both on every click meant
+/// the first case silently left a file behind and the second had to read a
+/// path out of a button caption.
+///
+/// Icons rather than captions because the row already carries the sentence
+/// that explains it, and two labelled buttons here would be wider than the
+/// panel. Both have tooltips, which is where the detail about what the report
+/// does and does not contain now lives.
+fn diagnostics_row() -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Vertical, 0);
+
+    // Where the outcome is reported. The buttons cannot say it themselves any
+    // more — an icon has no caption to change — and a clipboard write is
+    // otherwise completely invisible.
+    let status = Label::new(None);
+    status.add_css_class("hint");
+    status.set_halign(Align::Start);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.set_max_width_chars(38);
+    status.set_visible(false);
+    status.set_margin_start(8);
+    status.set_margin_end(8);
+    status.set_margin_bottom(8);
+
+    // A generation counter, so two clicks in a row do not leave the first
+    // click's timer to clear the second click's message six seconds early.
+    let generation = Rc::new(Cell::new(0u32));
+    let say = {
+        let status = status.clone();
+        let generation = generation.clone();
+        move |msg: String| {
+            status.set_text(&msg);
+            status.set_visible(true);
+            let mine = generation.get().wrapping_add(1);
+            generation.set(mine);
+            let status = status.clone();
+            let generation = generation.clone();
+            glib::timeout_add_local_once(Duration::from_secs(6), move || {
+                if generation.get() == mine {
+                    status.set_visible(false);
+                }
+            });
+        }
+    };
+
+    let save = icon_button(
+        "document-save-symbolic",
+        "🖫",
+        "Save the report to a file, to attach it to a bug report.\n\nIt goes next \
+         to the log, in your state directory.",
+    );
+    let copy = icon_button(
+        "edit-copy-symbolic",
+        "⧉",
+        "Copy the report to the clipboard, to paste into an issue.\n\nVersions, \
+         libraries, what is configured, and the recent log. No calibration data, \
+         and your username, home path and monitor serial are left out or hashed.",
+    );
+
+    {
+        let say = say.clone();
+        save.connect_clicked(move |_| {
+            let text = tobii_diagnostics::report();
+            match write_report_file(&text) {
+                Some(path) => say(format!("Saved to {path}")),
+                None => {
+                    // Not silent: the one thing worse than failing to write the
+                    // file is saying nothing and letting somebody go looking
+                    // for it.
+                    tobii_diagnostics::log::warn("could not write the diagnostics file");
+                    say("Could not write the file — see the log".to_string());
+                }
+            }
         });
-    });
-    btn
+    }
+    {
+        let say = say.clone();
+        copy.connect_clicked(move |b| {
+            // `set_text` reports nothing, so whether the clipboard took it is
+            // not observable from here. Saying "copied" is the best this can
+            // honestly do.
+            b.display()
+                .clipboard()
+                .set_text(&tobii_diagnostics::report());
+            say("Copied to the clipboard".to_string());
+        });
+    }
+
+    let buttons = gtk::Box::new(Orientation::Horizontal, 6);
+    buttons.append(&save);
+    buttons.append(&copy);
+
+    row.append(&settings_row(
+        "Diagnostics",
+        "The report an issue asks for: versions, libraries, what is configured, and the \
+         recent log.",
+        &buttons,
+    ));
+    row.append(&status);
+    row
 }
 
+/// A square, captionless button, with a glyph if the icon theme has no icon.
+///
+/// GTK's icon lookup falls back to a "missing image" square rather than to
+/// nothing, so an unchecked name leaves a broken tile rather than a plain one.
+fn icon_button(icon: &str, glyph: &str, tooltip: &str) -> gtk::Button {
+    let btn = gtk::Button::new();
+    btn.add_css_class("quiet");
+    btn.add_css_class("icon-btn");
+    btn.set_valign(Align::Center);
+    btn.set_tooltip_text(Some(tooltip));
+    let has = gtk::gdk::Display::default()
+        .is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(icon));
+    if has {
+        btn.set_icon_name(icon);
+    } else {
+        let label = Label::new(Some(glyph));
+        // The same vertical slack `widget::button` gives every glyph here.
+        label.set_margin_top(2);
+        label.set_margin_bottom(2);
+        btn.set_child(Some(&label));
+    }
+    btn
+}
 /// Also drop the report next to the log, so it survives the clipboard.
 ///
 /// A clipboard lasts until the next copy, and somebody collecting a bug report

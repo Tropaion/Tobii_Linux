@@ -1,0 +1,41 @@
+# Tobii Eye Tracker 5 (EyeChip) — access without root
+#
+# # Why the file is called 60- and not 99-
+#
+# `uaccess` is the mechanism that grants access: systemd-logind puts an ACL on
+# the device for whoever is logged in at the seat, and removes it when they log
+# out. But the tag alone does nothing — what acts on it is
+# /usr/lib/udev/rules.d/73-seat-late.rules:
+#
+#     TAG=="uaccess", ENV{MAJOR}!="", RUN{builtin}+="uaccess"
+#
+# udev processes rule files in lexical order, so a file named 99- sets the tag
+# twenty-six files AFTER the only rule that reads it. This one used to be
+# 99-tobii.rules, and the consequence was measurable on a machine where it was
+# installed and the tracker plugged in:
+#
+#     $ udevadm info -q all -n /dev/bus/usb/007/002 | grep TAGS
+#     E: CURRENT_TAGS=:uaccess:
+#     $ getfacl -p /dev/bus/usb/007/002
+#     user::rw-   group::rw-   other::rw-      <- no ACL for the logged-in user
+#
+# Tagged, and no ACL: the builtin had already run. So `uaccess` was decorative
+# and MODE="0666" was doing all the work — which is why the mode could not
+# simply be tightened without moving the file first.
+#
+# # Why MODE is 0660
+#
+# 0666 hands every local process — every sandboxed application, every other
+# user on the machine — access to an infrared camera pointed at the person
+# using it. With the tag now effective, the ACL is the way in and the mode does
+# not have to be.
+#
+# On a system without logind there is no ACL and the device stays root-only.
+# That is a deliberate trade: defaulting the other way makes every desktop less
+# safe in order to serve the few systems that are not one. See the README
+# ("If the tracker still needs root") for the group-based alternative.
+
+# Bootloader / DFU mode
+SUBSYSTEM=="usb", ATTR{idVendor}=="2104", ATTR{idProduct}=="0102", MODE="0660", TAG+="uaccess"
+# Runtime mode
+SUBSYSTEM=="usb", ATTR{idVendor}=="2104", ATTR{idProduct}=="0313", MODE="0660", TAG+="uaccess"

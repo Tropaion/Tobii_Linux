@@ -144,9 +144,55 @@ fn install_kind() -> String {
         return format!("package `{pkg}` via {mgr}");
     }
     if tobii_update::install::is_build_tree(&dir) {
-        return format!("build tree ({})", tilde(&dir.display().to_string()));
+        return format!("build tree ({})", safe_path(&dir));
     }
-    format!("unmanaged ({})", tilde(&dir.display().to_string()))
+    format!("unmanaged ({})", safe_path(&dir))
+}
+
+/// A path that cannot carry a username, whatever `$HOME` happens to be.
+///
+/// [`tilde`] folds the home directory, which is the whole redaction as long as
+/// the home the program is running under is the home the binary sits in. Under
+/// `sudo` it is not: `env_reset` sets `HOME=/root` while the binary is still
+/// under the real user's home, and this very report tells people the tracker
+/// "needs root" without the udev rule — so `sudo tobii debug` is a flow the
+/// tool itself invites. Measured before this existed:
+///
+/// ```text
+/// $ env HOME=/root tobii debug
+/// install    build tree (/home/tropaion/Dokumente/Git/TobiiLinux/target/release)
+/// redacted: username, home path, hostname, monitor serial (…)
+/// ```
+///
+/// The footer was making a promise the line above it had already broken.
+/// [`home_spellings`] now resolves the invoking user's home too, which covers
+/// sudo properly and keeps the *useful* answer (`~/.local/bin`). This is the
+/// backstop for everything that resolution cannot reach: a home somewhere no
+/// convention names, `su - other`, a container with a rewritten passwd. If the
+/// path did not fold and is not under a directory that belongs to the system,
+/// only its last two components go out — enough to recognise `bin/release` or
+/// `.local/bin`, never enough to name anybody.
+fn safe_path(dir: &std::path::Path) -> String {
+    let folded = tilde(&dir.display().to_string());
+    // Folded, or somewhere every machine has the same: publish it as it is.
+    const SYSTEM: [&str; 6] = ["/usr/", "/opt/", "/bin/", "/sbin/", "/snap/", "/nix/"];
+    if folded.starts_with('~') || SYSTEM.iter().any(|p| folded.starts_with(p)) {
+        return folded;
+    }
+    let tail: Vec<&std::ffi::OsStr> = dir
+        .iter()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let joined = tail
+        .iter()
+        .map(|c| c.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("…/{joined}")
 }
 
 fn distro() -> String {
@@ -232,17 +278,39 @@ fn usb_present() -> String {
     "NOT FOUND on the bus".into()
 }
 
+/// Whether the udev rule is installed — and whether it is the one that works.
+///
+/// Both names are looked for. The rule shipped before v0.1.0 was called
+/// `99-tobii.rules`, and the number is not cosmetic: udev reads rule files in
+/// lexical order, and `73-seat-late.rules` is what turns `TAG+="uaccess"` into
+/// an ACL, so a tag set at 99 arrives after the only rule that reads it.
+/// Measured on a machine with the old file installed and the tracker plugged
+/// in: `CURRENT_TAGS=:uaccess:` and no ACL on the device node at all. The rule
+/// "worked" only because it also said `MODE="0666"`, which is a different and
+/// much broader grant. A leftover copy of the old file still wins on mode, so
+/// it is worth naming in the report rather than passing as installed.
 fn udev_rule() -> String {
-    for p in [
-        "/etc/udev/rules.d/99-tobii.rules",
-        "/usr/lib/udev/rules.d/99-tobii.rules",
-        "/lib/udev/rules.d/99-tobii.rules",
-    ] {
-        if Path::new(p).exists() {
-            return format!("installed ({p})");
-        }
+    const DIRS: [&str; 3] = [
+        "/etc/udev/rules.d",
+        "/usr/lib/udev/rules.d",
+        "/lib/udev/rules.d",
+    ];
+    let found = |name: &str| {
+        DIRS.iter()
+            .map(|d| format!("{d}/{name}"))
+            .find(|p| Path::new(p).exists())
+    };
+    match (found("60-tobii.rules"), found("99-tobii.rules")) {
+        (Some(new), Some(old)) => format!(
+            "installed ({new}) — but {old} is still there and overrides its mode; delete it"
+        ),
+        (Some(new), None) => format!("installed ({new})"),
+        (None, Some(old)) => format!(
+            "installed ({old}), the OLD rule — its uaccess tag is set too late to \
+             have any effect; replace it with 60-tobii.rules"
+        ),
+        (None, None) => "NOT INSTALLED — the tracker needs root without it".into(),
     }
-    "NOT INSTALLED — the tracker needs root without it".into()
 }
 
 fn display_area() -> String {
@@ -444,25 +512,53 @@ fn tilde(path: &str) -> String {
 /// The raw `$HOME`, and its canonical form when they differ. Longest first, so
 /// folding one cannot leave a fragment of another behind.
 fn home_spellings() -> Vec<String> {
-    let Ok(raw) = std::env::var("HOME") else {
-        return Vec::new();
-    };
-    let raw = raw.trim_end_matches('/').to_string();
-    if raw.len() <= 1 {
+    let mut all: Vec<String> = Vec::new();
+    // `$HOME`, and the home of whoever invoked `sudo`. The second is not a
+    // nicety: sudo's `env_reset` sets HOME=/root, so under sudo the first one
+    // names a directory the binary is not in and folds nothing — while the
+    // real user's home sits in the path, in a report built to be pasted on a
+    // public tracker.
+    let invoking = std::env::var("SUDO_USER").ok().and_then(passwd_home);
+    for raw in [std::env::var("HOME").ok(), invoking].into_iter().flatten() {
+        let raw = raw.trim_end_matches('/').to_string();
         // "" or "/" names no user directory, and folding "/" would replace
         // every separator in every path — "~~.local~bin".
-        return Vec::new();
-    }
-    let mut all = vec![raw.clone()];
-    if let Ok(canon) = std::fs::canonicalize(&raw) {
-        let canon = canon.display().to_string();
-        let canon = canon.trim_end_matches('/').to_string();
-        if canon.len() > 1 && canon != raw {
-            all.push(canon);
+        if raw.len() <= 1 {
+            continue;
         }
+        if let Ok(canon) = std::fs::canonicalize(&raw) {
+            let canon = canon
+                .display()
+                .to_string()
+                .trim_end_matches('/')
+                .to_string();
+            if canon.len() > 1 {
+                all.push(canon);
+            }
+        }
+        all.push(raw);
     }
     all.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    all.dedup();
     all
+}
+
+/// A user's home directory, read out of `/etc/passwd`.
+///
+/// `getpwnam` would be the right call and would also see LDAP and SSSD users,
+/// but it needs libc bindings this crate does not have — and the case that
+/// matters here, a desktop user running `sudo tobii debug`, is in the local
+/// file. Failing to resolve costs a fold, not correctness: [`safe_path`]
+/// truncates whatever `tilde` could not fold.
+fn passwd_home(user: String) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|l| {
+        let mut f = l.split(':');
+        (f.next()? == user)
+            .then(|| f.nth(4))?
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn first_line(path: &str) -> String {
@@ -489,6 +585,63 @@ mod tests {
 
     /// The property that matters: whatever this prints is going onto a public
     /// issue tracker, so it must not carry the things that identify a person.
+    /// The leak the test above could not see, because the test and the bug
+    /// shared an assumption.
+    ///
+    /// `the_report_does_not_leak_who_you_are` compares the report against the
+    /// same `$HOME` the code folds with, so it passes by construction whenever
+    /// the two agree — and the interesting case is exactly when they do not.
+    /// `sudo` sets `HOME=/root` while the binary is still under the real
+    /// user's home, and this report tells people the tracker "needs root"
+    /// without the udev rule, so `sudo tobii debug` is a flow the tool itself
+    /// invites. Measured before the fix, with the shipped binary:
+    ///
+    /// ```text
+    /// $ env HOME=/root tobii debug
+    /// install    build tree (/home/tropaion/Dokumente/Git/TobiiLinux/target/release)
+    /// redacted: username, home path, hostname, …
+    /// ```
+    ///
+    /// So this one points `$HOME` somewhere the install is definitely NOT and
+    /// asserts the real path still does not come out.
+    #[test]
+    fn a_home_that_is_not_where_the_binary_lives_still_does_not_leak() {
+        // `$HOME` is process-global. This takes the same lock the log tests
+        // use so it cannot race a sibling reading it.
+        let _guard = log::tests::LOG_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(real) = test_home() else {
+            return; // no home to leak
+        };
+
+        let restore = std::env::var_os("HOME");
+        let sudo = std::env::var_os("SUDO_USER");
+        std::env::set_var("HOME", "/root");
+        std::env::remove_var("SUDO_USER");
+        let r = report();
+        match restore {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Some(u) = sudo {
+            std::env::set_var("SUDO_USER", u);
+        }
+
+        assert!(
+            !r.contains(&real),
+            "with HOME=/root the real home reached the report:\n{r}"
+        );
+        // And the report must still say something useful about the install —
+        // a redaction that erased the line would pass the assertion above and
+        // be a worse report.
+        assert!(
+            r.lines()
+                .any(|l| l.starts_with("install") && l.contains('(') && !l.contains("()")),
+            "the install line went missing — redacting it away is not the fix:\n{r}"
+        );
+    }
+
     #[test]
     fn the_report_does_not_leak_who_you_are() {
         let r = report();

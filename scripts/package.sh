@@ -38,8 +38,13 @@ fi
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-arch="$(uname -m)"
-triple="${2:-${arch}-unknown-linux-gnu}"
+triple="${2:-$(uname -m)-unknown-linux-gnu}"
+# The architecture comes from the TRIPLE, not from `uname -m`. They are the
+# same thing only when this runs on the machine it is packaging for — and the
+# second argument exists precisely so it does not have to. Cross-packaging
+# aarch64 on an x86_64 host used to label the .deb `amd64` and the .rpm
+# `x86_64`, which apt and dnf both believe.
+arch="${triple%%-*}"
 name="tobii-linux-${version}-${triple}"
 dist="$root/dist"
 tarball="$dist/$name.tar.gz"
@@ -121,7 +126,7 @@ chmod 644 "$payload/usr/share/doc/tobii-linux/copyright"
 # Without the udev rule the tracker is only reachable as root. A package puts it
 # in place as part of the install; the tarball ships the same rule and an
 # install.sh that offers to copy it, so neither channel leaves a user stuck.
-install -m 644 assets/99-tobii.rules "$payload/usr/lib/udev/rules.d/99-tobii.rules"
+install -m 644 assets/60-tobii.rules "$payload/usr/lib/udev/rules.d/60-tobii.rules"
 
 installed_kb="$(du -sk "$payload" | cut -f1)"
 
@@ -205,8 +210,18 @@ EOF
 chmod 755 "$ctl/postinst"
 
 # `md5sums` is what `dpkg -V` verifies against. Paths are relative to /.
+#
+# Not silenced. This used to end in `2>/dev/null || true`, which turns every
+# way it can go wrong — no `md5sum`, an unreadable file, xargs splitting the
+# list — into an empty or partial manifest that dpkg accepts without complaint,
+# so `dpkg -V` would verify nothing and say so by saying nothing.
 ( cd "$deb_root" && find . -type f -printf '%P\0' | sort -z \
-    | xargs -0 md5sum > "$ctl/md5sums" ) 2>/dev/null || true
+    | xargs -0 md5sum > "$ctl/md5sums" )
+if [[ ! -s "$ctl/md5sums" ]] \
+   || [[ "$(wc -l < "$ctl/md5sums")" -ne "$(find "$deb_root" -type f ! -path "*/DEBIAN/*" | wc -l)" ]]; then
+    echo "md5sums does not cover every file in the package" >&2
+    exit 1
+fi
 
 # A .deb is an ar archive of exactly these three members, in this order.
 # `debian-binary` must come first or dpkg refuses the file.
@@ -257,7 +272,7 @@ package() {
         "\$pkgdir/usr/share/applications/com.tobiilinux.Configuration.desktop"
     install -Dm644 assets/com.tobiilinux.Configuration.svg \\
         "\$pkgdir/usr/share/icons/hicolor/scalable/apps/com.tobiilinux.Configuration.svg"
-    install -Dm644 assets/99-tobii.rules "\$pkgdir/usr/lib/udev/rules.d/99-tobii.rules"
+    install -Dm644 assets/60-tobii.rules "\$pkgdir/usr/lib/udev/rules.d/60-tobii.rules"
     install -Dm644 README.md "\$pkgdir/usr/share/doc/\$pkgname/README.md"
     install -Dm644 LICENSE   "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE"
 }
@@ -300,7 +315,7 @@ cp -a %{_sourcedir}/payload/. %{buildroot}/
 /usr/bin/tobii-gtk
 /usr/share/applications/com.tobiilinux.Configuration.desktop
 /usr/share/icons/hicolor/scalable/apps/com.tobiilinux.Configuration.svg
-/usr/lib/udev/rules.d/99-tobii.rules
+/usr/lib/udev/rules.d/60-tobii.rules
 %doc /usr/share/doc/tobii-linux/*
 
 %post

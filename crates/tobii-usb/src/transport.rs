@@ -32,7 +32,7 @@ impl std::fmt::Display for UsbError {
             ),
             UsbError::PermissionDenied => write!(
                 f,
-                "no permission to open the Tobii ET5 (2104:0313) — install assets/99-tobii.rules \
+                "no permission to open the Tobii ET5 (2104:0313) — install assets/60-tobii.rules \
                  into /etc/udev/rules.d/ and replug the tracker"
             ),
             UsbError::DeviceBusy => write!(
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn the_permission_error_names_the_udev_rule_and_the_replug() {
         let msg = UsbError::PermissionDenied.to_string();
-        assert!(msg.contains("assets/99-tobii.rules"), "{msg}");
+        assert!(msg.contains("assets/60-tobii.rules"), "{msg}");
         assert!(msg.contains("replug"), "{msg}");
     }
 
