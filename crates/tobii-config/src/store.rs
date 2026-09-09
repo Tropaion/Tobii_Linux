@@ -221,6 +221,46 @@ pub fn load_enabled_eye() -> io::Result<Option<tobii_protocol::EnabledEye>> {
     }
 }
 
+/// Path to the automatic-update-check preference, beside `config.toml`.
+pub fn update_check_path() -> PathBuf {
+    config_path().with_file_name("update_check")
+}
+
+/// Whether the GUI may ask GitHub for the latest release when it starts.
+///
+/// Defaults to on, and is the program's only unprompted network request — so
+/// there has to be a way to say no that does not mean "never run the GUI". Both
+/// the file and `TOBII_NO_UPDATE_CHECK` are honoured: the file for the checkbox
+/// in the hub, the environment variable for a packager who wants the check off
+/// for everyone without writing to anybody's config.
+pub fn update_check_enabled() -> bool {
+    if std::env::var_os("TOBII_NO_UPDATE_CHECK").is_some_and(|v| v != "0") {
+        return false;
+    }
+    update_check_enabled_at(&update_check_path())
+}
+
+/// [`update_check_enabled`] against a given path, without the env override.
+pub fn update_check_enabled_at(path: &Path) -> bool {
+    // Anything unreadable or unexpected means the default, which is on: a
+    // corrupt preference file must not quietly disable the only path by which
+    // a user learns a fix exists.
+    match read_opt(path) {
+        Ok(Some(b)) => std::str::from_utf8(&b).map(str::trim) != Ok("off"),
+        _ => true,
+    }
+}
+
+/// Persist whether the GUI checks for updates at launch.
+pub fn save_update_check(enabled: bool) -> io::Result<()> {
+    save_update_check_to(&update_check_path(), enabled)
+}
+
+/// [`save_update_check`] to a given path, for tests.
+pub fn save_update_check_to(path: &Path, enabled: bool) -> io::Result<()> {
+    write_atomic(path, if enabled { b"on\n" } else { b"off\n" })
+}
+
 /// Path to the persisted head-pose pitch offset, beside `config.toml`.
 pub fn pitch_offset_path() -> PathBuf {
     config_path().with_file_name("headpose_pitch_offset")
@@ -310,6 +350,36 @@ pub fn load_setup_monitor_id() -> io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The default has to be on — a user who never touches the setting should
+    /// still hear about a fix — but an unreadable or unexpected file must not
+    /// be read as "off" and silently switch the check off forever.
+    #[test]
+    fn the_update_check_defaults_to_on_and_only_off_turns_it_off() {
+        let dir = std::env::temp_dir().join(format!("tobii-upd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("update_check");
+
+        assert!(update_check_enabled_at(&path), "unset means on");
+
+        save_update_check_to(&path, false).unwrap();
+        assert!(!update_check_enabled_at(&path));
+        save_update_check_to(&path, true).unwrap();
+        assert!(update_check_enabled_at(&path));
+
+        for junk in ["", "  ", "yes", "0", "OFF", "\u{0}\u{1}"] {
+            std::fs::write(&path, junk).unwrap();
+            assert!(
+                update_check_enabled_at(&path),
+                "{junk:?} is not \"off\" and must leave the check on"
+            );
+        }
+        // Trailing whitespace is what a hand-edited file looks like.
+        std::fs::write(&path, "off\n").unwrap();
+        assert!(!update_check_enabled_at(&path));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     fn sample() -> DisplaySetup {

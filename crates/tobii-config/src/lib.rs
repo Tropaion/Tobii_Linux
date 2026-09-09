@@ -38,5 +38,6 @@ pub use store::{
     calibration_path, config_path, enabled_eye_path, load, load_calibration, load_calibration_from,
     load_enabled_eye, load_from, load_pitch_offset, load_setup_monitor_id, pitch_offset_path, save,
     save_calibration, save_calibration_to, save_enabled_eye, save_pitch_offset,
-    save_setup_monitor_id, save_to, CalMeta,
+    save_setup_monitor_id, save_to, save_update_check, update_check_enabled, update_check_path,
+    CalMeta,
 };

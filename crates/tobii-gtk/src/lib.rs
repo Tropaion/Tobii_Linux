@@ -113,6 +113,8 @@ scrollbar slider { min-width: 8px; min-height: 8px; }
 .dialog-terms { font-size: 13px; color: #8a949d; }
 .dialog-facts { font-size: 12px; color: #79838d; border-top: 1px solid #232a32;
                 padding-top: 10px; margin-top: 2px; }
+.dialog-note { font-size: 12px; color: #79838d; border-top: 1px solid #232a32;
+               padding-top: 10px; margin-top: 2px; }
 .dialog-url { font-size: 11px; }
 .cal-fail-heading { font-size: 26px; font-weight: bold; }
 .cal-fail-tips { font-size: 14px; color: #8a949d; }
@@ -148,6 +150,15 @@ pub fn run() -> glib::ExitCode {
     // renders cleanly under "gl" here, so if the clipping survives this change,
     // the renderer was innocent. `GSK_RENDERER=gl|ngl|vulkan|cairo` still works
     // as an override for whoever tests it next.
+    // Answered before GTK is initialised, so it needs no display and opens no
+    // window. The updater runs this on a freshly downloaded binary to check it
+    // can execute here before replacing the installed one, and a GUI binary
+    // that needs a display to say its own version would be useless for that.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("tobii-gtk {}", env!("CARGO_PKG_VERSION"));
+        return gtk::glib::ExitCode::SUCCESS;
+    }
+
     let mut builder = Application::builder().application_id(APP_ID);
     if accuracy_mode() {
         // GApplication is single-instance by default: with the hub already
@@ -168,7 +179,7 @@ pub fn run() -> glib::ExitCode {
 
 /// Flags this binary handles itself, which must never reach GTK's parser.
 fn is_our_flag(arg: &str) -> bool {
-    matches!(arg, "--accuracy")
+    matches!(arg, "--accuracy" | "--version" | "-V")
 }
 
 /// Whether to run the gaze-accuracy diagnostic instead of the hub.
@@ -631,6 +642,13 @@ pub fn build_ui(app: &Application) {
         "If you move the sensor to a different monitor, you'll need to set up the new display.",
         &b_setup,
     ));
+    right.append(&section(
+        "Check for updates",
+        "Asks GitHub for the latest release when this window opens. It's the only thing this \
+         program does on the network without being asked. Nothing is downloaded until you \
+         choose to update.",
+        &update_check_switch(),
+    ));
 
     // --- Recommend-recalibration banner: a dismissible row, not a modal. Shown
     // by the tick's once-per-connection `decide()` evaluation below. ---
@@ -991,6 +1009,35 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
         }
     });
     banner.set_visible(true);
+}
+
+/// The switch that turns the launch-time release check on and off.
+///
+/// The check is the program's only unprompted network request, so it needs a
+/// visible off switch — not just an environment variable a user would have to
+/// already know about. `TOBII_NO_UPDATE_CHECK` still wins, and the switch is
+/// shown insensitive when it does, because a control that silently does nothing
+/// is worse than one that explains itself.
+fn update_check_switch() -> Switch {
+    let sw = Switch::new();
+    sw.set_valign(Align::Center);
+    let forced_off = std::env::var_os("TOBII_NO_UPDATE_CHECK").is_some_and(|v| v != "0");
+    sw.set_active(tobii_config::update_check_enabled());
+    if forced_off {
+        sw.set_sensitive(false);
+        sw.set_tooltip_text(Some(
+            "Turned off for this session by TOBII_NO_UPDATE_CHECK.",
+        ));
+        return sw;
+    }
+    sw.set_tooltip_text(Some("Takes effect the next time this window opens."));
+    sw.connect_state_set(|_, on| {
+        if let Err(e) = tobii_config::save_update_check(on) {
+            eprintln!("could not save the update-check setting: {e}");
+        }
+        glib::Propagation::Proceed
+    });
+    sw
 }
 
 /// A settings section: bold title, wrapped description (original wording), and

@@ -9,8 +9,20 @@
 //!
 //! What that buys is deliberately narrow: it fetches the release *listing*,
 //! which is metadata. Nothing is downloaded and nothing on disk changes until
-//! the user presses Update, and the download is verified against the checksums
-//! published beside it before anything is put where it would be run.
+//! the user presses Update.
+//!
+//! It can be switched off — in Settings, or with `TOBII_NO_UPDATE_CHECK=1` —
+//! and then no request is made at all. A program that reaches out on its own
+//! needs a way to say no that is not "stop using the program".
+//!
+//! # What pressing Update trusts
+//!
+//! The checksums are published in the same release as the archive and fetched
+//! over the same connection, so they catch a *corrupted download* and nothing
+//! more. There is no signature, so installing an update trusts the project's
+//! GitHub release exactly as much as downloading a binary from it by hand
+//! would. The dialog says so before the button is pressed, rather than implying
+//! a guarantee that does not exist. See `tobii_update::install`.
 //!
 //! The check runs on a worker thread and the banner stays hidden until it has
 //! something to say, so a slow or absent network costs the hub nothing.
@@ -47,6 +59,27 @@ pub fn installing(step: &str) -> String {
     format!("Updating — {step}…")
 }
 
+/// How the banner reads when the release has no build for this machine.
+pub fn no_build_headline(version: &str) -> String {
+    format!(
+        "Version {version} is available, but not as a build for {}.",
+        tobii_update::Target::triple()
+    )
+}
+
+/// What the user is agreeing to when they press Update.
+///
+/// Deliberately not reassuring. The checksum published with a release is
+/// fetched from that release, so it proves the download arrived intact and
+/// nothing about who wrote it.
+pub fn trust_note() -> String {
+    "Installing replaces this program's binaries with the ones published in this release. \
+     The published checksums are used to confirm the download arrived intact; they are not a \
+     signature, so this trusts the project's GitHub releases as much as downloading and \
+     running a binary from them by hand would."
+        .to_string()
+}
+
 /// Build the update banner. It is hidden until a check finds something.
 pub fn banner() -> gtk::Box {
     let row = gtk::Box::new(Orientation::Horizontal, 12);
@@ -77,6 +110,11 @@ pub fn banner() -> gtk::Box {
         dismiss.connect_clicked(move |_| row.set_visible(false));
     }
 
+    // Nothing is asked of the network when the user has said not to.
+    if !tobii_config::update_check_enabled() {
+        return row;
+    }
+
     // The check, off the UI thread. A hub that stalled on a DNS lookup at
     // startup would be a worse bug than the one this feature fixes.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -95,6 +133,23 @@ pub fn banner() -> gtk::Box {
                 return glib::ControlFlow::Break
             }
             Ok(Ok(Check::UpToDate)) => return glib::ControlFlow::Break,
+            // A newer release with no build for this machine. Saying so beats
+            // an Update button that could only ever fail, and beats silence:
+            // the release does exist and can be built from source.
+            Ok(Ok(Check::NotForThisTarget { version, url })) => {
+                text.set_text(&no_build_headline(&version.to_string()));
+                update_btn.set_visible(false);
+                let url = url.clone();
+                notes_btn.connect_clicked(move |btn| {
+                    let _ = gtk::gio::AppInfo::launch_default_for_uri(
+                        &url,
+                        gtk::gio::AppLaunchContext::NONE,
+                    );
+                    let _ = btn;
+                });
+                crate::widget::set_button_text(notes_btn, "Releases");
+                row.set_visible(true);
+            }
             Ok(Ok(Check::Newer(release))) => {
                 text.set_text(&headline(&release));
                 wire(row, text, notes_btn, update_btn, dismiss, *release);
@@ -134,6 +189,13 @@ fn wire(
         dismiss.set_sensitive(false);
         text.set_text(&installing("starting"));
 
+        // Closing the window mid-install would otherwise end the process
+        // between the two renames, leaving a new `tobii` beside an old
+        // `tobii-gtk`. The hold is released when the install finishes, either
+        // way. (`swap_in` also rolls back, but only for failures it is told
+        // about — a process that simply exits tells it nothing.)
+        let guard = gtk::gio::Application::default().map(|app| app.hold());
+
         // The install downloads, verifies and rewrites files. All of that is
         // off the UI thread; the worker reports through a channel and touches
         // no widgets.
@@ -148,6 +210,9 @@ fn wire(
         });
 
         let (row, text, btn, dismiss) = (row.clone(), text.clone(), btn.clone(), dismiss.clone());
+        // `hold()` hands back an RAII guard, so releasing it is a drop.
+        let guard = std::cell::RefCell::new(guard);
+        let release_hold = move || drop(guard.borrow_mut().take());
         glib::timeout_add_local(Duration::from_millis(150), move || {
             while let Ok(step) = prx.try_recv() {
                 text.set_text(&installing(&step));
@@ -155,6 +220,7 @@ fn wire(
             match rx.try_recv() {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Ok(Ok(done)) => {
+                    release_hold();
                     text.set_text(&format!("Updated to {}. Restart to run it.", done.version));
                     btn.set_visible(false);
                     dismiss.set_sensitive(true);
@@ -162,12 +228,14 @@ fn wire(
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
+                    release_hold();
                     text.set_text(&format!("Update failed: {e}"));
                     btn.set_sensitive(true);
                     dismiss.set_sensitive(true);
                     glib::ControlFlow::Break
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    release_hold();
                     text.set_text("Update failed: the updater stopped unexpectedly.");
                     btn.set_sensitive(true);
                     dismiss.set_sensitive(true);
@@ -204,6 +272,13 @@ fn changelog_dialog(parent: Option<&gtk::Window>, release: &Release) {
     scroller.set_vexpand(true);
     scroller.set_min_content_height(260);
 
+    let trust = Label::new(Some(&trust_note()));
+    trust.add_css_class("dialog-note");
+    trust.set_wrap(true);
+    trust.set_xalign(0.0);
+    trust.set_halign(Align::Start);
+    trust.set_max_width_chars(64);
+
     let link = Label::new(None);
     link.set_markup(&format!(
         "<a href=\"{url}\">{url}</a>",
@@ -228,6 +303,7 @@ fn changelog_dialog(parent: Option<&gtk::Window>, release: &Release) {
     content.set_margin_end(26);
     content.append(&heading);
     content.append(&scroller);
+    content.append(&trust);
     content.append(&link);
     content.append(&buttons);
 
@@ -296,5 +372,27 @@ mod tests {
     #[test]
     fn progress_reads_as_a_sentence() {
         assert_eq!(installing("verifying"), "Updating — verifying…");
+    }
+
+    /// The banner must not offer an Update button that could only fail, and
+    /// must still name the version, so the user knows the release exists.
+    #[test]
+    fn a_release_with_no_build_here_says_which_machine_it_is_missing() {
+        let h = no_build_headline("0.9.0");
+        assert!(h.contains("0.9.0"), "{h}");
+        assert!(h.contains(&tobii_update::Target::triple()), "{h}");
+    }
+
+    /// The wording shown before Update is pressed has to be accurate: the
+    /// checksum is not a signature, and claiming otherwise is the one thing
+    /// this dialog must not do.
+    #[test]
+    fn the_trust_note_does_not_claim_a_guarantee_it_cannot_give() {
+        let t = trust_note();
+        assert!(t.contains("not a signature"), "{t}");
+        assert!(t.contains("arrived intact"), "{t}");
+        for overclaim in ["verified", "safe", "secure", "trusted source"] {
+            assert!(!t.contains(overclaim), "{overclaim:?} overstates it: {t}");
+        }
     }
 }

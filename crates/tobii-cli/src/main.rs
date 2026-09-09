@@ -20,6 +20,15 @@ fn main() -> ExitCode {
     let sub = args.get(1).map(String::as_str);
     let arg2 = args.get(2).map(String::as_str);
     let result = match (sub, arg2) {
+        // Answered before anything else is touched: no device, no config, no
+        // network. The updater runs this on a freshly downloaded binary to
+        // check it can actually execute here before it replaces the installed
+        // one — a build made against a newer glibc dies at the dynamic linker,
+        // and that has to be found while the old binary is still in place.
+        (Some("--version" | "-V" | "version"), _) => {
+            println!("tobii {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         (Some("stream"), _) => stream(
             args.iter().any(|a| a == "--json"),
             args.iter().any(|a| a == "--eyes"),
@@ -102,12 +111,20 @@ fn update(args: &[String]) -> CmdResult {
             println!("up to date — nothing newer has been released.");
             Ok(())
         }
+        Check::NotForThisTarget { version, url } => {
+            println!(
+                "\n{version} is available, but it publishes no build for {}.",
+                tobii_update::Target::triple()
+            );
+            println!("Build it from source, or see {url}");
+            Ok(())
+        }
         Check::Newer(r) => {
             println!("\n{} is available.\n", r.version);
             if r.notes.trim().is_empty() {
                 println!("(this release has no notes)");
             } else {
-                println!("{}", r.notes.trim_end());
+                println!("{}", sanitize_notes(&r.notes));
             }
             println!("\n{}", r.html_url);
             if !args.iter().any(|a| a == "--install") {
@@ -126,6 +143,15 @@ fn update(args: &[String]) -> CmdResult {
                     dir.display()
                 );
             }
+            // Said plainly before anything is downloaded. The checksum published
+            // with a release is fetched from that same release, so it catches a
+            // corrupted download and not a hostile one; installing an update
+            // trusts the GitHub release as much as running a binary downloaded
+            // by hand from it would.
+            println!(
+                "\nThis downloads and runs binaries published at {}.",
+                tobii_update::releases_url()
+            );
             println!();
             let done = tobii_update::install_release(&r, &|step| println!("  {step}"))?;
             println!(
@@ -138,6 +164,25 @@ fn update(args: &[String]) -> CmdResult {
             Ok(())
         }
     }
+}
+
+/// Release notes, made safe to print to a terminal.
+///
+/// The body is written by whoever published the release and was printed
+/// verbatim. A terminal reads control characters in it as commands, so a
+/// changelog could move the cursor, recolour the rest of the session, or clear
+/// the screen — and `\x1b]` can set the window title. Tabs and newlines are the
+/// only control characters a changelog needs.
+fn sanitize_notes(notes: &str) -> String {
+    notes
+        .trim_end()
+        .chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect()
 }
 
 /// Delete the installed model. Head tracking keeps working without it.
