@@ -149,12 +149,25 @@ pub fn banner() -> gtk::Box {
             Ok(Ok(Check::CannotInstall { version, url, why })) => {
                 text.set_text(&blocked_headline(&version.to_string(), why));
                 update_btn.set_visible(false);
+                // Checked before it is handed to the desktop's URI handler.
+                // This string comes out of the same release document as every
+                // other URL the crate refuses unless `is_trusted` passes, and
+                // `launch_default_for_uri` will hand any scheme to whatever
+                // claims it — so an unchecked one is a "click here" button
+                // pointing wherever the document says.
                 let url = url.clone();
                 notes_btn.connect_clicked(move |btn| {
-                    let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                        &url,
-                        gtk::gio::AppLaunchContext::NONE,
-                    );
+                    if tobii_update::net::is_trusted(&url) {
+                        let _ = gtk::gio::AppInfo::launch_default_for_uri(
+                            &url,
+                            gtk::gio::AppLaunchContext::NONE,
+                        );
+                    } else {
+                        tobii_diagnostics::log::warn(&format!(
+                            "refusing to open a release URL that is not on the \
+                             allowlist: {url}"
+                        ));
+                    }
                     let _ = btn;
                 });
                 crate::widget::set_button_text(notes_btn, "Releases");

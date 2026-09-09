@@ -8,9 +8,14 @@
 #
 #   scripts/release.sh 0.2.0
 #
-# Then attach dist/* to the GitHub release for tag v0.2.0. The tag has to be a
-# version — `Version::parse` ignores anything else, so a `nightly` tag is
-# invisible to the updater rather than offered as an upgrade.
+# This is for checking what a release WOULD contain. It is not how one is
+# published: `git tag v0.2.0 && git push origin v0.2.0` fires release.yml, which
+# runs this same script inside a Debian 13 container and drafts the release from
+# that build. Publishing the dist/ this produces would ship the developer
+# machine's glibc floor, which is the failure the container exists to prevent.
+#
+# The tag has to be a version — `Version::parse` ignores anything else, so a
+# `nightly` tag is invisible to the updater rather than offered as an upgrade.
 #
 # NOTE ON TRUST: the checksums are published in the same release as the archive
 # and fetched over the same connection, so they are an integrity check and not a
@@ -139,11 +144,22 @@ cat > "$dist/$name/install.sh" <<'INSTALLER'
 # Install this release. Everything lands in your home directory except the udev
 # rule, which needs sudo and which the script asks about before using it.
 #
-#   ./install.sh                 # into ~/.local/bin
-#   ./install.sh /usr/local/bin  # somewhere else (may need sudo)
+#   ./install.sh                    # into ~/.local/bin
+#   ./install.sh /usr/local/bin     # somewhere else (may need sudo)
+#   ./install.sh --no-udev          # skip the one step that needs sudo
+#   ./install.sh --lean             # the CLI only, no menu entry
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "$here/assets/install-payload.sh" "${1:-$HOME/.local/bin}" "$here" "$here/assets"
+# A leading non-flag argument is the install directory; everything else is
+# passed straight through. This used to forward only "$1", so every flag the
+# payload script documents was silently dropped — including --no-udev, the one
+# a user reaches for precisely because they do not want it running sudo.
+bindir="$HOME/.local/bin"
+if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then
+    bindir="$1"
+    shift
+fi
+exec bash "$here/assets/install-payload.sh" "$bindir" "$here" "$here/assets" "$@"
 INSTALLER
 chmod 755 "$dist/$name/install.sh" "$dist/$name/assets/install-payload.sh"
 
@@ -160,4 +176,11 @@ ls -1 "$dist"
 echo
 echo "next:"
 echo "  git tag v$version && git push origin v$version"
-echo "  gh release create v$version dist/* --title v$version --notes-file <changelog>"
+echo
+echo "  That is the whole procedure. release.yml rebuilds all of this in a"
+echo "  Debian 13 container and drafts the release from THAT build."
+echo
+echo "  Do NOT publish the dist/ you just built. This machine's glibc is the"
+echo "  floor of anything it produces, and it is newer than the floor CI"
+echo "  enforces — a hand-published archive would fail to start for very"
+echo "  nearly everyone who downloaded it."

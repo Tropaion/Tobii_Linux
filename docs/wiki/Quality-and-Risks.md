@@ -18,7 +18,7 @@ What is measured, what is assumed, and what is known to be wrong. Background in
 | Before the op-code fix | **80 mm** | same panel — every calibration before 2026-08-15 was a silent no-op |
 | Head-pose yaw vs geometry | slope **+1.03**, r = **0.998** | `tobii headpose --check` on hardware |
 | Head-pose roll vs geometry | slope **+0.96**, r = **0.990** | same |
-| Pitch offset (mounting + model frame) | **+24.08°**, 10–90% spread 2.57° | `--calibrate-pitch` on the reporter's setup |
+| Pitch offset (mounting + model frame) | **−24.08°**, 10–90% spread 2.57° | `--calibrate-pitch` on the reporter's setup |
 
 ### 10.2 Latency and throughput
 
@@ -62,6 +62,15 @@ pinned in the binary; there is none.*
 **The head-pose focal length is assumed.** `DEFAULT_FOCAL_PX = 355` feeds a
 perspective correction worth 12–16° of pitch. `focal_from_eye_origins` can
 compute the real value from data already on the wire; it is not yet wired up.
+
+**The head-pose model download has a second, unguarded fetcher.**
+`model_store.rs` builds its own curl/wget invocation rather than going through
+`tobii-update`'s `net.rs`, so it carries none of that module's flags — no
+`--proto =https`, no `--proto-redir`, no size cap, no per-hop host check. It is
+a one-off fetch of a model the user has explicitly agreed to, from an allowlisted
+host, verified by SHA-256 afterwards — but ADR 15's rule about network access
+governs the updater and not this. *Closing it means routing `download_to`
+through `net::fetch`.*
 
 **The replay fixture is a photograph.** It proves the code still does what it
 did when recorded, not that the device still does. A firmware change would

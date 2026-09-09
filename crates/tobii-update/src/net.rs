@@ -77,6 +77,13 @@ const MAX_REDIRECTS: usize = 5;
 /// a memory problem. 512 MB is far above any real build here.
 pub const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 
+/// How long a transfer may stall with no bytes arriving.
+///
+/// curl gets its bound from `--max-time`; wget has no equivalent, so it is
+/// bounded per-read instead. A server that dribbles one byte a minute is
+/// otherwise unbounded on that backend.
+const READ_TIMEOUT: &str = "60";
+
 /// curl's exit code for "exceeded the maximum allowed file size".
 const CURL_TOO_LARGE: i32 = 63;
 
@@ -215,6 +222,15 @@ fn wget_args(url: &str, dest: Option<&Path>) -> Vec<String> {
         CONNECT_TIMEOUT.into(),
         "--tries".into(),
         "2".into(),
+        // The two bounds curl gets from `--max-time` and `--max-filesize`.
+        // Without them this backend had neither: a server that answered slowly
+        // forever, or kept sending, was bounded only by `run()`'s stdout cap —
+        // which does not apply at all when wget writes to a file with `-O`.
+        // `--quota` stops the transfer, `--read-timeout` stops the stall.
+        "--quota".into(),
+        MAX_DOWNLOAD.to_string(),
+        "--read-timeout".into(),
+        READ_TIMEOUT.into(),
         "--header".into(),
         "Accept: application/vnd.github+json".into(),
         "--user-agent".into(),

@@ -114,20 +114,65 @@ pub fn decode_camera_frame(payload: &[u8]) -> Option<CameraFrame> {
 /// pixel count. Prefers the last matching pair (metadata sits after the small
 /// column-id values), so a stray `1*n == n` coincidence early on can't win.
 fn find_dims(vals: &[u32], pixel_count: usize) -> Option<(u32, u32)> {
-    let mut best: Option<(u32, u32)> = None;
-    for (a, &w) in vals.iter().enumerate() {
-        for &h in &vals[a + 1..] {
-            if w >= 8 && h >= 8 && (w as usize) * (h as usize) == pixel_count {
-                best = Some((w, h));
-            }
+    // Linear, not quadratic. The pair search used to be a nested loop over
+    // every value against every later value — and `vals` comes off the wire, so
+    // a malformed frame at the accumulator cap turned it into seconds of
+    // device-thread CPU for a frame that was going to be rejected anyway.
+    //
+    // The height is not searched for: given a width there is exactly one height
+    // that can satisfy `w * h == pixel_count`, so it is a division and a
+    // lookup. Same answer as before — the last valid pair in the old
+    // iteration order is the one with the largest `a`, and for that `a` the
+    // largest `b`, which is what scanning `a` downwards against the last index
+    // of each value finds.
+    let mut last_idx: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (i, &v) in vals.iter().enumerate() {
+        last_idx.insert(v, i);
+    }
+    for (a, &w) in vals.iter().enumerate().rev() {
+        if w < 8 || pixel_count == 0 || !pixel_count.is_multiple_of(w as usize) {
+            continue;
+        }
+        let h = pixel_count / (w as usize);
+        if h < 8 || h > u32::MAX as usize {
+            continue;
+        }
+        if last_idx.get(&(h as u32)).is_some_and(|&b| b > a) {
+            return Some((w, h as u32));
         }
     }
-    best
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `find_dims` used to be a nested loop over every value against every
+    /// later one, on data that comes off the wire. At the accumulator cap that
+    /// is seconds of device-thread CPU spent on a frame about to be rejected.
+    /// Linear now; this pins both the answer and the cost.
+    #[test]
+    fn find_dims_is_linear_and_still_prefers_the_last_pair() {
+        // The documented preference: metadata sits after the small column-id
+        // values, so a stray `1*n == n` early on must not win.
+        let vals = vec![1, 307_200, 640, 480, 640, 480];
+        assert_eq!(find_dims(&vals, 307_200), Some((640, 480)));
+        // Nothing plausible.
+        assert_eq!(find_dims(&[3, 5, 7], 307_200), None);
+        // Below the 8-pixel floor on either side.
+        assert_eq!(find_dims(&[4, 76_800], 307_200), None);
+        // A pathological payload: 40,000 values, which the old nested loop
+        // walked 800 million times.
+        let big: Vec<u32> = (1..40_000u32).chain([640, 480]).collect();
+        let t = std::time::Instant::now();
+        assert_eq!(find_dims(&big, 307_200), Some((640, 480)));
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "find_dims took {:?} — it is quadratic again",
+            t.elapsed()
+        );
+    }
 
     /// Build a minimal camera payload in the real wire shape: prefix, a row
     /// marker, then per-column `[marker][id][value]` triples (both id and a u32

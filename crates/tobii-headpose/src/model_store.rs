@@ -256,6 +256,13 @@ pub fn download_to(src: &ModelSource, dest: &Path) -> Result<(), StoreError> {
             ],
         ),
     ];
+    // wget is a fallback for curl's ABSENCE, never for its failure.
+    //
+    // This loop used to fall through to wget on any non-zero exit, which is the
+    // pattern `tobii-update`'s net.rs refuses by name: retrying a failed curl
+    // with wget quietly downgrades every guarantee curl was enforcing, and the
+    // two do not agree about redirects, size caps or TLS. A `break` is the
+    // whole difference — `continue` only when the program is not installed.
     let mut found_any = false;
     let mut last = String::new();
     for (prog, args) in attempts {
@@ -264,6 +271,7 @@ pub fn download_to(src: &ModelSource, dest: &Path) -> Result<(), StoreError> {
             Err(e) => {
                 found_any = true;
                 last = e.to_string();
+                break;
             }
             Ok(out) => {
                 found_any = true;
@@ -271,6 +279,7 @@ pub fn download_to(src: &ModelSource, dest: &Path) -> Result<(), StoreError> {
                     return Ok(());
                 }
                 last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                break;
             }
         }
     }

@@ -98,7 +98,8 @@ tar -xzf tobii-linux-*.tar.gz
 cd tobii-linux-*/ && ./install.sh          # ~/.local/bin, menu entry, udev rule
 
 sudo apt install ./tobii-linux_*.deb       # Debian, Ubuntu, Mint, Pop!_OS
-sudo dnf install ./tobii-linux-*.rpm       # Fedora, RHEL, openSUSE
+sudo dnf install ./tobii-linux-*.rpm       # Fedora, RHEL (gtk4-layer-shell is in EPEL)
+sudo zypper install ./tobii-linux-*.rpm    # openSUSE
 # Arch: download PKGBUILD *and* tobii-linux.install into the same directory
 makepkg -si
 ```
@@ -157,8 +158,9 @@ Ubuntu's `rustc` is often too old; the rustup line above is the reliable route.
 <summary><b>Fedora, RHEL, Rocky, Alma</b></summary>
 
 ```sh
-sudo dnf install gcc git rust cargo pkgconf-pkg-config \
+sudo dnf install gcc git pkgconf-pkg-config \
      gtk4-devel gtk4-layer-shell-devel libusb1-devel
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if you have no Rust
 git clone https://github.com/Tropaion/Tobii_Linux.git && cd Tobii_Linux
 scripts/build.sh --install --udev
 ```
@@ -172,8 +174,9 @@ On RHEL and its rebuilds, `gtk4-layer-shell-devel` comes from
 <summary><b>openSUSE Tumbleweed / Leap</b></summary>
 
 ```sh
-sudo zypper install gcc git rust cargo pkg-config \
+sudo zypper install gcc git pkg-config \
      gtk4-devel gtk4-layer-shell-devel libusb-1_0-devel
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if you have no Rust
 git clone https://github.com/Tropaion/Tobii_Linux.git && cd Tobii_Linux
 scripts/build.sh --install --udev
 ```
@@ -248,7 +251,7 @@ scripts/build.sh --udev             # also install the udev rule
 Plain `cargo build --release` works too. The neural head-pose backend is on by
 default and brings a sizeable dependency tree (`tract`, ~110 crates); the
 **CLI** can be built without it — 5 DOF head tracking, everything else
-unchanged, and a 1 MB binary instead of 32 MB:
+unchanged, and a 1.2 MB binary instead of 35 MB:
 
 ```sh
 cargo build --release -p tobii-cli --no-default-features
@@ -301,12 +304,13 @@ cargo run --release -p tobii-gtk
 Or pick **Tobii Eye Tracker** from your application menu, once
 `scripts/build.sh --install` has added it.
 
-The hub shows connection status, the live instrument panel, and the settings:
-improve calibration, head tracking, preview my gaze, select eyes, change screen,
-start at login, check for updates.
+The hub shows connection status, the live instrument panel, and the tracking
+settings: improve calibration, head tracking, preview my gaze, select eyes,
+change screen. The cogwheel beside the connection status holds the rest — start
+at login, check for updates, and saving or copying the diagnostics report.
 
 ```sh
-tobii-gtk --background   # no window; keeps the tracker configured (see below)
+tobii-gtk --background   # resident, no window, tracker off (see below)
 tobii-gtk --version
 ```
 
@@ -384,9 +388,15 @@ GNOME Tweaks or KDE's Autostart page is also honoured — the switch reads their
 ## Configuration
 
 Stored under `$XDG_CONFIG_HOME/tobii-linux/` (default `~/.config/tobii-linux/`):
-`config.toml` (display geometry), `calibration.bin`, `enabled_eye`,
-`headpose_pitch_offset`, `update_check`, and `models/` (the fetched head-pose
-model). The autostart entry, if enabled, is
+`config.toml` (display geometry), `calibration.bin` and `calibration.meta.toml`,
+`enabled_eye`, `headpose_pitch_offset`, `update_check`, `setup_monitor_id`,
+`report_salt` (32 random bytes, mode 0600, which is what makes the monitor id in
+a diagnostics report meaningless to anyone else), and `models/` (the fetched
+head-pose model).
+
+The **log** is not there: it is at `$XDG_STATE_HOME/tobii-linux/tobii.log`
+(default `~/.local/state/…`), because the XDG spec puts logs in state. The
+autostart entry, if enabled, is
 `~/.config/autostart/com.tobiilinux.Configuration.desktop`; the menu entry and
 icon go under `~/.local/share/`.
 
@@ -537,8 +547,11 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-`rust-toolchain.toml` pins the compiler, and rustup honours it automatically, so
-your `clippy` and `rustfmt` are the ones CI runs.
+`rust-toolchain.toml` pins the compiler, and **rustup** honours it
+automatically, so your `clippy` and `rustfmt` are the ones CI runs. A
+distribution Rust ignores the pin entirely — the install blocks above use rustup
+for exactly that reason, and `dnf install rust cargo` or `zypper install rust
+cargo` would give you a compiler these three commands do not describe.
 
 **Most of what "needs an ET5" does not** — `tobii record` captures a real session
 and `cargo test -p tobii-usb --test replay` regression-tests the protocol against

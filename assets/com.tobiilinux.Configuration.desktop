@@ -5,8 +5,10 @@ Name=Tobii Eye Tracker
 GenericName=Eye Tracker Configuration
 Comment=Set up and calibrate a Tobii Eye Tracker 5
 Keywords=eye;tracker;tobii;gaze;calibration;head;tracking;
-# No path: the launcher resolves it on PATH, so this entry works whether the
-# binaries were installed into ~/.local/bin or /usr/local/bin.
+# No path here, because the PACKAGES install to /usr/bin, which is always on a
+# launcher's PATH. A home install cannot rely on that — a launcher does not read
+# your shell profile — so scripts/install-payload.sh rewrites this line to an
+# absolute path when it installs the entry under ~/.local/share.
 Exec=tobii-gtk
 Icon=com.tobiilinux.Configuration
 Terminal=false

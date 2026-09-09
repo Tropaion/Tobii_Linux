@@ -669,9 +669,21 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let demand = demand.clone();
-        b_setup.connect_clicked(move |_| {
+        b_setup.connect_clicked(move |btn| {
+            // One flow at a time, the same guard `b_cal` has. A GtkButton emits
+            // `clicked` per release and presenting a fullscreen Wayland surface
+            // is asynchronous, so a double click lands both on the hub before
+            // the first window maps — two wizards over one device session, both
+            // seeded from the same config snapshot, and whichever is completed
+            // second silently reverts the first.
+            btn.set_sensitive(false);
             let win = setup_flow::launch(&app, cmd_tx.clone());
             hold_while_open(&demand, &win, "display setup");
+            let btn = btn.clone();
+            win.connect_close_request(move |_| {
+                btn.set_sensitive(true);
+                glib::Propagation::Proceed
+            });
         });
     }
 
@@ -1010,6 +1022,13 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     let tick_demand = demand.clone();
     let tick_banner = banner.clone();
     let tick_banner_label = banner_label.clone();
+    // The forced-calibration path needs this for the same reason the two
+    // user-initiated ones do: the layer-shell gaze overlay composites ABOVE the
+    // fullscreen calibration window, so the user chases their own gaze dot
+    // instead of the stimulus dot — which poisons every sample while still
+    // reporting success. This branch is reachable with the preview on: turn it
+    // on, have no usable saved calibration, then unplug and replug.
+    let tick_sw_preview = sw_preview.clone();
     // The hub's claim on the tracker, synced from `window.is_active()` on every
     // tick. Declared here because the tick below owns it.
     let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
@@ -1079,6 +1098,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
                             &cal_evaluated,
                             tobii_config::CalAction::ForceCalibration,
                             {
+                                tick_sw_preview.set_active(false);
                                 let state = state.clone();
                                 let cmd_tx = tick_cmd_tx.clone();
                                 let demand = tick_demand.clone();
@@ -1566,8 +1586,8 @@ fn diagnostics_row() -> gtk::Box {
                 // the dialog took the focus — so the status line under the
                 // buttons would never be seen.
                 tobii_diagnostics::log::warn(&format!(
-                    "could not write the diagnostics report to {}: {e}",
-                    path.display()
+                    "could not write the diagnostics report as {}: {e}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
                 ));
                 let alert = gtk::AlertDialog::builder()
                     .message("The report could not be saved")
@@ -1575,9 +1595,14 @@ fn diagnostics_row() -> gtk::Box {
                     .build();
                 alert.show(parent.as_ref());
             } else {
+                // The FILE NAME, not the path. The user picked the location
+                // and does not need telling; the log tail goes into the report,
+                // and a save to a USB stick writes /run/media/<login>/... which
+                // no redaction shape folds. Two guards close that, and this is
+                // the one that does not depend on getting the shapes right.
                 tobii_diagnostics::log::info(&format!(
-                    "diagnostics report saved to {}",
-                    path.display()
+                    "diagnostics report saved as {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
                 ));
             }
         });
@@ -1591,7 +1616,12 @@ fn diagnostics_row() -> gtk::Box {
             b.display()
                 .clipboard()
                 .set_text(&tobii_diagnostics::report());
-            say("Copied to the clipboard".to_string());
+            // "while this window is open" is the honest half. A Wayland
+            // clipboard selection belongs to the process that set it: close the
+            // hub and the selection goes with it, so a user who copies, closes
+            // the hub and then pastes into a browser gets nothing. Save is the
+            // button that survives.
+            say("Copied — paste it before closing this window".to_string());
         });
     }
 

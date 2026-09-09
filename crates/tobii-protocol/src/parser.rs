@@ -114,6 +114,21 @@ impl Parser {
 
     /// Feed a USB chunk; returns any complete frames it produced.
     /// On a framing error the accumulator is reset and the error returned.
+    ///
+    /// # The caller's invariant: one device transfer per call
+    ///
+    /// A continuation envelope is stripped only when it sits at byte 0 of
+    /// `src`. That makes it the caller's job to hand over chunks that begin
+    /// exactly where a device transfer began — `read_bulk` does, because a bulk
+    /// read ends at the device's short packet.
+    ///
+    /// Merging transfers and re-splitting them at some other size breaks it
+    /// silently: the envelope lands mid-chunk, is not recognised, and its eight
+    /// bytes are spliced into the payload. `tobii-usb`'s send-time soak buffer
+    /// did exactly that, which destroyed every large notification (a camera
+    /// frame is ~78 KB over several transfers) that arrived during a send.
+    /// `a_continuation_envelope_is_only_stripped_at_the_start_of_a_chunk` pins
+    /// it.
     pub fn feed(&mut self, src: &[u8]) -> Result<Vec<Frame>, ProtocolError> {
         let mut data = src;
         if self.acc.len() >= ENVELOPE_SIZE + TTP_HDR_SIZE {
@@ -221,6 +236,59 @@ mod tests {
             frames[0].payload,
             tail.to_vec(),
             "eight bytes of real payload were eaten as a continuation envelope"
+        );
+    }
+
+    /// The invariant the transport has to honour: one device transfer per feed.
+    ///
+    /// A continuation envelope is recognised only at byte 0. That is fine while
+    /// every chunk begins where a transfer began, and silently destructive the
+    /// moment something merges transfers and re-splits them — the envelope
+    /// lands mid-chunk, is not stripped, and its eight bytes are spliced into
+    /// the payload.
+    ///
+    /// `tobii-usb`'s send-time soak buffer did exactly that: it concatenated
+    /// reads into one `Vec<u8>` and `recv` handed them back re-split at the
+    /// caller's buffer size. It is a `VecDeque<Vec<u8>>` of whole reads now.
+    /// This test is the reason why — it feeds the SAME bytes both ways and
+    /// shows only one of them reassembles.
+    #[test]
+    fn a_continuation_envelope_is_only_stripped_at_the_start_of_a_chunk() {
+        // header (op, 24 payload bytes) | envelope + 24 payload
+        let payload_len = 24usize;
+        let mut hdr_chunk = vec![0x01, 0x00, 0x00, 0x00];
+        hdr_chunk.extend_from_slice(&((ENVELOPE_SIZE + TTP_HDR_SIZE) as u32).to_le_bytes());
+        let mut hdr = vec![0u8; TTP_HDR_SIZE];
+        hdr[0..4].copy_from_slice(&0x52u32.to_be_bytes());
+        hdr[4..8].copy_from_slice(&7u32.to_be_bytes());
+        hdr[12..16].copy_from_slice(&0x501u32.to_be_bytes()); // a camera frame
+        hdr[20..24].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        hdr_chunk.extend_from_slice(&hdr);
+
+        let mut run = vec![0x01, 0x00, 0x00, 0x00];
+        run.extend_from_slice(&((ENVELOPE_SIZE + payload_len) as u32).to_le_bytes());
+        run.extend_from_slice(&[0xcd; 24]);
+
+        // Transfer boundaries preserved — what `read_bulk` delivers.
+        let mut ok = Parser::new();
+        assert!(ok.feed(&hdr_chunk).unwrap().is_empty());
+        let frames = ok.feed(&run).unwrap();
+        assert_eq!(frames.len(), 1, "boundaries preserved: the frame completes");
+        assert_eq!(frames[0].payload, vec![0xcd; 24]);
+
+        // The same bytes, merged and re-split one byte later — what the old
+        // soak buffer produced.
+        let mut merged = hdr_chunk.clone();
+        merged.extend_from_slice(&run);
+        let cut = hdr_chunk.len() + 1;
+        let mut broken = Parser::new();
+        let a = broken.feed(&merged[..cut]);
+        let b = broken.feed(&merged[cut..]);
+        let got: Vec<_> = a.into_iter().chain(b).flatten().collect();
+        assert!(
+            got.first().map(|f| f.payload.as_slice()) != Some(&[0xcd; 24][..]),
+            "re-splitting must NOT silently produce a correct frame, or this \
+             test is not pinning anything"
         );
     }
 

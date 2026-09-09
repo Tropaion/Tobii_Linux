@@ -198,10 +198,11 @@ sequence from §6.1, which is why an unplug/replug is invisible to the user.
                                            ├── ENFORCES the glibc floor
    User machine                            ├── verifies SHA256SUMS
    ────────────                            └── publishes a DRAFT release
-   ~/.local/bin/{tobii,tobii-gtk}
-   ~/.config/tobii-linux/…                        │
-   ~/.config/autostart/…  (optional)              │  tobii update --install
-   /etc/udev/rules.d/60-tobii.rules  ◄────────────┘  or the hub's banner
+   ~/.local/bin/{tobii,tobii-gtk}    ◄────────────┐  tobii update --install
+   ~/.config/tobii-linux/…                        │  or the hub's banner
+   ~/.local/state/tobii-linux/tobii.log           │  (BINARIES ONLY — the
+   ~/.config/autostart/…  (optional)              │   updater never touches
+   /etc/udev/rules.d/60-tobii.rules  ─────────────┘   config or the rule)
 ```
 
 **Why the container matters.** The machine a binary is compiled on *is* its

@@ -5,7 +5,10 @@ This wiki documents the USB protocol of the **Tobii Eye Tracker 5** (ET5, USB
 project — a clean-room Rust reimplementation. The device speaks a message
 protocol Tobii calls **TTP** over USB **bulk** transfers, wrapped in a small
 length-prefixed USB envelope. A host opens a session, performs a
-hello → realm-auth → display-area → subscribe handshake, and then receives a
+hello → query-realm → open-realm (HMAC-MD5 on the auth path) → subscribe
+handshake — after which the display area, eye selection and calibration blob are
+re-applied as ordinary requests, because the device wipes them on every reboot —
+and then receives a
 continuous ~33 Hz **gaze notification** stream (op `0x500`) carrying 39
 tab-separated ("XDS") data columns encoded as a TLV byte stream with Q42
 fixed-point numbers. Configuration (display area, calibration, selected eyes) is
@@ -51,7 +54,7 @@ The reverse-engineered ET5 USB protocol.
 |------|--------|
 | [[USB-Transport]] | Device id, bulk endpoints, the USB envelope, reassembly, session open/close & reboot behavior |
 | [[TTP-Framing]] | The 24-byte TTP header, the three magics, seq echo, notify op==stream_id |
-| [[Handshake]] | Connect sequence: hello, realm HMAC-MD5 auth, display-area apply, subscribe |
+| [[Handshake]] | Connect sequence: hello, query-realm, open-realm (HMAC-MD5 auth), subscribe. The display area is applied *after* it, not in it |
 | [[Encoding]] | TLV codec, tags, Q42 fixed-point, XDS row/column framing, a worked byte-by-byte decode |
 | [[Op-Catalog]] | Master table of every known op code |
 | [[Streams]] | Subscription model, the known streams (gaze / eye images / state event), probing |

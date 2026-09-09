@@ -577,6 +577,15 @@ pub fn install_release(
         return Err(InstallError::NotWritable(dir));
     }
 
+    // Anything an earlier run left behind, first.
+    //
+    // Every scratch name carries the pid that made it, so a run that was killed
+    // or panicked between staging and the swap leaves its files under a name no
+    // later run ever revisits: the archive, the unpacked tree and an executable
+    // copy of each binary — up to 73 MB — sitting in the install directory
+    // forever. `remove_dir_all(&work)` below only ever cleans THIS run's.
+    sweep_stale_scratch(&dir);
+
     // A scratch directory beside the install, so the final move is a rename on
     // the same filesystem rather than a copy that can half-finish.
     let work = dir.join(format!(".tobii-update-{}", std::process::id()));
@@ -585,6 +594,45 @@ pub fn install_release(
     let result = install_inner(release, archive, sums_asset, &dir, &work, progress);
     let _ = std::fs::remove_dir_all(&work);
     result
+}
+
+/// Delete scratch files left by a run that did not finish.
+///
+/// Matched by name, not by age: `.tobii-update-<pid>`,
+/// `.tobii-update-probe-<pid>` and `.<binary>.new-<pid>` are this program's own
+/// shapes, and nothing else in an install directory looks like them. The
+/// current process's own files are skipped, since a second updater running
+/// concurrently would otherwise delete the first's staging out from under it —
+/// and a live pid is a poor signal here, because pids are reused.
+fn sweep_stale_scratch(dir: &Path) {
+    let me = format!("{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let Some(pid) = name
+            .strip_prefix(".tobii-update-probe-")
+            .or_else(|| name.strip_prefix(".tobii-update-"))
+            .or_else(|| {
+                BINARIES
+                    .iter()
+                    .find_map(|b| name.strip_prefix(&format!(".{b}.new-")))
+            })
+        else {
+            continue;
+        };
+        if pid == me || pid.is_empty() || !pid.bytes().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let path = e.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
 }
 
 fn install_inner(
@@ -939,7 +987,23 @@ fn installed_version(dir: &Path) -> Option<String> {
         if !p.is_file() {
             continue;
         }
-        let out = version_command(&p).output().ok()?;
+        // Bounded, like every other subprocess in this crate. This ran the
+        // just-installed, network-supplied binary with a bare `.output()` — no
+        // deadline and no cap on what it reads — which is the one subprocess
+        // here that was neither. A binary that answers `--version` during
+        // `probe` (a staged copy) and then hangs afterwards would wedge the
+        // install thread for the life of the process, holding a GApplication
+        // hold, after the swap has already happened.
+        let Ok(child) = version_command(&p)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let Ok(out) = wait_bounded(child, PROBE_TIMEOUT) else {
+            continue;
+        };
         if !out.status.success() {
             continue;
         }
@@ -1114,6 +1178,46 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
     /// Asked of the package managers, not guessed from the path. A file no
     /// package owns — a tarball install, a build tree — must come back `None`,
     /// or the updater would refuse to update the copies it exists for.
+    /// A killed or panicking install left up to 73 MB in the install directory
+    /// under a pid-stamped name no later run ever looked at again.
+    #[test]
+    fn scratch_from_a_dead_run_is_swept_and_this_run_s_is_not() {
+        let s = Scratch::new("sweep");
+        let dir = s.path();
+        let me = std::process::id();
+
+        // A dead run's leavings: all three shapes.
+        std::fs::create_dir_all(dir.join(".tobii-update-999999")).unwrap();
+        std::fs::write(dir.join(".tobii-update-999999/archive.tar.gz"), b"x").unwrap();
+        std::fs::write(dir.join(".tobii-update-probe-999999"), b"x").unwrap();
+        std::fs::write(dir.join(".tobii.new-999999"), b"x").unwrap();
+        std::fs::write(dir.join(".tobii-gtk.new-999999"), b"x").unwrap();
+        // This run's, which a concurrent updater must not have deleted.
+        std::fs::create_dir_all(dir.join(format!(".tobii-update-{me}"))).unwrap();
+        // And things that merely look similar.
+        std::fs::write(dir.join("tobii"), b"x").unwrap();
+        std::fs::write(dir.join(".tobii-update-notes"), b"x").unwrap();
+
+        sweep_stale_scratch(dir);
+
+        assert!(!dir.join(".tobii-update-999999").exists(), "dead work dir");
+        assert!(
+            !dir.join(".tobii-update-probe-999999").exists(),
+            "dead probe"
+        );
+        assert!(!dir.join(".tobii.new-999999").exists(), "dead staging");
+        assert!(!dir.join(".tobii-gtk.new-999999").exists(), "dead staging");
+        assert!(
+            dir.join(format!(".tobii-update-{me}")).exists(),
+            "own work dir"
+        );
+        assert!(dir.join("tobii").exists(), "a real binary");
+        assert!(
+            dir.join(".tobii-update-notes").exists(),
+            "a non-numeric suffix is not a pid and must be left alone"
+        );
+    }
+
     #[test]
     fn a_file_no_package_owns_is_not_reported_as_package_managed() {
         // Takes the PATH lock: the stub tests below repoint `PATH` at a fake

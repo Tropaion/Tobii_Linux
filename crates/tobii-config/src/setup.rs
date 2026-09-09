@@ -227,9 +227,17 @@ impl DisplaySetup {
                 continue;
             };
             let val = val.split('#').next().unwrap_or("").trim();
+            // `"NaN"` and `"inf"` both parse as f64. A non-finite width makes
+            // every derived corner NaN, the device is told a plane it cannot
+            // use, and the tracker reports no eyes — which presents as broken
+            // hardware. Skipping the key leaves the field at its default, which
+            // is a value the rest of the code already handles.
             let Ok(v) = val.parse::<f64>() else {
                 continue;
             };
+            if !v.is_finite() {
+                continue;
+            }
             match key.trim() {
                 "width_mm" => w = Some(v),
                 "height_mm" => h = Some(v),

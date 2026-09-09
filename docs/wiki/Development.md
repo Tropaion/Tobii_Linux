@@ -11,7 +11,7 @@ How to build, test, and change this project. Architecture background:
 ```sh
 scripts/build.sh            # checks dependencies first, then builds release
 scripts/build.sh --check    # only check dependencies
-scripts/build.sh --lean     # CLI only, no neural backend (992 KB vs 32 MB)
+scripts/build.sh --lean     # CLI only, no neural backend (1.2 MB vs 35 MB)
 scripts/build.sh --install  # + install to ~/.local/bin and the app menu
 scripts/build.sh --udev     # + install the device rule
 ```
@@ -83,9 +83,10 @@ tobii record --calibration   # + the one fragmented response there is
 cargo test -p tobii-usb --test replay
 ```
 
-Two captures, because they want different things. `session.tobiicap` is a few
-hundred short lines, so a re-recording produces a diff a human can read — which
-is why the format is line-oriented hex at all. `calibration.tobiicap` is 1.5 MB
+Two captures, because they want different things. `session.tobiicap` is 62 lines — short
+enough that a re-recording produces a diff a human can read, which is why the
+format is line-oriented hex at all, though the longest line is still 3,450
+characters. `calibration.tobiicap` is 1.5 MB
 whose payload is a handful of enormous lines, and is opaque on purpose: it
 exists to exercise reassembly of a response larger than the 16 KB read buffer.
 

@@ -571,8 +571,9 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
                 warn = true;
                 text.push_str(&format!(
                     "\nA {:.0} mm curve radius is impossible on a {:.0} mm wide screen — it \
-                     has to be more than half the width ({:.0} mm), so the curve correction \
-                     is switched off. Use the figure from the spec sheet: \"1800R\" is 1800.",
+                     has to be more than half the width ({:.0} mm), so this is not a radius \
+                     and will not be recorded as one. Use the figure from the spec sheet: \
+                     \"1800R\" is 1800.",
                     s.curvature_radius_mm,
                     s.width_mm,
                     s.width_mm / 2.0
@@ -763,11 +764,17 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
             "Screen curve radius (mm)",
             (
                 diagram_curvature,
+                // What the field actually does, which is: get recorded. A
+                // runtime gaze correction driven by this number was written and
+                // then disproved on hardware — a per-user calibration already
+                // absorbs the curve — so promising one here sends people
+                // hunting for drift the program never claimed to remove.
                 "The curve radius from your monitor's spec sheet — \"1800R\" \
-                 means 1800. 0 means a flat screen. It matters because the \
-                 tracker can only be told about a flat plane, so on a curved \
-                 screen the gaze point drifts by a few centimetres through the \
-                 middle region of the screen.",
+                 means 1800. 0 means a flat screen. It is recorded with your \
+                 setup for reference; the tracker is only ever told about a \
+                 flat plane, and your calibration absorbs the curve. \
+                 Recalibrate after changing screens rather than expecting this \
+                 number to correct anything.",
             ),
             100.0,
             0.0,

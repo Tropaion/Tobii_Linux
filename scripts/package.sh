@@ -174,8 +174,15 @@ Priority: optional
 Architecture: ${deb_arch}
 Maintainer: Fabian Plaimauer <noreply@github.com>
 Installed-Size: ${installed_kb}
-Depends: libc6${glibc_req:+ (>= ${glibc_req})}, libgtk-4-1, libgtk4-layer-shell0, libusb-1.0-0
+Depends: libc6${glibc_req:+ (>= ${glibc_req})}, libgtk-4-1, libgtk4-layer-shell0, libusb-1.0-0, libcairo2, libgcc-s1, libglib2.0-0t64 | libglib2.0-0
 Recommends: curl | wget
+# The list above is every SONAME the binaries actually link (checked with
+# `objdump -p`), not just the interesting ones. cairo, libgcc and glib arrive
+# transitively through libgtk-4-1 in practice, but Policy asks for a direct
+# dependency on what you directly link, and "it works because something else
+# happens to pull it in" is not a dependency. The glib alternative spans the
+# t64 rename: trixie and Ubuntu 24.04 ship libglib2.0-0t64, older releases
+# libglib2.0-0.
 Homepage: https://github.com/Tropaion/Tobii_Linux
 Description: Linux runtime and GUI for the Tobii Eye Tracker 5
  A clean-room reimplementation of the Tobii Eye Tracker 5's USB protocol, with
@@ -208,7 +215,7 @@ if [ "$1" = configure ]; then
     fi
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload >/dev/null 2>&1 || true
-        udevadm trigger >/dev/null 2>&1 || true
+        udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || true
     fi
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
@@ -311,7 +318,7 @@ _tobii_post() {
         echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
     fi
     udevadm control --reload >/dev/null 2>&1 || true
-    udevadm trigger >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || true
     echo "Re-plug the Eye Tracker 5 so the udev rule takes effect."
 }
 post_install() { _tobii_post; }
@@ -334,7 +341,16 @@ Summary:        Linux runtime and GUI for the Tobii Eye Tracker 5
 License:        GPL-3.0-only
 URL:            https://github.com/Tropaion/Tobii_Linux
 BuildArch:      ${arch}
-Requires:       gtk4, gtk4-layer-shell, libusb1${glibc_req:+, libc.so.6(GLIBC_${glibc_req})${rpm_bits}}
+# No package NAMES here, deliberately. `gtk4`, `gtk4-layer-shell` and `libusb1`
+# are Fedora's names; openSUSE ships the same libraries as libgtk-4-1,
+# libgtk4-layer-shell0 and libusb-1_0-0, so those three lines made the package
+# uninstallable there with three unsatisfiable requirements — on a distribution
+# the README sends people to. What is left is a SONAME requirement, which is
+# distribution-neutral, and rpm derives the rest (libgtk-4.so.1,
+# libusb-1.0.so.0, libgtk4-layer-shell.so.0) from the ELF itself now that
+# AutoReqProv is on. release.yml opens the finished package and fails if they
+# are missing.
+Requires:       ${glibc_req:+libc.so.6(GLIBC_${glibc_req})${rpm_bits}}
 # Automatic dependency generation left ON deliberately (it was `AutoReqProv:
 # no`). Turning it off also turns off the `libc.so.6(GLIBC_x.y)` requirement rpm
 # derives from the ELF — exactly the check that stops this installing on a
@@ -372,7 +388,7 @@ if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
     echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
 fi
 udevadm control --reload >/dev/null 2>&1 || :
-udevadm trigger >/dev/null 2>&1 || :
+udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || :
 EOF
     cp -a "$payload" "$rpmtop/SOURCES/payload"
     rpmbuild --define "_topdir $rpmtop" -bb "$rpmtop/SPECS/tobii-linux.spec" >/dev/null

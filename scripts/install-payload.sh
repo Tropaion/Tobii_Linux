@@ -107,14 +107,28 @@ fi
 # there quietly making the tighter rule pointless.
 rule="$assets/60-tobii.rules"
 legacy=/etc/udev/rules.d/99-tobii.rules
-# Already installed with no stale copy to remove, or no rule to install:
-# either way there is nothing to do.
-if [[ -e /etc/udev/rules.d/60-tobii.rules && ! -e "$legacy" ]] || [[ ! -f "$rule" ]]; then
+
+# Every hint that tells the user to install the rule by hand has to tell them to
+# delete the old one too. The accept-path below does it; a hint that leaves it
+# out hands somebody a command that appears to harden the rule and does not,
+# because 99- sorts after 60- and its MODE="0666" wins.
+legacy_hint() {
+    [[ -e "$legacy" ]] || return 0
+    echo "  ${dim}sudo rm -f $legacy${reset}   # the old rule still overrides the new one's mode"
+}
+# Nothing to do only when the installed rule is BYTE-IDENTICAL to the one being
+# shipped and there is no stale copy to remove. Testing for the file's presence
+# alone meant an updated rule was never installed on top of an older one — and
+# the whole reason this release ships a new rule is that the old one was wrong.
+if { [[ -f /etc/udev/rules.d/60-tobii.rules ]] \
+     && cmp -s "$rule" /etc/udev/rules.d/60-tobii.rules \
+     && [[ ! -e "$legacy" ]]; } || [[ ! -f "$rule" ]]; then
     :
 elif [[ "$udev" == "no" ]]; then
     echo
     echo "  ${bold}The udev rule is not installed${reset}, so the tracker needs root."
     echo "  ${dim}sudo cp $rule /etc/udev/rules.d/ && sudo udevadm control --reload${reset}"
+    legacy_hint
 else
     if [[ "$udev" == "ask" ]]; then
         echo
@@ -133,6 +147,7 @@ else
         fi
         if [[ "$udev" == "no" ]]; then
             echo "  ${dim}skipped — sudo cp $rule /etc/udev/rules.d/${reset}"
+            legacy_hint
         fi
     fi
     if [[ "$udev" != "no" ]]; then
@@ -142,7 +157,10 @@ else
             echo "  removed $legacy (the old rule, which overrode the new one's mode)"
         fi
         sudo udevadm control --reload
-        sudo udevadm trigger
+        # Only the USB subsystem. A bare `udevadm trigger` re-events every
+        # device on the machine, which on a desktop means re-probing disks,
+        # input devices and graphics for the sake of one tracker.
+        sudo udevadm trigger --subsystem-match=usb
         echo "  installed — ${bold}re-plug the Eye Tracker 5${reset} for it to take effect"
     fi
 fi

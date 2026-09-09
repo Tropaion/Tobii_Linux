@@ -373,13 +373,26 @@ impl Transport for ReplayTransport {
             // The device having nothing to say is a timeout, not an error.
             return None;
         };
-        // A recorded frame longer than the caller's buffer would be silently
-        // truncated, which would look like a decode bug rather than a replay
-        // bug. The recording was taken through the same code paths, so this
-        // means the buffer shrank since.
-        let n = next.len().min(buf.len());
-        buf[..n].copy_from_slice(&next[..n]);
-        Some(n)
+        // Loud, not silent. A recorded read longer than the caller's buffer
+        // used to be truncated here, and the result looks exactly like a decode
+        // bug: frames that reassemble wrongly, in a harness whose whole purpose
+        // is to prove reassembly. The committed calibration fixture sits on
+        // this boundary, so it is one buffer-size change away from happening.
+        //
+        // A panic rather than an error: this is a test transport, the condition
+        // means the recording and the code have gone out of step, and every
+        // caller of it is a test that should fail with the reason rather than
+        // with a mystery.
+        assert!(
+            next.len() <= buf.len(),
+            "replay: a recorded read of {} bytes does not fit the caller's {}-byte \
+             buffer. Truncating it would look like a decode bug — re-record the \
+             capture, or restore the buffer size it was taken with.",
+            next.len(),
+            buf.len()
+        );
+        buf[..next.len()].copy_from_slice(&next);
+        Some(next.len())
     }
 }
 

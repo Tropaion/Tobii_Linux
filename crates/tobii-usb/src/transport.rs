@@ -1,5 +1,6 @@
 //! Byte-transport abstraction and its libusb implementation.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// Errors from opening or talking to the device.
@@ -120,6 +121,14 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Ceiling on bytes buffered by `soak_incoming` during one send.
 const SOAK_CAP: usize = 1 << 20;
 
+/// The buffer a single soaked read lands in — and therefore the largest
+/// transfer this can hold without splitting.
+///
+/// Equal to `connection::READ_BUF`, and a sixteenth of `STREAM_READ_BUF`, so a
+/// buffered transfer always fits whichever buffer asks for it. Changing this
+/// without changing those breaks the one-transfer-per-`recv` guarantee.
+const SOAK_SCRATCH: usize = 16384;
+
 /// Largest single bulk OUT the device accepts.
 const CHUNK: usize = 8192;
 /// The per-transfer envelope: four zero bytes then a little-endian length.
@@ -144,7 +153,20 @@ pub struct UsbTransport {
     /// concurrently with sends. Buffering rather than discarding matters
     /// because the parser upstream reassembles a byte *stream*; a hole in it
     /// would desync framing far more thoroughly than the stall did.
-    pending: Vec<u8>,
+    /// Reads soaked up during a large send, **one entry per device transfer**.
+    ///
+    /// A `Vec<u8>` here was a real bug. `Parser::feed` strips a continuation
+    /// envelope only when it sits at byte 0 of the chunk it is handed, which
+    /// makes "every chunk begins where a device transfer began" an invariant on
+    /// this transport. Concatenating transfers into one buffer and letting
+    /// `recv` re-split them at the caller's buffer size broke it: a
+    /// continuation envelope landed mid-chunk, went unstripped, and its eight
+    /// bytes were spliced into the payload — destroying every large
+    /// notification (a camera frame is ~78 KB across several transfers) that
+    /// happened to be buffered during a send.
+    pending: VecDeque<Vec<u8>>,
+    /// Bytes held in [`Self::pending`], so [`SOAK_CAP`] still means bytes.
+    pending_bytes: usize,
 }
 
 impl UsbTransport {
@@ -177,7 +199,8 @@ impl UsbTransport {
 
         Ok(Self {
             handle,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
+            pending_bytes: 0,
         })
     }
 }
@@ -249,12 +272,26 @@ impl Transport for UsbTransport {
         Ok(())
     }
     fn recv(&mut self, buf: &mut [u8], timeout: Duration) -> Option<usize> {
-        // Anything soaked up during a large send comes first, in order.
-        if !self.pending.is_empty() {
-            let n = buf.len().min(self.pending.len());
-            buf[..n].copy_from_slice(&self.pending[..n]);
-            self.pending.drain(..n);
-            return Some(n);
+        // Anything soaked up during a large send comes first, in order, and
+        // ONE TRANSFER PER CALL — see `pending`. Never merged, never split.
+        if let Some(read) = self.pending.pop_front() {
+            self.pending_bytes -= read.len();
+            if read.len() > buf.len() {
+                // Cannot happen: a soaked read is capped at `SOAK_SCRATCH`, and
+                // every caller's buffer is at least that big (READ_BUF is
+                // exactly it, STREAM_READ_BUF is sixteen times it). If it ever
+                // does, say so instead of splitting — splitting is the bug this
+                // queue exists to prevent, and it is silent.
+                eprintln!(
+                    "usb: a soaked read of {} bytes does not fit a {}-byte buffer; \
+                     dropping it rather than splitting a transfer",
+                    read.len(),
+                    buf.len()
+                );
+                return None;
+            }
+            buf[..read.len()].copy_from_slice(&read);
+            return Some(read.len());
         }
         match self.handle.read_bulk(EP_IN, buf, timeout) {
             Ok(n) if n > 0 => Some(n),
@@ -272,10 +309,10 @@ impl UsbTransport {
     /// problems than the frames it is dropping, and growing without limit
     /// would be worse than either.
     fn soak_incoming(&mut self) {
-        if self.pending.len() >= SOAK_CAP {
+        if self.pending_bytes >= SOAK_CAP {
             return;
         }
-        let mut scratch = [0u8; 16384];
+        let mut scratch = [0u8; SOAK_SCRATCH];
         // A 0 timeout means *wait forever* in libusb, not "poll" — hence 1ms.
         while let Ok(n) = self
             .handle
@@ -284,8 +321,10 @@ impl UsbTransport {
             if n == 0 {
                 break;
             }
-            self.pending.extend_from_slice(&scratch[..n]);
-            if self.pending.len() >= SOAK_CAP {
+            // One entry per transfer. The boundary is the whole point.
+            self.pending.push_back(scratch[..n].to_vec());
+            self.pending_bytes += n;
+            if self.pending_bytes >= SOAK_CAP {
                 break;
             }
         }

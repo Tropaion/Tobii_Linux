@@ -31,10 +31,16 @@ read path at all.
 
 ### 8.3 Persistence
 
-Everything under `$XDG_CONFIG_HOME/tobii-linux/`, every write atomic
-(temp + rename in the same directory), every read treating "unparseable" as
-"unset" rather than as a wrong value. A corrupt pitch offset must mean *not
+Configuration under `$XDG_CONFIG_HOME/tobii-linux/`, every *config* write
+atomic (temp + rename in the same directory), every read treating "unparseable"
+as "unset" rather than as a wrong value. A corrupt pitch offset must mean *not
 calibrated*, never a wrong angle.
+
+Two things are deliberately not under that sentence. The **log** lives at
+`$XDG_STATE_HOME/tobii-linux/tobii.log`, because the XDG spec puts logs in
+state, and its writes are append-only and best-effort rather than atomic — a
+program that cannot write its log must still run. The **autostart entry** is at
+`$XDG_CONFIG_HOME/autostart/`, where the desktop specification requires it.
 
 ### 8.4 Threading
 
@@ -145,8 +151,8 @@ asserted the opposite, which would lead the next person to believe in a boundary
 that never existed. There is a test that the UI wording does not claim a
 guarantee the checksums cannot give. Commits `43c1cb6`, `3288f62`.
 
-**15. All network access goes through one guarded module, and wget is a fallback
-for curl's *absence*, never its *failure*.** An asset URL comes out of network
+**15. The updater's network access goes through one guarded module, and wget is
+a fallback for curl's *absence*, never its *failure*.** An asset URL comes out of network
 JSON, and curl reads a leading `-` there as an option — `-K/tmp/x` turned the
 launch-time check into an arbitrary write, proven end to end before fixing.
 Retrying a failed curl with wget quietly downgrades every guarantee curl was
@@ -155,6 +161,13 @@ wget, which has no such option. And `wget --https-only` only applies in recursiv
 mode — a reviewer captured cleartext on port 80 after an https→http redirect, so
 redirects are now followed one checked hop at a time. Commits `91c712f`,
 `86171ca`.
+
+*Scope, stated because the unqualified version of this sentence was false.*
+`tobii-headpose`'s model download has its own fetcher in `model_store.rs`; it
+does not route through `net.rs` and carries none of its flags. It did also fall
+through to wget on a failed curl, which this decision says does not happen —
+that is fixed, but the fetcher is still separate, and the honest reading is that
+this decision governs the updater. See [[Quality-and-Risks]] §11.1.
 
 **16. The install swap: hard-link backup, then one rename per binary,
 all-or-nothing.** Two renames are each atomic but not atomic *together*, so a

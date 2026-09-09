@@ -192,9 +192,12 @@ a backlog of stale frames is worse than a skipped one.
 
 `Demand` is the reference count on the USB session. Consumers take a
 `DemandGuard`: the hub while its window has focus, the gaze overlay while shown,
-a calibration or setup flow while it runs, a queued command until it is applied.
-Three seconds after the last guard drops, the session closes. See
-[[Runtime-View]] §2 for why the linger exists.
+a calibration or setup flow while it runs. A queued command is the one thing
+that opens a session WITHOUT taking a guard — the device thread's wait is
+`!demand.active() && pending.is_empty()`, so "select left eye only" typed into
+an idle hub still takes effect. Three seconds after the last guard drops, the
+session closes. See
+[[Runtime-View]] §6.2 for why the linger exists.
 
 **`tobii-update`** — `net.rs` is the only place the crate touches the network;
 `install.rs` does digest → unpack → probe → swap with all-or-nothing rollback.

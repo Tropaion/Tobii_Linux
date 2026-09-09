@@ -12,9 +12,16 @@ pub fn config_path() -> PathBuf {
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| {
+            // An absent or empty HOME must not produce a RELATIVE path.
+            // `PathBuf::default().join(".config")` is `.config`, so every
+            // loader and every writer would resolve against the working
+            // directory — `tobii debug` in a git checkout created a `.config`
+            // tree inside it, and a service started with a scrubbed
+            // environment would scatter one wherever it happened to be.
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .unwrap_or_default();
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| PathBuf::from("/nonexistent"));
             home.join(".config")
         });
     base.join("tobii-linux").join("config.toml")

@@ -188,7 +188,19 @@ pub fn tail_file(max: usize) -> Vec<String> {
     // Lossy rather than `read_to_string`, for the same reason `append` no
     // longer gives up on invalid UTF-8: a log that lost a block would
     // otherwise vanish from the report entirely, exactly when it is wanted.
-    let Ok(bytes) = std::fs::read(log_path()) else {
+    let path = log_path();
+    // A regular file, or nothing. `fs::read` on a FIFO blocks until somebody
+    // writes to the other end — forever, in practice — and this runs on the GTK
+    // main thread when the settings popover's copy button is pressed. The path
+    // is `TOBII_LOG_FILE`-settable, and /dev/stdin, a socket and a directory
+    // are all reachable by accident as well as on purpose.
+    if !std::fs::metadata(&path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&bytes);

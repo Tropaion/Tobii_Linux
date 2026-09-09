@@ -166,9 +166,13 @@ fn update(args: &[String]) -> CmdResult {
             );
             println!();
             let done = tobii_update::install_release(&r, &|step| println!("  {step}"))?;
+            // `done.version` is what the DOWNLOADED binary printed for
+            // `--version`, so it is release-controlled like the notes and the
+            // URL above it and goes through the same filter. The directory is
+            // local and the replaced names are compile-time constants.
             println!(
                 "\ninstalled {} into {} ({})",
-                done.version,
+                sanitize_notes(&done.version),
                 done.dir.display(),
                 done.replaced.join(", ")
             );

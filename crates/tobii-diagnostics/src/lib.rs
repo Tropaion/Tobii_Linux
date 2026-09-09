@@ -161,8 +161,14 @@ pub fn report() -> String {
             "no monitor id was read at all"
         } else if salted {
             "salted hash above"
-        } else {
+        } else if matches!(tobii_config::load_setup_monitor_id(), Ok(Some(_))) {
+            // There IS a monitor line, and it carries the UNSALTED marker.
             "hashed above, but see the warning on that line"
+        } else {
+            // No monitor was recorded, so no hash was printed and there is no
+            // warning to point at. The footer used to send the reader looking
+            // for one.
+            "no monitor id was recorded"
         }
     );
     o
@@ -630,32 +636,48 @@ fn tilde(path: &str) -> String {
 /// is not strictly accurate — but the report's purpose is to name nobody, and
 /// an inaccurate `~` names nobody while an accurate `/home/someone` does.
 fn fold_home_shaped(text: &str) -> String {
-    const PREFIXES: [&str; 2] = ["/var/home/", "/home/"];
+    // Longest first, so a tie at the same offset takes the more specific shape.
+    //
+    // The media shapes are here because udisks2 — what mounts removable media
+    // on KDE and GNOME — mounts at `/run/media/<login>/<label>`, and the older
+    // Debian convention is `/media/<login>/<label>`. Saving the diagnostics
+    // report to a USB stick is a natural thing to do on a machine whose GUI is
+    // broken, and without these the login name goes into the log and then into
+    // the next report.
+    const PREFIXES: [&str; 4] = ["/var/home/", "/run/media/", "/media/", "/home/"];
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    'outer: while !rest.is_empty() {
-        for prefix in PREFIXES {
-            if let Some(at) = rest.find(prefix) {
-                let after = &rest[at + prefix.len()..];
-                // The user name is up to the next separator. A path that is
-                // exactly "/home/" with nothing after it names nobody.
-                let end = after
-                    .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
-                    .unwrap_or(after.len());
-                if end == 0 {
-                    // "/home//..." — no name to fold. Copy past it and go on.
-                    out.push_str(&rest[..at + prefix.len()]);
-                    rest = after;
-                    continue 'outer;
-                }
-                out.push_str(&rest[..at]);
-                out.push('~');
-                rest = &after[end..];
-                continue 'outer;
-            }
+    while !rest.is_empty() {
+        // The EARLIEST match in the string, not the first prefix that matches
+        // somewhere in it. Taking the first prefix meant a line holding both
+        // shapes folded only the later one:
+        //   "/home/alice/a and /var/home/bob/b"
+        //     -> "/home/alice/a and ~/b"
+        // because "/var/home/" was tried first and found a match, so "/home/"
+        // was never tried at all — leaving a login name in a report whose
+        // footer says there is none.
+        let Some((prefix, at)) = PREFIXES
+            .iter()
+            .filter_map(|p| rest.find(p).map(|at| (*p, at)))
+            .min_by_key(|&(p, at)| (at, std::cmp::Reverse(p.len())))
+        else {
+            out.push_str(rest);
+            break;
+        };
+        let after = &rest[at + prefix.len()..];
+        // The name runs to the next separator. A path that is exactly the
+        // prefix with nothing after it names nobody.
+        let end = after
+            .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+            .unwrap_or(after.len());
+        if end == 0 {
+            out.push_str(&rest[..at + prefix.len()]);
+            rest = after;
+            continue;
         }
-        out.push_str(rest);
-        break;
+        out.push_str(&rest[..at]);
+        out.push('~');
+        rest = &after[end..];
     }
     out
 }
@@ -998,6 +1020,21 @@ mod tests {
         assert_eq!(tilde("/homework/notes"), "/homework/notes");
         // A name with no path after it still folds.
         assert_eq!(tilde("/home/bob"), "~");
+        // udisks2 mounts removable media at /run/media/<login>/<label>; the
+        // older Debian convention is /media/<login>/<label>. Saving the report
+        // to a USB stick used to write the login name into the log, and the
+        // log tail goes into the next report.
+        assert_eq!(
+            tilde("/run/media/bob/STICK/report.txt"),
+            "~/STICK/report.txt"
+        );
+        assert_eq!(tilde("/media/bob/STICK/report.txt"), "~/STICK/report.txt");
+        // And "/var/home/x" must not be matched as the shorter "/home/x".
+        assert_eq!(tilde("/var/home/bob/x"), "~/x");
+        // Both shapes on one line, the /home/ one FIRST. Taking the first
+        // prefix that matched anywhere left this one unfolded.
+        assert_eq!(tilde("/home/alice/a and /var/home/bob/b"), "~/a and ~/b");
+        assert_eq!(tilde("/media/bob/x and /home/bob/y"), "~/x and ~/y");
         // Degenerate input must terminate and not eat the string.
         assert_eq!(tilde("/home/"), "/home/");
         assert_eq!(tilde(""), "");

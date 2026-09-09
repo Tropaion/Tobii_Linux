@@ -136,9 +136,16 @@ fn quote_exec(exec: &str) -> String {
     out.push('"');
     for c in exec.chars() {
         match c {
+            // A literal backslash is escaped TWICE over: once for the quoted
+            // argument (`\` -> `\\`) and then once more because this is also a
+            // desktop-entry *value*, where each of those backslashes is itself
+            // written `\\`. Four characters, not three. Writing three produced
+            // a value that unescapes to `\"` — an escaped quote — so a path
+            // containing a backslash silently ended the argument early.
+            '\\' => out.push_str("\\\\\\"),
             // Reserved inside a quoted argument. Written as an escaped
             // backslash because this is also a desktop-entry *value*.
-            '"' | '`' | '$' | '\\' => out.push_str("\\\\"),
+            '"' | '`' | '$' => out.push_str("\\\\"),
             // `%` starts a field code, so a literal one is doubled.
             '%' => out.push('%'),
             _ => {}
