@@ -104,6 +104,14 @@ pub enum InstallError {
     Unpack(String),
     /// The archive contained none of the binaries this project installs.
     NothingToInstall,
+    /// The archive is missing a binary that is installed here.
+    ///
+    /// Refused rather than partly applied: replacing one of a pair and leaving
+    /// the other at the old version is the mismatch the whole rollback path
+    /// exists to prevent, and it would otherwise be reported as a success.
+    Incomplete {
+        missing: String,
+    },
     /// A binary from the archive would not run on this machine.
     ///
     /// Caught before the installed binaries are touched. The usual cause is a
@@ -155,6 +163,12 @@ impl std::fmt::Display for InstallError {
             InstallError::NothingToInstall => write!(
                 f,
                 "the release archive contained none of this project's binaries"
+            ),
+            InstallError::Incomplete { missing } => write!(
+                f,
+                "the release archive is missing {missing}, which is installed here — \
+                 installing the rest would leave versions that do not match, so nothing \
+                 was changed"
             ),
             InstallError::WillNotRun { name, detail } => write!(
                 f,
@@ -413,6 +427,10 @@ pub fn install_verified_archive(
         let staging = dir.join(format!(".{name}.new-{}", std::process::id()));
         let _ = std::fs::remove_file(&staging);
         if let Err(e) = std::fs::copy(&src, &staging) {
+            // A copy that failed part-way still created the file, and nothing
+            // else would ever remove it: it lives in the install directory, not
+            // the scratch directory that gets cleaned up.
+            let _ = std::fs::remove_file(&staging);
             discard(&staged);
             return Err(e.into());
         }
@@ -430,6 +448,30 @@ pub fn install_verified_archive(
     if staged.is_empty() {
         return Err(InstallError::NothingToInstall);
     }
+    // Every binary installed here must be in the archive. Installing only the
+    // ones it happens to carry leaves a new `tobii` beside an old `tobii-gtk`
+    // — the exact mismatched pair the backups and rollback exist to prevent,
+    // arriving by the front door and reported as success.
+    let installed_here: Vec<&str> = BINARIES
+        .iter()
+        .copied()
+        .filter(|n| dir.join(n).symlink_metadata().is_ok_and(|m| m.is_file()))
+        .collect();
+    if staged.len() != installed_here.len() {
+        let have: Vec<&str> = staged
+            .iter()
+            .filter_map(|(_, t)| t.file_name().and_then(|s| s.to_str()))
+            .collect();
+        let missing: Vec<&str> = installed_here
+            .iter()
+            .copied()
+            .filter(|n| !have.contains(n))
+            .collect();
+        discard(&staged);
+        return Err(InstallError::Incomplete {
+            missing: missing.join(", "),
+        });
+    }
 
     progress("installing");
     let replaced = swap_in(&staged)?;
@@ -444,10 +486,17 @@ pub fn install_verified_archive(
 
 /// Move every staged binary into place, or put everything back.
 ///
-/// The renames themselves are atomic one at a time, but two of them are not
-/// atomic together: without the backups below, a failure on the second left the
-/// machine with a new `tobii` and an old `tobii-gtk`. Each swap therefore keeps
-/// the old binary aside until all of them have succeeded.
+/// Two properties, and the second is why this is not just a loop of renames:
+///
+/// 1. **Each replacement is one atomic rename over the target.** The backup is
+///    a *hard link*, made before the rename — not the target renamed aside — so
+///    there is never a moment when the path does not exist. Renaming the target
+///    away first left a window in which `tobii` was simply missing, while the
+///    module docs claimed a single atomic rename over the running binary.
+/// 2. **Either all of them land or none do.** Two renames are each atomic but
+///    not atomic together, so a failure on the second would leave a new `tobii`
+///    beside an old `tobii-gtk`. Every completed swap is undone if a later one
+///    fails.
 fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
     let mut done: Vec<(PathBuf, PathBuf)> = Vec::new(); // (target, backup)
     let mut replaced = Vec::new();
@@ -458,10 +507,12 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
             target.file_name().and_then(|s| s.to_str()).unwrap_or("bin"),
             std::process::id()
         ));
-        let step = std::fs::rename(target, &backup)
+        let _ = std::fs::remove_file(&backup);
+        let step = std::fs::hard_link(target, &backup)
             // Rename over the running binary. On Linux this unlinks the old
-            // inode rather than touching it, so a process still executing from
-            // it keeps running and the swap is atomic.
+            // directory entry rather than touching the inode, so a process
+            // still executing from it keeps running — and because the backup is
+            // a link to that same inode, the old binary is still reachable.
             .and_then(|_| std::fs::rename(staging, target));
         match step {
             Ok(()) => {
@@ -473,7 +524,24 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
             Err(e) => {
                 // Undo the swaps that did land, newest first.
                 let mut detail = e.to_string();
-                let _ = std::fs::rename(&backup, target);
+                // This entry needs no restore: the rename that would have
+                // replaced `target` is precisely the one that failed, so it
+                // still holds the old binary. Only the backup link is cleaned
+                // up.
+                //
+                // It must NOT be `rename(backup, target)` here. The two are
+                // hard links to the same inode, and POSIX says renaming one
+                // onto the other "shall return successfully and perform no
+                // other action" — so the rename reports success, changes
+                // nothing, and leaves the backup behind forever. Caught by
+                // `a_failed_swap_puts_every_binary_back`.
+                let _ = std::fs::remove_file(&backup);
+
+                // The ones that DID land are different: their target points at
+                // the new inode and their backup at the old one, so a rename
+                // genuinely restores. Newest first, and every failure reported
+                // — this loop's error used to be the only one in the function
+                // that was discarded.
                 for (t, b) in done.iter().rev() {
                     if let Err(u) = std::fs::rename(b, t) {
                         detail = format!(
@@ -497,6 +565,67 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
     Ok(replaced)
 }
 
+/// How many times to retry a spawn that failed with `ETXTBSY`.
+///
+/// See [`spawn_probe`]. Six tries with 20 ms between them covers a window that
+/// is over as soon as the other thread's `execve` completes.
+const ETXTBSY_TRIES: usize = 6;
+
+/// Start the probe, retrying the one failure that is not the binary's fault.
+///
+/// A file that was *just written* cannot be executed while any process still
+/// holds a write descriptor for it: Linux answers `execve` with `ETXTBSY`. The
+/// descriptor here is our own, from `fs::copy` — and although `copy` closes it,
+/// `fork`/`posix_spawn` on **another thread** duplicates every open descriptor
+/// into the child, where it survives until that child's own `execve`. So a
+/// concurrent spawn anywhere else in the process — GLib launching a helper, a
+/// sibling test, the head-pose worker — pins our write fd open for a few
+/// microseconds and our exec fails.
+///
+/// Measured before this retry existed: the seven end-to-end install tests, which
+/// all copy-then-exec and run concurrently in one binary, failed 51 of 200 runs
+/// (0 of 200 with `--test-threads=1`). And it failed in the worst possible way:
+/// `probe` reported it as [`InstallError::WillNotRun`], whose message says the
+/// release "was built against newer system libraries than this machine has" —
+/// a confident wrong diagnosis, for exactly the failure these tests exist to
+/// rule out.
+///
+/// Retrying is the right answer rather than serialising, because the race is not
+/// confined to tests: `install_release` runs on a worker thread while the GTK
+/// main loop is live and free to spawn whatever it likes.
+fn spawn_probe(path: &Path) -> Result<std::process::Child, String> {
+    let mut last = String::new();
+    for attempt in 0..ETXTBSY_TRIES {
+        match std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // A GUI binary must not try to talk to the session's display here.
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .spawn()
+        {
+            Ok(c) => return Ok(c),
+            Err(e) if is_text_file_busy(&e) => {
+                last = e.to_string();
+                // Someone else's fork is holding our write descriptor. It goes
+                // as soon as their execve does.
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+            }
+            Err(e) => return Err(format!("it could not be started: {e}")),
+        }
+    }
+    Err(format!("it could not be started: {last}"))
+}
+
+/// Whether an error is the kernel refusing to exec a file open for writing.
+fn is_text_file_busy(e: &std::io::Error) -> bool {
+    // `ExecutableFileBusy` is the named kind; the raw code is checked too
+    // because the mapping has not always existed.
+    e.kind() == std::io::ErrorKind::ExecutableFileBusy || e.raw_os_error() == Some(26)
+}
+
 /// Run a freshly downloaded binary to see whether it works on this machine.
 ///
 /// `--version` is answered before either binary opens a device, reads config or
@@ -510,16 +639,7 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
 /// bytes are about to be installed and run anyway, and this way it happens
 /// while the old binary is still in place.
 fn probe(path: &Path) -> Result<(), String> {
-    let mut child = std::process::Command::new(path)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // A GUI binary must not try to talk to the session's display for this.
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY")
-        .spawn()
-        .map_err(|e| format!("it could not be started: {e}"))?;
+    let mut child = spawn_probe(path)?;
 
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
@@ -529,12 +649,20 @@ fn probe(path: &Path) -> Result<(), String> {
                 if status.success() {
                     return Ok(());
                 }
-                let detail = child
-                    .wait_with_output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| format!("it exited with {status}"));
+                // Read the pipe directly rather than `wait_with_output`, which
+                // waits for the pipe to close — and a probed binary that
+                // spawned a child holding it open would hang here, past the
+                // deadline that was supposed to bound this whole function.
+                let mut detail = String::new();
+                if let Some(err) = child.stderr.take() {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    let _ = err.take(8 * 1024).read_to_end(&mut buf);
+                    detail = String::from_utf8_lossy(&buf).trim().to_string();
+                }
+                if detail.is_empty() {
+                    detail = format!("it exited with {status}");
+                }
                 return Err(detail.lines().take(3).collect::<Vec<_>>().join("; "));
             }
             Ok(None) => {
@@ -726,13 +854,12 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         let dir = std::env::temp_dir();
         assert!(is_writable(&dir), "the temp dir should be writable");
         assert!(!is_writable(Path::new("/proc/self/nonexistent-subdir")));
-        // The probe must not survive the check.
-        let left = std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(".tobii-update-probe")
-        });
-        assert!(!left, "the probe file was left behind");
+        // The probe must not survive the check. Named for THIS process only:
+        // scanning for any `.tobii-update-probe*` searched a directory shared
+        // with every other program on the machine, so a leftover from an
+        // unrelated run failed this test.
+        let mine = dir.join(format!(".tobii-update-probe-{}", std::process::id()));
+        assert!(!mine.exists(), "the probe file was left behind");
     }
 
     #[test]
@@ -820,6 +947,49 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
             .filter(|n| n.starts_with('.'))
             .collect();
         assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+    }
+
+    /// The property the hard-link backup exists to give: the path a user (or a
+    /// desktop launcher, or a running script) might exec is never absent, not
+    /// even for the instant between taking a backup and putting the new binary
+    /// in place. Renaming the target aside to make the backup left exactly that
+    /// window open, while the module docs claimed a single atomic rename.
+    #[test]
+    fn the_binary_never_disappears_even_for_an_instant() {
+        let s = Scratch::new("never-gone");
+        let dir = s.path();
+        let target = dir.join("tobii");
+        std::fs::write(&target, b"old").unwrap();
+        let staging = dir.join(".tobii.new-test");
+        std::fs::write(&staging, b"new").unwrap();
+
+        // Watch the path from another thread while the swap runs. Any single
+        // observation of "not there" is a failure.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let missing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let watcher = {
+            let (stop, missing, target) = (stop.clone(), missing.clone(), target.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !target.exists() {
+                        missing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+        for _ in 0..200 {
+            std::fs::write(&staging, b"new").unwrap();
+            swap_in(&[(staging.clone(), target.clone())]).unwrap();
+            std::fs::write(&target, b"old").unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        watcher.join().unwrap();
+
+        assert_eq!(
+            missing.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the binary was absent at least once during the swap"
+        );
     }
 
     #[test]

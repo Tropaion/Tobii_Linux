@@ -74,10 +74,25 @@ done
 # glibc they need, so a release that only works on the maintainer's laptop is
 # noticed here rather than by the first person who installs it.
 if command -v objdump >/dev/null 2>&1; then
-    need="$(objdump -T "$dist/$name/tobii" 2>/dev/null \
-        | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
+    # BOTH binaries, and the highest of the two. tobii-gtk links the whole GTK4
+    # stack, so its floor is far above the CLI's: measured on this repo, tobii
+    # needs GLIBC_2.39 and tobii-gtk needs 2.44. Reporting only the CLI
+    # understated the archive by five minor versions, which is worse than not
+    # reporting at all — it is a number a maintainer would trust.
+    need=""
+    for bin in tobii tobii-gtk; do
+        [[ -f "$dist/$name/$bin" ]] || continue
+        this="$(objdump -T "$dist/$name/$bin" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' \
+            | sort -V | tail -1 || true)"
+        [[ -n "$this" ]] || continue
+        echo "  $bin needs $this"
+        if [[ -z "$need" ]] || [[ "$(printf '%s\n%s\n' "${need#GLIBC_}" "${this#GLIBC_}" \
+                | sort -V | tail -1)" == "${this#GLIBC_}" ]]; then
+            need="$this"
+        fi
+    done
     if [[ -n "$need" ]]; then
-        echo "  needs $need or newer — anyone on an older glibc cannot run this build"
+        echo "  → this archive needs $need or newer; nobody on an older glibc can run it"
     fi
 fi
 

@@ -111,12 +111,19 @@ fn update(args: &[String]) -> CmdResult {
             println!("up to date — nothing newer has been released.");
             Ok(())
         }
-        Check::NotForThisTarget { version, url } => {
-            println!(
-                "\n{version} is available, but it publishes no build for {}.",
-                tobii_update::Target::triple()
-            );
-            println!("Build it from source, or see {url}");
+        Check::CannotInstall { version, url, why } => {
+            match why {
+                tobii_update::release::Blocked::NoBuildForTarget => println!(
+                    "\n{version} is available, but it publishes no build for {}.",
+                    tobii_update::Target::triple()
+                ),
+                tobii_update::release::Blocked::NoChecksums => println!(
+                    "\n{version} is available and has a build for this machine, but it \
+                     publishes no SHA256SUMS — so a truncated download could not be told \
+                     from a complete one."
+                ),
+            }
+            println!("Build it from source, or see {}", sanitize_notes(&url));
             Ok(())
         }
         Check::Newer(r) => {
@@ -126,7 +133,8 @@ fn update(args: &[String]) -> CmdResult {
             } else {
                 println!("{}", sanitize_notes(&r.notes));
             }
-            println!("\n{}", r.html_url);
+            // Sanitized like the notes: it comes out of the same JSON document.
+            println!("\n{}", sanitize_notes(&r.html_url));
             if !args.iter().any(|a| a == "--install") {
                 println!("\nRun `tobii update --install` to download and install it.");
                 return Ok(());
@@ -177,9 +185,22 @@ fn sanitize_notes(notes: &str) -> String {
     notes
         .trim_end()
         .chars()
+        // A carriage return is dropped rather than replaced: GitHub stores
+        // release bodies with CRLF line endings, so replacing it put a U+FFFD
+        // at the end of every single line of a real changelog.
+        .filter(|c| *c != '\r')
         .map(|c| match c {
             '\n' | '\t' => c,
-            c if c.is_control() => '\u{fffd}',
+            // `is_control` covers C0 and DEL but NOT the C1 block, which some
+            // terminals still act on, nor the bidi overrides that can reorder
+            // text into something that reads as a different sentence.
+            c if c.is_control()
+                || ('\u{80}'..='\u{9f}').contains(&c)
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c) =>
+            {
+                '\u{fffd}'
+            }
             c => c,
         })
         .collect()
@@ -459,8 +480,12 @@ fn decode_points(payload: &[u8]) {
 /// shifted by two bytes. Nothing checks the reply, so a rejection would look
 /// exactly like success. This prints the reply so it cannot.
 ///
-/// Non-destructive by construction: whichever form the device prefers is
-/// applied LAST, so the session ends in the better of the two states.
+/// **Not** non-destructive: an earlier version of this comment claimed the two
+/// forms are applied in an order chosen so the session ends in the better
+/// state. They are applied in a fixed order, and nothing here reads the replies
+/// to decide which was preferred — the point is to PRINT them so a human can
+/// see which one the device accepted. Run it on a tracker you are willing to
+/// recalibrate.
 fn cal_blob() -> CmdResult {
     let transport = UsbTransport::open()?;
     let mut conn = Connection::connect(transport)?;
@@ -884,8 +909,19 @@ fn camera(args: &[String]) -> CmdResult {
 
     let mut saved = 0u32;
     let deadline = Instant::now() + Duration::from_secs(20);
+    // Whether the device has been seeing eyes during this capture, and when it
+    // last did.
+    //
+    // Declared OUT here on purpose. It used to live inside the `while`, so it
+    // was reset on every `read_notifications` chunk and could only ever be true
+    // if a gaze notification arrived in the SAME chunk as the camera frame,
+    // earlier in the list. That never happens: a 280x280 camera payload is
+    // 78400 bytes against a 16 KB read buffer, so a completed camera frame
+    // always emerges from its own transfer. Measured: 0 of 265 frames ever said
+    // DETECTED, so the annotation this exists for could not fire, and the "dark
+    // frame with no eyes" hint below fired on every dark frame regardless.
+    let mut last_eyes: Option<Instant> = None;
     while saved < count && Instant::now() < deadline {
-        let mut eyes_seen = false;
         for (op, payload) in conn.read_notifications() {
             // Track whether the device is actually seeing eyes while these
             // frames are captured. Without it a dark frame is ambiguous: nobody
@@ -893,7 +929,9 @@ fn camera(args: &[String]) -> CmdResult {
             // apart before blaming a model for finding no face.
             if op == tobii_protocol::frame::OP_GAZE_NOTIFY {
                 if let Some(g) = tobii_protocol::GazeSample::decode(&payload) {
-                    eyes_seen |= g.validity_l == 0 || g.validity_r == 0;
+                    if g.validity_l == 0 || g.validity_r == 0 {
+                        last_eyes = Some(Instant::now());
+                    }
                 }
             }
             if op != id as u32 {
@@ -914,6 +952,11 @@ fn camera(args: &[String]) -> CmdResult {
                 .open(&path)?;
             file.write_all(&out)?;
             let peak = f.pixels.iter().copied().max().unwrap_or(0);
+            // Eyes seen recently enough to describe THIS frame. The gaze and
+            // camera notifications arrive in separate transfers, so they are
+            // never simultaneous; a second is generous for 30 Hz gaze and still
+            // short enough that "detected" means during this capture.
+            let eyes_seen = last_eyes.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
             println!(
                 "{}  ({}x{}, {}-bit, mean {mean}, peak {peak}, eyes {})",
                 path.display(),
@@ -1193,9 +1236,23 @@ fn parse_udp_addr(raw: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
 }
 
 /// Parse the `--rate` argument into a positive, finite frequency in Hz.
+/// Slowest and fastest send rates this will accept.
+///
+/// A lower bound is not fussiness: `send_interval` is `1.0 / rate_hz`, and
+/// `Duration::from_secs_f64` panics above about 1.8e19 seconds — so
+/// `--rate 1e-300` passed the "positive and finite" test and then killed the
+/// process on the next line. One sample per minute is already far slower than
+/// anything usable for head tracking.
+const MIN_RATE_HZ: f64 = 1.0 / 60.0;
+const MAX_RATE_HZ: f64 = 10_000.0;
+
 fn parse_rate(raw: &str) -> Result<f64, Box<dyn std::error::Error>> {
     match raw.parse::<f64>() {
-        Ok(hz) if hz.is_finite() && hz > 0.0 => Ok(hz),
+        Ok(hz) if hz.is_finite() && (MIN_RATE_HZ..=MAX_RATE_HZ).contains(&hz) => Ok(hz),
+        Ok(hz) if hz.is_finite() && hz > 0.0 => Err(format!(
+            "--rate must be between {MIN_RATE_HZ:.4} and {MAX_RATE_HZ} Hz, got `{raw}`"
+        )
+        .into()),
         _ => Err(format!("--rate needs a positive number of Hz, got `{raw}`").into()),
     }
 }
@@ -1864,6 +1921,60 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--rate 1e-300` used to parse, then `1.0 / rate` overflowed the
+    /// `Duration` on the very next line and killed the process — a panic
+    /// reachable from a value the validator had just approved.
+    #[test]
+    fn a_rate_the_parser_accepts_can_always_be_turned_into_an_interval() {
+        for ok in ["30", "0.5", "120", "1000"] {
+            let hz = parse_rate(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            // The operation that used to panic.
+            let d = std::time::Duration::from_secs_f64(1.0 / hz);
+            assert!(d.as_secs_f64() > 0.0, "{ok}");
+        }
+        for bad in ["1e-300", "0", "-5", "nan", "inf", "abc", "", "1e300"] {
+            assert!(parse_rate(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    /// GitHub stores release bodies with CRLF line endings, so a naive
+    /// "replace every control character" put a U+FFFD at the end of every line
+    /// of every real changelog.
+    #[test]
+    fn a_changelog_survives_sanitising_with_its_text_intact() {
+        let notes = "## Fixed\r\n- the thing\r\n- another\r\n";
+        assert_eq!(sanitize_notes(notes), "## Fixed\n- the thing\n- another");
+        assert_eq!(
+            sanitize_notes("plain\nlines\n\ttabbed"),
+            "plain\nlines\n\ttabbed"
+        );
+        assert_eq!(
+            sanitize_notes("émoji ✨ and — dashes"),
+            "émoji ✨ and — dashes"
+        );
+    }
+
+    /// The body is written by whoever published the release and used to be
+    /// printed verbatim. A terminal reads control characters in it as commands.
+    #[test]
+    fn control_sequences_in_a_release_body_cannot_reach_the_terminal() {
+        // A CSI that would recolour the rest of the session, and an OSC that
+        // would set the window title.
+        let hostile = "ok\u{1b}[31mred\u{1b}]0;pwned\u{7}";
+        let clean = sanitize_notes(hostile);
+        assert!(!clean.contains('\u{1b}'), "{clean:?}");
+        assert!(!clean.contains('\u{7}'), "{clean:?}");
+        assert!(
+            clean.contains("ok"),
+            "the readable text survives: {clean:?}"
+        );
+
+        // C1 controls: not `is_control()` in Rust, still acted on by terminals.
+        assert!(!sanitize_notes("a\u{9b}31m").contains('\u{9b}'));
+        // Bidi overrides can reorder a line into a different sentence.
+        assert!(!sanitize_notes("a\u{202e}b").contains('\u{202e}'));
     }
 
     #[test]

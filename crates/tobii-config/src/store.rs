@@ -21,11 +21,17 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Write `setup` as TOML to `path`, creating parent directories as needed.
+///
+/// Atomic, for the reason `write_atomic` gives: a plain write truncates first,
+/// so a crash or a full disk mid-write leaves a file that parses as nothing.
+/// This is the worst file in the program to lose — without a display area the
+/// ET5 reports no eyes at all, so a truncated `config.toml` presents as a
+/// tracker that has simply stopped working.
 pub fn save_to(path: &Path, setup: &DisplaySetup) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, setup.to_toml())
+    write_atomic(path, setup.to_toml().as_bytes())
 }
 
 /// Read a `DisplaySetup` from `path`. `Ok(None)` if the file does not exist or
@@ -208,7 +214,7 @@ pub fn save_enabled_eye(eye: tobii_protocol::EnabledEye) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, [eye.to_wire() as u8])
+    write_atomic(&path, &[eye.to_wire() as u8])
 }
 
 /// Load the persisted eye choice. `Ok(None)` if unset or unparseable.

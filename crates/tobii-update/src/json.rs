@@ -86,9 +86,14 @@ pub const MAX_DEPTH: usize = 64;
 
 /// Largest document this will parse, in bytes.
 ///
-/// A releases page with twenty entries is a few hundred kilobytes. The cap is
-/// on the same footing as the depth limit: an answer this program did not ask
-/// for should not be able to decide how much memory it uses.
+/// A releases page with twenty entries is a few hundred kilobytes.
+///
+/// This is a **parse** limit, not the memory limit — by the time `parse` is
+/// called the text is already resident, and parsing would roughly triple it.
+/// What actually bounds memory is applied while reading the reply, in
+/// [`crate::net`], which stops at `MAX_DOWNLOAD` bytes rather than collecting a
+/// whole body and measuring it afterwards. This one keeps a reply that slipped
+/// under that from being expanded into a `Value` tree.
 pub const MAX_LEN: usize = 8 * 1024 * 1024;
 
 /// Parse one JSON document. Trailing whitespace is allowed, trailing data is not.

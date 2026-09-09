@@ -33,7 +33,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Align, Label, Orientation};
 
-use tobii_update::release::{Check, Release};
+use tobii_update::release::{Blocked, Check, Release};
 
 /// How the banner reads for a release.
 pub fn headline(r: &Release) -> String {
@@ -59,12 +59,22 @@ pub fn installing(step: &str) -> String {
     format!("Updating — {step}…")
 }
 
-/// How the banner reads when the release has no build for this machine.
-pub fn no_build_headline(version: &str) -> String {
-    format!(
-        "Version {version} is available, but not as a build for {}.",
-        tobii_update::Target::triple()
-    )
+/// How the banner reads when a newer release cannot be installed from here.
+///
+/// The two reasons need different words. Telling somebody "no build for your
+/// machine" when the build is right there and only the checksums are missing
+/// sends them looking for something that exists.
+pub fn blocked_headline(version: &str, why: Blocked) -> String {
+    match why {
+        Blocked::NoBuildForTarget => format!(
+            "Version {version} is available, but not as a build for {}.",
+            tobii_update::Target::triple()
+        ),
+        Blocked::NoChecksums => format!(
+            "Version {version} is available, but it was published without checksums, \
+             so it cannot be installed from here."
+        ),
+    }
 }
 
 /// What the user is agreeing to when they press Update.
@@ -136,8 +146,8 @@ pub fn banner() -> gtk::Box {
             // A newer release with no build for this machine. Saying so beats
             // an Update button that could only ever fail, and beats silence:
             // the release does exist and can be built from source.
-            Ok(Ok(Check::NotForThisTarget { version, url })) => {
-                text.set_text(&no_build_headline(&version.to_string()));
+            Ok(Ok(Check::CannotInstall { version, url, why })) => {
+                text.set_text(&blocked_headline(&version.to_string(), why));
                 update_btn.set_visible(false);
                 let url = url.clone();
                 notes_btn.connect_clicked(move |btn| {
@@ -377,10 +387,23 @@ mod tests {
     /// The banner must not offer an Update button that could only fail, and
     /// must still name the version, so the user knows the release exists.
     #[test]
-    fn a_release_with_no_build_here_says_which_machine_it_is_missing() {
-        let h = no_build_headline("0.9.0");
-        assert!(h.contains("0.9.0"), "{h}");
-        assert!(h.contains(&tobii_update::Target::triple()), "{h}");
+    fn a_release_that_cannot_be_installed_says_which_reason_it_is() {
+        let missing = blocked_headline("0.9.0", Blocked::NoBuildForTarget);
+        assert!(missing.contains("0.9.0"), "{missing}");
+        assert!(
+            missing.contains(&tobii_update::Target::triple()),
+            "{missing}"
+        );
+
+        let sums = blocked_headline("0.9.0", Blocked::NoChecksums);
+        assert!(sums.contains("0.9.0"), "{sums}");
+        assert!(sums.contains("checksums"), "{sums}");
+        // The trap this split exists to avoid: telling somebody there is no
+        // build for their machine when the build is right there.
+        assert!(
+            !sums.contains(&tobii_update::Target::triple()),
+            "a missing SHA256SUMS is not a missing build: {sums}"
+        );
     }
 
     /// The wording shown before Update is pressed has to be accurate: the

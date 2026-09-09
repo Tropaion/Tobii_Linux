@@ -951,153 +951,163 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     let tick_banner_label = banner_label.clone();
     let tick_breakpoint = breakpoint.take();
     let bp_window = window.clone();
-    glib::timeout_add_local(Duration::from_millis(33), move || {
-        // Re-check the layout breakpoint. `notify::default-width` misses some
-        // ways a window changes size (tiling, maximising), and this costs one
-        // integer compare — `apply` returns immediately when nothing changed.
-        if let Some(bp) = tick_breakpoint.as_ref() {
-            bp(bp_window.width());
-        }
-        // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
-        // under one lock. `new_cam` is None on the ticks between device frames.
-        let (snap, new_cam) = {
-            let mut s = state.lock().unwrap();
-            let cam = s.latest_camera.take();
-            (s.clone(), cam)
-        };
-        let conn = matches!(snap.status, device::ConnStatus::Connected);
-        connected.set(conn);
-        status_label.set_text(status_text(&snap.status));
-        status_dot.queue_draw();
-        // Evaluate the calibration state machine once per fresh `Connected`
-        // transition (reset on disconnect so a later reconnect — e.g. moved to
-        // a different monitor — is re-evaluated). All branching logic lives in
-        // `tobii_config::decide`; this only computes its inputs and maps its
-        // output to a UI action.
-        if conn {
-            if !cal_evaluated.get() && !forced_flow_open.get() {
-                cal_evaluated.set(true);
-                let display_configured = tobii_config::load().ok().flatten().is_some();
-                let fp = tobii_config::load()
-                    .ok()
-                    .flatten()
-                    .map(|s| s.fingerprint())
-                    .unwrap_or(0);
-                let cal = tobii_config::load_calibration()
-                    .ok()
-                    .flatten()
-                    .and_then(|(_, m)| m);
-                let active = device::active_monitor_id();
-                match tobii_config::decide(display_configured, cal.as_ref(), active.as_deref(), fp)
-                {
-                    tobii_config::CalAction::ForceSetup => launch_forced(
-                        &tick_app,
-                        &tick_window,
-                        &forced_flow_open,
-                        &cal_evaluated,
-                        {
-                            let cmd_tx = tick_cmd_tx.clone();
-                            let demand = tick_demand.clone();
-                            move |app| {
-                                let w = setup_flow::launch(app, cmd_tx.clone());
-                                hold_while_open(&demand, &w, "display setup");
-                                w
-                            }
-                        },
-                    ),
-                    tobii_config::CalAction::ForceCalibration => launch_forced(
-                        &tick_app,
-                        &tick_window,
-                        &forced_flow_open,
-                        &cal_evaluated,
-                        {
-                            let state = state.clone();
-                            let cmd_tx = tick_cmd_tx.clone();
-                            let demand = tick_demand.clone();
-                            move |app| {
-                                let w = calibrate_flow::launch(
-                                    app,
-                                    state.clone(),
-                                    cmd_tx.clone(),
-                                    false,
-                                );
-                                hold_while_open(&demand, &w, "calibration");
-                                w
-                            }
-                        },
-                    ),
-                    tobii_config::CalAction::RecommendCalibration(reason) => {
-                        show_recommend_banner(&tick_banner_label, &tick_banner, reason);
+    // Kept so the close handler can retire it: the tick captures the
+    // application and can open a forced flow, so it must not outlive the hub.
+    let tick_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    *tick_id.borrow_mut() = Some(glib::timeout_add_local(
+        Duration::from_millis(33),
+        move || {
+            // Re-check the layout breakpoint. `notify::default-width` misses some
+            // ways a window changes size (tiling, maximising), and this costs one
+            // integer compare — `apply` returns immediately when nothing changed.
+            if let Some(bp) = tick_breakpoint.as_ref() {
+                bp(bp_window.width());
+            }
+            // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
+            // under one lock. `new_cam` is None on the ticks between device frames.
+            let (snap, new_cam) = {
+                let mut s = state.lock().unwrap();
+                let cam = s.latest_camera.take();
+                (s.clone(), cam)
+            };
+            let conn = matches!(snap.status, device::ConnStatus::Connected);
+            connected.set(conn);
+            status_label.set_text(status_text(&snap.status));
+            status_dot.queue_draw();
+            // Evaluate the calibration state machine once per fresh `Connected`
+            // transition (reset on disconnect so a later reconnect — e.g. moved to
+            // a different monitor — is re-evaluated). All branching logic lives in
+            // `tobii_config::decide`; this only computes its inputs and maps its
+            // output to a UI action.
+            if conn {
+                if !cal_evaluated.get() && !forced_flow_open.get() {
+                    cal_evaluated.set(true);
+                    let display_configured = tobii_config::load().ok().flatten().is_some();
+                    let fp = tobii_config::load()
+                        .ok()
+                        .flatten()
+                        .map(|s| s.fingerprint())
+                        .unwrap_or(0);
+                    let cal = tobii_config::load_calibration()
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, m)| m);
+                    let active = device::active_monitor_id();
+                    match tobii_config::decide(
+                        display_configured,
+                        cal.as_ref(),
+                        active.as_deref(),
+                        fp,
+                    ) {
+                        tobii_config::CalAction::ForceSetup => launch_forced(
+                            &tick_app,
+                            &tick_window,
+                            &forced_flow_open,
+                            &cal_evaluated,
+                            {
+                                let cmd_tx = tick_cmd_tx.clone();
+                                let demand = tick_demand.clone();
+                                move |app| {
+                                    let w = setup_flow::launch(app, cmd_tx.clone());
+                                    hold_while_open(&demand, &w, "display setup");
+                                    w
+                                }
+                            },
+                        ),
+                        tobii_config::CalAction::ForceCalibration => launch_forced(
+                            &tick_app,
+                            &tick_window,
+                            &forced_flow_open,
+                            &cal_evaluated,
+                            {
+                                let state = state.clone();
+                                let cmd_tx = tick_cmd_tx.clone();
+                                let demand = tick_demand.clone();
+                                move |app| {
+                                    let w = calibrate_flow::launch(
+                                        app,
+                                        state.clone(),
+                                        cmd_tx.clone(),
+                                        false,
+                                    );
+                                    hold_while_open(&demand, &w, "calibration");
+                                    w
+                                }
+                            },
+                        ),
+                        tobii_config::CalAction::RecommendCalibration(reason) => {
+                            show_recommend_banner(&tick_banner_label, &tick_banner, reason);
+                        }
+                        tobii_config::CalAction::None => {}
                     }
-                    tobii_config::CalAction::None => {}
+                }
+            } else {
+                cal_evaluated.set(false);
+            }
+            // Seed the eye-selection radios once from the device's current value.
+            if conn && !eye_seeded.get() {
+                if let Some(e) = snap.enabled_eye {
+                    eye_seeding.set(true);
+                    match e {
+                        EnabledEye::Both => r_both.set_active(true),
+                        EnabledEye::Left => r_left.set_active(true),
+                        EnabledEye::Right => r_right.set_active(true),
+                    }
+                    eye_seeding.set(false);
+                    eye_seeded.set(true);
                 }
             }
-        } else {
-            cal_evaluated.set(false);
-        }
-        // Seed the eye-selection radios once from the device's current value.
-        if conn && !eye_seeded.get() {
-            if let Some(e) = snap.enabled_eye {
-                eye_seeding.set(true);
-                match e {
-                    EnabledEye::Both => r_both.set_active(true),
-                    EnabledEye::Left => r_left.set_active(true),
-                    EnabledEye::Right => r_right.set_active(true),
-                }
-                eye_seeding.set(false);
-                eye_seeded.set(true);
-            }
-        }
-        // Only the guidance *text* is driven from this tick — the dots redraw
-        // themselves on the frame clock (see `area.add_tick_callback` above).
-        // Text at 33 ms is ample: it is damped over 11-49 frames upstream.
-        let head_now = widget::head_view_for(&snap);
-        {
-            let ev = widget::eye_view_for(&snap);
-            let hv = head_now;
-            for (group, rows) in widget::readout_groups(&ev, hv.as_ref())
-                .into_iter()
-                .enumerate()
+            // Only the guidance *text* is driven from this tick — the dots redraw
+            // themselves on the frame clock (see `area.add_tick_callback` above).
+            // Text at 33 ms is ample: it is damped over 11-49 frames upstream.
+            let head_now = widget::head_view_for(&snap);
             {
-                for (i, r) in rows.into_iter().enumerate() {
-                    let Some((n, v)) = readout_cells.get(group).and_then(|g| g.get(i)) else {
-                        break;
-                    };
-                    n.set_text(r.label);
-                    v.set_text(&r.value);
-                    if r.alert {
-                        v.add_css_class("readout-alert");
-                    } else {
-                        v.remove_css_class("readout-alert");
+                let ev = widget::eye_view_for(&snap);
+                let hv = head_now;
+                for (group, rows) in widget::readout_groups(&ev, hv.as_ref())
+                    .into_iter()
+                    .enumerate()
+                {
+                    for (i, r) in rows.into_iter().enumerate() {
+                        let Some((n, v)) = readout_cells.get(group).and_then(|g| g.get(i)) else {
+                            break;
+                        };
+                        n.set_text(r.label);
+                        v.set_text(&r.value);
+                        if r.alert {
+                            v.add_css_class("readout-alert");
+                        } else {
+                            v.remove_css_class("readout-alert");
+                        }
                     }
                 }
             }
-        }
-        // Camera preview: keep the last frame between device frames; update on a
-        // new one; clear on disconnect so nothing stale lingers. Only redraw when
-        // something actually changed — repainting a 78 KB frame every tick is
-        // pure waste on the ticks between device frames.
-        if !conn {
-            let had = cam_frame.borrow().is_some();
-            *cam_frame.borrow_mut() = None;
-            if had {
+            // Camera preview: keep the last frame between device frames; update on a
+            // new one; clear on disconnect so nothing stale lingers. Only redraw when
+            // something actually changed — repainting a 78 KB frame every tick is
+            // pure waste on the ticks between device frames.
+            if !conn {
+                let had = cam_frame.borrow().is_some();
+                *cam_frame.borrow_mut() = None;
+                if had {
+                    cam_area.queue_draw();
+                }
+            } else if new_cam.is_some() {
+                *cam_frame.borrow_mut() = new_cam;
                 cam_area.queue_draw();
             }
-        } else if new_cam.is_some() {
-            *cam_frame.borrow_mut() = new_cam;
-            cam_area.queue_draw();
-        }
-        // Head pose: same discipline as the camera — only redraw when the view
-        // actually changed, so an unchanged pose costs nothing.
-        {
-            let next = head_now;
-            if *head_view.borrow() != next {
-                *head_view.borrow_mut() = next;
-                area.queue_draw();
+            // Head pose: same discipline as the camera — only redraw when the view
+            // actually changed, so an unchanged pose costs nothing.
+            {
+                let next = head_now;
+                if *head_view.borrow() != next {
+                    *head_view.borrow_mut() = next;
+                    area.queue_draw();
+                }
             }
-        }
-        glib::ControlFlow::Continue
-    });
+            glib::ControlFlow::Continue
+        },
+    ));
 
     // The tracker runs while you are looking at the hub, and not otherwise.
     //
@@ -1128,13 +1138,35 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     // here rather than waited for. If focus never arrives, the notify handler
     // drops it.
     *focus_hold.borrow_mut() = Some(demand.hold("the hub window"));
-    // Releasing on close matters as much as taking it: a hub closed while
-    // focused would otherwise leave a claim behind for the life of the process,
-    // which in background mode is until logout.
+    // Everything the hub owns is released here, and all of it matters.
     {
         let focus_hold = focus_hold.clone();
+        let overlay_win = overlay_win.clone();
+        let tick_id = tick_id.clone();
         window.connect_close_request(move |_| {
+            // 1. The tracker claim. A hub closed while focused would otherwise
+            //    leave one behind for the life of the process — which in
+            //    background mode is until logout, i.e. the illuminators never
+            //    go out again.
             *focus_hold.borrow_mut() = None;
+
+            // 2. The gaze overlay. It is a second ApplicationWindow of the same
+            //    GtkApplication, on layer-shell's Overlay layer, click-through
+            //    and with no decorations — so closing the hub used to leave a
+            //    full-screen surface on top of everything with no way to
+            //    dismiss it, and a GtkApplication that never exits because a
+            //    window remained.
+            if let Some(w) = overlay_win.borrow_mut().take() {
+                w.close();
+            }
+
+            // 3. The 33 ms tick. It captures the application and can open a
+            //    forced setup or calibration flow, so left running it would
+            //    keep waking on a destroyed hub and could raise a fullscreen
+            //    flow after the user closed the window.
+            if let Some(id) = tick_id.borrow_mut().take() {
+                id.remove();
+            }
             glib::Propagation::Proceed
         });
     }

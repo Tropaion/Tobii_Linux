@@ -137,6 +137,16 @@ pub fn parse_releases(text: &str) -> Result<Option<Release>, CheckError> {
     Ok(best)
 }
 
+/// Why a newer release cannot be installed from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocked {
+    /// The release publishes no archive named for this target triple.
+    NoBuildForTarget,
+    /// There is a build, but no `SHA256SUMS` to tell a complete download from a
+    /// truncated one.
+    NoChecksums,
+}
+
 /// What a check found.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Check {
@@ -144,12 +154,19 @@ pub enum Check {
     UpToDate,
     /// A newer release exists, with a build for this machine.
     Newer(Box<Release>),
-    /// A newer release exists but publishes no build for this machine.
+    /// A newer release exists but cannot be installed from here.
     ///
     /// Kept separate from `Newer` because the two need different words: an
-    /// "Update" button that can only ever fail is worse than no button. This
-    /// says what happened and points at the releases page.
-    NotForThisTarget { version: Version, url: String },
+    /// "Update" button that can only ever fail is worse than no button. `why`
+    /// says which of the two reasons it is, because they send the user to
+    /// different places — "no build for your machine" told to somebody whose
+    /// build is right there, and only the checksums are missing, sends them
+    /// looking for something that exists.
+    CannotInstall {
+        version: Version,
+        url: String,
+        why: Blocked,
+    },
 }
 
 /// Compare the latest release with the running build.
@@ -161,24 +178,45 @@ pub enum Check {
 /// that could never do anything.
 pub fn check() -> Result<Check, CheckError> {
     let running = Version::current();
-    let Some(r) = latest()? else {
-        return Ok(Check::UpToDate);
-    };
-    if !r.version.is_newer_than(&running) {
-        return Ok(Check::UpToDate);
-    }
     let triple = crate::install::Target::triple();
-    if r.archive_for(&triple).is_none() || r.checksums().is_none() {
-        return Ok(Check::NotForThisTarget {
+    Ok(decide(latest()?, &running, &triple))
+}
+
+/// The decision [`check`] makes, without the network.
+///
+/// Split out because `check` takes no arguments and reaches the network on its
+/// own, so nothing could test the gate that is the whole point of it: neutering
+/// the target-triple check left all 51 tests green. This is that gate, and it
+/// is tested directly.
+pub fn decide(latest: Option<Release>, running: &Version, triple: &str) -> Check {
+    let Some(r) = latest else {
+        return Check::UpToDate;
+    };
+    if !r.version.is_newer_than(running) {
+        return Check::UpToDate;
+    }
+    // Both are required to install: the archive for this machine, and the
+    // checksums without which a truncated download cannot be told from a
+    // complete one. Missing either means the Update button could only fail.
+    let why = if r.archive_for(triple).is_none() {
+        Some(Blocked::NoBuildForTarget)
+    } else if r.checksums().is_none() {
+        Some(Blocked::NoChecksums)
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        return Check::CannotInstall {
             version: r.version.clone(),
             url: if r.html_url.is_empty() {
                 crate::releases_url()
             } else {
                 r.html_url.clone()
             },
-        });
+            why,
+        };
     }
-    Ok(Check::Newer(Box::new(r)))
+    Check::Newer(Box::new(r))
 }
 
 #[cfg(test)]
@@ -263,6 +301,106 @@ mod tests {
         assert!(
             r.archive_for("").is_some(),
             "an empty triple matches anything"
+        );
+    }
+
+    fn rel(tag: &str, assets: &[(&str, &str)]) -> Release {
+        Release {
+            tag: tag.to_string(),
+            version: Version::parse(tag).unwrap(),
+            notes: String::new(),
+            assets: assets
+                .iter()
+                .map(|(n, u)| Asset {
+                    name: n.to_string(),
+                    url: u.to_string(),
+                    size: 0,
+                })
+                .collect(),
+            html_url: "https://example.invalid/r".into(),
+        }
+    }
+
+    const TRIPLE: &str = "x86_64-unknown-linux-gnu";
+
+    fn full(tag: &str) -> Release {
+        rel(
+            tag,
+            &[
+                (
+                    &format!(
+                        "tobii-linux-{}-{TRIPLE}.tar.gz",
+                        tag.trim_start_matches('v')
+                    ),
+                    "https://github.com/a/b/x.tar.gz",
+                ),
+                ("SHA256SUMS", "https://github.com/a/b/s"),
+            ],
+        )
+    }
+
+    /// The gate `check` exists for. Before this test, changing the condition to
+    /// `if false && (...)` left every other test in the crate green.
+    #[test]
+    fn an_update_is_only_offered_when_it_can_actually_be_installed() {
+        let running = Version::parse("0.1.0").unwrap();
+
+        // The ordinary case: newer, with a build for us and checksums.
+        assert!(matches!(
+            decide(Some(full("v0.2.0")), &running, TRIPLE),
+            Check::Newer(_)
+        ));
+
+        // A build for a different machine is not an update we can offer.
+        let other = decide(Some(full("v0.2.0")), &running, "aarch64-unknown-linux-gnu");
+        match other {
+            Check::CannotInstall { version, url, why } => {
+                assert_eq!(version.to_string(), "0.2.0");
+                assert!(!url.is_empty(), "the user needs somewhere to go");
+                assert_eq!(why, Blocked::NoBuildForTarget);
+            }
+            o => panic!("expected NotForThisTarget, got {o:?}"),
+        }
+
+        // An archive for us but no checksums: also not installable, and it must
+        // NOT be reported as "no build for this machine" — that sends the user
+        // looking for a build that is right there.
+        let no_sums = rel(
+            "v0.2.0",
+            &[(
+                &format!("tobii-linux-0.2.0-{TRIPLE}.tar.gz"),
+                "https://github.com/a/b/x.tar.gz",
+            )],
+        );
+        // ...and it must be reported as MISSING CHECKSUMS, not as "no build
+        // for your machine": the build is right there, and sending the user to
+        // look for one that exists is the worse of the two wrong answers.
+        assert!(matches!(
+            decide(Some(no_sums), &running, TRIPLE),
+            Check::CannotInstall {
+                why: Blocked::NoChecksums,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nothing_newer_is_up_to_date_whatever_it_ships() {
+        let running = Version::parse("0.2.0").unwrap();
+        assert_eq!(decide(None, &running, TRIPLE), Check::UpToDate);
+        assert_eq!(
+            decide(Some(full("v0.2.0")), &running, TRIPLE),
+            Check::UpToDate
+        );
+        assert_eq!(
+            decide(Some(full("v0.1.0")), &running, TRIPLE),
+            Check::UpToDate
+        );
+        // Not even when the older release has no build for us: there is nothing
+        // to tell the user about.
+        assert_eq!(
+            decide(Some(full("v0.1.0")), &running, "mips-unknown-none"),
+            Check::UpToDate
         );
     }
 

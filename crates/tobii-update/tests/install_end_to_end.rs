@@ -70,6 +70,32 @@ fn build_archive(root: &Path, stem: &str, bodies: &[(&str, &str)]) -> (PathBuf, 
     (archive, digest)
 }
 
+/// Ask a binary for its version, retrying the one failure that is not its fault.
+///
+/// A file that was just written cannot be exec'd while any process holds a write
+/// descriptor for it — Linux answers `ETXTBSY`. `write_exe` closes its own
+/// descriptor, but a `fork` on another thread duplicates every open descriptor
+/// into the child, where it lives until that child execs. These tests run
+/// concurrently and all of them write-then-exec, so they hand each other the
+/// race: measured at 19 failures in 200 runs before this retry, all of them
+/// here rather than in the library (which has its own retry, for the same
+/// reason, in `spawn_probe`).
+fn version_of(path: &Path) -> String {
+    for attempt in 0..8 {
+        match std::process::Command::new(path).arg("--version").output() {
+            Ok(out) => return String::from_utf8_lossy(&out.stdout).to_string(),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    || e.raw_os_error() == Some(26) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+            }
+            Err(e) => panic!("{} could not be run: {e}", path.display()),
+        }
+    }
+    panic!("{} stayed busy for every attempt", path.display())
+}
+
 /// A stand-in for an installed binary: it answers `--version` like the real
 /// ones do, so the probe and the version read-back both work.
 fn versioned(name: &str, version: &str) -> String {
@@ -84,6 +110,17 @@ fn install_dir_with_both(root: &Path) -> PathBuf {
     write_exe(&dir.join("tobii"), &versioned("tobii", "0.1.0"));
     write_exe(&dir.join("tobii-gtk"), &versioned("tobii-gtk", "0.1.0"));
     dir
+}
+
+/// Staging and backup files this crate creates are all dot-prefixed, so what is
+/// left in the install directory after a run is the whole cleanup question.
+fn hidden_files(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with('.'))
+        .collect()
 }
 
 fn work_dir(root: &Path) -> PathBuf {
@@ -121,21 +158,14 @@ fn a_real_archive_installs_both_binaries() {
     assert_eq!(done.version, "0.2.0", "read back from the binary");
 
     for name in ["tobii", "tobii-gtk"] {
-        let out = std::process::Command::new(dir.join(name))
-            .arg("--version")
-            .output()
-            .unwrap();
-        let said = String::from_utf8_lossy(&out.stdout);
+        let said = version_of(&dir.join(name));
         assert!(said.contains("0.2.0"), "{name} still reports: {said}");
     }
-    // Nothing left behind in the install directory.
-    let hidden: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with('.'))
-        .collect();
-    assert!(hidden.is_empty(), "leftovers: {hidden:?}");
+    assert!(
+        hidden_files(&dir).is_empty(),
+        "leftovers: {:?}",
+        hidden_files(&dir)
+    );
     assert!(steps.borrow().iter().any(|s| s == "installing"));
 }
 
@@ -156,11 +186,7 @@ fn a_wrong_digest_stops_before_anything_is_unpacked() {
         .expect_err("a mismatched digest must be fatal");
     assert!(matches!(e, InstallError::Digest { .. }), "{e}");
     assert!(!work.join("unpacked").exists(), "it unpacked anyway");
-    let out = std::process::Command::new(dir.join("tobii"))
-        .arg("--version")
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).contains("0.1.0"));
+    assert!(version_of(&dir.join("tobii")).contains("0.1.0"));
 }
 
 /// The failure that would otherwise brick the install: a release built against
@@ -199,22 +225,16 @@ fn a_binary_that_cannot_run_here_leaves_the_old_ones_alone() {
     // Both old binaries are untouched — including `tobii`, which passed its own
     // probe and was already staged when its sibling failed.
     for name in ["tobii", "tobii-gtk"] {
-        let out = std::process::Command::new(dir.join(name))
-            .arg("--version")
-            .output()
-            .unwrap();
         assert!(
-            String::from_utf8_lossy(&out.stdout).contains("0.1.0"),
+            version_of(&dir.join(name)).contains("0.1.0"),
             "{name} was replaced despite the failure"
         );
     }
-    let hidden: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with('.'))
-        .collect();
-    assert!(hidden.is_empty(), "staged files left behind: {hidden:?}");
+    assert!(
+        hidden_files(&dir).is_empty(),
+        "staged files left behind: {:?}",
+        hidden_files(&dir)
+    );
 }
 
 /// `tar` will happily create a symlink, and `fs::copy` reads through one. A
@@ -316,6 +336,41 @@ fn an_archive_without_our_binaries_is_an_error() {
     let work = work_dir(s.path());
     let e = install_verified_archive(&archive, &digest, &dir, &work, &|_| {}).unwrap_err();
     assert!(matches!(e, InstallError::NothingToInstall), "{e}");
+}
+
+/// An archive missing one of the two installed binaries must be refused, not
+/// half-applied. Installing the one it carries leaves a new `tobii` beside an
+/// old `tobii-gtk` — the mismatched pair the whole rollback path exists to
+/// prevent, arriving by the front door and reported as a success.
+#[test]
+fn an_archive_missing_an_installed_binary_changes_nothing() {
+    let s = Scratch::new("incomplete");
+    let (archive, digest) = build_archive(
+        s.path(),
+        "tobii-linux-0.2.0-x86_64-unknown-linux-gnu",
+        &[("tobii", &versioned("tobii", "0.2.0"))],
+    );
+    // Both are installed here, but the archive carries only one.
+    let dir = install_dir_with_both(s.path());
+    let work = work_dir(s.path());
+
+    let e = install_verified_archive(&archive, &digest, &dir, &work, &|_| {})
+        .expect_err("a half release must be refused");
+    match &e {
+        InstallError::Incomplete { missing } => assert!(missing.contains("tobii-gtk"), "{missing}"),
+        other => panic!("expected Incomplete, got {other}"),
+    }
+    for name in ["tobii", "tobii-gtk"] {
+        assert!(
+            version_of(&dir.join(name)).contains("0.1.0"),
+            "{name} was changed by a refused install"
+        );
+    }
+    assert!(
+        hidden_files(&dir).is_empty(),
+        "staged: {:?}",
+        hidden_files(&dir)
+    );
 }
 
 /// Only what is already installed is replaced. A machine with just the CLI must
