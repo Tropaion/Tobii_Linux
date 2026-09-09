@@ -96,6 +96,24 @@ button.quiet { background-color: transparent; border-color: #2b333c;
 button.quiet:hover { background-color: #1e242b; border-color: #3a444f;
                      color: #e8ecef; }
 button.spin-btn { min-width: 26px; padding: 2px 10px; }
+/* The header cogwheel. Square, borderless until touched: it sits beside the
+   connection status, where a filled button would read as an action to take. */
+menubutton.icon-btn > button {
+    min-width: 30px; min-height: 30px; padding: 4px;
+    background-color: transparent; border-color: transparent; color: #8a949d; }
+menubutton.icon-btn > button:hover {
+    background-color: #1e242b; border-color: #2b333c; color: #e8ecef; }
+menubutton.icon-btn > button:checked {
+    background-color: #1e242b; border-color: #3a444f; color: #e8ecef; }
+
+/* --- the settings popover ----------------------------------------------- */
+/* GTK draws a popover on its own surface, outside `window`, so it inherits
+   none of the ground colour above and would otherwise arrive in the system
+   theme's light grey in the middle of a dark hub. */
+popover > contents { background-color: #161a1f; color: #e8ecef;
+                     border: 1px solid #232a32; border-radius: 12px;
+                     padding: 4px; box-shadow: 0 6px 20px rgba(0,0,0,0.45); }
+popover > arrow { background-color: #161a1f; border: 1px solid #232a32; }
 button.help-btn { min-width: 22px; padding: 0 8px; background-color: transparent;
                   border-color: transparent; color: #8a949d; font-size: 12px; }
 button.help-btn:hover { background-color: #1e242b; color: #e8ecef; }
@@ -805,19 +823,6 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
         "If you move the sensor to a different monitor, you'll need to set up the new display.",
         &b_setup,
     ));
-    right.append(&section(
-        "Start when I log in",
-        "Keeps the tracker set up from login, so it works in games and other apps without \
-         opening this window first. The tracker itself stays off until something asks for it.",
-        &autostart_switch(),
-    ));
-    right.append(&section(
-        "Check for updates",
-        "Asks GitHub for the latest release when this window opens. It's the only thing this \
-         program does on the network without being asked. Nothing is downloaded until you \
-         choose to update.",
-        &update_check_switch(),
-    ));
 
     // --- Recommend-recalibration banner: a dismissible row, not a modal. Shown
     // by the tick's once-per-connection `decide()` evaluation below. ---
@@ -895,10 +900,10 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     split.attach(&right, 1, 0, 1, 1);
 
     let header = gtk::Box::new(Orientation::Horizontal, 12);
-    header.append(&title);
-    header.append(&diagnostics_button());
     title.set_hexpand(true);
+    header.append(&title);
     header.append(&status_bar);
+    header.append(&settings_button());
 
     // One margin all round, so the frame of background around the content is
     // even. Anything else reads as a mistake at the corners.
@@ -1271,6 +1276,152 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 /// since a clipboard write is otherwise completely invisible. Right-clicking —
 /// or copying with no clipboard, which happens on a bare compositor — falls
 /// back to writing a file and saying where it went.
+/// The cogwheel in the header, and the settings that are not about tracking.
+///
+/// # Why these three, and why not in the rack
+///
+/// The control rack answers one question per card — *how should the tracker
+/// behave?* Autostart, the update check and the diagnostics report answer a
+/// different one — *how should this program behave?* — and three cards' worth
+/// of prose about login sessions and network requests pushed the instrument
+/// panel down and made the hub taller than the thing it is monitoring. Moving
+/// them behind a cogwheel gives the window back to what it is for and costs one
+/// click for settings that are set once and then forgotten.
+///
+/// A `Popover`, not a second window: it is anchored to the button that opened
+/// it, it closes on click-away, and it needs no title bar, no size negotiation
+/// and no place in the window list for what is three rows of content.
+fn settings_button() -> gtk::MenuButton {
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&settings_list()));
+    // Under the cogwheel and flush with the right edge, so the panel does not
+    // hang off the side of the window on a narrow one.
+    popover.set_position(gtk::PositionType::Bottom);
+    popover.set_has_arrow(false);
+
+    let btn = gtk::MenuButton::new();
+    btn.add_css_class("icon-btn");
+    btn.set_valign(Align::Center);
+    btn.set_tooltip_text(Some("Settings"));
+    btn.set_popover(Some(&popover));
+    // A cogwheel, whichever icon theme is installed, or a glyph if none is.
+    //
+    // The name has to be checked rather than assumed twice over. GTK's lookup
+    // falls back to a "missing image" square rather than to nothing, so a theme
+    // without the name leaves a broken tile in the header. And the two obvious
+    // names do not agree about what they draw: `preferences-system-symbolic` is
+    // a cogwheel in Adwaita but a row of SLIDERS in Breeze — measured, by
+    // running the hub on this machine, which is a Breeze desktop. Both themes
+    // draw `emblem-system-symbolic` as a cogwheel (Adwaita keeps it under
+    // symbolic/legacy/), so that is the first choice.
+    let theme = gtk::gdk::Display::default().map(|d| gtk::IconTheme::for_display(&d));
+    let cog = ["emblem-system-symbolic", "preferences-system-symbolic"]
+        .into_iter()
+        .find(|n| theme.as_ref().is_some_and(|t| t.has_icon(n)));
+    match cog {
+        Some(name) => btn.set_icon_name(name),
+        None => {
+            let label = Label::new(Some("⚙"));
+            // The same vertical slack `widget::button` gives every glyph in
+            // this hub: the ink of a tall one needs more room than its
+            // logical box.
+            label.set_margin_top(2);
+            label.set_margin_bottom(2);
+            btn.set_child(Some(&label));
+        }
+    }
+    btn
+}
+
+/// The contents of that popover.
+fn settings_list() -> gtk::Box {
+    let list = gtk::Box::new(Orientation::Vertical, 4);
+    // An explicit width rather than one negotiated from the longest sentence.
+    // `set_max_width_chars` is a hint about where a label may wrap, not a cap
+    // on what it may be allocated, so without this the panel's width is
+    // whatever the prose happens to measure — and it changes whenever the
+    // prose is edited.
+    list.set_size_request(330, -1);
+    list.set_margin_top(6);
+    list.set_margin_bottom(6);
+    list.set_margin_start(6);
+    list.set_margin_end(6);
+
+    list.append(&settings_row(
+        "Start when I log in",
+        "Keeps the tracker set up from login, so it works in games and other apps without \
+         opening this window first. The tracker itself stays off until something asks for it.",
+        &autostart_switch(),
+    ));
+    list.append(&hairline());
+    list.append(&settings_row(
+        "Check for updates",
+        "Asks GitHub for the latest release when this window opens. It's the only thing this \
+         program does on the network without being asked. Nothing is downloaded until you \
+         choose to update.",
+        &update_check_switch(),
+    ));
+    list.append(&hairline());
+
+    // The report is an action, not a setting, so it gets the row to itself
+    // rather than a switch on the right.
+    let diag = diagnostics_button();
+    diag.set_halign(Align::Fill);
+    diag.set_margin_top(4);
+    let diag_box = gtk::Box::new(Orientation::Vertical, 0);
+    diag_box.set_margin_start(8);
+    diag_box.set_margin_end(8);
+    diag_box.set_margin_top(4);
+    diag_box.set_margin_bottom(4);
+    diag_box.append(&diag);
+    list.append(&diag_box);
+
+    list
+}
+
+/// One row of the settings popover: a title, why it exists, and its control.
+///
+/// Horizontal rather than [`section`]'s vertical stack — a popover is a narrow
+/// column, and a switch under its own paragraph reads as a separate control
+/// from the sentence above it.
+fn settings_row<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Horizontal, 12);
+    row.set_margin_start(8);
+    row.set_margin_end(8);
+    row.set_margin_top(8);
+    row.set_margin_bottom(8);
+
+    let text = gtk::Box::new(Orientation::Vertical, 2);
+    text.set_hexpand(true);
+    let t = Label::new(Some(title));
+    t.add_css_class("section-title");
+    t.set_halign(Align::Start);
+    t.set_xalign(0.0);
+    let d = Label::new(Some(desc));
+    d.add_css_class("section-desc");
+    d.set_halign(Align::Start);
+    d.set_xalign(0.0);
+    d.set_wrap(true);
+    // A wrapping label reports its UNWRAPPED width as natural, so without a cap
+    // the longest sentence sets the popover's width — the same trap `section`
+    // documents, and a popover has even less room to give away.
+    d.set_max_width_chars(34);
+    text.append(&t);
+    text.append(&d);
+
+    control.set_valign(Align::Center);
+    row.append(&text);
+    row.append(control);
+    row
+}
+
+/// A one-pixel rule between popover rows.
+fn hairline() -> gtk::Box {
+    let h = gtk::Box::new(Orientation::Horizontal, 0);
+    h.add_css_class("hairline");
+    h
+}
+
 fn diagnostics_button() -> gtk::Button {
     let btn = crate::widget::button("⃝ Copy diagnostics");
     btn.add_css_class("quiet");
