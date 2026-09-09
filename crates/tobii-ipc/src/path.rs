@@ -23,20 +23,59 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// The directory holding the socket.
+///
+/// Always `<runtime root>/tobii-linux`, whichever root is in use — see
+/// [`runtime_root_from`] for why that uniformity is load-bearing.
 pub fn socket_dir() -> PathBuf {
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+    runtime_root().0.join(DIR_NAME)
+}
+
+/// The per-user runtime directory, and whether we had to invent it.
+fn runtime_root() -> (PathBuf, bool) {
+    let uid = current_uid();
+    runtime_root_from(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        PathBuf::from(format!("/run/user/{uid}")).is_dir(),
+        uid,
+    )
+}
+
+/// The root the socket directory hangs off, as a pure function of its inputs.
+///
+/// Split out so all three branches can be tested. The last-resort branch is not
+/// reachable on a normal desktop — it needs both no `$XDG_RUNTIME_DIR` and no
+/// `/run/user/<uid>` — so it went unexercised until CI, which is exactly that
+/// environment, hit it: a Debian container running as root with no login
+/// session.
+///
+/// It used to return `/tmp/tobii-linux-<uid>` as the socket directory ITSELF,
+/// which made the last path component `tobii-linux-0` rather than
+/// `tobii-linux`. That broke the invariant the socket's own test asserts — that
+/// the path always ends `tobii-linux/tracker.sock` — and the test was right:
+/// the socket's location is quoted in error messages and documentation, and a
+/// spelling that changes with the environment is one more thing that has to be
+/// explained. The fallback is now a runtime ROOT like the other two, with the
+/// same `tobii-linux` directory joined onto it.
+///
+/// The bool says whether the root is ours to create and lock down: a real
+/// runtime dir is already per-user and 0700, but `/tmp` is world-writable, so
+/// the invented one has to be made 0700 by [`ensure_socket_dir`] before
+/// anything is put in it.
+fn runtime_root_from(
+    xdg: Option<&std::ffi::OsStr>,
+    run_user_exists: bool,
+    uid: u32,
+) -> (PathBuf, bool) {
+    if let Some(rt) = xdg {
         if !rt.is_empty() {
-            return PathBuf::from(rt).join(DIR_NAME);
+            return (PathBuf::from(rt), false);
         }
     }
-    let uid = current_uid();
-    let run_user = PathBuf::from(format!("/run/user/{uid}"));
-    if run_user.is_dir() {
-        return run_user.join(DIR_NAME);
+    if run_user_exists {
+        return (PathBuf::from(format!("/run/user/{uid}")), false);
     }
-    // Last resort. Namespaced by uid because /tmp is shared, and created 0700
-    // by `ensure_socket_dir` so another user cannot sit in the path.
-    PathBuf::from(format!("/tmp/{DIR_NAME}-{uid}"))
+    // Namespaced by uid because /tmp is shared.
+    (PathBuf::from(format!("/tmp/tobii-runtime-{uid}")), true)
 }
 
 /// This process's real user id, read without pulling in `libc`.
@@ -58,7 +97,15 @@ fn current_uid() -> u32 {
 
 /// Create the socket directory, owner-only.
 pub fn ensure_socket_dir() -> io::Result<PathBuf> {
-    let dir = socket_dir();
+    let (root, invented) = runtime_root();
+    // An invented root lives in a world-writable directory, so it is locked
+    // down before anything is placed inside it. A real runtime dir is already
+    // per-user and 0700 and is not ours to re-permission.
+    if invented {
+        std::fs::create_dir_all(&root)?;
+        set_owner_only(&root)?;
+    }
+    let dir = root.join(DIR_NAME);
     std::fs::create_dir_all(&dir)?;
     set_owner_only(&dir)?;
     Ok(dir)
@@ -141,6 +188,54 @@ mod tests {
                 assert!(p.starts_with(PathBuf::from(rt)), "{p:?}");
                 assert!(p.ends_with("tobii-linux/tracker.sock"), "{p:?}");
             }
+        }
+    }
+
+    /// All three roots, including the one no desktop reaches.
+    ///
+    /// This is the test that did not exist. `the_socket_is_always_named_
+    /// consistently` asserted the invariant but could only ever exercise
+    /// whichever branch the machine running it happened to take — a developer
+    /// desktop always has `$XDG_RUNTIME_DIR`, so the last-resort branch was
+    /// first executed by CI, in a container with no login session, and it
+    /// failed there: the directory was `tobii-linux-0`, not `tobii-linux`.
+    #[test]
+    fn every_runtime_root_puts_the_socket_in_the_same_named_directory() {
+        use std::ffi::OsStr;
+        let cases = [
+            (
+                Some(OsStr::new("/run/user/1000")),
+                true,
+                1000u32,
+                "/run/user/1000",
+                false,
+            ),
+            // An empty XDG_RUNTIME_DIR names nothing and must not be used as a
+            // root — that would put the socket at "/tobii-linux".
+            (Some(OsStr::new("")), true, 1000, "/run/user/1000", false),
+            (None, true, 1000, "/run/user/1000", false),
+            // The CI case: no runtime dir at all, running as root.
+            (None, false, 0, "/tmp/tobii-runtime-0", true),
+            (
+                Some(OsStr::new("")),
+                false,
+                1000,
+                "/tmp/tobii-runtime-1000",
+                true,
+            ),
+        ];
+        for (xdg, run_user, uid, want_root, want_invented) in cases {
+            let (root, invented) = runtime_root_from(xdg, run_user, uid);
+            assert_eq!(root, PathBuf::from(want_root), "{xdg:?} {run_user} {uid}");
+            assert_eq!(invented, want_invented, "{xdg:?} {run_user} {uid}");
+            // The invariant, for every branch: the socket directory is always
+            // spelled the same, so the path quoted in an error message does not
+            // change with the environment.
+            let sock = root.join(DIR_NAME).join(SOCK_NAME);
+            assert!(
+                sock.ends_with("tobii-linux/tracker.sock"),
+                "{sock:?} for {xdg:?} {run_user} {uid}"
+            );
         }
     }
 
