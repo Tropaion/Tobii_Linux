@@ -13,6 +13,7 @@ pub mod device;
 pub mod eye_preview;
 pub mod eyeview;
 pub mod focus;
+pub mod games;
 pub mod head_model;
 pub mod outputs;
 pub mod overlay;
@@ -828,6 +829,15 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
         "Sends your head position and angle to games and apps, over opentrack.",
         &head_model::control(state.clone(), cmd_tx.clone()),
     ));
+    // Beside "Head tracking" rather than in the cogwheel: it is about what the
+    // tracker does, not about how this program behaves.
+    let games_row = crate::games::GamesRow::build();
+    right.append(&section(
+        "Head tracking for games",
+        "Sends head tracking and gaze to a game. Wrap the game with \
+         `tobii game -- <command>` — in Steam, put that in Launch Options.",
+        &games_row.controls,
+    ));
     right.append(&section(
         "Preview my gaze",
         "Shows you a visual trail of your gaze.",
@@ -1029,6 +1039,10 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     // reporting success. This branch is reachable with the preview on: turn it
     // on, have no usable saved calibration, then unplug and replug.
     let tick_sw_preview = sw_preview.clone();
+    // The games row's status line is driven from here so that a game starting
+    // or stopping — or `tobii games` run in a terminal — is reflected without
+    // reopening the window, which is how somebody setting this up works.
+    let tick_games = Rc::new(games_row);
     // The hub's claim on the tracker, synced from `window.is_active()` on every
     // tick. Declared here because the tick below owns it.
     let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
@@ -1160,6 +1174,8 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
                     eye_seeded.set(true);
                 }
             }
+            tick_games.refresh(conn);
+
             // Only the guidance *text* is driven from this tick — the dots redraw
             // themselves on the frame clock (see `area.add_tick_callback` above).
             // Text at 33 ms is ample: it is damped over 11-49 frames upstream.
