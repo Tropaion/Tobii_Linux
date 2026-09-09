@@ -8,3 +8,10 @@ description = "libusb (rusb) transport + connection driver for the Tobii Eye Tra
 [dependencies]
 tobii-protocol = { path = "../tobii-protocol" }
 rusb = "0.9"
+
+[dev-dependencies]
+# For one line in the replay test: the digest that pins the reassembled
+# calibration blob to the exact bytes the device sent. tobii-config's SHA-256 is
+# hand-rolled and dependency-free, and is already cross-checked against
+# coreutils by its own tests, so this adds nothing to a release build.
+tobii-config = { path = "../tobii-config" }

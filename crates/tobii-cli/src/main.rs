@@ -942,25 +942,60 @@ fn record_session(args: &[String]) -> CmdResult {
     // one 32,000-character line whose diff says nothing to anybody. Keeping
     // them apart means the file you actually read stays readable, and the
     // opaque one is opaque on purpose.
-    let with_calibration = args.iter().any(|a| a == "--calibration");
+    // Parsed strictly, because the default output path is a COMMITTED TEST
+    // FIXTURE. Every way this used to be lenient ended with one of them
+    // overwritten:
+    //
+    //   * an unrecognised `--flag` was ignored, so `tobii record --calibraton`
+    //     (one letter short) recorded a plain session straight over
+    //     session.tobiicap and said nothing;
+    //   * FILE was "the first argument not starting with --", so
+    //     `tobii record --calibration 60` — the frame count, which
+    //     `--calibration` does not take — wrote the capture to a file called
+    //     `60`.
+    let mut with_calibration = false;
+    let mut positional: Vec<&str> = Vec::new();
+    for a in args.iter().skip(2) {
+        match a.as_str() {
+            "--calibration" => with_calibration = true,
+            f if f.starts_with("--") => {
+                return Err(format!(
+                    "unknown option `{f}`. Usage: tobii record [--calibration] [FILE] [FRAMES]"
+                )
+                .into())
+            }
+            other => positional.push(other),
+        }
+    }
+    if with_calibration {
+        if let Some(n) = positional.first() {
+            if n.parse::<usize>().is_ok() {
+                return Err(format!(
+                    "`{n}` looks like a frame count, and --calibration records no gaze \
+                     frames. Give a FILE, or drop the number."
+                )
+                .into());
+            }
+        }
+        if positional.len() > 1 {
+            return Err("--calibration takes at most a FILE".to_string().into());
+        }
+    }
     let default = if with_calibration {
         "crates/tobii-usb/tests/captures/calibration.tobiicap"
     } else {
         "crates/tobii-usb/tests/captures/session.tobiicap"
     };
-    let path = std::path::PathBuf::from(match args.iter().skip(2).find(|a| !a.starts_with("--")) {
-        Some(p) => p.as_str(),
-        None => default,
-    });
+    let path = std::path::PathBuf::from(*positional.first().unwrap_or(&default));
     let frames: usize = if with_calibration {
         0
     } else {
-        args.iter()
-            .skip(2)
-            .filter(|a| !a.starts_with("--"))
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(40)
+        match positional.get(1) {
+            Some(n) => n
+                .parse()
+                .map_err(|_| format!("FRAMES must be a number, not `{n}`"))?,
+            None => 40,
+        }
     };
 
     eprintln!("recording a session to {} ...", path.display());
@@ -1013,13 +1048,19 @@ fn record_session(args: &[String]) -> CmdResult {
     //
     // A read, never a write: nothing here changes what is on the device.
     if with_calibration {
-        match conn.retrieve_calibration() {
-            Ok(blob) => eprintln!("  calibration blob: {} bytes (fragmented)", blob.0.len()),
-            Err(e) => eprintln!(
-                "  no calibration blob ({e}) — this recording will NOT cover \
-                 fragmented reassembly. Calibrate first if you want that coverage."
-            ),
-        }
+        // Fatal, and nothing is written. This used to print a warning, save
+        // anyway and exit 0 — so a failed retrieve replaced the committed
+        // fixture with a capture that has no fragmented response in it, and the
+        // test that exists to catch the continuation-guard bug would have gone
+        // on passing against a recording that could no longer catch it.
+        let blob = conn.retrieve_calibration().map_err(|e| {
+            format!(
+                "no calibration blob ({e}), so this recording would not cover fragmented \
+                 reassembly — which is the only reason this capture exists. Nothing was \
+                 written. Calibrate the tracker first."
+            )
+        })?;
+        eprintln!("  calibration blob: {} bytes (fragmented)", blob.0.len());
     }
 
     if frames > 0 {

@@ -96,17 +96,23 @@ fn write_line(level: &str, msg: &str) {
     // tail count and the paste.
     // Runs of line breaks collapse to ONE space: `\r\n` is two characters and
     // would otherwise leave a double space in the middle of a sentence.
+    // Every control character, not just the line breaks. The breaks are what
+    // would split one entry into two and break the tail count; ESC and NUL are
+    // what would let a warning's text repaint or truncate the report it ends up
+    // in, since that report is read in a terminal and pasted into an issue. All
+    // of them collapse to a single space, so `\r\n` does not leave a double
+    // one in the middle of a sentence.
     let mut flat = String::with_capacity(msg.len());
-    let mut last_was_break = false;
+    let mut last_was_control = false;
     for c in msg.chars() {
-        if c == '\n' || c == '\r' {
-            if !last_was_break {
+        if c.is_control() {
+            if !last_was_control {
                 flat.push(' ');
             }
-            last_was_break = true;
+            last_was_control = true;
         } else {
             flat.push(c);
-            last_was_break = false;
+            last_was_control = false;
         }
     }
     let line = format!("{} {level} {}", stamp(), flat.trim());
@@ -134,13 +140,26 @@ fn append(line: &str) -> std::io::Result<()> {
     }
     // Trim before appending rather than after, so the file never exceeds the
     // cap even briefly.
+    //
+    // `read_to_string` used to guard this, which meant the cap stopped applying
+    // the moment the file was not valid UTF-8 — and then it grew without limit,
+    // silently, in the one case where something is already wrong. A log this
+    // program wrote is always UTF-8, but the file is a plain path: an
+    // interrupted write, a filesystem that lost a block, or a `TOBII_LOG_FILE`
+    // pointed at something else all produce bytes that are not. So the
+    // fallback is to truncate rather than to give up.
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let keep: Vec<&str> = text.lines().skip(text.lines().count() / 2).collect();
-            let _ = std::fs::write(
-                &path,
-                format!("[older entries dropped]\n{}\n", keep.join("\n")),
-            );
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let keep: Vec<&str> = text.lines().skip(text.lines().count() / 2).collect();
+                let _ = std::fs::write(
+                    &path,
+                    format!("[older entries dropped]\n{}\n", keep.join("\n")),
+                );
+            }
+            Err(_) => {
+                let _ = std::fs::write(&path, "[log was not text; dropped]\n");
+            }
         }
     }
     let mut f = std::fs::OpenOptions::new()
@@ -166,9 +185,13 @@ pub fn recent(max: usize) -> Vec<String> {
 /// — which is the case that matters most, since the GUI's warnings are the ones
 /// a user cannot see.
 pub fn tail_file(max: usize) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(log_path()) else {
+    // Lossy rather than `read_to_string`, for the same reason `append` no
+    // longer gives up on invalid UTF-8: a log that lost a block would
+    // otherwise vanish from the report entirely, exactly when it is wanted.
+    let Ok(bytes) = std::fs::read(log_path()) else {
         return Vec::new();
     };
+    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(max);
     lines[start..].iter().map(|s| s.to_string()).collect()
@@ -246,6 +269,52 @@ pub(crate) mod tests {
         });
         assert!(!last.contains('\n'), "{last}");
         assert!(last.contains("first second third"), "{last}");
+    }
+
+    /// ESC and NUL reach a terminal and an issue tracker if they are not
+    /// stopped here: the report is read in a terminal and pasted into a form,
+    /// and an escape sequence in a warning can repaint or hide what is around
+    /// it.
+    #[test]
+    fn control_characters_do_not_survive_into_a_log_line() {
+        let last = with_own_log("control", || {
+            warn("test: red\u{1b}[31m and \u{0}nul and \u{7}bell");
+            recent(1).pop().expect("a line")
+        });
+        assert!(!last.contains('\u{1b}'), "{last:?}");
+        assert!(!last.contains('\u{0}'), "{last:?}");
+        assert!(!last.contains('\u{7}'), "{last:?}");
+        assert!(last.contains("red"), "{last:?}");
+        assert!(last.contains("nul"), "{last:?}");
+    }
+
+    /// The cap used to be guarded by `read_to_string`, so it stopped applying
+    /// entirely the moment the file was not valid UTF-8 — and then grew without
+    /// limit, silently, in the one case where something is already wrong.
+    #[test]
+    fn a_log_that_is_not_utf8_is_still_capped() {
+        with_own_log("badutf8", || {
+            let path = log_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Over the cap, and invalid UTF-8 throughout.
+            std::fs::write(&path, vec![0xffu8; (MAX_FILE_BYTES + 4096) as usize]).unwrap();
+            warn("test: after the bad bytes");
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                len < MAX_FILE_BYTES,
+                "the file was not trimmed: {len} bytes"
+            );
+            // And the report can still read what is there.
+            assert!(
+                tail_file(5)
+                    .iter()
+                    .any(|l| l.contains("after the bad bytes")),
+                "{:?}",
+                tail_file(5)
+            );
+        });
     }
 
     #[test]

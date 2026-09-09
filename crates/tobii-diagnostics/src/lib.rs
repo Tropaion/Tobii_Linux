@@ -92,10 +92,27 @@ pub fn report() -> String {
     let _ = writeln!(o, "  {:<16} {}", "head-pose model", head_model());
 
     let tail = recent_log();
-    if tail.is_empty() {
-        let _ = writeln!(o, "\nrecent log     (empty — nothing has been logged yet)");
+    // Say when the log is not the program's own. `TOBII_LOG_FILE` points the
+    // log anywhere, which is what lets the tests use a file of their own — but
+    // it also means these lines can be any file's, and a reader who assumes
+    // otherwise is being misled by the report rather than by the person who
+    // pasted it.
+    let source = if std::env::var_os("TOBII_LOG_FILE").is_some() {
+        " — from TOBII_LOG_FILE, not the usual log"
     } else {
-        let _ = writeln!(o, "\nrecent log ({} lines, newest last)", tail.len());
+        ""
+    };
+    if tail.is_empty() {
+        let _ = writeln!(
+            o,
+            "\nrecent log     (empty — nothing has been logged yet{source})"
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "\nrecent log ({} lines, newest last{source})",
+            tail.len()
+        );
         for line in &tail {
             let _ = writeln!(o, "  {line}");
         }
@@ -132,7 +149,10 @@ fn recent_log() -> Vec<String> {
         }
     }
     let start = lines.len().saturating_sub(KEEP);
-    lines[start..].iter().map(|l| tilde(l)).collect()
+    // `sane` as well as `tilde`: lines written by THIS program are already
+    // one printable line each, but the file is a plain path and these are read
+    // in a terminal and pasted into a form.
+    lines[start..].iter().map(|l| sane(&tilde(l))).collect()
 }
 
 /// How this copy was installed, which decides who should update it.
@@ -215,8 +235,8 @@ fn distro() -> String {
             .map(|v| v.trim_matches('"').to_string())
     };
     match (field("PRETTY_NAME="), field("ID=")) {
-        (Some(p), Some(i)) => format!("{p} [{i}]"),
-        (Some(p), None) => p,
+        (Some(p), Some(i)) => format!("{} [{}]", sane(&p), sane(&i)),
+        (Some(p), None) => sane(&p),
         _ => "unknown".into(),
     }
 }
@@ -228,18 +248,19 @@ fn glibc_version() -> String {
     let Ok(out) = std::process::Command::new("ldd").arg("--version").output() else {
         return "unknown".into();
     };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().last())
-        .unwrap_or("unknown")
-        .to_string()
+    sane(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().last())
+            .unwrap_or("unknown"),
+    )
 }
 
 /// Wayland or X11, and which desktop — the two things every GUI bug depends on.
 fn session() -> String {
-    let t = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into());
-    let d = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into());
+    let t = sane(&std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".into()));
+    let d = sane(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into()));
     let w = std::env::var("WAYLAND_DISPLAY").is_ok();
     format!("{t} / {d}{}", if w { "" } else { " (no WAYLAND_DISPLAY)" })
 }
@@ -420,6 +441,33 @@ fn head_model() -> String {
         Status::Missing => "not installed — head tracking is 5 DOF, pitch reads 0".into(),
         Status::Corrupt { .. } => "present but NOT the expected bytes".into(),
     }
+}
+
+/// One line, printable, and short.
+///
+/// Everything in this report is read by a person on an issue tracker, and some
+/// of it comes from outside the program: environment variables, /etc/os-release,
+/// the kernel version, log lines. A value with a newline in it can add a whole
+/// convincing section to the report —
+/// `XDG_CURRENT_DESKTOP="KDE\n\nudev rule       installed"` — and one with an
+/// ANSI escape can hide what is already there from anybody reading it in a
+/// terminal. Neither is an attack worth much on its own; both make the report
+/// less trustworthy than it claims to be, which is the only thing it has.
+///
+/// So: control characters out, and a length cap. 200 characters is longer than
+/// any real value here and short enough that a runaway one cannot push the rest
+/// of the report out of view.
+fn sane(v: &str) -> String {
+    const MAX: usize = 200;
+    let mut out: String = v
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    out = out.trim().to_string();
+    if out.chars().count() > MAX {
+        out = out.chars().take(MAX).collect::<String>() + "…";
+    }
+    out
 }
 
 /// A short, stable stand-in for a value that must not be published verbatim.
@@ -626,7 +674,7 @@ fn passwd_home(user: String) -> Option<String> {
 fn first_line(path: &str) -> String {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|s| s.lines().next().map(|l| l.to_string()))
+        .and_then(|s| s.lines().next().map(sane))
         .unwrap_or_else(|| "unknown".into())
 }
 

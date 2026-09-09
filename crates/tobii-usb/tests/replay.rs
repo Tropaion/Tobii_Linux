@@ -35,6 +35,15 @@ const CAPTURE: &str = include_str!("captures/session.tobiicap");
 /// read, which is the reason the format is line-oriented hex at all.
 const CALIBRATION_CAPTURE: &str = include_str!("captures/calibration.tobiicap");
 
+/// SHA-256 of the reassembled calibration blob, as the device really sent it.
+///
+/// Taken from the committed recording, not from a specification — this pins the
+/// reassembly to the exact bytes, which a length alone does not. If a
+/// re-recording changes it, that is a new fixture and the constant moves with
+/// it; if a code change changes it, reassembly is wrong.
+const EXPECTED_BLOB_SHA256: &str =
+    "bf7980332f2aa1574efc1ef80439dd77fb3ac6724a2f927cbf5a73f47f82d436";
+
 /// How long a replayed request waits. See [`replay_the_recorded_session`].
 const REPLAY_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -140,16 +149,43 @@ fn a_fragmented_calibration_blob_is_reassembled_exactly() {
         "a blob this size must pass the driver's own plausibility check"
     );
 
-    // And it must be the bytes themselves, not merely the right count: a
-    // spliced-in envelope keeps the length if it also drops payload.
-    let recorded_total: usize = cap.received().iter().map(|f| f.len()).sum();
-    assert!(
-        recorded_total > blob.0.len(),
-        "the recording should carry more bytes than the payload (headers, envelopes)"
+    // And it must be the BYTES, not merely the right count.
+    //
+    // This assertion used to be `recorded_total > blob.len()`, comparing the
+    // recording's size against the payload's — which is true because of the
+    // envelopes and headers no matter what reassembly did, so 99 KB of the blob
+    // could be zeroed and the test still passed (checked: it does). A digest is
+    // the only thing that pins the content: a spliced envelope, a dropped chunk
+    // and a reordered run all keep the length if they take the same number of
+    // bytes out somewhere else, and all three change this.
+    let digest = tobii_config::sha256::hex_digest(&blob.0);
+    assert_eq!(
+        digest, EXPECTED_BLOB_SHA256,
+        "the reassembled blob is the right LENGTH but not the right bytes"
     );
 }
 
 /// The fixture is a real recording and stays one.
+///
+/// Both fixtures. This used to check only `session.tobiicap`, so the
+/// calibration capture — the one whose whole purpose is to be a genuine
+/// fragmented response — could have been hand-written and nothing would have
+/// said so.
+#[test]
+fn the_committed_captures_are_real_recorded_sessions() {
+    for (name, text) in [("session", CAPTURE), ("calibration", CALIBRATION_CAPTURE)] {
+        let c = Capture::parse(text).unwrap_or_else(|e| panic!("{name} capture parses: {e}"));
+        assert_eq!(c.header("device"), Some("2104:0313"), "{name}: from an ET5");
+        assert!(
+            c.header("recorded-at").is_some_and(|t| t.starts_with("20")),
+            "{name}: a capture must say when it was taken: {:?}",
+            c.header("recorded-at")
+        );
+        assert!(!c.sent().is_empty(), "{name}: the driver said nothing");
+        assert!(!c.received().is_empty(), "{name}: the device said nothing");
+    }
+}
+
 #[test]
 fn the_committed_capture_is_a_real_recorded_session() {
     let c = capture();
