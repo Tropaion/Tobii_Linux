@@ -345,7 +345,10 @@ fn apply_command<T: Transport>(
         DeviceCommand::ReloadHeadModel => reload_head = true,
         DeviceCommand::SetEnabledEye(e) => {
             let _ = conn.set_enabled_eye(e);
-            let _ = tobii_config::save_enabled_eye(e);
+            // NOT saved here. The UI writes the preference where the user
+            // chooses it, so it survives the tracker being unreachable; writing
+            // it again on the way to the device would mean two places that can
+            // disagree about what the user picked.
             state.lock().unwrap().enabled_eye = Some(e);
         }
         DeviceCommand::CalBegin { improve, token } => {

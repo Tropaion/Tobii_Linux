@@ -104,7 +104,7 @@ impl Capture {
             // an event — so a note with a line break silently injected frames
             // into the capture that the device never sent, and a leading
             // non-ASCII character on the continuation line used to panic.
-            s.push_str(&format!("# {} {}\n", one_line(k), one_line(v)));
+            s.push_str(&format!("# {} {}\n", one_token(k), one_line(v)));
         }
         for e in &self.events {
             let (marker, bytes) = match e {
@@ -223,6 +223,16 @@ fn one_line(s: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// A header KEY, with the separator removed as well as the line breaks.
+///
+/// `parse` splits a header line into key and value at the first space, so a key
+/// containing one comes back as a shorter key and a value with the rest of the
+/// key glued to the front. Keys are ours, not the user's, so this is a guard
+/// against a future typo rather than against input.
+fn one_token(s: &str) -> String {
+    one_line(s).replace(' ', "-")
 }
 
 fn to_hex(bytes: &[u8]) -> String {

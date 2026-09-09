@@ -41,9 +41,15 @@ The hardware-captured **BOTH** GET response is:
                         ^^^^^^^^^^ BE32 value = 3 (BOTH)
 ```
 
-`parse_enabled_eye` reads the trailing BE32. **[CONFIRMED]** —
-`commands.rs::enabled_eye_payload_and_parse_match_device`,
-`connection.rs::get_enabled_eye_parses_device_response`.
+`parse_enabled_eye` parses the payload **structurally** — the 2-byte prefix,
+then one type-`0x02` field of size 4 — via `tlv::Reader`. **[CONFIRMED]** against
+the committed replay capture, whose real reply is
+`0000 02 00000004 00000003`.
+
+> It used to read the trailing big-endian `u32` of *any* slice, with no check
+> that the bytes were a field of the right type or that they came from this
+> response at all: `parse_enabled_eye(&[0,0,0,2])` returned `Some(Right)` from
+> four bare bytes. Fixed in `1a3bf07`.
 
 > **This used to warn of an enum landmine. There isn't one — that warning was
 > the bug.** `cal_add_point` is `0x406`, not `0x408`, and its eye argument uses

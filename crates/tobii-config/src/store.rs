@@ -87,11 +87,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // while the bytes it points at are not, which yields an empty or partial
     // file under a name that was never supposed to hold one. The documentation
     // used to claim crash-safety this did not provide.
-    {
+    // Any failure here removes the temp file: the rename path below already
+    // cleans up after itself, and leaving debris only on the write path would
+    // be an inconsistency nobody would think to look for.
+    let written = (|| {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
 
     // Same directory, so rename is atomic (never crosses a filesystem).

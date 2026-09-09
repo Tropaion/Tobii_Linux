@@ -677,6 +677,11 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     // Radio indicators with SEPARATE labels: a CheckButton's built-in label
     // clips its text on this theme, a standalone GtkLabel does not.
     let eyes_ctl = gtk::Box::new(Orientation::Horizontal, 16);
+    // What the user last chose, for the case the device cannot answer. The
+    // radios were seeded only from the device, so a hub opened with the tracker
+    // unplugged showed "both" no matter what had been selected — and touching
+    // a radio to correct it would send a command that was then dropped.
+    let saved_eye = tobii_config::load_enabled_eye().ok().flatten();
     let radio = |text: &str, group: Option<&CheckButton>| {
         let cb = CheckButton::new();
         if let Some(g) = group {
@@ -693,9 +698,20 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
         (cb, row)
     };
     let (r_both, box_both) = radio("Both eyes", None);
-    r_both.set_active(true);
     let (r_left, box_left) = radio("Left eye only", Some(&r_both));
     let (r_right, box_right) = radio("Right eye only", Some(&r_both));
+    // Seeded from the SAVED preference before the device has said anything.
+    // The device's own value still overrides this on connect (below), which is
+    // the authority when there is one — but with the tracker unplugged the hub
+    // used to show "both" whatever the user had chosen, and correcting it sent
+    // a command that was then dropped.
+    eye_seeding.set(true);
+    match saved_eye {
+        Some(EnabledEye::Left) => r_left.set_active(true),
+        Some(EnabledEye::Right) => r_right.set_active(true),
+        _ => r_both.set_active(true),
+    }
+    eye_seeding.set(false);
     eyes_ctl.append(&box_both);
     eyes_ctl.append(&box_left);
     eyes_ctl.append(&box_right);

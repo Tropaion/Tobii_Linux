@@ -38,9 +38,22 @@ A fixed captured 47-byte payload. **[CONFIRMED]** (`commands.rs` `HELLO_PAYLOAD`
 ```
 
 ### 2. query_realm — op `0x640`
-Payload `00 00`. The response's first `size==4` field is the **realm_type**
-(0 = no authentication required). **[CODE-VERIFIED]** — `realm.rs::build_query_realm`,
-`handshake.rs::resp_first_u32`.
+Payload `00 00`. The response carries the **realm_type**, where 0 means no
+authentication is required. **[CONFIRMED]** on hardware that it is 0 for the ET5.
+
+> **The parse is known-wrong, and the wrongness is load-bearing.** `resp_fields`
+> walks a 4-byte `[type][pad][size:u16]` header, but the device replies with the
+> 5-byte `[type][size:u32]` framing from `tlv.rs`. The real reply is
+> `0000 02 00000004 00000000 …`, which that walker turns into nonsense and finds
+> no `size==4` field in — so the code falls back to 0, which is the right
+> answer, reached by accident.
+>
+> Making the unreadable case *fail* was tried in `1a3bf07` and reverted in
+> `f81a7c6`: the replay test caught it breaking every connection. Switching the
+> walker to the 5-byte framing was not done either — this is the only reply with
+> content we have, and this device's open-realm reply is empty, so nothing else
+> in that walker has ever met real data. If a tracker that demands authentication
+> turns up, start here, and re-record.
 
 ### 3. open_realm — op `0x76c`
 Payload `00 00` + `u32(realm_type)` (TLV type 2) + a single raw `0x00` choice

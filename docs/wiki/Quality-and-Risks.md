@@ -96,8 +96,8 @@ because the reasoning is worth more than the tidiness.
 **Open:**
 
 - **A failed query-realm parse is indistinguishable from "no authentication
-  required."** `resp_first_u32` returns 0 both when it finds a zero and when it
-  finds nothing, and 0 means skip auth. Making the unreadable case *fail* was
+  required."** `resp_first_u32_opt` cannot tell them apart, because the walker
+  above finds no field either way, and 0 means skip auth. Making the unreadable case *fail* was
   tried and the replay harness caught it breaking every connection: the real
   reply uses the 5-byte TLV framing while `resp_fields` walks a 4-byte one, so
   it finds nothing and the 0 default is what makes the handshake work. The

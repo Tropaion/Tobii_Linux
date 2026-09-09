@@ -49,13 +49,38 @@ fn le32(b: &[u8]) -> u32 {
 ///
 /// So the envelope's own length field is checked too. Inbound it **includes**
 /// the 8-byte envelope (asymmetric with outbound — see the module docs), so a
-/// genuine continuation satisfies all three of:
+/// genuine continuation satisfies both of:
 ///
-/// * it is at least an envelope long, and no longer than the chunk carrying it;
+/// * it is at least an envelope long;
 /// * it does not claim more payload than the in-flight frame still needs.
 ///
-/// The TLV false positive fails the first test: `01 00 00 00 04 ...` reads a
+/// The TLV false positive fails the first test: `01 00 00 00 04 …` reads a
 /// length of 4, which is smaller than the envelope it would have to be.
+///
+/// # What this must NOT also check
+///
+/// An earlier version required `env_len <= src.len()` — that the envelope's
+/// length fit inside the USB read carrying it. That looks obviously right and
+/// is wrong about this device, and it broke every calibration retrieval on real
+/// hardware while every test stayed green.
+///
+/// Measured on an ET5: `env_len` is the size of the whole continuation **run**,
+/// not of the read it arrives in. A 778 KB calibration blob comes back as
+///
+/// ```text
+/// chunk1  len=100    env_len=778188   <- one envelope, then 47 raw reads
+/// chunk52 len=8      env_len=572      <- a second envelope, alone in an 8-byte read
+/// ```
+///
+/// and `778188-8 + 572-8 + 11 == 778755 == plen`. Both real envelopes fail
+/// `env_len <= src.len()`, so neither was stripped, 16 envelope bytes were
+/// spliced into the payload, and the leftovers made the next frame decode as
+/// `BadDirection` — which `feed` reports as an error, discarding the frame it
+/// had already built. The caller then saw no response at all and timed out.
+///
+/// CI could not catch it: the committed replay capture contains no fragmented
+/// response, and the two tests below build continuations whose length field
+/// happens to equal their chunk length.
 fn looks_like_continuation(src: &[u8], remaining: usize) -> bool {
     if src.len() < ENVELOPE_SIZE
         || src[0] != 0x01
@@ -66,7 +91,10 @@ fn looks_like_continuation(src: &[u8], remaining: usize) -> bool {
         return false;
     }
     let env_len = le32(&src[4..]) as usize;
-    env_len >= ENVELOPE_SIZE && env_len <= src.len() && env_len - ENVELOPE_SIZE <= remaining
+    // Strictly greater: an envelope declaring a run of zero payload bytes is
+    // not something the device sends, and believing one swallows 8 bytes of
+    // real payload and desyncs the frame.
+    env_len > ENVELOPE_SIZE && env_len - ENVELOPE_SIZE <= remaining
 }
 
 impl Parser {
@@ -196,7 +224,66 @@ mod tests {
         );
     }
 
-    /// A genuine continuation envelope is still stripped.
+    /// The shape a REAL fragmented response has, which no test had.
+    ///
+    /// Measured on an ET5 retrieving a 778 KB calibration blob: the
+    /// continuation envelope's length field is the size of the whole
+    /// continuation RUN, so it is far larger than the USB read carrying it, and
+    /// a second envelope arrives ALONE in an 8-byte read. A guard that required
+    /// the length to fit inside its own chunk rejected both, spliced 16
+    /// envelope bytes into the payload, and made every calibration retrieval
+    /// fail — with every test green, because every test built an envelope whose
+    /// length happened to equal its chunk.
+    #[test]
+    fn a_continuation_envelope_longer_than_its_own_chunk_is_still_stripped() {
+        // Scaled down, same shape: header says 40 payload bytes, delivered as
+        // an envelope claiming the whole 40-byte run in a 12-byte read, then
+        // the rest raw, then a second envelope alone in an 8-byte read.
+        let payload_len = 40usize;
+        let mut first = Vec::new();
+        first.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        first.extend_from_slice(&((ENVELOPE_SIZE + TTP_HDR_SIZE) as u32).to_le_bytes());
+        let mut hdr = vec![0u8; TTP_HDR_SIZE];
+        hdr[0..4].copy_from_slice(&0x52u32.to_be_bytes());
+        hdr[4..8].copy_from_slice(&7u32.to_be_bytes());
+        hdr[12..16].copy_from_slice(&0x44cu32.to_be_bytes()); // OP_CAL_RETRIEVE
+        hdr[20..24].copy_from_slice(&(payload_len as u32).to_be_bytes());
+        first.extend_from_slice(&hdr);
+
+        let mut p = Parser::new();
+        assert!(p.feed(&first).unwrap().is_empty(), "header only so far");
+
+        // First run: 32 payload bytes, announced as 8 + 32 but delivered in a
+        // 12-byte read (envelope + 4 bytes) followed by raw reads.
+        let mut run1 = vec![0x01, 0x00, 0x00, 0x00];
+        run1.extend_from_slice(&((ENVELOPE_SIZE + 32) as u32).to_le_bytes());
+        run1.extend_from_slice(&[0xaa; 4]);
+        assert!(p.feed(&run1).unwrap().is_empty());
+        assert!(p.feed(&[0xaa; 28]).unwrap().is_empty(), "raw continuation");
+
+        // Second run: an envelope ALONE in an 8-byte read, then its 8 bytes.
+        let mut run2 = vec![0x01, 0x00, 0x00, 0x00];
+        run2.extend_from_slice(&((ENVELOPE_SIZE + 8) as u32).to_le_bytes());
+        assert_eq!(run2.len(), 8, "the envelope fills the whole read");
+        assert!(p.feed(&run2).unwrap().is_empty());
+        let frames = p.feed(&[0xbb; 8]).unwrap();
+
+        assert_eq!(frames.len(), 1, "the frame should have completed");
+        assert_eq!(frames[0].op, 0x44c);
+        let mut want = vec![0xaa; 32];
+        want.extend_from_slice(&[0xbb; 8]);
+        assert_eq!(
+            frames[0].payload, want,
+            "envelope bytes were spliced into the payload"
+        );
+        assert_eq!(p.buffered(), 0, "nothing should be left over");
+    }
+
+    /// A continuation whose declared run happens to equal its chunk.
+    ///
+    /// The easy case, and — before the hardware measurement above — the ONLY
+    /// case any test covered, which is why a guard that required exactly that
+    /// passed everything and broke every calibration retrieval.
     #[test]
     fn a_real_continuation_envelope_is_still_stripped() {
         let payload_len = 12usize;

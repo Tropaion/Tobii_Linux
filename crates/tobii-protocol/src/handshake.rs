@@ -37,9 +37,9 @@ fn resp_fields(data: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
     //     0000  02 00000004 00000000  02 00000004 00000000  02 00000004 00000000
     //           ^ type 2, size 4, value 0 = no authentication required
     //
-    // Walked with the header below, that yields nonsense (`type=4 size=256`)
-    // and no `size==4` field at all — so `resp_first_u32` falls back to 0, which
-    // is *the correct answer*, reached by accident.
+    // Walked with the header below, that yields no `size==4` field at all — so
+    // the caller falls back to 0, which is *the correct answer*, reached by
+    // accident.
     //
     // Switching this to the 5-byte framing was NOT done, because the only reply
     // with any content that we have is the one above: on this device the
@@ -326,10 +326,17 @@ mod resp_tests {
             0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
             0x00,
         ]);
+        // It must proceed to open-realm...
+        let next = hs.poll();
         assert!(
-            matches!(hs.poll(), HandshakeAction::Send(_)),
+            matches!(next, HandshakeAction::Send(_)),
             "the handshake must proceed to open-realm, not fail"
         );
+        // ...and with realm_type 0, which is what "no authentication" means and
+        // what the fallback is for. Without this the test passed for any value,
+        // including one that would have sent an auth exchange the device does
+        // not expect.
+        assert_eq!(hs.realm_type, 0, "an unreadable reply must mean no auth");
     }
 
     #[test]
