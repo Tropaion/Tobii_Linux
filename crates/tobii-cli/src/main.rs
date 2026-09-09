@@ -68,7 +68,7 @@ fn main() -> ExitCode {
                  tobii headpose --model-status\n  \
                  tobii headpose --fetch-model [--agree]\n  \
                  tobii headpose --check-update\n  \
-                 tobii record [FILE]\n  \
+                 tobii record [--calibration] [FILE]\n  \
                  tobii debug [--file PATH]\n  \
                  tobii headpose --remove-model\n  \
                  tobii headpose --install-model <FILE>\n  \
@@ -934,15 +934,42 @@ fn debug_report(args: &[String]) -> CmdResult {
 /// meant to alter the conversation: a capture is a photograph of what happened
 /// once, not a specification.
 fn record_session(args: &[String]) -> CmdResult {
-    let path = std::path::PathBuf::from(match args.get(2) {
+    // Two captures, not one, and the split is about reviewability.
+    //
+    // The everyday session is a few hundred short lines: a re-recording after a
+    // firmware change produces a diff a human can read, which is the whole
+    // reason the format is line-oriented hex. The calibration blob is 778 KB —
+    // one 32,000-character line whose diff says nothing to anybody. Keeping
+    // them apart means the file you actually read stays readable, and the
+    // opaque one is opaque on purpose.
+    let with_calibration = args.iter().any(|a| a == "--calibration");
+    let default = if with_calibration {
+        "crates/tobii-usb/tests/captures/calibration.tobiicap"
+    } else {
+        "crates/tobii-usb/tests/captures/session.tobiicap"
+    };
+    let path = std::path::PathBuf::from(match args.iter().skip(2).find(|a| !a.starts_with("--")) {
         Some(p) => p.as_str(),
-        None => "crates/tobii-usb/tests/captures/session.tobiicap",
+        None => default,
     });
-    let frames: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let frames: usize = if with_calibration {
+        0
+    } else {
+        args.iter()
+            .skip(2)
+            .filter(|a| !a.starts_with("--"))
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40)
+    };
 
     eprintln!("recording a session to {} ...", path.display());
     let transport = tobii_usb::RecordTransport::new(UsbTransport::open()?)
-        .with_note("connect, display area, enabled eye, gaze subscribe, gaze frames, unsubscribe")
+        .with_note(if with_calibration {
+            "connect, display area, enabled eye, calibration retrieve (fragmented)"
+        } else {
+            "connect, display area, enabled eye, gaze subscribe, gaze frames, unsubscribe"
+        })
         .header("recorded-at", &now_rfc3339())
         .header("device", "2104:0313")
         .header("driver-version", env!("CARGO_PKG_VERSION"));
@@ -974,17 +1001,42 @@ fn record_session(args: &[String]) -> CmdResult {
     let eye = conn.get_enabled_eye()?;
     eprintln!("  enabled eye: {eye:?}");
 
-    conn.subscribe_stream(tobii_protocol::frame::STREAM_GAZE)?;
-    eprintln!("  subscribed; collecting {frames} gaze frames (look at the screen)...");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut got = 0usize;
-    while got < frames && Instant::now() < deadline {
-        if conn.next_gaze().is_some() {
-            got += 1;
+    // Retrieve the calibration blob — the ONLY thing this driver does that
+    // produces a fragmented response, and therefore the only way a capture can
+    // exercise the parser's continuation-envelope handling.
+    //
+    // This is not hypothetical coverage: a guard that assumed the continuation
+    // envelope's length field fits inside its own USB read passed every test
+    // and broke every calibration retrieval on real hardware, because the field
+    // is the size of the whole continuation RUN. A capture without a fragmented
+    // response cannot catch that class at all.
+    //
+    // A read, never a write: nothing here changes what is on the device.
+    if with_calibration {
+        match conn.retrieve_calibration() {
+            Ok(blob) => eprintln!("  calibration blob: {} bytes (fragmented)", blob.0.len()),
+            Err(e) => eprintln!(
+                "  no calibration blob ({e}) — this recording will NOT cover \
+                 fragmented reassembly. Calibrate first if you want that coverage."
+            ),
         }
     }
-    eprintln!("  {got} gaze frames");
-    let _ = conn.unsubscribe_stream(tobii_protocol::frame::STREAM_GAZE);
+
+    if frames > 0 {
+        conn.subscribe_stream(tobii_protocol::frame::STREAM_GAZE)?;
+        eprintln!("  subscribed; collecting {frames} gaze frames (look at the screen)...");
+    }
+    let mut got = 0usize;
+    if frames > 0 {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while got < frames && Instant::now() < deadline {
+            if conn.next_gaze().is_some() {
+                got += 1;
+            }
+        }
+        eprintln!("  {got} gaze frames");
+        let _ = conn.unsubscribe_stream(tobii_protocol::frame::STREAM_GAZE);
+    }
 
     let mut capture = conn.into_transport().into_capture();
     if !corners_header.is_empty() {
@@ -996,7 +1048,7 @@ fn record_session(args: &[String]) -> CmdResult {
         std::fs::create_dir_all(parent)?;
     }
     tobii_usb::capture::save(&capture, &path)?;
-    if got == 0 {
+    if frames > 0 && got == 0 {
         eprintln!(
             "warning: no gaze frames were captured — the recording still covers the \
              handshake, but nothing in it exercises gaze decoding."

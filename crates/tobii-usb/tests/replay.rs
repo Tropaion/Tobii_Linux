@@ -26,6 +26,15 @@ use tobii_usb::Connection;
 
 const CAPTURE: &str = include_str!("captures/session.tobiicap");
 
+/// A second recording, covering the one thing the session capture cannot: a
+/// response too large for the 16 KB read buffer, which the device splits across
+/// many USB transfers with continuation envelopes between them.
+///
+/// Kept separate because it is 1.5 MB of one 32,000-character line. The session
+/// capture stays short enough that a re-recording produces a diff a human can
+/// read, which is the reason the format is line-oriented hex at all.
+const CALIBRATION_CAPTURE: &str = include_str!("captures/calibration.tobiicap");
+
 /// How long a replayed request waits. See [`replay_the_recorded_session`].
 const REPLAY_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -86,6 +95,58 @@ fn replay_the_recorded_session() -> (ReplayTransport, Vec<tobii_protocol::GazeSa
     }
     let _ = conn.unsubscribe_stream(tobii_protocol::frame::STREAM_GAZE);
     (conn.into_transport(), samples)
+}
+
+/// **The fragmentation test.** A 778 KB calibration blob, reassembled from the
+/// 60 device reads it really arrived in.
+///
+/// This exists because a guard that assumed the continuation envelope's length
+/// field fits inside its own USB read passed every test in the workspace and
+/// broke every calibration retrieval on real hardware: the field is the size of
+/// the whole continuation RUN, so a genuine envelope announcing 778,188 bytes
+/// turned up in a 100-byte read. Sixteen envelope bytes were spliced into the
+/// payload, the frame decoded as `BadDirection`, and the caller timed out with
+/// no response at all.
+///
+/// Nothing could catch that: the session capture has no fragmented response,
+/// and every parser unit test built an envelope whose length happened to equal
+/// its chunk. This is the coverage that closes it — and it is end to end,
+/// through `Connection::retrieve_calibration`, not just the parser.
+#[test]
+fn a_fragmented_calibration_blob_is_reassembled_exactly() {
+    let cap = Capture::parse(CALIBRATION_CAPTURE).expect("the calibration capture parses");
+    let mut conn =
+        Connection::connect(ReplayTransport::new(&cap)).expect("the handshake completes");
+    conn.set_request_timeout(REPLAY_TIMEOUT);
+    if let Some(corners) = recorded_corners(&cap) {
+        let _ = conn.set_display_area(&corners);
+    }
+    let _ = conn.get_enabled_eye();
+
+    let blob = conn
+        .retrieve_calibration()
+        .expect("the recorded blob must come back");
+
+    // The size the device really sent. A reassembly that drops or splices
+    // envelope bytes lands near this but not on it, which is exactly how the
+    // bug behaved.
+    assert_eq!(
+        blob.0.len(),
+        778_753,
+        "the reassembled blob is the wrong length"
+    );
+    assert!(
+        tobii_usb::is_plausible_calibration(&blob.0),
+        "a blob this size must pass the driver's own plausibility check"
+    );
+
+    // And it must be the bytes themselves, not merely the right count: a
+    // spliced-in envelope keeps the length if it also drops payload.
+    let recorded_total: usize = cap.received().iter().map(|f| f.len()).sum();
+    assert!(
+        recorded_total > blob.0.len(),
+        "the recording should carry more bytes than the payload (headers, envelopes)"
+    );
 }
 
 /// The fixture is a real recording and stays one.

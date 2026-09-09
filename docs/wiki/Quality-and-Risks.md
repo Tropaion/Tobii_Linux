@@ -117,9 +117,11 @@ because the reasoning is worth more than the tidiness.
 - **`UsbTransport` itself has no test that touches libusb.** Open/claim/detach,
   the vendor control transfers, chunking, `soak_incoming`, and the `Drop`
   session close are exercised only by running the program.
-- **The replay capture covers a narrow slice**: 8 host frames and 48 device
-  frames — handshake, subscribe, display area, enabled eye, gaze, unsubscribe.
-  No calibration, no camera stream, no error paths.
+- **The replay captures cover two slices, not everything.** `session.tobiicap`
+  is the everyday path (handshake, display area, enabled eye, gaze, unsubscribe);
+  `calibration.tobiicap` adds the one fragmented response this driver produces,
+  a 778 KB blob arriving across 60 reads with continuation envelopes. Still no
+  camera stream and no error paths.
 - **The replay test hand-reproduces `tobii-cli`'s recording sequence.** The two
   live in different crates and can drift apart silently.
 - **Past `SOAK_CAP` (1 MiB), `soak_incoming` drops IN bytes** — creating exactly

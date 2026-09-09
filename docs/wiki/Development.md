@@ -48,15 +48,16 @@ pinned; see [[Architecture-Decisions]] §18.
 
 | Crate | Tests | Shape |
 |---|---|---|
-| `tobii-protocol` | 79 | Inline unit tests over captured real frames |
-| `tobii-usb` | 49 | 41 unit + 6 replay (see below) |
+| `tobii-protocol` | 80 | Inline unit tests over captured real frames |
+| `tobii-usb` | 50 | 41 unit + 6 replay (see below) |
 | `tobii-config` | 53 | Unit; SHA-256 cross-checked against coreutils |
 | `tobii-headpose` | 93 (+7 ignored) | The ignored ones need the 13 MB model |
 | `tobii-update` | 61 | 51 unit + 8 install end-to-end |
-| `tobii-cli` | 14 | Argument parsing and text helpers |
+| `tobii-diagnostics` | 13 | The report and the log; a test fails if it leaks a home path |
+| `tobii-cli` | 9 | Argument parsing and text helpers |
 | `tobii-gtk` | 191 | Inline; pure logic split out from widget code |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
-| **Total** | **572** | |
+| **Total** | **582** | |
 
 There are almost no integration-test directories: the convention is inline
 `#[cfg(test)]` modules next to the code, with pure logic deliberately factored
@@ -67,9 +68,16 @@ out of widget and I/O code so it can be tested at all.
 Most of what "needs an ET5" does not, once a session has been recorded.
 
 ```sh
-tobii record                              # → crates/tobii-usb/tests/captures/session.tobiicap
+tobii record                 # the everyday session
+tobii record --calibration   # + the one fragmented response there is
 cargo test -p tobii-usb --test replay
 ```
+
+Two captures, because they want different things. `session.tobiicap` is a few
+hundred short lines, so a re-recording produces a diff a human can read — which
+is why the format is line-oriented hex at all. `calibration.tobiicap` is 1.5 MB
+of one 32,000-character line and is opaque on purpose: it exists to exercise
+reassembly of a response larger than the 16 KB read buffer.
 
 `tobii record` wraps the USB transport and writes every frame, both directions,
 to a line-oriented hex file with headers. The replay tests drive the driver
@@ -84,11 +92,19 @@ does what it did when the recording was taken — not that the device still does
 Re-record after a firmware update. The header carries when it was taken and the
 display geometry used, so the byte comparison reproduces on any machine.
 
-Its limits are worth knowing before you trust a green run: the fixture covers 8
-host frames and 48 device frames — handshake, subscribe, display area, enabled
-eye, gaze, unsubscribe. No calibration, no camera stream, no error paths. And
-because `RecordTransport` wraps the *outer* transport, replaying exercises none
-of `UsbTransport` itself.
+Its limits are worth knowing before you trust a green run: no camera stream and
+no error paths, and because `RecordTransport` wraps the *outer* transport,
+replaying exercises none of `UsbTransport` itself.
+
+**Why the calibration capture exists.** A guard added to the parser assumed a
+continuation envelope's length field fits inside the USB read carrying it. It
+passed every test in the workspace and broke every calibration retrieval on real
+hardware, because the field is the size of the whole continuation *run* — a
+genuine envelope announcing 778,188 bytes arrives in a 100-byte read. Nothing
+could catch it: no capture had a fragmented response, and every parser unit test
+built an envelope whose length happened to equal its chunk. Re-introducing that
+clause now fails `a_fragmented_calibration_blob_is_reassembled_exactly` with the
+same `NoResponse { op: 0x44c }` the hardware gave.
 
 ### What cannot be tested without hardware
 
