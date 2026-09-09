@@ -54,7 +54,7 @@ jobs:
             build-essential ca-certificates curl git pkg-config \
             libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # No toolchain named here: rust-toolchain.toml pins the version and its
       # components, so CI and a contributor's machine run the same clippy and

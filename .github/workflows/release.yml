@@ -80,7 +80,7 @@ jobs:
             libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev \
             rpm
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The pinned toolchain from rust-toolchain.toml, so a release is built
       # with the same compiler the checks ran under.
@@ -166,28 +166,50 @@ jobs:
       # most developer machines have no rpmbuild, so the .rpm's dependencies
       # cannot be read where it is written — an unverifiable claim in a script
       # is how `AutoReqProv: no` sat there silently declaring nothing.
+      # The archive floor above is measured from the binaries; this checks the
+      # PACKAGES actually say so, and that they parse at all. It is here rather
+      # than in package.sh because most developer machines have neither
+      # `rpmbuild` nor `dpkg-deb`, so neither package can be read where it is
+      # written — an unverifiable claim in a script is how `AutoReqProv: no`
+      # sat there silently declaring nothing, and how a `#` comment got into a
+      # deb control file, which is what failed the first v0.1.0 tag.
+      #
+      # Every failure names itself. The first version of this step used an
+      # unguarded `ls dist/*.deb` and unchecked command substitutions under
+      # `set -eu`, so a broken package surfaced as "exit code 2" with no clue
+      # which command produced it.
       - name: Check the packages declare the glibc floor
         run: |
           set -eu
-          deb="$(ls dist/*.deb)"
-          deps="$(dpkg-deb -f "$deb" Depends)"
+          echo "dist/ contains:"; ls -la dist/
+
+          deb="$(find dist -maxdepth 1 -name '*.deb' -print -quit)"
+          [ -n "$deb" ] || { echo "::error::no .deb in dist/"; exit 1; }
+          if ! deps="$(dpkg-deb -f "$deb" Depends 2>&1)"; then
+            echo "::error::dpkg-deb could not read $deb — the control file is malformed: $deps"
+            exit 1
+          fi
           echo "deb Depends: $deps"
           case "$deps" in
             *"libc6 (>= "*) ;;
-            *) echo "::error::the .deb depends on libc6 with no version — apt would install it on a system too old to run it" >&2; exit 1 ;;
+            *) echo "::error::the .deb depends on libc6 with no version" >&2; exit 1 ;;
           esac
-          rpm_file="$(ls dist/*.rpm 2>/dev/null || true)"
-          if [ -n "$rpm_file" ]; then
-            reqs="$(rpm -qpR "$rpm_file")"
-            echo "rpm Requires:"; echo "$reqs"
-            echo "$reqs" | grep -q 'libc\.so\.6(GLIBC_' || {
-              echo "::error::the .rpm declares no versioned glibc requirement" >&2; exit 1; }
-            echo "$reqs" | grep -q 'libgtk-4' || {
-              echo "::error::the .rpm declares no gtk4 soname — automatic dependency generation is off again" >&2; exit 1; }
-          else
-            echo "::error::no .rpm in dist/ — rpmbuild is supposed to be installed in this container" >&2
+
+          rpm_file="$(find dist -maxdepth 1 -name '*.rpm' -print -quit)"
+          if [ -z "$rpm_file" ]; then
+            echo "::error::no .rpm in dist/ — rpmbuild is supposed to be installed here" >&2
+            command -v rpmbuild || echo "rpmbuild is not on PATH"
             exit 1
           fi
+          if ! reqs="$(rpm -qpR "$rpm_file" 2>&1)"; then
+            echo "::error::rpm could not read $rpm_file: $reqs" >&2
+            exit 1
+          fi
+          echo "rpm Requires:"; echo "$reqs"
+          echo "$reqs" | grep -q 'libc\.so\.6(GLIBC_' || {
+            echo "::error::the .rpm declares no versioned glibc requirement" >&2; exit 1; }
+          echo "$reqs" | grep -q 'libgtk-4\.so' || {
+            echo "::error::the .rpm declares no gtk4 soname" >&2; exit 1; }
 
       - name: Verify SHA256SUMS matches the archive
         run: cd dist && sha256sum -c SHA256SUMS
@@ -211,7 +233,7 @@ jobs:
     steps:
       # Needed for docs/releases/<tag>.md below — this job would otherwise have
       # only the downloaded artifacts and no repository at all.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/download-artifact@v4
         with:

@@ -145,16 +145,50 @@ glibc_req=""
 rpm_bits=""
 if command -v objdump >/dev/null 2>&1; then
     for bin in tobii tobii-gtk; do
-        this="$(objdump -T "$payload/usr/bin/$bin" 2>/dev/null \
+        this="$(LC_ALL=C objdump -T "$payload/usr/bin/$bin" 2>/dev/null \
             | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
         [[ -n "$this" ]] || continue
         glibc_req="$(printf '%s\n%s\n' "$glibc_req" "${this#GLIBC_}" | sort -V | tail -1)"
-        if [[ -z "$rpm_bits" ]] && objdump -f "$payload/usr/bin/$bin" 2>/dev/null \
+        # LC_ALL=C: objdump TRANSLATES its field names — this reads
+        # "Dateiformat elf64-x86-64" on a German machine, so the probe found
+        # nothing and every rpm requirement lost its (64bit) tag. The same trap
+        # this file already documents for `pacman -Qo`, walked into again.
+        if [[ -z "$rpm_bits" ]] && LC_ALL=C objdump -f "$payload/usr/bin/$bin" 2>/dev/null \
             | grep -q 'file format elf64'; then
             rpm_bits="(64bit)"
         fi
     done
 fi
+# The SONAMEs the binaries link, as rpm dependency syntax.
+#
+# Not package names: `gtk4` on Fedora is `libgtk-4-1` on openSUSE, which made
+# this package uninstallable there. Not left to rpm's automatic generator
+# either — these are built on Debian, where rpmbuild runs but its ELF
+# dependency extraction cannot be checked from here. A SONAME is what every
+# rpm-based distribution Provides whatever it calls the package, and deriving
+# it from the ELF means it cannot drift from what the binaries need.
+rpm_sonames=""
+if command -v objdump >/dev/null 2>&1; then
+    for bin in tobii tobii-gtk; do
+        while read -r so; do
+            # libc is covered by the versioned symbol requirement below, and
+            # nobody declares a dependency on the dynamic loader.
+            case "$so" in libc.so.*|ld-linux*|"") continue ;; esac
+            # Separator-exact: the accumulator joins with ", ", so a pattern
+            # built with "," alone matches nothing and every soname the two
+            # binaries share is listed twice.
+            case ", $rpm_sonames, " in *", $so()${rpm_bits}, "*) continue ;; esac
+            rpm_sonames="${rpm_sonames:+$rpm_sonames, }$so()${rpm_bits}"
+        done < <(LC_ALL=C objdump -p "$payload/usr/bin/$bin" 2>/dev/null \
+                 | awk '/NEEDED/ {print $2}')
+    done
+fi
+if [[ -n "$rpm_sonames" ]]; then
+    echo "  rpm sonames: $rpm_sonames"
+else
+    echo "  WARNING: could not derive the rpm's soname requirements" >&2
+fi
+
 if [[ -n "$glibc_req" ]]; then
     echo "  glibc floor: $glibc_req"
 else
@@ -162,6 +196,18 @@ else
 fi
 
 # --------------------------------------------------------------------- the deb
+#
+# NOTE: everything inside the `control` heredoc below is parsed by dpkg as
+# RFC822-ish fields. There is NO comment syntax — a `#` line in there makes
+# dpkg-deb reject the whole package with "field name '#' must be followed by
+# colon", which is how the v0.1.0 tag first failed. Explanations go HERE.
+#
+# `Depends` lists every SONAME the binaries actually link, not just the
+# interesting ones: cairo, libgcc and glib arrive transitively through
+# libgtk-4-1 in practice, but Policy asks for a direct dependency on what you
+# directly link, and "something else happens to pull it in" is not a
+# dependency. The glib alternative spans the t64 rename — trixie and Ubuntu
+# 24.04 ship libglib2.0-0t64, older releases libglib2.0-0.
 
 
 ctl="$work/control-dir"
@@ -176,13 +222,6 @@ Maintainer: Fabian Plaimauer <noreply@github.com>
 Installed-Size: ${installed_kb}
 Depends: libc6${glibc_req:+ (>= ${glibc_req})}, libgtk-4-1, libgtk4-layer-shell0, libusb-1.0-0, libcairo2, libgcc-s1, libglib2.0-0t64 | libglib2.0-0
 Recommends: curl | wget
-# The list above is every SONAME the binaries actually link (checked with
-# `objdump -p`), not just the interesting ones. cairo, libgcc and glib arrive
-# transitively through libgtk-4-1 in practice, but Policy asks for a direct
-# dependency on what you directly link, and "it works because something else
-# happens to pull it in" is not a dependency. The glib alternative spans the
-# t64 rename: trixie and Ubuntu 24.04 ship libglib2.0-0t64, older releases
-# libglib2.0-0.
 Homepage: https://github.com/Tropaion/Tobii_Linux
 Description: Linux runtime and GUI for the Tobii Eye Tracker 5
  A clean-room reimplementation of the Tobii Eye Tracker 5's USB protocol, with
@@ -224,6 +263,26 @@ if [ "$1" = configure ]; then
 fi
 EOF
 chmod 755 "$ctl/postinst"
+
+# The control file has to PARSE, and this is the only machine that will check.
+#
+# dpkg-deb is not installed on most developer machines, so `control` was only
+# ever eyeballed with grep here — which is how a `#` comment got into it and
+# failed the first v0.1.0 tag. A deb control file is RFC822-ish: every line
+# either continues the previous one (leading whitespace) or starts a
+# `Field-Name:`. That is cheap to assert without dpkg.
+awk '
+    /^[ \t]/ { next }
+    /^$/     { next }
+    !/^[A-Za-z0-9-]+:/ {
+        printf "control line %d is not a field: %s\n", NR, $0 > "/dev/stderr"
+        bad = 1
+    }
+    END { exit bad }
+' "$ctl/control" || {
+    echo "the generated control file would be rejected by dpkg" >&2
+    exit 1
+}
 
 # `md5sums` is what `dpkg -V` verifies against. Paths are relative to /.
 #
@@ -350,7 +409,7 @@ BuildArch:      ${arch}
 # libusb-1.0.so.0, libgtk4-layer-shell.so.0) from the ELF itself now that
 # AutoReqProv is on. release.yml opens the finished package and fails if they
 # are missing.
-Requires:       ${glibc_req:+libc.so.6(GLIBC_${glibc_req})${rpm_bits}}
+Requires:       ${rpm_sonames}${rpm_sonames:+${glibc_req:+, }}${glibc_req:+libc.so.6(GLIBC_${glibc_req})${rpm_bits}}
 # Automatic dependency generation left ON deliberately (it was `AutoReqProv:
 # no`). Turning it off also turns off the `libc.so.6(GLIBC_x.y)` requirement rpm
 # derives from the ELF — exactly the check that stops this installing on a
