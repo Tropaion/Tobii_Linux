@@ -145,6 +145,34 @@ jobs:
             exit 1
           fi
 
+      # The archive floor above is measured from the binaries; this checks the
+      # PACKAGES actually say so. It is here rather than in package.sh because
+      # most developer machines have no rpmbuild, so the .rpm's dependencies
+      # cannot be read where it is written — an unverifiable claim in a script
+      # is how `AutoReqProv: no` sat there silently declaring nothing.
+      - name: Check the packages declare the glibc floor
+        run: |
+          set -eu
+          deb="$(ls dist/*.deb)"
+          deps="$(dpkg-deb -f "$deb" Depends)"
+          echo "deb Depends: $deps"
+          case "$deps" in
+            *"libc6 (>= "*) ;;
+            *) echo "::error::the .deb depends on libc6 with no version — apt would install it on a system too old to run it" >&2; exit 1 ;;
+          esac
+          rpm_file="$(ls dist/*.rpm 2>/dev/null || true)"
+          if [ -n "$rpm_file" ]; then
+            reqs="$(rpm -qpR "$rpm_file")"
+            echo "rpm Requires:"; echo "$reqs"
+            echo "$reqs" | grep -q 'libc\.so\.6(GLIBC_' || {
+              echo "::error::the .rpm declares no versioned glibc requirement" >&2; exit 1; }
+            echo "$reqs" | grep -q 'libgtk-4' || {
+              echo "::error::the .rpm declares no gtk4 soname — automatic dependency generation is off again" >&2; exit 1; }
+          else
+            echo "::error::no .rpm in dist/ — rpmbuild is supposed to be installed in this container" >&2
+            exit 1
+          fi
+
       - name: Verify SHA256SUMS matches the archive
         run: cd dist && sha256sum -c SHA256SUMS
 

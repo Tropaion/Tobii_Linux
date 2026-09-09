@@ -93,6 +93,37 @@ install -m 644 assets/99-tobii.rules "$payload/usr/lib/udev/rules.d/99-tobii.rul
 
 installed_kb="$(du -sk "$payload" | cut -f1)"
 
+# The glibc floor, from the binaries themselves, so the packages can DECLARE it.
+#
+# Without this the package manager has nothing to refuse on: an unversioned
+# `libc6` dependency installs happily on a system whose glibc is too old, and
+# the user's first experience is apt saying yes and the program saying
+# "version `GLIBC_2.41' not found". release.yml enforces the floor at build
+# time; this is what carries it to the person installing.
+glibc_req=""
+# rpm tags a symbol-version requirement with the ELF's bitness, and gets that
+# from the file itself rather than from a list of architecture names. So does
+# this: a hard-coded "(64bit)" is a second definition of the same fact, and the
+# one that is wrong the first time somebody builds for a 32-bit target.
+rpm_bits=""
+if command -v objdump >/dev/null 2>&1; then
+    for bin in tobii tobii-gtk; do
+        this="$(objdump -T "$payload/usr/bin/$bin" 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
+        [[ -n "$this" ]] || continue
+        glibc_req="$(printf '%s\n%s\n' "$glibc_req" "${this#GLIBC_}" | sort -V | tail -1)"
+        if [[ -z "$rpm_bits" ]] && objdump -f "$payload/usr/bin/$bin" 2>/dev/null \
+            | grep -q 'file format elf64'; then
+            rpm_bits="(64bit)"
+        fi
+    done
+fi
+if [[ -n "$glibc_req" ]]; then
+    echo "  glibc floor: $glibc_req"
+else
+    echo "  WARNING: could not determine the glibc floor; packages will not declare one" >&2
+fi
+
 # --------------------------------------------------------------------- the deb
 
 deb_root="$work/deb"
@@ -109,7 +140,7 @@ Priority: optional
 Architecture: ${deb_arch}
 Maintainer: Fabian Plaimauer <noreply@github.com>
 Installed-Size: ${installed_kb}
-Depends: libc6, libgtk-4-1, libgtk4-layer-shell0, libusb-1.0-0
+Depends: libc6${glibc_req:+ (>= ${glibc_req})}, libgtk-4-1, libgtk4-layer-shell0, libusb-1.0-0
 Recommends: curl | wget
 Homepage: https://github.com/Tropaion/Tobii_Linux
 Description: Linux runtime and GUI for the Tobii Eye Tracker 5
@@ -216,8 +247,13 @@ Summary:        Linux runtime and GUI for the Tobii Eye Tracker 5
 License:        GPL-3.0-only
 URL:            https://github.com/Tropaion/Tobii_Linux
 BuildArch:      ${arch}
-Requires:       gtk4, gtk4-layer-shell, libusb1
-AutoReqProv:    no
+Requires:       gtk4, gtk4-layer-shell, libusb1${glibc_req:+, libc.so.6(GLIBC_${glibc_req})${rpm_bits}}
+# Automatic dependency generation left ON deliberately (it was `AutoReqProv:
+# no`). Turning it off also turns off the `libc.so.6(GLIBC_x.y)` requirement rpm
+# derives from the ELF — exactly the check that stops this installing on a
+# system too old to run it. The explicit Requires above are a floor, not a
+# replacement for it: this script has no rpmbuild on most developer machines, so
+# release.yml re-reads both finished packages and fails if the floor is missing.
 
 %description
 A clean-room reimplementation of the Tobii Eye Tracker 5's USB protocol, with no

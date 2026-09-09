@@ -80,7 +80,11 @@ pub fn report() -> String {
 
     let _ = writeln!(o, "\nconfiguration");
     let _ = writeln!(o, "  {:<16} {}", "display area", display_area());
-    let _ = writeln!(o, "  {:<16} {}", "monitor", monitor());
+    // Established once and used twice: the monitor line marks itself when the
+    // hash is unsalted, and the footer must not promise a redaction that did
+    // not happen.
+    let salted = !report_salt().is_empty();
+    let _ = writeln!(o, "  {:<16} {}", "monitor", monitor(salted));
     let _ = writeln!(o, "  {:<16} {}", "calibration", calibration());
     let _ = writeln!(o, "  {:<16} {}", "enabled eye", enabled_eye());
     let _ = writeln!(o, "  {:<16} {}", "pitch offset", pitch_offset());
@@ -99,8 +103,13 @@ pub fn report() -> String {
 
     let _ = writeln!(
         o,
-        "\nredacted: username, home path, hostname, monitor serial (hashed above).\n\
-         no calibration data is included — only when it was made and how."
+        "\nredacted: username, home path, hostname, monitor serial ({}).\n\
+         no calibration data is included — only when it was made and how.",
+        if salted {
+            "salted hash above"
+        } else {
+            "hashed above, but see the warning on that line"
+        }
     );
     o
 }
@@ -254,9 +263,19 @@ fn display_area() -> String {
 /// The raw value contains the EDID serial number. Two reports from the same
 /// screen still hash the same, which is what makes it useful, without putting a
 /// serial on a public issue.
-fn monitor() -> String {
+fn monitor(salted: bool) -> String {
     match tobii_config::load_setup_monitor_id() {
-        Ok(Some(id)) => format!("id {}", short_hash(&id)),
+        Ok(Some(id)) => {
+            // Say so when the salt could not be established: an unsalted digest
+            // of a monitor id is recoverable in well under a second, and the
+            // user is about to paste this somewhere public.
+            let warn = if salted {
+                ""
+            } else {
+                "  (UNSALTED — this hash is reversible; delete the line if it matters to you)"
+            };
+            format!("id {}{warn}", short_hash(&id))
+        }
         Ok(None) => "not recorded".into(),
         Err(e) => format!("unreadable ({e})"),
     }
@@ -326,32 +345,124 @@ fn head_model() -> String {
 }
 
 /// A short, stable stand-in for a value that must not be published verbatim.
+///
+/// **Salted, per install.** An unsalted hash of a monitor id is not a redaction
+/// — it is an encoding. `edid_monitor_id` is `PNP(3 letters) + product(4 hex) +
+/// "-" + serial`, and real serials are short, structured and sequential within a
+/// batch, so the search space is around 2^20. Measured: the maintainer's own id
+/// was recovered from its 8-hex-character digest in **0.07 seconds** on one
+/// core, uniquely. And for this repository in particular no search was needed at
+/// all — `SAM7454-HNTY900001` is committed as a test fixture in six places, so
+/// `grep` reversed it.
+///
+/// The salt is 32 random bytes generated once per installation and kept in the
+/// config directory. It preserves the only property this hash was ever for —
+/// two reports from the same machine carry the same id, so a triager can see
+/// they are the same screen — while making the value meaningless to anybody
+/// else. A salt compiled into the binary would not help: the binary is public.
 fn short_hash(s: &str) -> String {
-    let full = tobii_config::sha256::hex_digest(s.as_bytes());
+    let mut input = report_salt();
+    input.extend_from_slice(s.as_bytes());
+    let full = tobii_config::sha256::hex_digest(&input);
     format!("{}…", &full[..8])
 }
 
-/// Replace the home directory with `~`, wherever it appears.
+/// The per-install salt, created on first use.
+///
+/// Falls back to a fixed value only if the salt can neither be read nor written
+/// — in which case the hash is no better than before, so the report says so
+/// rather than pretending. See [`monitor`].
+fn report_salt() -> Vec<u8> {
+    let path = tobii_config::config_path().with_file_name("report_salt");
+    if let Ok(existing) = std::fs::read(&path) {
+        if existing.len() >= 16 {
+            return existing;
+        }
+    }
+    // 32 bytes from the kernel. `read_exact` on a bounded buffer, NOT
+    // `fs::read` — /dev/urandom is an endless stream, so reading it to EOF
+    // never returns, and a diagnostics button that hangs the hub forever would
+    // be a worse bug than the one this salt fixes.
+    let mut fresh = [0u8; 32];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut fresh))
+        .is_ok();
+    let fresh = fresh.to_vec();
+    if filled {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&path, &fresh).is_ok() {
+            // Readable only by its owner: it is the only thing standing between
+            // a published report and the serial behind it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            return fresh;
+        }
+    }
+    Vec::new()
+}
+
+/// Replace the home directory with `~`, wherever it appears and however it is
+/// spelled.
 ///
 /// Both for privacy and because it makes two reports comparable: `~/.local/bin`
 /// is the same fact on every machine, `/home/someone/.local/bin` is not.
 ///
-/// **Every occurrence, not just a prefix.** This used to be `starts_with` plus
-/// `replacen(.., 1)`, which is right for a bare path and wrong for everything
-/// else the report now carries: a log line reads
-/// `2026-… WARN could not write /home/someone/.config/…`, where the home path
-/// is in the middle. It went into the report verbatim, in the one feature whose
-/// entire purpose is not publishing that. Caught by this module's own
-/// redaction test.
+/// **Every occurrence, and every spelling.** Two separate bugs were found here,
+/// and the second is the one that survived the fix for the first:
+///
+/// 1. It folded only a *prefix*, so a home path in the middle of a log line —
+///    `… WARN could not write /home/someone/.config/…` — went through intact.
+/// 2. It compared against the raw `$HOME` only. `install_dir` comes from
+///    `current_exe()`, which reads `/proc/self/exe` and is **fully
+///    symlink-resolved**, so on any system where the home is reached through a
+///    link the two are spelled differently and nothing matched. That is not
+///    exotic: ostree distributions ship `/home -> var/home` by default —
+///    Silverblue, Kinoite, Bluefin and Bazzite, the last of which is a gaming
+///    image and squarely this project's audience. `sudo`/`pkexec` does it too,
+///    setting `HOME=/root` while the binary is still under the real user's home,
+///    and this very report tells people the tracker "needs root" without the
+///    udev rule.
+///
+/// So both the raw and the canonical form are folded. The crate's own redaction
+/// test could not catch (2), because it compared the report against the same
+/// `$HOME` the code folded with — the test and the bug shared an assumption.
 fn tilde(path: &str) -> String {
-    match std::env::var("HOME") {
-        // A HOME of "" or "/" names no user directory, and folding "/" would
-        // replace every separator in every path — "~~.local~bin". Both happen
-        // in containers, which is where diagnostics get run when something is
-        // already wrong.
-        Ok(h) if h.len() > 1 && h != "/" => path.replace(h.trim_end_matches('/'), "~"),
-        _ => path.to_string(),
+    let mut out = path.to_string();
+    for home in home_spellings() {
+        out = out.replace(&home, "~");
     }
+    out
+}
+
+/// Every way this machine's home directory can be written.
+///
+/// The raw `$HOME`, and its canonical form when they differ. Longest first, so
+/// folding one cannot leave a fragment of another behind.
+fn home_spellings() -> Vec<String> {
+    let Ok(raw) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    let raw = raw.trim_end_matches('/').to_string();
+    if raw.len() <= 1 {
+        // "" or "/" names no user directory, and folding "/" would replace
+        // every separator in every path — "~~.local~bin".
+        return Vec::new();
+    }
+    let mut all = vec![raw.clone()];
+    if let Ok(canon) = std::fs::canonicalize(&raw) {
+        let canon = canon.display().to_string();
+        let canon = canon.trim_end_matches('/').to_string();
+        if canon.len() > 1 && canon != raw {
+            all.push(canon);
+        }
+    }
+    all.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    all
 }
 
 fn first_line(path: &str) -> String {
