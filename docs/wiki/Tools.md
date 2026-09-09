@@ -12,7 +12,7 @@ display area first (the device wipes it on reboot; see [[Display-Area]]).
 
 | Subcommand | Purpose |
 |-----------|---------|
-| `tobii update [--install]` | Check GitHub for a newer release and print its changelog. `--install` downloads the archive for this machine, verifies it against the release's `SHA256SUMS`, and replaces the installed binaries — refusing outright if the release publishes no checksums. |
+| `tobii update [--install]` | Check GitHub for a newer release and print its changelog. `--install` downloads the archive for this machine, checks it against the release's `SHA256SUMS`, runs the new binaries once to confirm they work here, and then replaces the installed ones — rolling every one of them back if any step fails. The checksums are published in the same release as the archive, so they catch a corrupted download, not a hostile one; see [Updates](../../README.md#updates). |
 | `tobii stream [--json] [--eyes]` | Connect and print decoded gaze samples (timestamp, `gaze_point_2d`, validities). `--eyes` also prints trackbox + eye-origin geometry; `--json` emits one JSON object per frame. |
 | `tobii headpose [--udp ADDR] [--rate HZ] [--model auto\|off\|FILE] [--check]` | Stream head pose to opentrack over UDP (default `127.0.0.1:4242`, 60 Hz). With a model installed this is **6 DOF** — position from the eye origins, rotation from the neural model; without one it is the 5-DOF geometry and **pitch is 0**. `--check` prints the model's yaw/roll beside the geometry's, which is the experiment that settles the sign conventions. See [[Head-Pose]]. |
 | `tobii headpose --model-status` | Report which head-pose models are installed in `~/.config/tobii-linux/models` and whether their sha256 matches the pinned one. |

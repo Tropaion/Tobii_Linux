@@ -54,8 +54,8 @@ inspired by the original Tobii Experience UI.
 - **Accuracy diagnostic** (`tobii-gtk --accuracy`) — a 39-target sweep reporting
   error per target, per angle band and per eye, with a diagnosis.
 - **Updates** — the hub checks for a new release at launch and can show the
-  changelog and install it. Nothing is downloaded without a click, and nothing is
-  installed that does not match the checksums published with the release.
+  changelog and install it. Nothing is downloaded without a click. The check can
+  be switched off. See [Updates](#updates) for what installing one trusts.
 
 ## Requirements
 
@@ -129,6 +129,7 @@ which is how the sign conventions were confirmed on hardware.
 ./target/release/tobii display get|set            # read / re-apply display area
 ./target/release/tobii enabled-eye [both|left|right]
 ./target/release/tobii update [--install]         # check for a new release
+./target/release/tobii --version                  # what this build reports
 ```
 
 Run `tobii` with no arguments for the full list, including the protocol
@@ -138,7 +139,8 @@ diagnostics (`streams`, `log`, `dump-stream`, `camera`, `cal-blob`, `cal-points`
 
 Stored under `$XDG_CONFIG_HOME/tobii-linux/` (default `~/.config/tobii-linux/`):
 `config.toml` (display geometry), `calibration.bin`, `enabled_eye`,
-`headpose_pitch_offset`, and `models/` (the fetched head-pose model).
+`headpose_pitch_offset`, `update_check`, and `models/` (the fetched head-pose
+model).
 
 > **Note:** the ET5 wipes its display area *and* its calibration every time it
 > reboots — which it does on every session close — so the driver **re-applies
@@ -152,9 +154,16 @@ overlay, and head tracking. The head-pose model's yaw and roll signs were
 confirmed against the geometric pose (slope +1.03 and +0.96, r = 0.998 and
 0.990).
 
-**Implemented but unproven:** the **update mechanism** has never run against a
-real release — this repository has no tags yet, so the download/verify/install
-path has only been exercised against fixtures.
+**Implemented, partly proven:** the **update mechanism**. Everything after the
+download — checksum, unpack, symlink refusal, the runnability probe, the swap
+and the rollback — is exercised end to end against real `tar.gz` archives built
+from real executables (`crates/tobii-update/tests/install_end_to_end.rs`). The
+network half has only run against GitHub's live releases endpoint returning an
+empty list, because this repository has no tags yet, so the *first real release
+is still the first real test of the download itself*.
+
+The trust model is the honest limitation, not a missing test: the checksums are
+an integrity check, not a signature. See [Updates](#updates).
 
 **Known limitations:**
 
@@ -189,16 +198,68 @@ A Cargo workspace of focused crates:
 | `tobii-usb`      | libusb (`rusb`) transport + connection driver. |
 | `tobii-config`   | Display geometry, EDID detection, persistence, SHA-256. |
 | `tobii-headpose` | Head pose: the geometric fallback, the ONNX backend, the model store, opentrack output. |
-| `tobii-update`   | Release checking, verification and installation. |
+| `tobii-update`   | Release checking, download integrity, and installation with rollback. |
 | `tobii-cli`      | The `tobii` command-line tool. |
 | `tobii-gtk`      | The GTK4 hub, guided flows and gaze overlay. |
 | `tobii-recap`    | Decodes a usbmon pcap capture into a readable TTP op catalog. |
 
-## Releases
+## Updates
 
-`scripts/release.sh <version>` builds the archive and `SHA256SUMS` in the layout
-the updater expects. A release without checksums is refused by the updater
-rather than trusted.
+The GUI asks GitHub for the latest release when its window opens — the one
+thing this program does on the network without being asked — and shows a banner
+only if there is something newer. `tobii update` does the same from the command
+line. Nothing is downloaded until you choose to update.
+
+**Turning the check off:** the switch in the hub under *Check for updates*, or
+`TOBII_NO_UPDATE_CHECK=1` in the environment, which also wins over the switch.
+The setting is stored in `~/.config/tobii-linux/update_check`. An explicit
+`tobii update` still works; only the automatic check is affected.
+
+### What installing an update trusts
+
+**The checksums are not a signature.** `SHA256SUMS` is published in the same
+release as the archive and fetched over the same connection by the same code, so
+it proves the download arrived intact and nothing about who produced it. Anyone
+able to publish to this repository's releases could publish binaries that every
+check in `tobii-update` accepts.
+
+So installing an update trusts this project's GitHub releases exactly as much as
+downloading a binary from the releases page and running it by hand would. That
+is a normal amount of trust for a program you already run, but it is not the
+guarantee a checksum is often assumed to give, and the UI says so before the
+button is pressed. Closing that gap needs a signature checked against a key
+compiled into the binary; there isn't one.
+
+### What it does protect against
+
+- Every request is HTTPS to a GitHub host, with the URL passed as an operand so
+  it can never be read as a `curl` option, redirects pinned to HTTPS, and a
+  timeout and size cap on all of it.
+- A truncated or corrupted download is caught before anything is unpacked.
+- Archive members that are symlinks are ignored, so an archive cannot cause a
+  file it never contained to be installed.
+- The new binaries are **run once before they are installed**. A release built
+  against newer system libraries than your machine has fails here, while the
+  working binaries are still in place, instead of leaving you with two that
+  don't start.
+- If any part of the swap fails, **every binary is rolled back**, so an update
+  can't leave a new `tobii` beside an old `tobii-gtk`.
+
+### Publishing a release
+
+`scripts/release.sh <version> [triple]` builds the archive and `SHA256SUMS` in
+the layout the updater expects, refuses to build if `Cargo.toml` disagrees with
+the tag, reports the oldest glibc the binaries need, and checks they answer
+`--version` — the same probe the updater runs before installing.
+
+A `gnu` build only runs on a glibc at least as new as the one it was built
+against, so building on a rolling distribution produces binaries that will not
+start on older ones. Build in an old-glibc container, or target musl:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+scripts/release.sh 0.2.0 x86_64-unknown-linux-musl
+```
 
 ## Credits & license
 
