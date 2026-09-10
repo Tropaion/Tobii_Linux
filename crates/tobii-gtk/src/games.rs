@@ -21,7 +21,11 @@
 use gtk::prelude::*;
 use gtk::{glib, Align, CheckButton, Label, Orientation, Switch};
 
+use std::sync::{Arc, Mutex};
+
 use tobii_output::games::{load_output_config, save_output_config, OutputConfig};
+
+use crate::device::JoystickStatus;
 
 /// Extended View strength presets, as `(yaw output_max, pitch output_max)` in
 /// degrees.
@@ -57,15 +61,28 @@ pub fn strength_index(cfg: &OutputConfig) -> Option<usize> {
 /// health check: with game output configured and nothing playing, the tracker is
 /// SUPPOSED to be off, and saying so is more useful than a green light that
 /// means nothing.
-pub fn status_text(cfg: &OutputConfig, tracker_on: bool) -> String {
+pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStatus) -> String {
     if !cfg.enabled {
         return "Off. Turn on to send head tracking to games.".to_string();
     }
     let mut sinks: Vec<String> = Vec::new();
-    // Named first because it is the one that needs nothing else installed, so
-    // it is the one a reader of this line most likely actually has.
+    // Reported from what the device thread actually did, never from the
+    // checkbox. The checkbox is a request; `/dev/uinput` can refuse it, and a
+    // line that says "sending to a virtual joystick" when none exists is
+    // exactly the support thread this row was written to prevent.
+    let mut trouble: Option<String> = None;
     if cfg.joystick {
-        sinks.push("a virtual joystick".to_string());
+        match joystick {
+            JoystickStatus::Present => sinks.push("a virtual joystick".to_string()),
+            // Wanted, and the device thread has not got to it yet — it polls
+            // the setting about once a second. Saying so beats a flicker of
+            // "no destination is configured" in the second after ticking the
+            // box.
+            JoystickStatus::Off => sinks.push("a virtual joystick (starting)".to_string()),
+            JoystickStatus::Failed(why) => {
+                trouble = Some(format!("The virtual joystick could not be created — {why}"));
+            }
+        }
     }
     if let Some(addr) = &cfg.opentrack {
         sinks.push(format!("opentrack ({addr})"));
@@ -74,16 +91,23 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool) -> String {
         sinks.push(format!("the Wine bridge (port {port})"));
     }
     if sinks.is_empty() {
-        return "On, but no destination is configured — nothing will receive it.".to_string();
+        return match trouble {
+            Some(t) => format!("{t}. Nothing else is configured, so nothing will receive it."),
+            None => "On, but no destination is configured — nothing will receive it.".to_string(),
+        };
     }
     let to = sinks.join(" and ");
-    if tracker_on {
+    let base = if tracker_on {
         format!("Sending to {to}.")
     } else {
         // Not a fault. The tracker is off because nothing is asking for it,
         // which is the whole standby behaviour — so the line says what to do
         // rather than implying something is broken.
         format!("Ready to send to {to}. Starts when a game asks: tobii game -- <command>")
+    };
+    match trouble {
+        Some(t) => format!("{base} {t}."),
+        None => base,
     }
 }
 
@@ -91,6 +115,7 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool) -> String {
 pub struct GamesRow {
     pub controls: gtk::Box,
     status: Label,
+    joystick: Arc<Mutex<JoystickStatus>>,
 }
 
 impl GamesRow {
@@ -100,7 +125,7 @@ impl GamesRow {
     /// constructs widgets; a `Default` impl — which clippy asks for on a `new()`
     /// taking no arguments — would advertise a cheap, side-effect-free
     /// constructor that this is not.
-    pub fn build() -> GamesRow {
+    pub fn build(joystick: Arc<Mutex<JoystickStatus>>) -> GamesRow {
         let cfg = load_output_config();
 
         let sw = Switch::new();
@@ -147,7 +172,11 @@ impl GamesRow {
         // second overwrite the other's change.
         let refresh = {
             let status = status.clone();
-            move || status.set_text(&status_text(&load_output_config(), false))
+            let joystick = Arc::clone(&joystick);
+            move || {
+                let js = joystick.lock().unwrap().clone();
+                status.set_text(&status_text(&load_output_config(), false, &js));
+            }
         };
 
         {
@@ -224,7 +253,11 @@ impl GamesRow {
         controls.append(&joy_row);
         controls.append(&status);
 
-        let row = GamesRow { controls, status };
+        let row = GamesRow {
+            controls,
+            status,
+            joystick,
+        };
         row.refresh(false);
         row
     }
@@ -236,8 +269,9 @@ impl GamesRow {
     /// reopening the window, which is exactly how somebody setting this up for
     /// the first time is working.
     pub fn refresh(&self, tracker_on: bool) {
+        let js = self.joystick.lock().unwrap().clone();
         self.status
-            .set_text(&status_text(&load_output_config(), tracker_on));
+            .set_text(&status_text(&load_output_config(), tracker_on, &js));
     }
 }
 
@@ -249,6 +283,17 @@ mod tests {
     /// inherited from the defaults, so these cases keep testing what they were
     /// written to test — with it on, "no destination is configured" would be
     /// unreachable.
+    /// Game output on, with the joystick as its only destination.
+    fn joystick_only() -> OutputConfig {
+        OutputConfig {
+            enabled: true,
+            opentrack: None,
+            bridge_port: None,
+            joystick: true,
+            ..OutputConfig::default()
+        }
+    }
+
     fn cfg_with(enabled: bool, opentrack: Option<&str>, bridge: Option<u16>) -> OutputConfig {
         OutputConfig {
             enabled,
@@ -264,20 +309,32 @@ mod tests {
     /// separate them, nothing does.
     #[test]
     fn each_broken_state_says_which_part_is_missing() {
-        let off = status_text(&cfg_with(false, Some("127.0.0.1:4242"), None), false);
+        let off = status_text(
+            &cfg_with(false, Some("127.0.0.1:4242"), None),
+            false,
+            &JoystickStatus::Off,
+        );
         assert!(off.contains("Off"), "{off}");
 
-        let no_sink = status_text(&cfg_with(true, None, None), true);
+        let no_sink = status_text(&cfg_with(true, None, None), true, &JoystickStatus::Off);
         assert!(no_sink.contains("no destination"), "{no_sink}");
 
-        let ready = status_text(&cfg_with(true, Some("127.0.0.1:4242"), None), false);
+        let ready = status_text(
+            &cfg_with(true, Some("127.0.0.1:4242"), None),
+            false,
+            &JoystickStatus::Off,
+        );
         assert!(ready.contains("Ready"), "{ready}");
         assert!(
             ready.contains("tobii game"),
             "a user who sees 'Ready' needs to be told what starts it: {ready}"
         );
 
-        let sending = status_text(&cfg_with(true, Some("127.0.0.1:4242"), None), true);
+        let sending = status_text(
+            &cfg_with(true, Some("127.0.0.1:4242"), None),
+            true,
+            &JoystickStatus::Off,
+        );
         assert!(sending.starts_with("Sending"), "{sending}");
 
         // And they are genuinely different sentences, not four spellings of one.
@@ -294,7 +351,11 @@ mod tests {
     /// would send people looking for a problem that is the design working.
     #[test]
     fn a_dark_tracker_is_not_reported_as_a_problem() {
-        let s = status_text(&cfg_with(true, Some("127.0.0.1:4242"), None), false);
+        let s = status_text(
+            &cfg_with(true, Some("127.0.0.1:4242"), None),
+            false,
+            &JoystickStatus::Off,
+        );
         for alarming in ["not running", "error", "failed", "cannot", "problem"] {
             assert!(
                 !s.to_lowercase().contains(alarming),
@@ -307,7 +368,11 @@ mod tests {
     /// knows which one to look at.
     #[test]
     fn both_destinations_are_named() {
-        let s = status_text(&cfg_with(true, Some("127.0.0.1:4242"), Some(4243)), true);
+        let s = status_text(
+            &cfg_with(true, Some("127.0.0.1:4242"), Some(4243)),
+            true,
+            &JoystickStatus::Off,
+        );
         assert!(s.contains("4242") && s.contains("4243"), "{s}");
     }
 
@@ -316,19 +381,51 @@ mod tests {
     /// told that something is nevertheless receiving.
     #[test]
     fn the_virtual_joystick_is_named_like_any_other_destination() {
-        let only_joystick = OutputConfig {
-            enabled: true,
-            opentrack: None,
-            bridge_port: None,
-            joystick: true,
-            ..OutputConfig::default()
-        };
-        let s = status_text(&only_joystick, true);
+        let s = status_text(&joystick_only(), true, &JoystickStatus::Present);
         assert!(s.contains("joystick"), "{s}");
         assert!(
             !s.contains("no destination"),
             "a joystick is a destination: {s}"
         );
+    }
+
+    /// The checkbox is a request, not an outcome: `/dev/uinput` is root-only on
+    /// most distributions and can refuse it. Reporting a controller that does
+    /// not exist is precisely the support thread this row was written to
+    /// prevent — the user would go looking for it in their game's bind list.
+    #[test]
+    fn a_joystick_that_could_not_be_created_is_not_reported_as_a_destination() {
+        let failed = JoystickStatus::Failed("/dev/uinput: Permission denied".into());
+
+        let alone = status_text(&joystick_only(), true, &failed);
+        assert!(
+            !alone.contains("Sending to a virtual joystick"),
+            "claimed a device that does not exist: {alone}"
+        );
+        assert!(alone.contains("could not be created"), "{alone}");
+        assert!(
+            alone.contains("Permission denied"),
+            "the reason is the whole point — three failures need three fixes: {alone}"
+        );
+
+        // With another sink working, the failure is reported ALONGSIDE it
+        // rather than replacing it: opentrack really is still receiving.
+        let mut with_udp = joystick_only();
+        with_udp.opentrack = Some("127.0.0.1:4242".to_string());
+        let both = status_text(&with_udp, true, &failed);
+        assert!(both.starts_with("Sending to opentrack"), "{both}");
+        assert!(both.contains("could not be created"), "{both}");
+    }
+
+    /// The device thread polls the setting about once a second, so there is a
+    /// window where the box is ticked and the device does not exist yet.
+    /// Reading "no destination is configured" during it would be wrong and
+    /// alarming.
+    #[test]
+    fn a_joystick_that_is_still_starting_does_not_read_as_missing() {
+        let s = status_text(&joystick_only(), false, &JoystickStatus::Off);
+        assert!(!s.contains("no destination"), "{s}");
+        assert!(s.contains("starting"), "{s}");
     }
 
     #[test]

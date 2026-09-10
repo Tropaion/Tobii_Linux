@@ -902,13 +902,15 @@ pub struct Tick {
 
 /// Spawn the device thread. It handshakes, then loops `device_tick`; on any
 /// connection failure it records the error and retries after a short delay.
-pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
+pub fn spawn() -> Session {
     let state = Arc::new(Mutex::new(DeviceState::default()));
     let (tx, rx) = channel::<DeviceCommand>();
     let demand = Demand::new();
     // Shared with the socket thread: it decides who may have the device, this
     // thread decides when it has actually let go.
     let lease: Arc<Mutex<Lease>> = Arc::new(Mutex::new(Lease::Free));
+    let joystick_status = Arc::new(Mutex::new(JoystickStatus::Off));
+    let thread_joystick_status = Arc::clone(&joystick_status);
     let thread_state = Arc::clone(&state);
     let thread_demand = demand.clone();
     let thread_lease = Arc::clone(&lease);
@@ -930,7 +932,7 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
         let mut joystick: Option<JoystickHandle> = None;
         let mut joystick_state = JoystickWanted::default();
         loop {
-            joystick_state.sync(&mut joystick);
+            joystick_state.sync(&mut joystick, &thread_joystick_status);
             // Nothing wants the tracker: do not open it. This is the whole
             // point of `Demand` — an idle hub leaves the illuminators dark and
             // the USB device free for `tobii headpose`.
@@ -958,7 +960,7 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
                 // Polled while idle too, so ticking the checkbox in an idle hub
                 // makes the controller appear rather than waiting for whatever
                 // next wakes the tracker.
-                joystick_state.sync(&mut joystick);
+                joystick_state.sync(&mut joystick, &thread_joystick_status);
             }
             device_session(
                 &thread_state,
@@ -970,7 +972,45 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
             );
         }
     });
-    (state, tx, demand)
+    (state, tx, demand, joystick_status)
+}
+
+/// The device thread and the handles onto it.
+///
+/// Every element is a clone of a shared thing — an `Arc`, a `Sender`, a
+/// `Demand` — so cloning a `Session` shares the one device thread rather than
+/// starting a second one. Defined here rather than beside the GUI that consumes
+/// it, because the shape of it is [`spawn`]'s business.
+///
+/// The last element is the virtual joystick's state, shared rather than
+/// derived: only this thread knows whether the device was actually created, and
+/// the games row exists to name which part is missing — so it must never report
+/// a controller from the setting alone.
+pub type Session = (
+    Arc<Mutex<DeviceState>>,
+    Sender<DeviceCommand>,
+    Demand,
+    Arc<Mutex<JoystickStatus>>,
+);
+
+/// What the virtual joystick is actually doing, for the hub to report.
+///
+/// Separate from [`DeviceState`] on purpose, and the reason is a bug this
+/// avoids: `DeviceState` is reset wholesale when the tracker goes idle
+/// (`*st = DeviceState { status: Idle, ..Default::default() }`), and the
+/// joystick deliberately outlives idle. Its status kept there would blink to
+/// the default every time the illuminators went out.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum JoystickStatus {
+    /// Not asked for — game output is off, or the joystick is unticked.
+    #[default]
+    Off,
+    /// The device exists. A game can bind it.
+    Present,
+    /// Asked for, and could not be created. Carries the reason, because the
+    /// three ways this fails need three different fixes and are
+    /// indistinguishable from inside a game.
+    Failed(String),
 }
 
 /// Keeps the virtual joystick's existence matched to the setting.
@@ -999,7 +1039,7 @@ struct JoystickWanted {
 const JOYSTICK_POLL: Duration = Duration::from_secs(1);
 
 impl JoystickWanted {
-    fn sync(&mut self, slot: &mut Option<JoystickHandle>) {
+    fn sync(&mut self, slot: &mut Option<JoystickHandle>, status: &Arc<Mutex<JoystickStatus>>) {
         let now = Instant::now();
         if self
             .checked
@@ -1019,8 +1059,15 @@ impl JoystickWanted {
                     );
                     self.warned = false;
                     *slot = Some(JoystickHandle::new(js));
+                    *status.lock().unwrap() = JoystickStatus::Present;
                 }
                 Err(e) => {
+                    // The status carries the reason every time; only the log
+                    // is rate-limited. A standing condition should not scroll
+                    // the log, but the hub still has to be able to say what is
+                    // wrong whenever it is asked.
+                    let first_line = e.to_string().lines().next().unwrap_or("failed").to_string();
+                    *status.lock().unwrap() = JoystickStatus::Failed(first_line);
                     if !self.warned {
                         self.warned = true;
                         tobii_diagnostics::log::warn(&format!(
@@ -1033,9 +1080,14 @@ impl JoystickWanted {
             // controller the user has switched off must leave the bind list.
             (false, true) => {
                 *slot = None;
+                *status.lock().unwrap() = JoystickStatus::Off;
                 tobii_diagnostics::log::info("game output: virtual joystick removed");
             }
-            _ => {}
+            // Steady state. `Off` is still asserted when nothing is wanted and
+            // nothing exists, so a failure that later stops being wanted does
+            // not leave its reason on screen for ever.
+            (false, false) => *status.lock().unwrap() = JoystickStatus::Off,
+            (true, true) => {}
         }
     }
 }

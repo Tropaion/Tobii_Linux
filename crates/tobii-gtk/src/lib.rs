@@ -199,7 +199,7 @@ pub fn run() -> glib::ExitCode {
 
     // The device thread, started once. In background mode it exists before any
     // window does; otherwise the first activation creates it.
-    let session: Rc<RefCell<Option<Session>>> = Rc::new(RefCell::new(None));
+    let session: Rc<RefCell<Option<device::Session>>> = Rc::new(RefCell::new(None));
     // The hub window, while it is open.
     let hub: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
     if autostart::background_mode() {
@@ -251,7 +251,7 @@ pub fn run() -> glib::ExitCode {
                 w.present();
                 return;
             }
-            // Cloned, not taken. Every handle in a `Session` is a clone of a
+            // Cloned, not taken. Every handle in a `device::Session` is a clone of a
             // shared thing — an `Arc`, a `Sender`, a `Demand` — so this shares
             // the one device thread. Taking it left the slot empty, and the
             // next hub in a long-lived background process spawned a SECOND
@@ -320,13 +320,6 @@ fn hold_while_open(demand: &device::Demand, win: &impl IsA<gtk::Window>, reason:
         *guard.borrow_mut() = None;
     });
 }
-
-/// The device thread and the handles onto it.
-type Session = (
-    std::sync::Arc<std::sync::Mutex<device::DeviceState>>,
-    std::sync::mpsc::Sender<device::DeviceCommand>,
-    device::Demand,
-);
 
 /// Whether to run the gaze-accuracy diagnostic instead of the hub.
 pub(crate) fn accuracy_mode() -> bool {
@@ -433,8 +426,8 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
 /// width and the panel's margins were checked. Exposing the real constructor
 /// rather than a probe-only twin means there is nothing here that only test
 /// scaffolding calls.
-pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindow> {
-    let (state, cmd_tx, demand) = session;
+pub fn build_hub(app: &Application, session: device::Session) -> Option<ApplicationWindow> {
+    let (state, cmd_tx, demand, joystick_status) = session;
     // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
     // needs the device thread, so it branches here rather than in `run`.
     if accuracy_mode() {
@@ -831,7 +824,7 @@ pub fn build_hub(app: &Application, session: Session) -> Option<ApplicationWindo
     ));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
     // tracker does, not about how this program behaves.
-    let games_row = crate::games::GamesRow::build();
+    let games_row = crate::games::GamesRow::build(std::sync::Arc::clone(&joystick_status));
     right.append(&section(
         "Head tracking for games",
         "Sends head tracking and gaze to a game. Wrap the game with \

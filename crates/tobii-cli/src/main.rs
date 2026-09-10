@@ -1988,10 +1988,18 @@ fn headpose(args: &[String]) -> CmdResult {
         router.add(Box::new(tobii_output::sinks::BridgeUdp::new(port)?));
     }
     if cfg.joystick {
-        // Fatal here, unlike in the hub: this command was asked for one run in
-        // a terminal, and failing loudly with the reason beats streaming to a
-        // sink the user believes exists.
-        router.add(Box::new(tobii_output::sinks::UinputJoystick::open()?));
+        // Named and skipped, not fatal — the same policy the hub states in
+        // `outputs::GameOutput::from_config`. This started out as `?`, with a
+        // comment arguing that a foreground command should fail loudly; that
+        // was wrong, and in a way worth recording. `/dev/uinput` is root-only
+        // on most distributions, so `?` here means that on any machine without
+        // the udev rule, a config with `enabled = true` stops `tobii headpose`
+        // from running at all — taking opentrack and the bridge down with it
+        // over an optional third sink that neither of them needs.
+        match tobii_output::sinks::UinputJoystick::open() {
+            Ok(s) => router.add(Box::new(s)),
+            Err(e) => eprintln!("not presenting a virtual joystick: {e}"),
+        }
     }
 
     let mut model = open_model(&model_choice(args));
@@ -2021,7 +2029,11 @@ fn headpose(args: &[String]) -> CmdResult {
     if let Some(port) = cfg.bridge_port {
         eprintln!("also sending to the FreeTrack bridge on port {port}");
     }
-    if cfg.joystick {
+    // From what the router actually holds, not from what the config asked for:
+    // the joystick is the one sink here that can be configured on and still
+    // fail to open, and announcing one that is not there sends the user looking
+    // for it in their game.
+    if router.sink_names().contains(&"joystick") {
         eprintln!(
             "also presenting a virtual joystick — bind its axes in any game that \
              has no head-tracking support"
