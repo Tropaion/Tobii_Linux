@@ -794,7 +794,15 @@ mod tests {
             | tobii_protocol::gaze::present::VALIDITY_L
             | tobii_protocol::gaze::present::VALIDITY_R;
 
-        out.offer(&sample, None, std::time::Instant::now());
+        // The first sample establishes the neutral, so it is zero displacement
+        // by construction — that is the point of the recentring, not a fault.
+        // The rate throttle means only one datagram is sent per 1/rate_hz, so
+        // the leaned sample is offered far enough ahead to be let through.
+        let t0 = std::time::Instant::now();
+        out.offer(&sample, None, t0);
+        sample.eye_origin_l_mm[2] = 500.0;
+        sample.eye_origin_r_mm[2] = 500.0;
+        out.offer(&sample, None, t0 + Duration::from_millis(500));
 
         let mut buf = [0u8; 128];
         let n = listener
@@ -802,11 +810,25 @@ mod tests {
             .expect("a datagram should have arrived");
         assert_eq!(n, 48, "an opentrack datagram is six f64");
 
-        // And it carries the position the eye origins imply, not zeroes.
-        let z = f64::from_le_bytes(buf[16..24].try_into().unwrap());
+        // Drain to the most recent datagram: the first carries the neutral.
+        let mut last = buf;
+        listener
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        while let Ok(n) = listener.recv(&mut buf) {
+            if n == 48 {
+                last = buf;
+            }
+        }
+
+        // And it carries the 100 mm lean the eye origins imply, not zeroes.
+        // Smoothing means it arrives partway there, so this asserts the sign
+        // and that something real moved rather than an exact figure.
+        let z = f64::from_le_bytes(last[16..24].try_into().unwrap());
         assert!(
-            z.abs() > 1.0,
-            "the datagram should carry a real distance, got {z}"
+            z < -1.0,
+            "leaning 100 mm closer should send a real negative displacement, \
+             got {z}"
         );
     }
 

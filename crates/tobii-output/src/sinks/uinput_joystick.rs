@@ -219,6 +219,11 @@ pub const ROLL_FULL_SCALE_DEG: f64 = 180.0;
 
 /// Head translation, in millimetres, that drives an axis to its limit.
 ///
+/// **Displacement from where you normally sit**, not distance from the sensor.
+/// [`FramePipeline`](crate::pipeline::FramePipeline) subtracts a neutral before
+/// anything reaches here; without that, an ordinary 680 mm seating distance
+/// pinned this axis at [`AXIS_MAX`] permanently, for every user.
+///
 /// The same ±500 mm span the TrackIR encoding uses — see
 /// [`AXIS_LIMIT`](crate::trackir::AXIS_LIMIT) — so that a movement of a given
 /// size means the same thing on every output this crate has. opentrack's

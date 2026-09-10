@@ -18,6 +18,13 @@
 //! * **Hold through a blink.** Gaze vanishes for 100–400 ms every few seconds.
 //!   Treating that as "look straight ahead" makes the camera lurch on every
 //!   blink, so the last Extended View offset is held and decayed instead.
+//! * **Recentre after Extended View, never before.** Translation goes out as
+//!   displacement from where you normally sit, not as your position in front of
+//!   the sensor — see [`FramePipeline::neutral`]. But Extended View is a geometric
+//!   construction against display corners measured in the tracker's frame, so
+//!   it needs the real position; subtract the neutral first and the head sits
+//!   at the origin of its own coordinate system and the angle collapses to
+//!   zero.
 //!
 //! This existed once as `compose_frame` inside the old `tobii serve` daemon,
 //! where nothing else could reach it, and `tobii headpose` grew its own
@@ -51,6 +58,35 @@ pub struct FramePipeline {
     last_ev: Option<(f64, f64)>,
     gaze_lost_since: Option<Instant>,
     last_tracked: Option<Instant>,
+    /// The neutral head position, and why translation is not sent raw.
+    ///
+    /// [`HeadPose`]'s translation is the head's position **in the tracker's own
+    /// frame**: `z` is how far in front of the sensor you are sitting, so an
+    /// ordinary user sits at `z ≈ 650–700 mm` and never goes near zero. Every
+    /// consumer of this crate wants the opposite quantity — displacement from where
+    /// you normally sit, which is what "lean forward" means to a game.
+    ///
+    /// Sending it raw was not a subtle error. Both encoders saturate:
+    ///
+    /// | z | joystick axis (`±500 mm` full scale) | TrackIR (`AXIS_LIMIT`) |
+    /// |---|---|---|
+    /// | 600 mm | 65534 of 65534 | 16383 of 16383 |
+    /// | 680 mm | 65534 of 65534 | 16383 of 16383 |
+    /// | 700 mm | 65534 of 65534 | 16383 of 16383 |
+    ///
+    /// So `ABS_Z` and TrackIR's `fNPZ` were pinned hard at their maximum for every
+    /// realistic head distance, for every user — a dead axis that looks in a game
+    /// like a permanently-leaned-in camera, or like a throttle stuck at full if
+    /// something auto-binds it. `x` and `y` were merely offset by wherever the
+    /// tracker is mounted, which is smaller and just as wrong.
+    ///
+    /// The neutral is taken from the first pose after tracking starts, and again
+    /// after a loss long enough to have reset the smoothing state — the moment the
+    /// tracker picks you up is, by construction, a moment you are sitting normally.
+    /// That reuses [`TRACKING_LOSS_RESET`] rather than inventing a second notion of
+    /// "you have gone away", and it means somebody who gets up and comes back sat
+    /// slightly differently does not acquire a permanent offset.
+    neutral: Option<[f64; 3]>,
 }
 
 impl FramePipeline {
@@ -61,6 +97,7 @@ impl FramePipeline {
             last_ev: None,
             gaze_lost_since: None,
             last_tracked: None,
+            neutral: None,
         }
     }
 
@@ -108,9 +145,28 @@ impl FramePipeline {
                 }
                 _ => (0.0, 0.0),
             };
+            // Recentre AFTER Extended View, never before. Extended View is a
+            // geometric construction: it needs the head's real position in the
+            // tracker's frame, because the display corners it measures against
+            // are in that same frame. Subtracting the neutral first puts the
+            // head at the origin of its own coordinate system and the angle
+            // collapses to nothing — which two of the tests below caught,
+            // rather than it going out as a silently weaker effect.
+            //
+            // Rotation is never recentred: it is already referenced to facing
+            // the screen, and pitch has its own measured zero
+            // (`tobii headpose --calibrate-pitch`).
+            let neutral = *self.neutral.get_or_insert([raw.x_mm, raw.y_mm, raw.z_mm]);
+            let centred = HeadPose {
+                x_mm: raw.x_mm - neutral[0],
+                y_mm: raw.y_mm - neutral[1],
+                z_mm: raw.z_mm - neutral[2],
+                ..raw
+            };
             // Compose first, then filter once: smoothing head and gaze
             // separately would leave the two contributions out of phase.
-            self.filter.update(fusion::compose(raw, ev_yaw, ev_pitch))
+            self.filter
+                .update(fusion::compose(centred, ev_yaw, ev_pitch))
         });
 
         if pose.is_some() {
@@ -121,6 +177,9 @@ impl FramePipeline {
                 self.filter.reset();
                 self.last_tracked = None;
                 self.last_ev = None;
+                // Dropped with the rest of the state: whoever comes back is
+                // sitting down again, and that is the position to call centre.
+                self.neutral = None;
             }
         }
 
@@ -326,6 +385,102 @@ mod tests {
         assert!(
             p.last_tracked.is_none(),
             "a loss of a full second must reset"
+        );
+    }
+
+    /// The one that matters: a head sitting at a normal distance must not
+    /// saturate the axis.
+    ///
+    /// Translation used to go out as the head's position in the tracker's own
+    /// frame, so `z ≈ 680 mm` against a ±500 mm full scale pinned the axis at
+    /// its maximum for every user — and the TrackIR encoder at its own limit —
+    /// permanently. Nothing failed; the axis was simply dead.
+    #[test]
+    fn a_head_at_a_normal_distance_does_not_peg_the_translation_axes() {
+        use crate::sinks::uinput_joystick::{
+            encode_axis, AXIS_CENTRE, AXIS_MAX, TRANSLATION_FULL_SCALE_MM,
+        };
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+
+        // Both eyes 680 mm in front of the sensor, which is where people sit.
+        let seated = |z: f64| {
+            let mut s = tracked_sample(Some([0.5, 0.5]));
+            s.eye_origin_l_mm = [-32.0, 0.0, z];
+            s.eye_origin_r_mm = [32.0, 0.0, z];
+            s
+        };
+
+        let first = p
+            .offer(&seated(680.0), None, &c, None, now)
+            .pose
+            .expect("a pose");
+        assert_eq!(
+            encode_axis(first.z_mm, TRANSLATION_FULL_SCALE_MM),
+            AXIS_CENTRE,
+            "the first pose is the neutral, so it must read as centre, not {}",
+            AXIS_MAX
+        );
+
+        // Lean 100 mm closer: a real, unsaturated deflection.
+        let leaned = p
+            .offer(&seated(580.0), None, &c, None, now)
+            .pose
+            .expect("a pose");
+        let axis = encode_axis(leaned.z_mm, TRANSLATION_FULL_SCALE_MM);
+        assert!(
+            axis < AXIS_CENTRE && axis > 0,
+            "leaning 100 mm closer should move the axis off centre without \
+             pegging it, got {axis}"
+        );
+    }
+
+    /// Coming back after a long absence re-establishes the neutral, rather
+    /// than leaving a permanent offset because you sat down differently.
+    #[test]
+    fn a_long_absence_recentres_but_a_blink_does_not() {
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let seated = |z: f64| {
+            let mut s = tracked_sample(Some([0.5, 0.5]));
+            s.eye_origin_l_mm = [-32.0, 0.0, z];
+            s.eye_origin_r_mm = [32.0, 0.0, z];
+            s
+        };
+        p.offer(&seated(680.0), None, &c, None, now);
+        assert_eq!(p.neutral.map(|n| n[2]), Some(680.0));
+
+        let lost = GazeSample {
+            validity_l: 4,
+            validity_r: 4,
+            ..Default::default()
+        };
+        p.offer(&lost, None, &c, None, now + Duration::from_millis(200));
+        assert_eq!(
+            p.neutral.map(|n| n[2]),
+            Some(680.0),
+            "a short loss must not move the centre"
+        );
+
+        p.offer(&lost, None, &c, None, now + TRACKING_LOSS_RESET);
+        assert_eq!(p.neutral, None, "a long loss drops it");
+
+        let back = p
+            .offer(
+                &seated(620.0),
+                None,
+                &c,
+                None,
+                now + Duration::from_secs(30),
+            )
+            .pose
+            .expect("a pose");
+        assert!(
+            back.z_mm.abs() < 0.01,
+            "sitting back down is the new centre, not a 60 mm offset: {}",
+            back.z_mm
         );
     }
 

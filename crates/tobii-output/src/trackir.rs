@@ -74,10 +74,17 @@ pub const TRANSLATION_SCALE: f32 = 32.768;
 /// Largest magnitude any axis may carry.
 ///
 /// TrackIR's fields are a 14-bit range expressed as floats, and the reference
-/// client clamps rather than wrapping: at 680 mm of head distance an unclamped
-/// `z` reached 43520 against this ceiling, which is not a large value but a
-/// meaningless one. Clamping keeps a far-away head pinned at the limit instead
-/// of arriving as noise.
+/// client clamps rather than wrapping: an unclamped value past this ceiling is
+/// not a large number but a meaningless one.
+///
+/// This used to say that at 680 mm of head distance an unclamped `z` reached
+/// 43520, and that clamping "keeps a far-away head pinned at the limit". Both
+/// halves were true and together they described a dead axis: translation was
+/// the head's position in front of the sensor, so `fNPZ` sat pinned at 16383
+/// for every user at every normal seating distance. It is displacement from a
+/// neutral now — see [`FramePipeline`](crate::pipeline::FramePipeline) — which
+/// puts an ordinary lean in the middle of the range and leaves this clamp for
+/// what it was meant for: the genuinely out-of-range value.
 pub const AXIS_LIMIT: f32 = 16383.0;
 
 /// Clamp one encoded axis into the representable range.
