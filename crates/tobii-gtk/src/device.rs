@@ -1052,6 +1052,16 @@ struct GameSide {
     warned: bool,
 }
 
+/// Whether the settings ask for a virtual joystick.
+///
+/// A free function so the rule can be tested: `enabled` is the master switch
+/// and `joystick` the one for this sink, and getting the conjunction wrong
+/// either leaves a controller in every game's bind list after the user switched
+/// game output off, or never creates one at all.
+fn wants_joystick(cfg: &tobii_output::games::OutputConfig) -> bool {
+    cfg.enabled && cfg.joystick
+}
+
 /// How often the settings are re-read.
 const GAMES_POLL: Duration = Duration::from_secs(1);
 
@@ -1103,7 +1113,7 @@ impl GameSide {
 
     /// Create or destroy the device to match the setting.
     fn sync_joystick(&mut self, cfg: &tobii_output::games::OutputConfig) {
-        let wanted = cfg.enabled && cfg.joystick;
+        let wanted = wants_joystick(cfg);
         match (wanted, self.joystick.is_some()) {
             (true, false) => match UinputJoystick::open() {
                 Ok(js) => {
@@ -1288,7 +1298,18 @@ fn device_session(
                     // Rate-limited to once a second inside `poll`, so this
                     // costs one small file read per second while a game runs.
                     if game_side.poll() {
-                        games = game_side.output();
+                        // Reconfigured in place, not rebuilt: a rebuild would
+                        // construct a fresh pipeline and re-take the head
+                        // neutral from wherever the user is at that instant.
+                        // See `GameOutput::reconfigure`.
+                        match games.as_mut() {
+                            Some(g) => {
+                                if !g.reconfigure(game_side.joystick.clone()) {
+                                    games = None;
+                                }
+                            }
+                            None => games = game_side.output(),
+                        }
                     }
                     if demand.active() {
                         idle_since = None;
@@ -1472,6 +1493,39 @@ fn now_unix_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The master switch has to dominate the per-sink one.
+    ///
+    /// `GameSide` had no test at all, and both of its recent defects were in
+    /// this area — settings frozen for a whole session, and a status reported
+    /// from the setting rather than the device. This pins the one part of the
+    /// decision that is pure.
+    #[test]
+    fn a_joystick_is_wanted_only_when_game_output_is_on_too() {
+        use tobii_output::games::OutputConfig;
+        let cfg = |enabled, joystick| OutputConfig {
+            enabled,
+            joystick,
+            ..OutputConfig::default()
+        };
+        assert!(super::wants_joystick(&cfg(true, true)));
+        assert!(
+            !super::wants_joystick(&cfg(false, true)),
+            "game output off must leave no controller in anyone's bind list"
+        );
+        assert!(!super::wants_joystick(&cfg(true, false)));
+        assert!(!super::wants_joystick(&cfg(false, false)));
+    }
+
+    /// `joystick` defaults ON, so the master switch is the only thing standing
+    /// between a fresh install and a controller appearing in every game.
+    #[test]
+    fn a_default_config_wants_no_joystick_until_game_output_is_turned_on() {
+        let d = tobii_output::games::OutputConfig::default();
+        assert!(d.joystick, "premise: the sink itself is on by default");
+        assert!(!d.enabled, "premise: game output is off by default");
+        assert!(!super::wants_joystick(&d));
+    }
 
     // --- the lease -------------------------------------------------------
     //

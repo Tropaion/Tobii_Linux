@@ -255,6 +255,9 @@ if [ "$1" = configure ]; then
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload >/dev/null 2>&1 || true
         udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || true
+        # misc too: the rule also grants /dev/uinput for the virtual joystick,
+        # and that is a virtual device no tracker re-plug ever re-events.
+        udevadm trigger --subsystem-match=misc >/dev/null 2>&1 || true
     fi
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
@@ -378,6 +381,8 @@ _tobii_post() {
     fi
     udevadm control --reload >/dev/null 2>&1 || true
     udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || true
+    # misc too — see the deb hook: /dev/uinput is a virtual device.
+    udevadm trigger --subsystem-match=misc >/dev/null 2>&1 || true
     echo "Re-plug the Eye Tracker 5 so the udev rule takes effect."
 }
 post_install() { _tobii_post; }
@@ -448,6 +453,8 @@ if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
 fi
 udevadm control --reload >/dev/null 2>&1 || :
 udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || :
+# misc too — see the deb hook: /dev/uinput is a virtual device.
+udevadm trigger --subsystem-match=misc >/dev/null 2>&1 || :
 EOF
     cp -a "$payload" "$rpmtop/SOURCES/payload"
     rpmbuild --define "_topdir $rpmtop" -bb "$rpmtop/SPECS/tobii-linux.spec" >/dev/null

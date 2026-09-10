@@ -10,7 +10,7 @@
 //! not a crash — it is a game camera that drifts, or lags, or snaps when you
 //! blink, none of which look like a bug in the thing that caused them.
 //!
-//! Two of those orderings are load-bearing and neither is obvious:
+//! Three of those orderings are load-bearing and none of them is obvious:
 //!
 //! * **Compose, then filter once.** Smoothing the head pose and the gaze
 //!   contribution separately leaves the two out of phase, so a fast look
@@ -99,6 +99,16 @@ impl FramePipeline {
             last_tracked: None,
             neutral: None,
         }
+    }
+
+    /// Change the smoothing strength without discarding anything else.
+    ///
+    /// Exists so a settings change does not have to mean a new pipeline: the
+    /// neutral and the blink state have nothing to do with the filter, and
+    /// re-taking the neutral mid-session silently recentres the user on
+    /// whatever pose they happened to be holding.
+    pub fn set_filter_alpha(&mut self, alpha: f64) {
+        self.filter = PoseFilter::new(alpha);
     }
 
     /// Compose one frame.
@@ -374,6 +384,39 @@ mod tests {
              blink {:.3}° vs centre {:.3}°",
             blink.yaw_deg,
             centre.yaw_deg
+        );
+    }
+
+    /// A settings change must not move the centre.
+    ///
+    /// The device thread used to rebuild the whole pipeline when any setting
+    /// changed, which took a fresh neutral from wherever the head was at that
+    /// instant — change a setting while leaning and "centre" becomes the lean,
+    /// permanently.
+    #[test]
+    fn changing_the_smoothing_strength_keeps_the_neutral() {
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        p.offer(&seated(680.0), None, &c, None, now);
+        assert_eq!(p.neutral.map(|n| n[2]), Some(680.0), "premise");
+
+        p.set_filter_alpha(0.9);
+        assert_eq!(
+            p.neutral.map(|n| n[2]),
+            Some(680.0),
+            "the centre is not the filter's business"
+        );
+
+        // And a later lean is still measured from the original neutral.
+        let leaned = p
+            .offer(&seated(580.0), None, &c, None, now)
+            .pose
+            .expect("a pose");
+        assert!(
+            leaned.z_mm < -1.0,
+            "leaning 100 mm closer should read as negative displacement, got {}",
+            leaned.z_mm
         );
     }
 

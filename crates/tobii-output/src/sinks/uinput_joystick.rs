@@ -72,6 +72,8 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use tobii_headpose::HeadPose;
+
 use crate::{Sink, SinkError, TrackingFrame};
 
 // ---------------------------------------------------------------- uapi
@@ -355,6 +357,37 @@ pub fn encode_unit(value: f64) -> i32 {
     (value.clamp(0.0, 1.0) * AXIS_MAX as f64).round() as i32
 }
 
+/// One value per axis of [`AXES`], in that order.
+///
+/// Free, and separate from writing them, because the pairing of quantity to
+/// axis is positional: this array's order and `AXES`'s order are the only thing
+/// deciding that head yaw drives `ABS_RX` rather than `ABS_RY`. Swapping two
+/// entries is invisible to the type system and produces a game whose camera
+/// tilts when the head turns. Inside `emit` that pairing could only be checked
+/// by creating a real device and reading it back; out here it is an ordinary
+/// unit test.
+fn axis_values(pose: &HeadPose, gaze: [i32; 2], r: &Response) -> [i32; 8] {
+    [
+        encode_axis(pose.x_mm, TRANSLATION_FULL_SCALE_MM),
+        encode_axis(pose.y_mm, TRANSLATION_FULL_SCALE_MM),
+        encode_axis(pose.z_mm, TRANSLATION_FULL_SCALE_MM),
+        encode_axis(
+            r.shape(pose.yaw_deg, 0, YAW_FULL_SCALE_DEG),
+            YAW_FULL_SCALE_DEG,
+        ),
+        encode_axis(
+            r.shape(pose.pitch_deg, 1, PITCH_FULL_SCALE_DEG),
+            PITCH_FULL_SCALE_DEG,
+        ),
+        encode_axis(
+            r.shape(pose.roll_deg, 2, ROLL_FULL_SCALE_DEG),
+            ROLL_FULL_SCALE_DEG,
+        ),
+        gaze[0],
+        gaze[1],
+    ]
+}
+
 /// The gaze axes' value for this frame, holding the last one through a blink.
 ///
 /// Gaze vanishes for 100-400 ms every few seconds. Reporting centre for those
@@ -588,26 +621,7 @@ impl Sink for UinputJoystick {
             return Ok(());
         };
         self.last_gaze = hold_gaze(self.last_gaze, frame.gaze);
-        let r = &self.response;
-        self.report([
-            encode_axis(pose.x_mm, TRANSLATION_FULL_SCALE_MM),
-            encode_axis(pose.y_mm, TRANSLATION_FULL_SCALE_MM),
-            encode_axis(pose.z_mm, TRANSLATION_FULL_SCALE_MM),
-            encode_axis(
-                r.shape(pose.yaw_deg, 0, YAW_FULL_SCALE_DEG),
-                YAW_FULL_SCALE_DEG,
-            ),
-            encode_axis(
-                r.shape(pose.pitch_deg, 1, PITCH_FULL_SCALE_DEG),
-                PITCH_FULL_SCALE_DEG,
-            ),
-            encode_axis(
-                r.shape(pose.roll_deg, 2, ROLL_FULL_SCALE_DEG),
-                ROLL_FULL_SCALE_DEG,
-            ),
-            self.last_gaze[0],
-            self.last_gaze[1],
-        ])?;
+        self.report(axis_values(&pose, self.last_gaze, &self.response))?;
         Ok(())
     }
 }
@@ -710,7 +724,7 @@ mod tests {
         assert_eq!(size_of::<InputEvent>(), 24);
     }
 
-    /// The four request numbers, computed against the values in
+    /// The seven request numbers, computed against the values in
     /// `<linux/uinput.h>`. Transcribing these by hand is the classic way to
     /// get a silently dead uinput device, so they are pinned.
     #[test]
@@ -722,6 +736,65 @@ mod tests {
         assert_eq!(UI_SET_EVBIT, 0x4004_5564);
         assert_eq!(UI_SET_KEYBIT, 0x4004_5565);
         assert_eq!(UI_SET_ABSBIT, 0x4004_5567);
+    }
+
+    /// Which quantity lands on which axis, checked without a device.
+    ///
+    /// Positional pairing between this array and `AXES` is the only thing that
+    /// makes head yaw drive `ABS_RX`; swapping two entries compiles, passes
+    /// every other test, and produces a game whose camera rolls when the user
+    /// turns their head. Before this it was checked only by the `#[ignore]`d
+    /// hardware test, which does not run by default.
+    #[test]
+    fn each_quantity_lands_on_its_own_axis() {
+        let r = Response::default();
+        // Every quantity distinct, and distinct from centre, so a swap shows.
+        let pose = HeadPose {
+            x_mm: 100.0,
+            y_mm: -200.0,
+            z_mm: 37.0,
+            yaw_deg: 21.0,
+            pitch_deg: -17.5,
+            roll_deg: 13.0,
+        };
+        let gaze = [1234, 5678];
+        let v = axis_values(&pose, gaze, &r);
+        let of = |code: u16| {
+            let i = AXES
+                .iter()
+                .position(|c| *c == code)
+                .expect("a declared axis");
+            v[i]
+        };
+
+        assert_eq!(of(ABS_X), encode_axis(100.0, TRANSLATION_FULL_SCALE_MM));
+        assert_eq!(of(ABS_Y), encode_axis(-200.0, TRANSLATION_FULL_SCALE_MM));
+        assert_eq!(of(ABS_Z), encode_axis(37.0, TRANSLATION_FULL_SCALE_MM));
+        assert_eq!(
+            of(ABS_RX),
+            encode_axis(r.shape(21.0, 0, YAW_FULL_SCALE_DEG), YAW_FULL_SCALE_DEG)
+        );
+        assert_eq!(
+            of(ABS_RY),
+            encode_axis(
+                r.shape(-17.5, 1, PITCH_FULL_SCALE_DEG),
+                PITCH_FULL_SCALE_DEG
+            )
+        );
+        assert_eq!(
+            of(ABS_RZ),
+            encode_axis(r.shape(13.0, 2, ROLL_FULL_SCALE_DEG), ROLL_FULL_SCALE_DEG)
+        );
+        assert_eq!(of(ABS_THROTTLE), gaze[0]);
+        assert_eq!(of(ABS_RUDDER), gaze[1]);
+
+        // Every value distinct, so no pair could be swapped unnoticed. This
+        // fires easily: 250 mm and 35 deg of yaw both encode to 49151, and the
+        // first fixture chosen here aliased on exactly that.
+        let mut sorted = v.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), v.len(), "the fixture must not alias: {v:?}");
     }
 
     /// Without the response stage a real head only reaches a third of the
@@ -788,8 +861,14 @@ mod tests {
         }
     }
 
-    /// An axis whose halves differ in length reads as a permanent offset in
-    /// any game that normalises to `[-1, 1]`.
+    /// The end stops must be exactly reachable, and rest must encode to centre.
+    ///
+    /// This used to say an odd span "reads as a permanent offset in any game
+    /// that normalises to `[-1, 1]`" — the rationale [`AXIS_MAX`] now records as
+    /// disproven, since joydev and SDL disagree about which span centres and
+    /// each by one step. What these assertions actually guard is the encoder's
+    /// own arithmetic: `encode_axis` emits `AXIS_CENTRE ± AXIS_CENTRE`, so an
+    /// odd span would declare a maximum it can never produce.
     #[test]
     fn the_axis_is_symmetric_about_centre() {
         assert_eq!(AXIS_CENTRE - AXIS_MIN, AXIS_MAX - AXIS_CENTRE);

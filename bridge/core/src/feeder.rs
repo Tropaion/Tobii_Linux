@@ -61,10 +61,21 @@ pub const PORT_ENV: &str = "TOBII_BRIDGE_PORT";
 /// This lives here, rather than only in the TrackIR DLL that receives it,
 /// because publishing it needs write access to the mapping — and until the
 /// feeder moved into the DLL, the DLL was a read-only consumer of a mapping
-/// another process owned. `npclient::trackir` recorded the id and said so:
-/// "closing the loop would mean either a second channel back to the provider or
-/// a read-write mapping with two writers". Neither is needed now that the
-/// process holding the id is the process writing the mapping.
+/// another process owned.
+///
+/// **It is per DLL image, not per process, and that is a real limit.** Each
+/// `cdylib` links its own copy of this crate, so a game that loads *both*
+/// clients has two `GAME_ID`s and two `START`s. Only the TrackIR side ever
+/// records an id (`NP_RegisterProgramProfileID`; `FTReportID` is a stub), so if
+/// the FreeTrack DLL is the one that won the port, the id it publishes is its
+/// own copy — which nothing ever writes — and `FTHeap.GameID` stays 0 for the
+/// session. Being one process is not enough; the statics would have to be
+/// shared, and PE has no interposition.
+///
+/// Left as it is because nothing in this tree reads `GameID` back: it is there
+/// so a consumer can tell which title is being served, which is interop and
+/// diagnostics rather than tracking. Recorded so the next person does not
+/// conclude from "same process" that it must work.
 pub static GAME_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// The port to listen on, from the environment or the default.
@@ -171,8 +182,24 @@ static START: Once = Once::new();
 /// very next act is to open that mapping as a consumer — and the consumer handle
 /// is cached for the life of the process, so losing that race once would mean
 /// reporting "no data" forever.
+///
+/// # Why the module is pinned
+///
+/// The thread it starts is detached and loops forever inside this DLL's own
+/// image. If the game ever called `FreeLibrary` on the client DLL, the loader
+/// would unmap that image while the thread was sitting in `recv_from`, and the
+/// next instruction fetch would fault inside the game. Process exit is safe —
+/// Windows stops threads before detach — so this only bites on an explicit
+/// unload, which the TrackIR ABI does invite: `NP_StopDataTransmission` and
+/// `NP_UnregisterWindowHandle` are the documented teardown, and a game may well
+/// unload afterwards. Pinning is one call and removes the whole question; the
+/// alternative, a shutdown channel, would have to win a race against the loader
+/// lock this function already exists to stay clear of.
 pub fn ensure_started() {
     START.call_once(|| {
+        // Before the thread exists, so there is no window in which it is
+        // running inside an image that can still be unmapped.
+        crate::winapi::pin_this_module(serve as *const ());
         let (tx, rx) = mpsc::channel();
         let p = port();
         if std::thread::Builder::new()

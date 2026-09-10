@@ -219,11 +219,15 @@ pub(crate) fn pose_is_fresh(at: Option<std::time::Instant>, now: std::time::Inst
 /// The hub's own game output: compose a frame per gaze sample, route it to the
 /// configured sinks.
 ///
-/// Built per CONNECTION rather than once at startup. The tracker only opens when
-/// something asks for it, so the next connect is the next moment anybody could
-/// be watching — which makes toggling the games switch take effect without
-/// restarting the hub, and re-reads the display corners Extended View needs
-/// after a screen change.
+/// Built per connection, and **reconfigured in place** whenever the settings
+/// change under it — see [`GameOutput::reconfigure`] and `device::GameSide`.
+///
+/// Per connection alone was not enough, and this comment used to say it was:
+/// "the next connect is the next moment anybody could be watching, which makes
+/// toggling the games switch take effect without restarting the hub". A session
+/// lasts as long as anything holds the tracker — the whole time the hub has
+/// focus, the whole life of a game started with `tobii game` — so the settings
+/// were frozen for exactly as long as somebody was there to change them.
 pub struct GameOutput {
     cfg: tobii_output::games::OutputConfig,
     router: tobii_output::Router,
@@ -300,6 +304,34 @@ impl GameOutput {
             cfg,
             router,
         })
+    }
+
+    /// Take a settings change without disturbing the tracking state.
+    ///
+    /// # Why this is not just a rebuild
+    ///
+    /// Rebuilding `GameOutput` is what the device thread used to do on any
+    /// settings change, and it constructs a fresh [`FramePipeline`] — which
+    /// throws away the **neutral**, the head position that reads as zero
+    /// displacement. Re-taking it mid-game means re-taking it from wherever the
+    /// user's head happens to be at that instant. Change the Extended View
+    /// strength while leaning forward and "centre" becomes the leaning pose,
+    /// permanently, until tracking is lost for a full second.
+    ///
+    /// The pipeline has nothing to do with which sinks are attached, so it is
+    /// simply kept. Only the smoothing strength can require touching it, and
+    /// only when it actually changed.
+    pub fn reconfigure(&mut self, joystick: Option<JoystickHandle>) -> bool {
+        let Some(fresh) = GameOutput::for_session(joystick) else {
+            return false;
+        };
+        if (fresh.cfg.filter_alpha - self.cfg.filter_alpha).abs() > f64::EPSILON {
+            self.pipeline.set_filter_alpha(fresh.cfg.filter_alpha);
+        }
+        self.cfg = fresh.cfg;
+        self.router = fresh.router;
+        self.corners = fresh.corners;
+        true
     }
 
     /// Compose and route one sample.

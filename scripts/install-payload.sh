@@ -161,6 +161,10 @@ else
         # device on the machine, which on a desktop means re-probing disks,
         # input devices and graphics for the sake of one tracker.
         sudo udevadm trigger --subsystem-match=usb
+        # And misc, for the /dev/uinput grant the virtual joystick needs. The
+        # comment above explains why this is not a bare `udevadm trigger`; it
+        # was written when the rule only covered the tracker.
+        sudo udevadm trigger --subsystem-match=misc
         echo "  installed — ${bold}re-plug the Eye Tracker 5${reset} for it to take effect"
     fi
 fi

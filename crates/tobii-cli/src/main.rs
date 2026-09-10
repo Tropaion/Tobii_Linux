@@ -162,7 +162,8 @@ fn game(args: &[String]) -> ExitCode {
     // anywhere. That presents as "head tracking does not work" with a lit
     // tracker as evidence that it should, which is the worst combination to
     // debug. The hub's games row names this state; the wrapper has to as well.
-    if !tobii_output::games::load_output_config().enabled {
+    let games = tobii_output::games::load_output_config();
+    if !games.enabled {
         eprintln!(
             "note: game output is off, so {name} will receive nothing even though \
              the tracker comes on. Turn it on in the hub, or: tobii games set enabled true"
@@ -182,7 +183,19 @@ fn game(args: &[String]) -> ExitCode {
         }
     };
 
-    let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
+    let mut child = std::process::Command::new(&cmd[0]);
+    child.args(&cmd[1..]);
+    // Put into the game's environment, because the Wine-side DLL reads its port
+    // from there and nothing else can tell it. The hub sends on `bridge_port`;
+    // the DLL defaults to 4243. Change that setting and, without this, the two
+    // sit on different ports with nothing to say so — the game just gets no
+    // tracking. Spelled literally rather than imported: the constant lives in
+    // `bridge/core/src/feeder.rs`, a separate workspace this crate does not
+    // depend on.
+    if let Some(port) = games.bridge_port {
+        child.env("TOBII_BRIDGE_PORT", port.to_string());
+    }
+    let status = child.status();
     // Explicit, and after the wait: this is the line that puts the tracker out.
     drop(client);
 

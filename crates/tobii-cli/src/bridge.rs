@@ -231,7 +231,6 @@ fn on_path(cmd: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Resolve the prefix: `--prefix`, else `$WINEPREFIX`, else `~/.wine`.
 /// The Proton build a Steam prefix was made with, from its `config_info`.
 ///
 /// # Why this matters more than a convenience
@@ -449,6 +448,8 @@ fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
     })
 }
 
+/// Resolve the prefix: `--steam`, else `--prefix`, else `$WINEPREFIX`, else
+/// `~/.wine`.
 fn resolve_prefix(args: &[String]) -> Result<PathBuf, String> {
     if let Some(wanted) = crate::flag_value(args, "--steam") {
         let home = std::env::var_os("HOME")
@@ -555,7 +556,18 @@ fn install(args: &[String]) -> CmdResult {
             eprintln!("note: {name} not built yet — skipping");
             continue;
         }
-        std::fs::copy(&from, dest.join(name))?;
+        // Written beside the target and renamed, never copied over in place.
+        // A game that is running has the DLL mapped; `fs::copy` onto it either
+        // fails outright or, if the loader lets it through, leaves a torn file
+        // that the next launch loads. `rename` within one directory is atomic,
+        // so the old DLL stays whole until the instant the new one replaces it.
+        let target = dest.join(name);
+        let staged = dest.join(format!(".{name}.new"));
+        std::fs::copy(&from, &staged)?;
+        if let Err(e) = std::fs::rename(&staged, &target) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("could not replace {}: {e}", target.display()).into());
+        }
         copied += 1;
         println!("  {name}");
     }

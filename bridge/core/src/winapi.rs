@@ -65,6 +65,12 @@ extern "system" {
     pub fn ReleaseMutex(hMutex: HANDLE) -> BOOL;
 
     pub fn GetLastError() -> DWORD;
+
+    pub fn GetModuleHandleExA(
+        dwFlags: DWORD,
+        lpModuleName: LPCSTR,
+        phModule: *mut HANDLE,
+    ) -> BOOL;
 }
 
 // The registry lives in advapi32, which — unlike kernel32 — is not in the
@@ -166,4 +172,30 @@ pub fn set_hkcu_string(subkey: &str, value_name: &str, data: &str) -> Result<(),
 pub fn delete_hkcu_key(subkey: &str) {
     let sub = cstr(subkey);
     unsafe { RegDeleteKeyA(HKEY_CURRENT_USER, sub.as_ptr()) };
+}
+
+/// Take a reference on this DLL that is never released.
+///
+/// `addr` must be an address inside this image — a function pointer from this
+/// crate is the simplest one to hand.
+///
+/// The feeder thread runs forever inside the client DLL's own image. Without
+/// this, a game calling `FreeLibrary` would unmap that image out from under a
+/// thread sitting in `recv_from`, and the fault would land in the game with no
+/// module left to attribute it to. `GET_MODULE_HANDLE_EX_FLAG_PIN` is the
+/// documented way to say "this image stays for the life of the process"; the
+/// handle it hands back is deliberately dropped, because pinning is the whole
+/// effect and there is nothing to close.
+///
+/// Best-effort: if it fails, the only consequence is that the pre-existing
+/// unload hazard is still there, which is no worse than not calling it.
+pub fn pin_this_module(addr: *const ()) {
+    /// `GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`
+    const FLAGS: DWORD = 0x0000_0001 | 0x0000_0004;
+    let mut handle: HANDLE = std::ptr::null_mut();
+    // SAFETY: `addr` is an address inside this image, which is what
+    // FROM_ADDRESS asks for, and `handle` is a live out-parameter.
+    unsafe {
+        GetModuleHandleExA(FLAGS, addr.cast(), &mut handle);
+    }
 }
