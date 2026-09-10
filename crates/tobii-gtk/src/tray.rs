@@ -1,0 +1,554 @@
+//! The tray icon — a StatusNotifierItem published on the session bus.
+//!
+//! The hub is a program that owns a device: it has to outlive its own window,
+//! because a game needs head tracking long after the settings have been put
+//! away. Dismissing the window therefore cannot end the process — and a process
+//! with no window and no icon is one the user cannot get back. This module is
+//! the way back: an icon in the system tray whose click raises the hub again,
+//! and the only visible sign of the hub when it is autostarted at login with no
+//! window at all.
+//!
+//! # Why this is written out against D-Bus by hand
+//!
+//! There is no XEmbed system tray under Wayland. What Plasma reads instead —
+//! and with it waybar, xfce4-panel, LXQt, and GNOME via the AppIndicator
+//! extension — is StatusNotifierItem: an object the application exports on the
+//! session bus, announced to a `StatusNotifierWatcher` that the desktop
+//! publishes. The part of that protocol worth having is seven properties, four
+//! methods and a handful of change signals, which is small enough to write
+//! directly against `gio`'s D-Bus API. `gio` is already in the tree underneath
+//! GTK, whereas every tray *library* on offer (libappindicator,
+//! libayatana-appindicator, ksni's zbus stack) is either a C dependency to
+//! package on each distro this ships to or a second async runtime to carry.
+//!
+//! # No tray menu, deliberately
+//!
+//! `ItemIsMenu` is published as false and no `Menu` property is published at
+//! all. A tray menu is not part of this interface: it is `com.canonical.dbusmenu`,
+//! a second exported object with its own layout-revision, item-property and
+//! event model. That is a large amount of surface to carry for one "Quit"
+//! entry, and the hub already has Quit in its cogwheel popover. Right-click and
+//! middle-click therefore raise the window just as left-click does — see
+//! [`Gesture`] — because a click that does nothing reads as a broken icon.
+//!
+//! # Threading
+//!
+//! Everything here runs on the GLib main context that is thread-default when
+//! [`install`] is called, so [`install`] must be called from the GTK main
+//! thread: that is what makes it safe for `on_activate` to touch widgets.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use gtk::gio;
+use gtk::glib;
+use gtk::prelude::*;
+
+use crate::APP_ID;
+
+/// The interface hosts look for, and the object it lives on.
+///
+/// `org.kde.*` rather than `org.freedesktop.*`: the spec was written for
+/// freedesktop but never adopted there, so KDE's original names are what the
+/// interface is still called everywhere. Only the *bus name* below varies —
+/// applications publish items under both prefixes, and the same item exports
+/// this interface either way.
+const ITEM_INTERFACE: &str = "org.kde.StatusNotifierItem";
+const ITEM_PATH: &str = "/StatusNotifierItem";
+const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
+const WATCHER_PATH: &str = "/StatusNotifierWatcher";
+
+/// What the tray shows under the icon, and what a host with no `ToolTip` falls
+/// back to. The same string as `Name` in `assets/com.tobiilinux.Configuration.desktop`,
+/// so the tray and the application menu agree on what this program is called.
+const TITLE: &str = "Tobii Eye Tracker";
+
+/// The icon theme name.
+///
+/// The same string as [`APP_ID`] because that is what `Icon=` in
+/// `assets/com.tobiilinux.Configuration.desktop` names, and
+/// `scripts/install-payload.sh` installs `com.tobiilinux.Configuration.svg`
+/// into `…/icons/hicolor/scalable/apps`. A host that cannot find it in the
+/// icon theme shows its own placeholder; the icon is not sent over the bus as
+/// pixels, so there is nothing to fall back to here.
+const ICON_NAME: &str = APP_ID;
+
+/// How long to wait for either of the two calls this module makes.
+///
+/// Both go over the session bus's local socket to a process that is sitting in
+/// its own main loop, which answers in well under a millisecond; a wait worth
+/// measuring means something is already wrong. The bound is there so that when
+/// something is, the hub pays two seconds rather than GDBus's 25-second
+/// default.
+const CALL_TIMEOUT_MS: i32 = 2_000;
+
+/// The interface, as the hosts' introspection expects to find it.
+///
+/// Only what is implemented is declared, and this list is load-bearing in one
+/// direction only. GDBus answers `Get`/`GetAll` and `Introspect` from it and
+/// refuses what is absent — an undeclared property or method is rejected
+/// before the closures below ever run — but it does NOT check what the getter
+/// hands back against the signature declared here. A property declared with no
+/// arm in [`property`] therefore goes out as an empty string under a type the
+/// host was promised, and neither side says a word: the host simply reads
+/// nonsense or nothing. There is no runtime check to catch that, which is why
+/// the test module holds the two lists together instead.
+const ITEM_XML: &str = r#"
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <method name="ContextMenu">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="Activate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="Scroll">
+      <arg name="delta" type="i" direction="in"/>
+      <arg name="orientation" type="s" direction="in"/>
+    </method>
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <signal name="NewTitle"/>
+    <signal name="NewIcon"/>
+    <signal name="NewStatus">
+      <arg name="status" type="s"/>
+    </signal>
+    <signal name="NewToolTip"/>
+  </interface>
+</node>
+"#;
+
+/// What a host's click should do.
+///
+/// Right-click (`ContextMenu`) and middle-click (`SecondaryActivate`) raise the
+/// window like a left-click, because this item publishes no menu for a
+/// right-click to open — see the module documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gesture {
+    /// Bring the hub back.
+    Raise,
+    /// Answer the call and do nothing else.
+    Ignore,
+}
+
+/// The gesture a method call from a host means.
+fn gesture(method: &str) -> Gesture {
+    match method {
+        "Activate" | "SecondaryActivate" | "ContextMenu" => Gesture::Raise,
+        // In practice only `Scroll`: GDBus rejects any method not in
+        // [`ITEM_XML`] before this runs. The arm is what keeps a method added
+        // to that list from falling through with no reply.
+        _ => Gesture::Ignore,
+    }
+}
+
+/// The value of one `org.kde.StatusNotifierItem` property.
+///
+/// `None` for a name this interface does not declare, which GDBus never asks
+/// for: it rejects properties absent from [`ITEM_XML`] before the getter runs.
+fn property(name: &str, tooltip: &str) -> Option<glib::Variant> {
+    Some(match name {
+        // The category describes what the item IS, not what it watches. This
+        // is an application the user opens; "Hardware", the tempting one for a
+        // program that talks to a device, is for readouts of the machine
+        // itself — battery, temperature, disk.
+        "Category" => "ApplicationStatus".to_variant(),
+        // The application id, so a host that looks for a desktop entry by this
+        // name finds com.tobiilinux.Configuration.desktop and can offer its
+        // actions.
+        "Id" => APP_ID.to_variant(),
+        "Title" => TITLE.to_variant(),
+        // Never "Passive": a passive item is one the host is free to hide, and
+        // an icon that hides itself is exactly the way back that this module
+        // exists to provide.
+        "Status" => "Active".to_variant(),
+        "IconName" => ICON_NAME.to_variant(),
+        "ItemIsMenu" => false.to_variant(),
+        "ToolTip" => tooltip_variant(tooltip),
+        _ => return None,
+    })
+}
+
+/// A `ToolTip` value: icon name, icon pixmaps, title, description.
+///
+/// The icon name is left empty so the host reuses the item's own icon, and the
+/// text goes in the title rather than the description because a host that shows
+/// only one of the two shows the title.
+fn tooltip_variant(text: &str) -> glib::Variant {
+    // Typed from Rust rather than from a parsed type string: `(i32, i32,
+    // Vec<u8>)` *is* `(iiay)`, so an empty pixmap array cannot be built with
+    // the wrong element type and cannot panic building it.
+    let pixmaps = glib::Variant::array_from_iter::<(i32, i32, Vec<u8>)>(std::iter::empty());
+    glib::Variant::tuple_from_iter(["".to_variant(), pixmaps, text.to_variant(), "".to_variant()])
+}
+
+/// The bus name this item is published under.
+///
+/// The `-<pid>-<n>` shape is the spec's, and the pid makes it unique without
+/// asking the bus for anything; `1` because this process publishes exactly one
+/// item. Convention rather than enforcement — KDE's watcher was observed
+/// holding an item registered under a bare unique name — but conforming costs
+/// nothing and is what a host is entitled to assume.
+fn bus_name() -> String {
+    format!("org.kde.StatusNotifierItem-{}-1", std::process::id())
+}
+
+/// Everything the D-Bus callbacks share.
+///
+/// `Rc`, not `Arc`: every one of those callbacks is dispatched on the main
+/// context this was built on, and none of them is `Send`.
+struct State {
+    bus_name: String,
+    /// The hover text, read back by the `ToolTip` getter.
+    tooltip: RefCell<String>,
+    /// Whether the bus name is ours, and whether a watcher is up.
+    ///
+    /// The item can only be announced once both hold, and either can become
+    /// true first — the name is acquired asynchronously and the watcher may
+    /// appear at any time, including after a panel restart. So both transitions
+    /// call [`State::announce`] and it decides.
+    have_name: Cell<bool>,
+    watcher_up: Cell<bool>,
+}
+
+impl State {
+    fn announce(&self, conn: &gio::DBusConnection) {
+        if !self.have_name.get() || !self.watcher_up.get() {
+            return;
+        }
+        conn.call(
+            Some(WATCHER_NAME),
+            WATCHER_PATH,
+            // The watcher's interface name and its bus name are the same
+            // string; this is not a copy-paste slip.
+            WATCHER_NAME,
+            "RegisterStatusNotifierItem",
+            Some(&glib::Variant::tuple_from_iter([self
+                .bus_name
+                .to_variant()])),
+            None,
+            gio::DBusCallFlags::NONE,
+            CALL_TIMEOUT_MS,
+            gio::Cancellable::NONE,
+            // Nothing to do either way: the icon appears or it does not, and
+            // there is no second thing to try. A watcher that comes back later
+            // re-announces through the NameOwnerChanged subscription below.
+            |_reply| {},
+        );
+    }
+}
+
+/// A published tray icon. Dropping it takes the icon away.
+pub struct Tray {
+    conn: gio::DBusConnection,
+    state: Rc<State>,
+    /// `Option` only so that [`Drop`] can take them: the ids are move-only and
+    /// each teardown call consumes one.
+    registration: Option<gio::RegistrationId>,
+    owner: Option<gio::OwnerId>,
+    /// Held for its `Drop`, which unsubscribes; never read.
+    _watcher: gio::SignalSubscription,
+}
+
+impl Tray {
+    /// Update the hover text, e.g. "Tobii Eye Tracker 5 — tracker off".
+    ///
+    /// The signal is what makes it visible: a host reads `ToolTip` once and
+    /// then waits to be told, so a silent write would only be seen by a host
+    /// that happened to restart.
+    pub fn set_tooltip(&self, text: &str) {
+        if *self.state.tooltip.borrow() == text {
+            return;
+        }
+        self.state.tooltip.replace(text.to_owned());
+        let _ = self
+            .conn
+            .emit_signal(None, ITEM_PATH, ITEM_INTERFACE, "NewToolTip", None);
+    }
+}
+
+impl Drop for Tray {
+    fn drop(&mut self) {
+        // Before unregistering the object: dropping the name is what tells the
+        // watcher the item is gone, and a host that reacts by reading one last
+        // property should still find something to read.
+        if let Some(id) = self.owner.take() {
+            gio::bus_unown_name(id);
+        }
+        if let Some(id) = self.registration.take() {
+            let _ = self.conn.unregister_object(id);
+        }
+    }
+}
+
+/// Publish a StatusNotifierItem for this application.
+///
+/// `on_activate` is invoked on the GTK main thread when the user clicks the
+/// icon. Returns `None` when this desktop publishes no StatusNotifierWatcher,
+/// which is the ordinary case on stock GNOME.
+///
+/// Call this from the GTK main thread, and hold the returned [`Tray`] for as
+/// long as the icon should exist.
+///
+/// # What `None` means, exactly
+///
+/// It is decided by one question to the bus daemon: does anything own
+/// `org.kde.StatusNotifierWatcher` *right now*. That is the only way to know
+/// before returning, and the answer is what a caller needs in order to decide
+/// whether hiding its window is safe. The cost is a boot race on desktops where
+/// the panel starts alongside the autostarted application rather than before it
+/// — Plasma starts kded, which owns the name, well before XDG autostart runs,
+/// but a tiling compositor launching a bar from its own config need not. A
+/// caller that autostarts and gets `None` at login may reasonably try again a
+/// few seconds later.
+///
+/// Once it has said yes, a watcher that restarts is handled: the item
+/// re-announces itself without the caller doing anything.
+pub fn install(on_activate: impl Fn() + 'static) -> Option<Tray> {
+    // Blocking, but only as far as the session bus GTK itself is already
+    // connected to: GLib caches one connection per bus type, so with the
+    // application registered this hands back the connection it is already
+    // using. With no session bus at all it fails here and the hub starts
+    // without a tray.
+    let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
+    if !watcher_is_up(&conn) {
+        return None;
+    }
+
+    let node = gio::DBusNodeInfo::for_xml(ITEM_XML).ok()?;
+    let interface = node.lookup_interface(ITEM_INTERFACE)?;
+
+    let state = Rc::new(State {
+        bus_name: bus_name(),
+        tooltip: RefCell::new(TITLE.to_owned()),
+        have_name: Cell::new(false),
+        // True because `watcher_is_up` just said so; the subscription below is
+        // what keeps it honest from here on.
+        watcher_up: Cell::new(true),
+    });
+
+    let registration = conn
+        .register_object(ITEM_PATH, &interface)
+        .property({
+            let state = state.clone();
+            move |_conn, _sender, _path, _interface, name| {
+                // The fallback is unreachable — GDBus rejects any name absent
+                // from ITEM_XML before calling this — and exists because the
+                // signature has no room to say so.
+                property(name, &state.tooltip.borrow()).unwrap_or_else(|| "".to_variant())
+            }
+        })
+        .method_call(
+            move |_conn, _sender, _path, _interface, method, _args, invocation| {
+                if gesture(method) == Gesture::Raise {
+                    on_activate();
+                }
+                // Every declared method must be answered, including the ones
+                // that do nothing: an unanswered call leaves the host blocked
+                // until its own timeout expires.
+                invocation.return_result(Ok(None));
+            },
+        )
+        .build()
+        .ok()?;
+
+    // Owning the name before announcing it: the watcher resolves the name the
+    // moment it is told about it, and announcing one nobody owns yet is how an
+    // item ends up registered and invisible.
+    let owner = gio::bus_own_name_on_connection(
+        &conn,
+        &state.bus_name,
+        gio::BusNameOwnerFlags::NONE,
+        {
+            let state = state.clone();
+            move |conn, _name| {
+                state.have_name.set(true);
+                state.announce(&conn);
+            }
+        },
+        {
+            let state = state.clone();
+            move |_conn, _name| state.have_name.set(false)
+        },
+    );
+
+    // A panel restart is routine on Plasma, and the watcher goes with it. This
+    // is what puts the icon back afterwards: the new watcher starts with an
+    // empty register, so every item has to announce itself again or it is gone
+    // for the rest of the session.
+    let _watcher = conn.subscribe_to_signal(
+        Some("org.freedesktop.DBus"),
+        Some("org.freedesktop.DBus"),
+        Some("NameOwnerChanged"),
+        Some("/org/freedesktop/DBus"),
+        Some(WATCHER_NAME),
+        gio::DBusSignalFlags::NONE,
+        {
+            let state = state.clone();
+            move |signal| {
+                // (name, old owner, new owner); an empty new owner means the
+                // name was released rather than taken over.
+                let new_owner = signal.parameters.child_value(2);
+                let up = new_owner.str().is_some_and(|s| !s.is_empty());
+                state.watcher_up.set(up);
+                if up {
+                    state.announce(signal.connection);
+                }
+            }
+        },
+    );
+
+    Some(Tray {
+        conn,
+        state,
+        registration: Some(registration),
+        owner: Some(owner),
+        _watcher,
+    })
+}
+
+/// Whether anything owns the watcher name at this moment.
+///
+/// Asked of the bus daemon rather than of the watcher, because the daemon is
+/// the one process guaranteed to be there to answer.
+fn watcher_is_up(conn: &gio::DBusConnection) -> bool {
+    let reply = conn.call_sync(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        Some(&glib::Variant::tuple_from_iter([WATCHER_NAME.to_variant()])),
+        Some(glib::VariantTy::new("(b)").expect("a literal D-Bus type string")),
+        gio::DBusCallFlags::NONE,
+        CALL_TIMEOUT_MS,
+        gio::Cancellable::NONE,
+    );
+    reply
+        .ok()
+        .and_then(|r| r.child_value(0).get::<bool>())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The attribute values of every `<tag ` element in [`ITEM_XML`].
+    ///
+    /// Enough of a parser for XML this module owns, and no more. gio exposes no
+    /// way to walk a parsed `DBusInterfaceInfo`'s members from Rust — only
+    /// `lookup_*` by name — so the declarations have to be read out of the text
+    /// to be checked against the code that answers them.
+    fn declared(tag: &str, attr: &str) -> Vec<String> {
+        ITEM_XML
+            .split(&format!("<{tag} "))
+            .skip(1)
+            .filter_map(|el| {
+                let rest = el.split_once(&format!("{attr}=\""))?.1;
+                Some(rest.split_once('"')?.0.to_owned())
+            })
+            .collect()
+    }
+
+    /// The parser above finding nothing would make every test using it pass
+    /// vacuously, so the counts are pinned here.
+    #[test]
+    fn the_interface_declares_the_members_hosts_call() {
+        let node = gio::DBusNodeInfo::for_xml(ITEM_XML).expect("the interface XML must parse");
+        let iface = node
+            .lookup_interface(ITEM_INTERFACE)
+            .expect("the interface hosts look for");
+        assert_eq!(iface.name(), ITEM_INTERFACE);
+
+        let methods = declared("method", "name");
+        assert_eq!(
+            methods,
+            ["ContextMenu", "Activate", "SecondaryActivate", "Scroll"],
+            "the four methods a host may call"
+        );
+        assert_eq!(declared("property", "name").len(), 7);
+        for m in &methods {
+            assert!(
+                iface.lookup_method(m).is_some(),
+                "{m} is declared in the text but not in the parsed interface"
+            );
+        }
+    }
+
+    /// Nothing at runtime checks this. GDBus was measured handing a string
+    /// straight through for a property declared `b`, with no warning on either
+    /// side of the bus — so a getter that answers with the wrong type is a
+    /// property the host silently misreads, and this test is the only thing
+    /// standing between that and a shipped build.
+    #[test]
+    fn every_declared_property_is_answered_with_the_type_it_declares() {
+        let names = declared("property", "name");
+        let types = declared("property", "type");
+        assert_eq!(names.len(), types.len());
+        for (name, ty) in names.iter().zip(&types) {
+            let value = property(name, "hover text")
+                .unwrap_or_else(|| panic!("{name} is declared but never answered"));
+            assert_eq!(
+                value.type_().as_str(),
+                ty,
+                "{name} is declared as {ty} but answered as {}",
+                value.type_().as_str()
+            );
+        }
+    }
+
+    /// The hub's own state line is put here, so it has to survive the trip.
+    #[test]
+    fn the_tooltip_carries_the_text_a_host_shows() {
+        let v = tooltip_variant("Tobii Eye Tracker 5 — tracker off");
+        assert_eq!(v.type_().as_str(), "(sa(iiay)ss)");
+        assert_eq!(
+            v.child_value(2).get::<String>().as_deref(),
+            Some("Tobii Eye Tracker 5 — tracker off"),
+            "the text belongs in the title field, which is the one hosts show"
+        );
+        assert_eq!(
+            v.child_value(1).n_children(),
+            0,
+            "no pixmaps: the icon is named, not sent"
+        );
+    }
+
+    /// No published menu means a right-click has nothing to open, so it must
+    /// raise the window instead of doing nothing.
+    #[test]
+    fn every_click_a_host_reports_raises_the_window() {
+        for m in ["Activate", "SecondaryActivate", "ContextMenu"] {
+            assert_eq!(gesture(m), Gesture::Raise, "{m} must raise the hub");
+        }
+        assert_eq!(gesture("Scroll"), Gesture::Ignore);
+    }
+
+    /// The shape is convention; the assertion that the bus would accept the
+    /// name is not. A name the daemon rejects is never acquired — GLib says so
+    /// on stderr, where a GUI user never looks — [`install`] still returns a
+    /// [`Tray`], nothing is ever announced to the watcher, and the icon simply
+    /// never appears.
+    #[test]
+    fn the_bus_name_is_the_one_watchers_expect() {
+        let name = bus_name();
+        assert_eq!(
+            name,
+            format!("org.kde.StatusNotifierItem-{}-1", std::process::id())
+        );
+        // And it is a name the bus will let us own at all.
+        assert!(gio::dbus_is_name(&name));
+        assert!(!gio::dbus_is_unique_name(&name));
+    }
+}

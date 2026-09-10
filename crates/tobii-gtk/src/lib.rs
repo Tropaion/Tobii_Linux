@@ -20,6 +20,7 @@ pub mod overlay;
 pub mod particles;
 pub mod screen_pick;
 pub mod setup_flow;
+pub mod tray;
 pub mod update;
 pub mod widget;
 
@@ -196,6 +197,42 @@ pub fn run() -> glib::ExitCode {
     }
     let app = builder.build();
     app.connect_startup(|_| load_css());
+
+    // The tray icon, published once the app starts.
+    //
+    // Kept in a thread-local rather than passed down, because the two places
+    // that need it are far apart and neither can reach the other: it is created
+    // at startup (before any window exists, which is the whole point in
+    // background mode), and it is CONSULTED by the hub's close handler, which
+    // has to know whether hiding the window would leave the user no way back.
+    // GTK is single-threaded and there is exactly one application, so the
+    // sharing is real rather than incidental.
+    {
+        let app_for_click = app.clone();
+        app.connect_startup(move |_| {
+            let app = app_for_click.clone();
+            publish_tray(&app);
+
+            // Retried once, and only when there is no window.
+            //
+            // `install` has to answer synchronously — the close handler needs
+            // to know whether hiding is safe — so it asks whether a watcher
+            // owns its name right now. At login that is a race: the desktop's
+            // status-area host and this program are both starting. Losing it
+            // costs nothing when there is a window, because the window is the
+            // way back. In `--background` there is no window, so losing it
+            // would leave a running program with no icon and no way to reach
+            // it short of launching it again from a menu.
+            if autostart::background_mode() {
+                let app = app.clone();
+                glib::timeout_add_seconds_local_once(5, move || {
+                    if !tray_is_published() {
+                        publish_tray(&app);
+                    }
+                });
+            }
+        });
+    }
 
     // The device thread, started once. In background mode it exists before any
     // window does; otherwise the first activation creates it.
@@ -410,6 +447,38 @@ fn with_css_provider<T>(f: impl FnOnce(&gtk::CssProvider) -> T) -> T {
     }
     PROVIDER.with(|p| f(p.get_or_init(gtk::CssProvider::new)))
 }
+
+thread_local! {
+    /// The published tray icon, for as long as the process runs.
+    static TRAY: RefCell<Option<tray::Tray>> = const { RefCell::new(None) };
+}
+
+/// Publish the tray icon, replacing any previous one.
+///
+/// Clicking it goes through `activate`, which already knows how to either
+/// present the hub that exists or build one — doing it here instead would be a
+/// second, divergent copy of that decision.
+fn publish_tray(app: &Application) {
+    let app = app.clone();
+    let tray = tray::install(move || app.activate());
+    if let Some(t) = &tray {
+        t.set_tooltip("Tobii Eye Tracker 5");
+    }
+    TRAY.with(|c| *c.borrow_mut() = tray);
+}
+
+/// Whether a tray icon is published, and therefore whether hiding the window
+/// leaves the user a way back to it.
+fn tray_is_published() -> bool {
+    TRAY.with(|c| c.borrow().is_some())
+}
+
+/// A "fit the window to its content" callback, filled once the window exists.
+///
+/// Late-bound because the cogwheel — which is what changes the text size — is
+/// built as part of the header, and the header is built before the window it
+/// would have to resize.
+type Refit = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
 /// How wide a control column is.
 ///
@@ -1044,11 +1113,17 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // short of what it had been sized for.
     let (three_col_min, _, _, _) = split.measure(Orientation::Horizontal, -1);
 
+    // Re-fit the window to its content. Late-bound on purpose: the cogwheel is
+    // built as part of the header, which is built before the window exists, so
+    // the control that changes the text size cannot capture a window that is
+    // not there yet. The cell is filled the moment it is.
+    let refit: Refit = Rc::new(RefCell::new(None));
+
     let header = gtk::Box::new(Orientation::Horizontal, 12);
     title.set_hexpand(true);
     header.append(&title);
     header.append(&status_bar);
-    header.append(&settings_button(&really_quitting));
+    header.append(&settings_button(&really_quitting, refit.clone()));
 
     // One margin all round, so the frame of background around the content is
     // even. Anything else reads as a mistake at the corners.
@@ -1059,7 +1134,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     root.set_margin_start(PAGE_MARGIN);
     root.set_margin_end(PAGE_MARGIN);
     root.append(&header);
-    root.append(&update::banner());
+    let update_banner = update::banner();
+    root.append(&update_banner);
     root.append(&banner);
     root.append(&split);
 
@@ -1090,6 +1166,41 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         .default_height(natural_height)
         .build();
     window.set_child(Some(&scroller));
+
+    // The window follows its content from here on.
+    //
+    // `natural_height` above is a single measurement taken at build time, and
+    // two ordinary things invalidate it: the text size, which the cogwheel can
+    // change at any moment, and a banner appearing — the update notice arrives
+    // from a network check hundreds of milliseconds after the window is drawn.
+    // Both used to leave the window at whatever height it was born with, so
+    // larger text was clipped and a banner pushed the last card out of view.
+    {
+        let window = window.clone();
+        let root = root.clone();
+        let fit: Rc<dyn Fn()> = Rc::new(move || {
+            // Never on a window the user has sized themselves. Maximised or
+            // fullscreen, the height is not ours to choose; and re-fitting a
+            // window someone has deliberately made small would fight them.
+            if window.is_maximized() || window.is_fullscreen() {
+                return;
+            }
+            let width = window.width().max(window.default_width());
+            let (_, wanted, _, _) = root.measure(Orientation::Vertical, width);
+            if wanted != window.default_height() {
+                window.set_default_size(width, wanted);
+            }
+        });
+        *refit.borrow_mut() = Some(fit.clone());
+
+        // Watched rather than called from the code that shows them: both
+        // banners are shown from several places (a timeout, a dismiss, the
+        // once-per-connection evaluation), and one signal covers all of them.
+        for b in [&update_banner, &banner] {
+            let fit = fit.clone();
+            b.connect_visible_notify(move |_| fit());
+        }
+    }
     // A floor, kept deliberately low. Width is the constraint that carries
     // meaning — the breakpoints below drop from three columns to two to one as
     // it shrinks — while height only decides how much scrolling there is, so
@@ -1397,27 +1508,42 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         let tick_id = tick_id.clone();
         let quitting = really_quitting.clone();
         window.connect_close_request(move |w| {
-            // PRESSING X MINIMISES; it does not exit.
+            // PRESSING X PUTS THE PROGRAM IN THE BACKGROUND; it does not exit.
             //
             // The tracker's data has to keep reaching a game while the user is
             // playing, and configuring it means opening this window — so the
             // program that owns the device cannot be one that dies when its
-            // window is dismissed. Closing therefore parks it in the taskbar,
-            // where it is visible and one click from coming back, instead of
-            // vanishing into a process list.
+            // window is dismissed.
+            //
+            // WHERE it goes depends on whether there is a tray icon, and the
+            // difference matters: hiding a window with no way back is how a
+            // program becomes a thing you have to kill from a terminal.
+            //
+            // * With a tray icon, the window is HIDDEN. It leaves the taskbar
+            //   entirely and lives in the status area, which is what "runs in
+            //   the background" means to a desktop — and the icon is the way
+            //   back.
+            // * Without one — stock GNOME publishes no StatusNotifierWatcher —
+            //   it is MINIMISED instead, staying in the taskbar where it is
+            //   visible and one click from returning.
             //
             // Nothing else is needed to keep the process alive: the window is
             // never destroyed, so `GApplication` still has one and does not
             // exit. And the tracker still goes dark, because the claim below is
-            // polled from `is_active()` on the 33 ms tick and a minimised
-            // window is not active — the illuminators are out within a frame or
-            // two of the click, without this handler doing anything about it.
+            // polled from `is_active()` on the 33 ms tick and neither a hidden
+            // nor a minimised window is active — the illuminators are out
+            // within a frame or two of the click, without this handler doing
+            // anything about it.
             //
             // The gaze overlay is deliberately NOT closed here. It has its own
             // switch and its own claim; if the user left it on, something
             // genuinely wants data and the tracker is right to stay lit.
             if !quitting.get() {
-                w.minimize();
+                if tray_is_published() {
+                    w.set_visible(false);
+                } else {
+                    w.minimize();
+                }
                 return glib::Propagation::Stop;
             }
 
@@ -1550,9 +1676,9 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 /// A `Popover`, not a second window: it is anchored to the button that opened
 /// it, it closes on click-away, and it needs no title bar, no size negotiation
 /// and no place in the window list for what is three rows of content.
-fn settings_button(quitting: &Rc<Cell<bool>>) -> gtk::MenuButton {
+fn settings_button(quitting: &Rc<Cell<bool>>, refit: Refit) -> gtk::MenuButton {
     let popover = gtk::Popover::new();
-    popover.set_child(Some(&settings_list(quitting)));
+    popover.set_child(Some(&settings_list(quitting, refit)));
     popover.set_position(gtk::PositionType::Bottom);
     popover.set_has_arrow(false);
     // Right edge flush with the cogwheel's, not centred under it. A popover is
@@ -1607,7 +1733,7 @@ fn settings_button(quitting: &Rc<Cell<bool>>) -> gtk::MenuButton {
 /// steps are meaningful, so a slider would offer a hundred positions to choose
 /// between five — and a slider is the harder thing to hit for exactly the user
 /// who is here because the text is too small to read.
-fn text_size_row() -> gtk::Box {
+fn text_size_row(refit: Refit) -> gtk::Box {
     /// One press. Large enough to be worth pressing, small enough that the
     /// range is not crossed in two.
     const STEP: f64 = 0.1;
@@ -1651,6 +1777,12 @@ fn text_size_row() -> gtk::Box {
             // a read-only config directory costs the user the persistence
             // rather than the feature.
             apply_text_scale(next);
+            // The window has to grow with the text, or the last card is simply
+            // cut off — which reads as the setting being broken rather than as
+            // a window that needs dragging.
+            if let Some(fit) = refit.borrow().as_ref() {
+                fit();
+            }
             if let Err(e) = tobii_config::save_text_scale(next) {
                 tobii_diagnostics::log::warn(&format!("could not save the text size: {e}"));
             }
@@ -1671,7 +1803,7 @@ fn text_size_row() -> gtk::Box {
     )
 }
 
-fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
+fn settings_list(quitting: &Rc<Cell<bool>>, refit: Refit) -> gtk::Box {
     let list = gtk::Box::new(Orientation::Vertical, 4);
     // An explicit width rather than one negotiated from the longest sentence.
     // `set_max_width_chars` is a hint about where a label may wrap, not a cap
@@ -1708,7 +1840,7 @@ fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
         &update_check_switch(),
     ));
     list.append(&hairline());
-    list.append(&text_size_row());
+    list.append(&text_size_row(refit));
     list.append(&hairline());
 
     list.append(&diagnostics_row());
