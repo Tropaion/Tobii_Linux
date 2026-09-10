@@ -36,10 +36,15 @@ impl std::fmt::Display for UsbError {
                 "no permission to open the Tobii ET5 (2104:0313) — install assets/60-tobii.rules \
                  into /etc/udev/rules.d/ and replug the tracker"
             ),
+            // "Close it and retry" was the advice before the hub could hand the
+            // device over. It still is for anything that does not ask, so the
+            // message keeps it — but telling somebody to close a window they do
+            // not need to close is worse than telling them nothing.
             UsbError::DeviceBusy => write!(
                 f,
                 "the Tobii ET5 (2104:0313) is already claimed by another process — usually \
-                 tobii-gtk; close it and retry"
+                 tobii-gtk. A program can ask it for the device over its socket instead; \
+                 otherwise close tobii-gtk and retry"
             ),
             UsbError::Usb(e) => write!(f, "libusb error: {e}"),
             UsbError::ShortWrite { wrote, expected } => {
@@ -421,6 +426,10 @@ mod tests {
     fn the_busy_error_names_the_gui_as_the_likely_holder() {
         let msg = UsbError::DeviceBusy.to_string();
         assert!(msg.contains("tobii-gtk"), "{msg}");
+        // And says there is a way that is not "close the thing you are using":
+        // the hub hands the device over on request now, so advice that only
+        // offers closing it sends people to the worse of two options.
+        assert!(msg.contains("ask"), "{msg}");
     }
 
     #[test]

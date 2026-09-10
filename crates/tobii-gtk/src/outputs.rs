@@ -31,9 +31,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tobii_ipc::{subs, ClientId, Server, StatusCode};
+use tobii_ipc::{subs, ClientId, LeaseAction, Server, StatusCode};
 
-use crate::device::{ConnStatus, Demand, DemandGuard, DeviceState};
+use crate::device::{ConnStatus, Demand, DemandGuard, DeviceState, Lease};
 
 /// How often the socket is drained and the client list reconciled.
 ///
@@ -122,6 +122,82 @@ impl Holds {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.held.len()
+    }
+}
+
+/// Decide and act on one lease request.
+///
+/// The reply for a granted acquire is deliberately NOT sent here. See
+/// [`Lease`]: the libusb interface is released when the device thread drops its
+/// connection, and answering before that races the client into `DeviceBusy` on
+/// an interface nobody has let go of yet.
+fn handle_lease(
+    server: &Server,
+    demand: &Demand,
+    lease: &Arc<Mutex<Lease>>,
+    awaiting: &mut Vec<ClientId>,
+    from: ClientId,
+    name: &str,
+    action: LeaseAction,
+) {
+    let mut l = lease.lock().unwrap();
+    let holder = match &*l {
+        Lease::Free => None,
+        Lease::Requested { by, name } | Lease::Held { by, name } => Some((*by, name.as_str())),
+    };
+    match crate::device::lease_decision(holder, from, action) {
+        crate::device::LeaseDecision::Grant => {
+            // The hub can refuse. Calibration and display setup are long
+            // stateful conversations with the device whose invariants live in
+            // this crate; handing the device away mid-way through one would
+            // leave both sides believing something different about it.
+            let reasons = demand.reasons();
+            if crate::device::wants_exclusive(&reasons) {
+                drop(l);
+                server.send_to(
+                    from,
+                    &tobii_ipc::codec::Msg::LeaseReply {
+                        ok: false,
+                        text: format!(
+                            "the hub is busy with {} — try again when it has finished",
+                            reasons.join(" and ")
+                        ),
+                    },
+                );
+                return;
+            }
+            *l = Lease::Requested {
+                by: from,
+                name: name.to_string(),
+            };
+            if !awaiting.contains(&from) {
+                awaiting.push(from);
+            }
+        }
+        crate::device::LeaseDecision::Refuse(why) => {
+            drop(l);
+            server.send_to(
+                from,
+                &tobii_ipc::codec::Msg::LeaseReply {
+                    ok: false,
+                    text: why,
+                },
+            );
+        }
+        crate::device::LeaseDecision::Released => {
+            *l = Lease::Free;
+            drop(l);
+            server.send_to(
+                from,
+                &tobii_ipc::codec::Msg::LeaseReply {
+                    ok: true,
+                    text: String::new(),
+                },
+            );
+        }
+        // A release from a client that never held it must not take the device
+        // away from the client that does.
+        crate::device::LeaseDecision::NotHeld => {}
     }
 }
 
@@ -237,7 +313,7 @@ impl GameOutput {
 /// degradation, not a failure: a hub that refuses to open because another one
 /// already has the socket would be a worse outcome than a hub with no game
 /// output, and the second one is exactly today's behaviour.
-pub(crate) fn spawn(demand: Demand, state: Arc<Mutex<DeviceState>>) {
+pub(crate) fn spawn(demand: Demand, state: Arc<Mutex<DeviceState>>, lease: Arc<Mutex<Lease>>) {
     let server = match Server::bind() {
         Ok(s) => s,
         Err(e) => {
@@ -250,9 +326,20 @@ pub(crate) fn spawn(demand: Demand, state: Arc<Mutex<DeviceState>>) {
     };
     std::thread::spawn(move || {
         let mut holds = Holds::default();
+        // Clients told "yes, in a moment" — answered once the device thread has
+        // actually let go. See `Lease`.
+        let mut awaiting: Vec<ClientId> = Vec::new();
         let mut last_sent: Option<StatusCode> = None;
         loop {
-            tick(&server, &demand, &state, &mut holds, &mut last_sent);
+            tick(
+                &server,
+                &demand,
+                &state,
+                &lease,
+                &mut holds,
+                &mut awaiting,
+                &mut last_sent,
+            );
             std::thread::sleep(POLL);
         }
     });
@@ -263,20 +350,58 @@ pub(crate) fn spawn(demand: Demand, state: Arc<Mutex<DeviceState>>) {
 /// Split from the loop so a test can drive it against a real `Server` on a
 /// temporary path. The pure `Holds` tests below cover the decisions; this is
 /// what proves the decisions are reached from an actual client connecting.
+#[allow(clippy::too_many_arguments)]
 fn tick(
     server: &Server,
     demand: &Demand,
     state: &Arc<Mutex<DeviceState>>,
+    lease: &Arc<Mutex<Lease>>,
     holds: &mut Holds,
+    awaiting: &mut Vec<ClientId>,
     last_sent: &mut Option<StatusCode>,
 ) {
     for msg in server.poll() {
-        if let tobii_ipc::codec::Msg::Hello { subs: bits, .. } = msg.msg {
-            holds.hello(demand, msg.from, bits);
+        match msg.msg {
+            tobii_ipc::codec::Msg::Hello { subs: bits, .. } => {
+                holds.hello(demand, msg.from, bits);
+            }
+            tobii_ipc::codec::Msg::Lease(action) => {
+                let name = server
+                    .clients()
+                    .into_iter()
+                    .find(|c| c.id == msg.from)
+                    .map(|c| c.name)
+                    .unwrap_or_default();
+                handle_lease(server, demand, lease, awaiting, msg.from, &name, action);
+            }
+            _ => {}
         }
     }
     let live: Vec<ClientId> = server.clients().into_iter().map(|c| c.id).collect();
     holds.reap(&live);
+
+    // A client that died holding the lease gets it taken back. This is the same
+    // reasoning as reaping a hold: a socket that is gone is the truth, and it
+    // needs no timeout.
+    {
+        let mut l = lease.lock().unwrap();
+        if l.client().is_some_and(|id| !live.contains(&id)) {
+            *l = Lease::Free;
+        }
+    }
+
+    // The device thread has let go: answer everyone who was told to wait.
+    if matches!(*lease.lock().unwrap(), Lease::Held { .. }) {
+        for id in awaiting.drain(..) {
+            server.send_to(
+                id,
+                &tobii_ipc::codec::Msg::LeaseReply {
+                    ok: true,
+                    text: String::new(),
+                },
+            );
+        }
+    }
 
     // Only on a change. A status broadcast every 50 ms would be a wake-up per
     // client per tick for information that changes a few times a minute.
@@ -421,16 +546,34 @@ mod tests {
         let demand = Demand::new();
         let state = Arc::new(Mutex::new(DeviceState::default()));
         let mut holds = Holds::default();
+        let lease = Arc::new(Mutex::new(Lease::Free));
+        let mut awaiting = Vec::new();
         let mut last = None;
 
-        tick(&server, &demand, &state, &mut holds, &mut last);
+        tick(
+            &server,
+            &demand,
+            &state,
+            &lease,
+            &mut holds,
+            &mut awaiting,
+            &mut last,
+        );
         assert!(!demand.active(), "no clients, no reason");
 
         let client = Client::connect_at(&path, subs::POSE, "a game").expect("connect");
         // The hello arrives on the server's accept thread, so give it a moment
         // rather than assuming it is there on the first tick.
         let lit = (0..100).any(|_| {
-            tick(&server, &demand, &state, &mut holds, &mut last);
+            tick(
+                &server,
+                &demand,
+                &state,
+                &lease,
+                &mut holds,
+                &mut awaiting,
+                &mut last,
+            );
             if demand.active() {
                 return true;
             }
@@ -446,7 +589,15 @@ mod tests {
 
         drop(client);
         let dark = (0..100).any(|_| {
-            tick(&server, &demand, &state, &mut holds, &mut last);
+            tick(
+                &server,
+                &demand,
+                &state,
+                &lease,
+                &mut holds,
+                &mut awaiting,
+                &mut last,
+            );
             if !demand.active() {
                 return true;
             }
@@ -480,6 +631,118 @@ mod tests {
             !pose_is_fresh(Some(now - Duration::from_secs(60)), now),
             "a minute-old rotation is not a head position"
         );
+    }
+
+    /// The ordering the middle state exists for: a client is not told it has
+    /// the device until the hub has actually let go of it.
+    ///
+    /// Replying earlier races the client into `DeviceBusy` on an interface
+    /// nobody has released — and that failure looks like the tracker being
+    /// broken, not like a protocol mistake.
+    #[test]
+    fn a_lease_is_not_confirmed_until_the_device_is_released() {
+        use tobii_ipc::codec::Msg;
+        use tobii_ipc::Client;
+
+        let path = std::env::temp_dir().join(format!("tobii-lease-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let server = Server::bind_at(&path).expect("bind");
+        let demand = Demand::new();
+        let state = Arc::new(Mutex::new(DeviceState::default()));
+        let lease = Arc::new(Mutex::new(Lease::Free));
+        let (mut holds, mut awaiting, mut last) = (Holds::default(), Vec::new(), None);
+
+        let mut client = Client::connect_at(&path, subs::POSE, "a game").expect("connect");
+        client
+            .send(&Msg::Lease(tobii_ipc::LeaseAction::Acquire))
+            .expect("the acquire is sent");
+
+        // Pump until the request has been seen.
+        let asked = (0..100).any(|_| {
+            tick(
+                &server,
+                &demand,
+                &state,
+                &lease,
+                &mut holds,
+                &mut awaiting,
+                &mut last,
+            );
+            if matches!(*lease.lock().unwrap(), Lease::Requested { .. }) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(asked, "the acquire should have been recorded");
+        assert_eq!(awaiting.len(), 1, "and the reply deferred, not sent");
+
+        // The hub is still letting go, so no confirmation yet, however many
+        // times the loop runs.
+        for _ in 0..5 {
+            tick(
+                &server,
+                &demand,
+                &state,
+                &lease,
+                &mut holds,
+                &mut awaiting,
+                &mut last,
+            );
+        }
+        assert_eq!(awaiting.len(), 1, "still not confirmed while Requested");
+
+        // The device thread announces the release.
+        *lease.lock().unwrap() = Lease::Held {
+            by: awaiting[0],
+            name: "a game".into(),
+        };
+        tick(
+            &server,
+            &demand,
+            &state,
+            &lease,
+            &mut holds,
+            &mut awaiting,
+            &mut last,
+        );
+        assert!(awaiting.is_empty(), "now it is answered");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A client that dies holding the lease must not keep the device forever.
+    /// Same reasoning as reaping a hold: a socket that is gone is the truth.
+    #[test]
+    fn a_lease_held_by_a_dead_client_is_taken_back() {
+        let path = std::env::temp_dir().join(format!("tobii-lease2-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let server = Server::bind_at(&path).expect("bind");
+        let demand = Demand::new();
+        let state = Arc::new(Mutex::new(DeviceState::default()));
+        // A holder that never existed on this server stands in for one that
+        // has gone: either way it is not in `clients()`.
+        let lease = Arc::new(Mutex::new(Lease::Held {
+            by: 4242,
+            name: "a departed game".into(),
+        }));
+        let (mut holds, mut awaiting, mut last) = (Holds::default(), Vec::new(), None);
+
+        tick(
+            &server,
+            &demand,
+            &state,
+            &lease,
+            &mut holds,
+            &mut awaiting,
+            &mut last,
+        );
+        assert_eq!(
+            *lease.lock().unwrap(),
+            Lease::Free,
+            "the device must come back when its holder is gone"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A datagram actually leaves.

@@ -81,6 +81,105 @@ impl Demand {
     }
 }
 
+/// The reasons the hub will not give the device away.
+///
+/// A lease hands the WHOLE device to another process, so anything mid-way
+/// through a stateful conversation with it has to be able to say no. These two
+/// are exactly that: calibration is a long exchange whose invariants live in
+/// this crate, and display setup is writing the geometry the device needs
+/// before it will report eyes at all. Everything else — a focused window, the
+/// gaze preview — is just watching, and can be interrupted.
+const EXCLUSIVE: [&str; 2] = ["calibration", "display setup"];
+
+/// Whether any current reason forbids handing the device over.
+///
+/// Reads the reasons rather than a separate flag, so a new exclusive flow
+/// cannot forget to set one: it only has to name itself in [`EXCLUSIVE`].
+pub fn wants_exclusive(reasons: &[&'static str]) -> bool {
+    reasons.iter().any(|r| EXCLUSIVE.contains(r))
+}
+
+/// Who has the device, from the hub's point of view.
+///
+/// # Why a state and not a boolean
+///
+/// Granting a lease is not instantaneous. The device thread owns a
+/// `Connection<UsbTransport>`, and the libusb interface is only released when
+/// that is dropped — so a client told "yes" before the drop happens races the
+/// hub into `DeviceBusy` on an interface nobody has let go of yet. The middle
+/// state is that gap, and making it explicit is what stops the reply being sent
+/// too early: the socket thread cannot answer until it has SEEN `Held`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Lease {
+    /// The hub may use the tracker.
+    #[default]
+    Free,
+    /// A client has asked; the device thread has not let go yet.
+    Requested { by: u64, name: String },
+    /// The device is released and the client may open it.
+    Held { by: u64, name: String },
+}
+
+impl Lease {
+    /// The client holding or claiming the device, if any.
+    pub fn client(&self) -> Option<u64> {
+        match self {
+            Lease::Free => None,
+            Lease::Requested { by, .. } | Lease::Held { by, .. } => Some(*by),
+        }
+    }
+
+    /// Whether the hub must keep its hands off the device.
+    ///
+    /// True from the moment a lease is REQUESTED, not from when it is held:
+    /// between those two the hub is letting go, and reopening in that window is
+    /// exactly the race the middle state exists to prevent.
+    pub fn hub_must_not_open(&self) -> bool {
+        !matches!(self, Lease::Free)
+    }
+}
+
+/// Who, if anyone, may hold the device lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseDecision {
+    /// Hand the device over to this client.
+    Grant,
+    /// Refuse, with a message naming the current holder.
+    Refuse(String),
+    /// Give the device back.
+    Released,
+    /// A release from someone who was not holding it: ignore.
+    NotHeld,
+}
+
+/// Decide what a lease request means.
+///
+/// Pure, because the interesting cases — a second client asking while one holds
+/// it, a release from a client that never had it — are exactly the ones nobody
+/// exercises by hand.
+///
+/// Ported from the older branch's daemon with the roles swapped: there a client
+/// asked the daemon for the device, here a client asks the hub. The logic did
+/// not change, because the question did not.
+pub fn lease_decision(
+    holder: Option<(u64, &str)>,
+    requester: u64,
+    action: tobii_ipc::LeaseAction,
+) -> LeaseDecision {
+    use tobii_ipc::LeaseAction;
+    match (action, holder) {
+        (LeaseAction::Acquire, None) => LeaseDecision::Grant,
+        // Re-acquiring is idempotent rather than an error: a client that missed
+        // its own reply should not be told the tracker is held by itself.
+        (LeaseAction::Acquire, Some((id, _))) if id == requester => LeaseDecision::Grant,
+        (LeaseAction::Acquire, Some((_, name))) => {
+            LeaseDecision::Refuse(format!("the tracker is leased by {name}"))
+        }
+        (LeaseAction::Release, Some((id, _))) if id == requester => LeaseDecision::Released,
+        (LeaseAction::Release, _) => LeaseDecision::NotHeld,
+    }
+}
+
 /// One consumer's claim on the tracker. Releases it when dropped.
 pub struct DemandGuard {
     held: Arc<Mutex<BTreeMap<&'static str, usize>>>,
@@ -806,14 +905,18 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
     let state = Arc::new(Mutex::new(DeviceState::default()));
     let (tx, rx) = channel::<DeviceCommand>();
     let demand = Demand::new();
+    // Shared with the socket thread: it decides who may have the device, this
+    // thread decides when it has actually let go.
+    let lease: Arc<Mutex<Lease>> = Arc::new(Mutex::new(Lease::Free));
     let thread_state = Arc::clone(&state);
     let thread_demand = demand.clone();
+    let thread_lease = Arc::clone(&lease);
 
     // The socket other programs get tracking data from. Started here rather
     // than from the GUI because this is where the `Demand` is constructed, and
     // a connected client IS a demand — see `crate::outputs`. Nothing published
     // yet; this is the seam alone.
-    crate::outputs::spawn(demand.clone(), Arc::clone(&state));
+    crate::outputs::spawn(demand.clone(), Arc::clone(&state), Arc::clone(&lease));
     std::thread::spawn(move || {
         // Commands that arrived while the tracker was off. They are not
         // dropped: "select left eye only" typed into an idle hub has to take
@@ -823,7 +926,11 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
             // Nothing wants the tracker: do not open it. This is the whole
             // point of `Demand` — an idle hub leaves the illuminators dark and
             // the USB device free for `tobii headpose`.
-            while !thread_demand.active() && pending.is_empty() {
+            // A lease is the inverse of a demand: something else has the
+            // device, so the hub waits regardless of who wants it here.
+            while (!thread_demand.active() && pending.is_empty())
+                || thread_lease.lock().unwrap().hub_must_not_open()
+            {
                 while let Ok(cmd) = rx.try_recv() {
                     pending.push(cmd);
                 }
@@ -841,7 +948,13 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
                 }
                 std::thread::sleep(Duration::from_millis(120));
             }
-            device_session(&thread_state, &thread_demand, &rx, &mut pending);
+            device_session(
+                &thread_state,
+                &thread_demand,
+                &thread_lease,
+                &rx,
+                &mut pending,
+            );
         }
     });
     (state, tx, demand)
@@ -884,9 +997,28 @@ fn fail_queued_command(state: &Mutex<DeviceState>, cmd: DeviceCommand, e: &UsbEr
 fn device_session(
     thread_state: &Arc<Mutex<DeviceState>>,
     demand: &Demand,
+    lease: &Arc<Mutex<Lease>>,
     rx: &Receiver<DeviceCommand>,
     pending: &mut Vec<DeviceCommand>,
 ) {
+    // Runs on every exit from this function, however it left — a lease, a
+    // disconnect, or the demand going quiet. Anything asked for while the hub
+    // still held the device is only answered here, because this is the point at
+    // which `conn` and its `UsbTransport` have actually been dropped.
+    struct AnnounceRelease<'a>(&'a Arc<Mutex<Lease>>);
+    impl Drop for AnnounceRelease<'_> {
+        fn drop(&mut self) {
+            let mut l = self.0.lock().unwrap();
+            if let Lease::Requested { by, name } = &*l {
+                *l = Lease::Held {
+                    by: *by,
+                    name: name.clone(),
+                };
+            }
+        }
+    }
+    let _announce = AnnounceRelease(lease);
+
     {
         thread_state.lock().unwrap().status = ConnStatus::Connecting;
         match UsbTransport::open().and_then(Connection::connect) {
@@ -966,6 +1098,13 @@ fn device_session(
                             // answers by rebooting — and the illuminators go out.
                             break;
                         }
+                    }
+                    // Somebody has asked for the device. Leave the loop, which
+                    // drops `conn` and with it the libusb interface; the socket
+                    // thread is watching for that and only answers the client
+                    // once it has happened.
+                    if lease.lock().unwrap().hub_must_not_open() {
+                        break;
                     }
                     let tick =
                         device_tick(&mut conn, thread_state, rx, head.as_ref(), games.as_mut());
@@ -1132,6 +1271,105 @@ fn now_unix_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    // --- the lease -------------------------------------------------------
+    //
+    // Ported from the old branch's daemon with the roles swapped. The five
+    // decision tests are its five, because the question they ask did not change
+    // when the owner did.
+
+    #[test]
+    fn an_unheld_lease_is_granted() {
+        assert_eq!(
+            lease_decision(None, 1, tobii_ipc::LeaseAction::Acquire),
+            LeaseDecision::Grant
+        );
+    }
+
+    /// Two clients must not both believe they own the tracker, and the refusal
+    /// has to name the holder or the user cannot tell what to close.
+    #[test]
+    fn a_second_client_is_refused_and_told_who_holds_it() {
+        match lease_decision(Some((1, "a game")), 2, tobii_ipc::LeaseAction::Acquire) {
+            LeaseDecision::Refuse(why) => assert!(why.contains("a game"), "{why}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A client that missed its own reply and asks again must not be told the
+    /// tracker is held by itself — that is a deadlock it cannot get out of.
+    #[test]
+    fn re_acquiring_your_own_lease_is_idempotent() {
+        assert_eq!(
+            lease_decision(Some((7, "a game")), 7, tobii_ipc::LeaseAction::Acquire),
+            LeaseDecision::Grant
+        );
+    }
+
+    #[test]
+    fn releasing_a_lease_you_hold_gives_the_device_back() {
+        assert_eq!(
+            lease_decision(Some((7, "a game")), 7, tobii_ipc::LeaseAction::Release),
+            LeaseDecision::Released
+        );
+    }
+
+    /// A stray release from a client that never held the lease must not take
+    /// the device away from the client that does.
+    #[test]
+    fn a_release_from_a_non_holder_is_ignored() {
+        assert_eq!(
+            lease_decision(Some((7, "a game")), 9, tobii_ipc::LeaseAction::Release),
+            LeaseDecision::NotHeld
+        );
+        assert_eq!(
+            lease_decision(None, 9, tobii_ipc::LeaseAction::Release),
+            LeaseDecision::NotHeld
+        );
+    }
+
+    /// The hub stops touching the device the moment a lease is REQUESTED, not
+    /// when it is held. Between those two it is still letting go, and reopening
+    /// in that window is the race the middle state exists to prevent.
+    #[test]
+    fn the_hub_backs_off_from_the_request_not_from_the_grant() {
+        assert!(!Lease::Free.hub_must_not_open());
+        assert!(Lease::Requested {
+            by: 1,
+            name: "a game".into()
+        }
+        .hub_must_not_open());
+        assert!(Lease::Held {
+            by: 1,
+            name: "a game".into()
+        }
+        .hub_must_not_open());
+    }
+
+    /// Handing the whole device away mid-calibration would leave both sides
+    /// believing something different about it. Reading the reasons rather than
+    /// a separate flag means a new exclusive flow only has to name itself.
+    #[test]
+    fn the_hub_refuses_to_hand_over_the_device_mid_flow() {
+        assert!(wants_exclusive(&["calibration"]));
+        assert!(wants_exclusive(&["display setup"]));
+        assert!(wants_exclusive(&["the hub window", "calibration"]));
+        // Merely watching is interruptible.
+        assert!(!wants_exclusive(&["the hub window"]));
+        assert!(!wants_exclusive(&["the gaze preview"]));
+        assert!(!wants_exclusive(&[]));
+    }
+
+    /// Every reason a flow can hold the tracker for is spelled the same way in
+    /// both places, or `wants_exclusive` silently stops matching.
+    #[test]
+    fn the_exclusive_reasons_are_reasons_that_actually_exist() {
+        let d = Demand::new();
+        let held: Vec<_> = EXCLUSIVE.iter().map(|r| d.hold(r)).collect::<Vec<_>>();
+        assert!(wants_exclusive(&d.reasons()), "{:?}", d.reasons());
+        drop(held);
+        assert!(!wants_exclusive(&d.reasons()));
+    }
 
     /// The whole point of `Demand`: nothing asked, nothing opened. If this ever
     /// reports active with no guards held, the tracker's illuminators come on
