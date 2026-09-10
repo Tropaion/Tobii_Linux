@@ -45,9 +45,11 @@ controller. Measured, rather than inferred from documentation:
 
 XInput's fixed two-stick layout has nowhere to put eight axes, so a game that
 speaks only XInput cannot use this sink and needs the Wine bridge or opentrack
-instead. A known-value pose survived the whole chain into SDL exactly: yaw +90°
-of ±180 arrived as `16384` (half scale), pitch −45° of ±90 as `−16385`, gaze at
-the right-hand screen edge as `32767`.
+instead. A known-value pose survives the whole chain into SDL exactly, with the
+response stage in place: composed yaw **+35°** — half of the 70°
+`joystick_yaw_full_deg` default — arrives as `16384`, half deflection; pitch
+**−17.5°** of the 35° default as `−16385`; gaze at the right-hand screen edge as
+`32767`.
 
 | Axis | Carries | Full scale |
 |---|---|---|
@@ -101,12 +103,14 @@ saturates at, so a movement of a given size means the same thing on every output
 this program has. opentrack's equivalent is ±1 m; matching *it* would have made
 our two outputs disagree with each other.
 
-The axis range is `0..65534` centred on `32767` — an even span, so the two
-halves are exactly equal. An axis whose halves differ by one step reads as a
-permanent fractional offset in anything that normalises to `[-1, 1]`, which
-presents as slow drift with nothing to point at as the cause. Confirmed through
-`joydev`, which rescales to `[-32767, 32767]` and reported every axis at exactly
-`0` at rest.
+The axis range is `0..65534` centred on `32767`, because `encode_axis` emits
+`centre ± centre`: an odd span would declare a maximum the encoder can never
+reach. It is **not** chosen for centring — the two consumers disagree about
+that, each by a single step. joydev rescales about `(min + max) / 2` and reports
+exactly `0` at rest for this span (the rejected pairing, max 65535 centred
+32768, reports `1`); SDL maps onto its own asymmetric `[-32768, 32767]` and
+reports `-1` at rest either way. One step in 32767 is about 0.005° of a ±180°
+axis, far below any deadzone or the tracker's own noise.
 
 ### Why the device declares a key capability it never uses
 

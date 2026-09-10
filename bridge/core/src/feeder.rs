@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use tobii_output::TrackingFrame;
 
-use crate::shm::Provider;
+use crate::shm::{Consumer, Provider};
 
 /// Default loopback port, matching `tobii-output`'s bridge sink.
 pub const DEFAULT_PORT: u16 = 4243;
@@ -79,30 +79,60 @@ pub fn port() -> u16 {
 pub enum Started {
     /// This process owns the port and is publishing.
     Feeding,
-    /// Somebody else owns it — the mapping will come from them.
+    /// Somebody in **this** wineserver session owns it, proven by their mapping
+    /// being openable — so reading theirs is right.
     AlreadyTaken,
+    /// The port is held from another session, whose mapping this one cannot
+    /// see. Still retrying; the game has nothing to read until it frees up.
+    Waiting,
     /// The mapping could not be created at all.
     Failed,
 }
+
+/// How often a port held by another wineserver session is retried.
+const RETRY: Duration = Duration::from_secs(1);
 
 /// Receive frames on `port` forever, publishing each into the mapping.
 ///
 /// `ready` is signalled once the mapping exists and the socket is bound, so a
 /// caller can wait for the mapping before trying to open it as a consumer.
 fn serve(port: u16, ready: mpsc::Sender<Started>) {
+    // Bind BEFORE creating the mapping, and never create one we might drop.
+    //
+    // The first version did the opposite, and it was a real bug rather than an
+    // ordering preference. The UDP port is **host-wide**; `FT_SharedMem` is
+    // **per-wineserver**. So "somebody already has the port" does not imply
+    // "somebody in this session has a mapping" — a leftover `tobii bridge run`,
+    // or a game in another prefix, holds the port from a different session
+    // entirely. Creating a provider and then dropping it on a failed bind
+    // destroyed the only mapping in the game's own session, and the caller's
+    // immediate `Consumer::open` usually won the race against that drop and
+    // pinned the doomed section: the game then read `FTGetData == true` with an
+    // all-zero frame and a ticking counter — a live-looking tracker frozen at
+    // dead centre — for the life of the process, because `START` is a `Once`.
+    //
+    // Ceding is only correct when the holder is in THIS session, and an
+    // openable mapping is exactly what proves that. Otherwise the port is
+    // watched until it frees up.
+    let socket = loop {
+        match UdpSocket::bind(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) => {
+                if Consumer::open().is_some() {
+                    let _ = ready.send(Started::AlreadyTaken);
+                    return;
+                }
+                // A holder in another session. Keep waiting rather than
+                // leaving the game blind: when it exits, this takes over.
+                let _ = ready.send(Started::Waiting);
+                std::thread::sleep(RETRY);
+            }
+        }
+    };
     let provider = match Provider::create() {
         Ok(p) => p,
         Err(_) => {
             let _ = ready.send(Started::Failed);
-            return;
-        }
-    };
-    let socket = match UdpSocket::bind(("127.0.0.1", port)) {
-        Ok(s) => s,
-        // Someone else is already listening. Drop our mapping and let theirs
-        // be the one everybody reads.
-        Err(_) => {
-            let _ = ready.send(Started::AlreadyTaken);
             return;
         }
     };

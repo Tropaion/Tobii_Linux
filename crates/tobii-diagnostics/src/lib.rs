@@ -400,19 +400,35 @@ fn udev_rule() -> String {
 /// say `rw-rw----` root:root on a machine where it works perfectly.
 fn uinput() -> String {
     const NODE: &str = "/dev/uinput";
-    if !Path::new(NODE).exists() {
+    let access = std::fs::OpenOptions::new()
+        .write(true)
+        .open(NODE)
+        .map(|_| ())
+        .map_err(|e| e.kind());
+    uinput_message(Path::new(NODE).exists(), access)
+}
+
+/// The wording, separated from the probe so every branch can be tested.
+///
+/// Split out because the guard on the report's whitespace can only inspect the
+/// branch the test host happens to take, and on a working machine that is the
+/// one branch whose literal has no line continuation and therefore cannot carry
+/// the defect the guard exists for.
+fn uinput_message(exists: bool, access: Result<(), std::io::ErrorKind>) -> String {
+    const NODE: &str = "/dev/uinput";
+    if !exists {
         return format!(
             "{NODE} MISSING — the uinput module is not loaded and no rule creates \
              the node; install 60-tobii.rules, or run: sudo modprobe uinput"
         );
     }
-    match std::fs::OpenOptions::new().write(true).open(NODE) {
-        Ok(_) => "writable — the virtual joystick can be created".into(),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => format!(
+    match access {
+        Ok(()) => "writable — the virtual joystick can be created".into(),
+        Err(std::io::ErrorKind::PermissionDenied) => format!(
             "{NODE} NOT WRITABLE — the virtual joystick cannot be created; \
              install 60-tobii.rules and log out and back in"
         ),
-        Err(e) => format!("{NODE} unusable ({e})"),
+        Err(e) => format!("{NODE} unusable ({e:?})"),
     }
 }
 
@@ -807,6 +823,47 @@ mod tests {
                 "a run of spaces inside a value: {line:?}"
             );
         }
+    }
+
+    /// The walk above can only see whichever branch this machine takes, and on
+    /// a working one that is the single-line literal — the only `uinput()`
+    /// branch that *cannot* carry the defect. Every branch is checked here.
+    #[test]
+    fn every_uinput_message_reads_as_one_sentence() {
+        use std::io::ErrorKind;
+        for m in [
+            uinput_message(false, Ok(())),
+            uinput_message(true, Ok(())),
+            uinput_message(true, Err(ErrorKind::PermissionDenied)),
+            uinput_message(true, Err(ErrorKind::NotFound)),
+        ] {
+            assert!(!m.contains("   "), "a run of spaces mid-sentence: {m:?}");
+            assert!(!m.contains('\n'), "the report is one line per field: {m:?}");
+        }
+    }
+
+    /// The three ways this fails are indistinguishable from inside a game — the
+    /// controller simply is not in the bind list — so each has to name its own
+    /// remedy rather than all reading as "not available".
+    #[test]
+    fn each_uinput_failure_names_a_different_remedy() {
+        use std::io::ErrorKind;
+        let missing = uinput_message(false, Ok(()));
+        let denied = uinput_message(true, Err(ErrorKind::PermissionDenied));
+        let working = uinput_message(true, Ok(()));
+
+        assert!(missing.contains("modprobe"), "{missing}");
+        assert!(denied.contains("60-tobii.rules"), "{denied}");
+        assert!(
+            denied.contains("log out"),
+            "re-plugging cannot apply a logind ACL to a virtual device: {denied}"
+        );
+        assert!(
+            !denied.contains("re-plug"),
+            "that advice is right for the tracker and wrong for /dev/uinput: {denied}"
+        );
+        assert_ne!(missing, denied);
+        assert!(!working.contains("NOT"), "{working}");
     }
     use super::*;
 

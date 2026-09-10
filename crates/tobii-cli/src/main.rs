@@ -1897,6 +1897,30 @@ fn apply_games_opt_in(cfg: &mut tobii_output::games::OutputConfig, args: &[Strin
     }
 }
 
+/// Apply one `KEY VALUE` to a config, or say why it was refused.
+///
+/// Split from [`games_cmd`] so the decision can be tested without touching the
+/// user's config file. It used to be inline, and the test that claimed to cover
+/// it exercised only `tobii-output` — breaking this arm outright left
+/// `cargo test -p tobii-cli` entirely green.
+fn games_set(
+    cfg: &mut tobii_output::games::OutputConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    if cfg.apply_key(key, value) {
+        return Ok(());
+    }
+    // `OutputConfig::keys()` is the one list. It is hand-written and pinned by
+    // a test to exactly what `to_toml` emits — scraping a second list out of
+    // `to_toml` here, which is what this did at first, was itself the
+    // duplication it claimed to be avoiding.
+    Err(format!(
+        "{key} = {value:?} was not accepted.\nvalid keys: {}",
+        tobii_output::games::OutputConfig::keys().join(", ")
+    ))
+}
+
 /// `tobii games` — show the game-output settings; `tobii games set K V` — change one.
 ///
 /// Writes through [`OutputConfig::apply_key`], the same function the file
@@ -1918,18 +1942,7 @@ fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
                 _ => return Err("usage: tobii games set KEY VALUE".into()),
             };
             let mut cfg = load_output_config();
-            if !cfg.apply_key(key, value) {
-                // `OutputConfig::keys()` is the one list. It is hand-written
-                // and pinned by a test to exactly what `to_toml` emits —
-                // scraping a second list out of `to_toml` here, which is what
-                // this did at first, was itself the duplication it claimed to
-                // be avoiding.
-                return Err(format!(
-                    "{key} = {value:?} was not accepted.\nvalid keys: {}",
-                    tobii_output::games::OutputConfig::keys().join(", ")
-                )
-                .into());
-            }
+            games_set(&mut cfg, key, value)?;
             save_output_config(&cfg)?;
             println!("{key} = {value}");
             Ok(())
@@ -2560,38 +2573,50 @@ mod tests {
         assert_eq!(exit_code_of(killed), 137, "the shell's 128 + signal");
     }
 
-    /// The keys `tobii games set` accepts must be exactly the keys the file
-    /// writes. They are derived from a serialized config rather than listed by
-    /// hand precisely so they cannot drift apart — but the derivation has to
-    /// skip the file's comment lines, two of which contain `" = "`.
+    /// `tobii games set` has to accept what the file advertises and refuse what
+    /// it does not — and this must exercise THIS crate's code.
+    ///
+    /// Its predecessor lived here and called only `tobii_output`, so breaking
+    /// the `set` arm outright left `cargo test -p tobii-cli` green. The
+    /// keys-match-the-file property it also asserted belongs with the config
+    /// and now lives there, as
+    /// `the_advertised_keys_are_exactly_the_keys_the_file_writes`.
     #[test]
-    fn the_settable_keys_are_the_keys_the_file_writes() {
-        let doc = tobii_output::games::OutputConfig::default().to_toml();
-        let keys: Vec<&str> = doc
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim()))
-            .collect();
-        assert!(keys.contains(&"joystick"), "{keys:?}");
-        assert!(
-            !keys.iter().any(|k| k.starts_with('#')),
-            "the file's comments are not settings: {keys:?}"
-        );
-        let mut cfg = tobii_output::games::OutputConfig::default();
-        for k in &keys {
-            // Every listed key must actually be settable, or the error message
-            // that lists them is lying about what it accepts.
-            let probe = match *k {
-                "opentrack" => "127.0.0.1:1",
-                "ev_yaw_curve" | "ev_pitch_curve" => "linear",
-                _ if k.ends_with("_deg") || *k == "rate_hz" => "1",
-                "filter_alpha" => "0.5",
-                "ev_hold_ms" => "1",
-                "bridge_port" => "1",
-                _ => "true",
+    fn games_set_accepts_every_advertised_key_and_names_them_when_refusing() {
+        use tobii_output::games::OutputConfig;
+        let mut cfg = OutputConfig::default();
+        for key in OutputConfig::keys() {
+            let probe = match *key {
+                "enabled" | "extended_view" | "joystick" => "true",
+                "opentrack" => "127.0.0.1:9999",
+                "bridge_port" => "4243",
+                "ev_hold_ms" => "150",
+                "filter_alpha" => "0.3",
+                k if k.ends_with("_curve") => "linear",
+                _ => "3",
             };
-            assert!(cfg.apply_key(k, probe), "{k} is listed but not settable");
+            assert!(
+                games_set(&mut cfg, key, probe).is_ok(),
+                "advertised key `{key}` was refused by the command"
+            );
         }
+
+        let err = games_set(&mut cfg, "nonsense", "1").expect_err("must refuse");
+        assert!(err.contains("nonsense"), "{err}");
+        assert!(
+            err.contains("joystick"),
+            "a refusal has to list what IS accepted: {err}"
+        );
+        assert!(
+            !err.contains('#'),
+            "the file's comments are not settings: {err}"
+        );
+
+        // A refused value must leave the config untouched, since the caller
+        // saves whatever comes back.
+        let before = cfg.clone();
+        assert!(games_set(&mut cfg, "rate_hz", "not-a-number").is_err());
+        assert_eq!(cfg, before, "a refused set must change nothing");
     }
 
     /// `tobii headpose` shipped in v0.1.0 as plain head pose to opentrack. The

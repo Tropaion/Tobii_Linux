@@ -292,10 +292,13 @@ pub fn steam_libraries(home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in STEAM_ROOTS {
         let root = home.join(root);
+        // Not `else { continue }`: that skipped the root fallback below, so a
+        // Steam install whose libraryfolders.vdf is missing, unreadable or not
+        // UTF-8 produced NO libraries at all — and every `--steam` path sources
+        // its libraries here, so the whole surface then reported "no Steam
+        // libraries found" on a machine with games plainly installed.
         let vdf = root.join("steamapps/libraryfolders.vdf");
-        let Ok(text) = std::fs::read_to_string(&vdf) else {
-            continue;
-        };
+        let text = std::fs::read_to_string(&vdf).unwrap_or_default();
         for line in text.lines() {
             let line = line.trim();
             let Some(rest) = line.strip_prefix("\"path\"") else {
@@ -349,8 +352,23 @@ pub fn steam_apps(home: &Path) -> Vec<(String, String)> {
 /// launches. Its absence is the commonest reason this fails and is worth saying
 /// out loud rather than reporting as "not found".
 pub fn steam_prefix(home: &Path, appid: &str) -> Option<PathBuf> {
-    steam_libraries(home)
+    let libs = steam_libraries(home);
+    // The library holding the manifest is asked first, not just whichever
+    // library happens to come first. Steam's "Move Install Folder" does not
+    // move `compatdata`, so a game moved between libraries leaves its old
+    // prefix behind and gets a fresh one on the next run — and installing into
+    // the abandoned one succeeds, prints the ordinary success text, and does
+    // nothing at all for the game.
+    let owner = libs
+        .iter()
+        .find(|lib| {
+            lib.join(format!("steamapps/appmanifest_{appid}.acf"))
+                .is_file()
+        })
+        .cloned();
+    owner
         .into_iter()
+        .chain(libs)
         .map(|lib| lib.join("steamapps/compatdata").join(appid).join("pfx"))
         .find(|p| p.join("drive_c").is_dir())
 }

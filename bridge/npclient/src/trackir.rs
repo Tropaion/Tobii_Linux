@@ -54,6 +54,12 @@ pub fn fill(out: &mut TrackIrData) {
         return;
     };
     let raw = shm.read();
+    // As in `ftclient`: a never-written mapping is an all-zero frame, and
+    // advancing the signature over it would present a live tracker frozen at
+    // dead centre. `DataID == 0` is reserved for "nothing published yet".
+    if u32::from_le_bytes(raw[0..4].try_into().expect("4-byte slice")) == 0 {
+        return;
+    }
     let sig = FRAME_SIGNATURE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     from_ft_heap(&raw, sig, out);
 }

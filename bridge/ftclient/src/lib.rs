@@ -93,6 +93,15 @@ pub unsafe extern "system" fn FTGetData(data: *mut FtData) -> bool {
         return false;
     };
     let raw = shm.read();
+    // A mapping that has never been written reads as a valid all-zero frame,
+    // which in a game is a live tracker sitting at dead centre — worse than no
+    // tracker, because nothing looks wrong. Since this DLL creates the mapping
+    // itself now, that state is ordinary whenever nothing is sending yet, so
+    // `DataID == 0` is reserved to mean exactly it (see
+    // `tobii_output::freetrack::next_data_id`).
+    if u32::from_le_bytes(raw[0..4].try_into().expect("4-byte slice")) == 0 {
+        return false;
+    }
     let out = &mut *data;
     out.data_id = u32::from_le_bytes(raw[0..4].try_into().expect("4-byte slice"));
     out.cam_width = i32::from_le_bytes(raw[4..8].try_into().expect("4-byte slice"));

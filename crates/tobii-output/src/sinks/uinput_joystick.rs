@@ -219,17 +219,19 @@ pub const AXIS_CENTRE: i32 = 32767;
 /// "a permanent fractional offset in games that normalise to `[-1, 1]`", and
 /// that is not what either consumer does:
 ///
-/// * joydev rescales to `[-32767, 32767]` and reports exactly `0` at rest for
-///   a 65534 span *and* for a 65535 one, so it does not discriminate.
+/// * joydev rescales about `(min + max) / 2`, which integer division puts at
+///   `32767` for both spans. This span therefore reports exactly `0` at rest;
+///   the pairing rejected below — max 65535, centre 32768 — sits one step above
+///   that pivot and reports `1`. So joydev prefers this span, by one step.
 /// * SDL2 maps the span onto its own asymmetric `[-32768, 32767]` and reports
 ///   `-1` at rest. With this span SDL's `0` is unreachable: raw 32767 reads
 ///   `-1` and raw 32768 reads `+1`. The span rejected here, paired with centre
 ///   32768, is the one that would give SDL an exact zero.
 ///
 /// One step in 32767 is about 0.005° of a ±180° axis — below any deadzone a
-/// game offers, and far below the tracker's own noise. So the choice is made on
-/// the encoder's arithmetic, which is real, rather than on a centring benefit,
-/// which is not.
+/// game offers, and far below the tracker's own noise. The two consumers want
+/// opposite spans and each by exactly that one step, so neither of them decides
+/// it; the choice is made on the encoder's arithmetic, which is real.
 pub const AXIS_MAX: i32 = AXIS_CENTRE * 2;
 
 /// What one end of a rotation axis *means*, in degrees.

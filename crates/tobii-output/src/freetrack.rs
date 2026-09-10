@@ -87,13 +87,21 @@ pub mod offset {
     pub const GAME_ID2: usize = 104;
 }
 
-/// The next `DataID`, wrapping at [`DATA_ID_WRAP`].
+/// The next `DataID`, wrapping at [`DATA_ID_WRAP`] and never yielding `0`.
+///
+/// Zero is reserved to mean "nothing has ever been published here". A client
+/// DLL now creates the mapping itself before any frame has arrived, so an
+/// all-zero mapping is the ordinary state while nothing is sending — and
+/// without a reserved value the DLL cannot tell that apart from a real frame,
+/// and reports a live tracker sitting at dead centre. Skipping `0` costs one
+/// value out of half a billion and makes the distinction exact for the
+/// standalone provider too.
 ///
 /// Consumers detect new data by watching this change, so it must advance on
 /// every write and must never repeat consecutively — a counter that stuck would
 /// read as "the tracker stopped" even while frames kept arriving.
 pub fn next_data_id(prev: u32) -> u32 {
-    (prev + 1) % DATA_ID_WRAP
+    (prev % (DATA_ID_WRAP - 1)) + 1
 }
 
 /// Narrow to `f32`, mapping anything non-finite to zero.
@@ -323,7 +331,18 @@ mod tests {
     fn the_data_id_advances_every_write_and_wraps_without_repeating() {
         assert_eq!(next_data_id(0), 1);
         assert_eq!(next_data_id(DATA_ID_WRAP - 2), DATA_ID_WRAP - 1);
-        assert_eq!(next_data_id(DATA_ID_WRAP - 1), 0, "wraps at 1<<29");
+        assert_eq!(
+            next_data_id(DATA_ID_WRAP - 1),
+            1,
+            "wraps at 1<<29, skipping 0 — which means 'never published'"
+        );
+        // The reserved value: nothing the counter produces may be 0, or a
+        // never-written mapping reads as a real frame.
+        let mut id = 0;
+        for _ in 0..1000 {
+            id = next_data_id(id);
+            assert_ne!(id, 0, "0 is reserved for 'nothing published yet'");
+        }
 
         let mut id = DATA_ID_WRAP - 3;
         for _ in 0..6 {

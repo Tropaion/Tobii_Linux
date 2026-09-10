@@ -1,12 +1,22 @@
 //! The `FT_SharedMem` mapping: one provider, several consumers.
 //!
-//! The **exe is the sole provider**. It creates the mapping, owns the mutex and
-//! writes frames. The DLLs are pure consumers that open the mapping read-only.
+//! Exactly one process per wineserver session creates the mapping, owns the
+//! mutex and writes frames; everyone else opens it read-only.
 //!
-//! Deliberately *not* letting the DLLs host their own provider. It would double
-//! the state space, and a stale in-process provider racing a real one is a nasty
-//! failure mode to debug from inside a game — the view would half-work,
-//! intermittently, with two writers disagreeing about `DataID`.
+//! # The provider used to have to be the exe, and no longer is
+//!
+//! This said "deliberately *not* letting the DLLs host their own provider — a
+//! stale in-process provider racing a real one is a nasty failure mode to debug
+//! from inside a game". The concern was right; the conclusion did not survive
+//! contact with Proton, where a separate exe cannot reach the game's wineserver
+//! session at all. So the DLLs do host a provider now — see [`crate::feeder`] —
+//! and the race the old comment feared is what that module's port rule exists
+//! to prevent, having already been caught happening once.
+//!
+//! Two writers can still never disagree about `DataID`, because two writers
+//! cannot exist: creating the mapping is gated on winning a host-wide UDP bind,
+//! and ceding it is gated on being able to open somebody else's mapping — which
+//! is only possible within one session.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -110,11 +120,19 @@ unsafe impl Send for Consumer {}
 unsafe impl Sync for Consumer {}
 
 impl Consumer {
-    /// Open the provider's mapping, or `None` if no provider is running.
+    /// Open the mapping, or `None` if this session has none.
     ///
-    /// Absent is the ordinary case — the game may well start before the
-    /// bridge — so it is not an error, and the exports above simply report
-    /// no data until it appears.
+    /// Absent is not an error. It is also how [`crate::feeder`] tells a port
+    /// holder in **this** wineserver session (whose mapping opens, so reading
+    /// it is right) from one in another session (whose mapping is invisible
+    /// here, so standing down would leave the game with nothing).
+    ///
+    /// Note that opening successfully is not the same as having data: the
+    /// feeder creates the mapping before any frame arrives, so a fresh one is
+    /// all zeroes. `DataID == 0` is reserved to mean exactly that — see
+    /// [`tobii_output::freetrack::next_data_id`] — and the client exports check
+    /// it before reporting a frame, or a game would see a live tracker sitting
+    /// at dead centre.
     pub fn open() -> Option<Consumer> {
         let name = cstr(FT_SHARED_MEM_NAME);
         let mutex_name = cstr(FT_MUTEX_NAME);
