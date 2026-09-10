@@ -405,7 +405,7 @@ It appears as **Tobii Eye Tracker 5 head tracking**, an eight-axis controller:
 
 | Axis | Carries | Full scale |
 |---|---|---|
-| X, Y, Z | head position | ±500 mm |
+| X, Y, Z | head displacement from where you sit | ±500 mm |
 | RX, RY, RZ | yaw, pitch, roll | ±180°, ±90°, ±180° |
 | Throttle, Rudder | gaze on screen, left→right and top→bottom | the whole screen |
 
@@ -416,6 +416,13 @@ joystick** too (not XInput — measured under Wine 11.17; XInput's two-stick
 layout has nowhere to put eight axes). The last two axes are gaze, which no
 other head tracker offers; bind them to a free-look axis and the camera follows
 your eyes.
+
+If the axes feel like they barely move, turn up the amplification — this is the
+first thing to tune with a game in front of you:
+
+```sh
+tobii games set joystick_yaw_full_deg 45   # head angle for a full swing (default 70)
+```
 
 Two things to know before you bind it, both covered in
 [`docs/wiki/Game-Output.md`](docs/wiki/Game-Output.md): some games' "look" axis

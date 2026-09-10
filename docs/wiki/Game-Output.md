@@ -51,9 +51,50 @@ the right-hand screen edge as `32767`.
 
 | Axis | Carries | Full scale |
 |---|---|---|
-| `ABS_X`, `ABS_Y`, `ABS_Z` | head position | ±500 mm |
+| `ABS_X`, `ABS_Y`, `ABS_Z` | head displacement from where you sit | ±500 mm |
 | `ABS_RX`, `ABS_RY`, `ABS_RZ` | yaw, pitch, roll | ±180°, ±90°, ±180° |
 | `ABS_THROTTLE`, `ABS_RUDDER` | gaze on screen, x and y | the whole screen |
+
+### How much head movement reaches full deflection
+
+The axis *means* ±180°/±90°/±180°, because that is the physical range of the
+quantity and what every head-tracking wire format assumes. A head does not cover
+it. With Extended View at *Normal* and a 20° head turn, composed yaw reaches
+about 65° — **36%** of the axis. Roll gets no Extended View contribution at all,
+so a 15° head tilt is **8%**.
+
+opentrack and TrackIR both have an amplification stage before the wire for
+exactly this reason: opentrack's docs describe mapping 15° of physical yaw onto
+90–180° of camera rotation, and NaturalPoint tell TrackIR users to shape the
+motion curve rather than move their heads further. We had copied opentrack's
+wire scale and not its curve.
+
+```sh
+tobii games set joystick_yaw_full_deg 70      # the default
+tobii games set joystick_pitch_full_deg 35
+tobii games set joystick_roll_full_deg 20
+```
+
+The number is the composed head angle that reaches the end stop. The defaults
+put "look at the edge of the screen and turn your head slightly" at roughly full
+deflection. **This is the first thing to tune with a real game in front of you.**
+
+Erring hot is deliberate: every game with an axis-tuning panel can attenuate a
+strong signal trivially, and several cannot amplify a weak one at all — Elite
+Dangerous exposes a per-axis deadzone and nothing else.
+
+The mapping is linear with a hard clamp, not an eased curve. Easing would
+flatten the response either side of centre as well as at the ends, and a soft
+centre is a deadzone by another name, sitting exactly where the user is looking.
+
+**Only the joystick gets this stage.** The rule is: shape it where we are the
+last stage, send it raw where something downstream will shape it. opentrack
+receives us as a *tracker* and applies its own mapping curves, which its users
+have already tuned — amplifying first would double-apply and silently break
+their profiles. The Wine bridge stands in for the TrackIR software, which is
+what shapes the signal before a game sees it, so it arguably wants this too; it
+is deliberately left raw until a real game has consumed that path, rather than
+changing its feel and bringing it up at the same time.
 
 Translation full scale is deliberately the same ±500 mm the TrackIR encoder
 saturates at, so a movement of a given size means the same thing on every output

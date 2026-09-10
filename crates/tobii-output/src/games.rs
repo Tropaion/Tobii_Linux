@@ -61,6 +61,29 @@ pub struct OutputConfig {
     pub opentrack: Option<String>,
     /// Loopback port for the Wine bridge, or `None` to not send there.
     pub bridge_port: Option<u16>,
+    /// The composed head angle, in degrees, that drives each joystick axis to
+    /// full deflection — yaw, pitch, roll.
+    ///
+    /// # Why this stage has to exist
+    ///
+    /// The joystick axes span ±180°/±90°/±180°, because that is the physical
+    /// range of the quantity and what every head-tracking guide assumes. A head
+    /// does not cover it: with Extended View at *Normal* and a 20° head turn,
+    /// composed yaw reaches about 65°, which is **36%** of the axis. Roll gets
+    /// no Extended View contribution at all, so a 15° head tilt is **8%**.
+    ///
+    /// opentrack and TrackIR both have an amplification stage before the wire
+    /// for exactly this reason — opentrack's own docs describe mapping 15° of
+    /// physical yaw onto 90–180° of camera rotation, and NaturalPoint tell
+    /// TrackIR users to shape the motion curve rather than move their heads
+    /// further. We copied opentrack's wire scale and not its curve.
+    ///
+    /// Defaults of 70/35/20 put "look at the edge of the screen and turn your
+    /// head slightly" at roughly full deflection. Erring hot is deliberate:
+    /// every game with an axis-tuning panel can attenuate a strong signal
+    /// trivially, and several — Elite Dangerous exposes a deadzone and nothing
+    /// else — cannot amplify a weak one at all.
+    pub joystick_full_deg: [f64; 3],
     /// Whether to present a virtual joystick on `/dev/uinput`.
     ///
     /// On by default, unlike every other sink, because it is the only one that
@@ -81,6 +104,7 @@ impl Default for OutputConfig {
             filter_alpha: tobii_headpose::filter::DEFAULT_ALPHA,
             opentrack: Some(DEFAULT_OPENTRACK_ADDR.to_string()),
             bridge_port: Some(DEFAULT_BRIDGE_PORT),
+            joystick_full_deg: [70.0, 35.0, 20.0],
             joystick: true,
             extended_view: ExtendedView::default(),
         }
@@ -132,6 +156,18 @@ impl OutputConfig {
             self.bridge_port.unwrap_or(0)
         ));
         s.push_str(&format!("joystick = {}\n", self.joystick));
+        s.push_str(&format!(
+            "joystick_yaw_full_deg = {}\n",
+            self.joystick_full_deg[0]
+        ));
+        s.push_str(&format!(
+            "joystick_pitch_full_deg = {}\n",
+            self.joystick_full_deg[1]
+        ));
+        s.push_str(&format!(
+            "joystick_roll_full_deg = {}\n",
+            self.joystick_full_deg[2]
+        ));
         s.push_str(&format!("extended_view = {}\n", self.extended_view.enabled));
         s.push_str(&format!("ev_hold_ms = {}\n", self.extended_view.hold_ms));
         s.push_str(&axis_to_toml("ev_yaw", &self.extended_view.yaw));
@@ -210,6 +246,20 @@ impl OutputConfig {
                 Ok(b) => self.joystick = b,
                 Err(_) => return false,
             },
+            // Zero or negative would be a division by zero downstream, and
+            // "full deflection at no head movement" is not a thing to want.
+            "joystick_yaw_full_deg" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.joystick_full_deg[0] = v,
+                None => return false,
+            },
+            "joystick_pitch_full_deg" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.joystick_full_deg[1] = v,
+                None => return false,
+            },
+            "joystick_roll_full_deg" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.joystick_full_deg[2] = v,
+                None => return false,
+            },
             "extended_view" => match value.parse::<bool>() {
                 Ok(b) => self.extended_view.enabled = b,
                 Err(_) => return false,
@@ -270,6 +320,9 @@ impl OutputConfig {
             "opentrack",
             "bridge_port",
             "joystick",
+            "joystick_yaw_full_deg",
+            "joystick_pitch_full_deg",
+            "joystick_roll_full_deg",
             "extended_view",
             "ev_hold_ms",
             "ev_yaw_deadzone_deg",
@@ -335,6 +388,7 @@ mod tests {
             // Off, because the default is on: the round-trip tests below only
             // mean anything if every field differs from its default.
             joystick: false,
+            joystick_full_deg: [55.0, 30.0, 18.0],
             extended_view: ExtendedView {
                 hold_ms: 350,
                 yaw: AxisResponse {
@@ -488,6 +542,7 @@ mod tests {
         for key in OutputConfig::keys() {
             let value = match *key {
                 "enabled" | "extended_view" | "joystick" => "true",
+                k if k.starts_with("joystick_") => "45",
                 "opentrack" => "127.0.0.1:9999",
                 "bridge_port" => "4243",
                 "ev_hold_ms" => "150",

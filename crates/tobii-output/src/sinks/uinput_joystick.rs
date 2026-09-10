@@ -205,17 +205,74 @@ pub const AXIS_CENTRE: i32 = 32767;
 /// presents as slow drift with nothing to point at as the cause.
 pub const AXIS_MAX: i32 = AXIS_CENTRE * 2;
 
-/// Head rotation, in degrees, that drives an axis to its limit.
+/// What one end of a rotation axis *means*, in degrees.
 ///
-/// The physical limits of the quantity rather than the limits of a neck: a
-/// tracker composing Extended View on top of a real head turn can exceed any
-/// comfortable range, and an axis that saturates there would clip the very
-/// movement the feature exists to produce. Games apply their own curve on top.
+/// The physical limits of the quantity rather than the limits of a neck, so
+/// that the axis carries the same meaning as every other head-tracking wire
+/// format. How much head movement it takes to get there is a separate
+/// question, answered by `joystick_*_full_deg` in the config and applied by
+/// [`Response`] — without which a real head only ever reaches a third of this.
 pub const YAW_FULL_SCALE_DEG: f64 = 180.0;
 /// As [`YAW_FULL_SCALE_DEG`]. Pitch is half, because it is physically half.
 pub const PITCH_FULL_SCALE_DEG: f64 = 90.0;
 /// As [`YAW_FULL_SCALE_DEG`].
 pub const ROLL_FULL_SCALE_DEG: f64 = 180.0;
+
+/// The amplification stage, and where it does and does not belong.
+///
+/// # Why the joystick has one and the opentrack sink does not
+///
+/// The rule is: **shape it where we are the last stage, send it raw where
+/// something downstream will shape it.**
+///
+/// * The **joystick** is the whole chain. Nothing between this and the game
+///   will amplify anything, so if we do not, a 65° composed turn arrives as 36%
+///   of the axis and the user is told to turn their in-game sensitivity up.
+/// * The **opentrack sink** is not. opentrack receives us as a *tracker* and
+///   applies its own mapping curves, which its users have already tuned.
+///   Amplifying first would double-apply and silently break their profiles.
+/// * The **Wine bridge** stands in for the TrackIR/FreeTrack software, which is
+///   the thing that shapes the signal before a game sees it — so it arguably
+///   wants this too. It is deliberately left raw for now: no game has yet
+///   consumed that path, and changing its feel at the same time as bringing it
+///   up would mean two untested changes at once.
+#[derive(Debug, Clone, Copy)]
+pub struct Response {
+    /// Head angle reaching full deflection, per axis: yaw, pitch, roll.
+    full_deg: [f64; 3],
+}
+
+impl Default for Response {
+    fn default() -> Self {
+        Response {
+            full_deg: crate::games::OutputConfig::default().joystick_full_deg,
+        }
+    }
+}
+
+impl Response {
+    /// The stage the user's settings ask for.
+    pub fn from_config(cfg: &crate::games::OutputConfig) -> Response {
+        Response {
+            full_deg: cfg.joystick_full_deg,
+        }
+    }
+
+    /// Map a composed head angle onto the axis's own scale.
+    ///
+    /// Linear with a hard clamp, not an eased curve. Smoothstep would flatten
+    /// the response either side of centre as well as at the ends, and a soft
+    /// centre is the one thing a head tracker must not have — it is a deadzone
+    /// by another name, in the middle of where the user is looking. Games that
+    /// want a curve have one; this stage exists only to make the range usable.
+    fn shape(&self, raw_deg: f64, axis: usize, full_scale: f64) -> f64 {
+        let head_full = self.full_deg.get(axis).copied().unwrap_or(full_scale);
+        if !raw_deg.is_finite() || !head_full.is_finite() || head_full <= 0.0 {
+            return 0.0;
+        }
+        (raw_deg / head_full * full_scale).clamp(-full_scale, full_scale)
+    }
+}
 
 /// Head translation, in millimetres, that drives an axis to its limit.
 ///
@@ -277,6 +334,8 @@ const AXES: [u16; 8] = [
 /// A virtual joystick fed by head pose and gaze.
 pub struct UinputJoystick {
     fd: File,
+    /// How much head movement reaches full deflection — see [`Response`].
+    response: Response,
     /// Last gaze reported, held across blinks.
     ///
     /// Gaze vanishes for a fraction of a second every few seconds. Reporting
@@ -376,8 +435,18 @@ impl UinputJoystick {
 
         Ok(UinputJoystick {
             fd,
+            response: Response::default(),
             last_gaze: [AXIS_CENTRE; 2],
         })
+    }
+
+    /// Re-tune without recreating the device.
+    ///
+    /// The device deliberately outlives any one tracking session, so a settings
+    /// change has to reach the live one — recreating it to apply a number would
+    /// take the controller out of every running game's bind list.
+    pub fn set_response(&mut self, response: Response) {
+        self.response = response;
     }
 
     /// Write one batch of axis values, terminated by the `SYN_REPORT` that
@@ -448,13 +517,23 @@ impl Sink for UinputJoystick {
         if let Some([gx, gy]) = frame.gaze {
             self.last_gaze = [encode_unit(gx), encode_unit(gy)];
         }
+        let r = &self.response;
         self.report([
             encode_axis(pose.x_mm, TRANSLATION_FULL_SCALE_MM),
             encode_axis(pose.y_mm, TRANSLATION_FULL_SCALE_MM),
             encode_axis(pose.z_mm, TRANSLATION_FULL_SCALE_MM),
-            encode_axis(pose.yaw_deg, YAW_FULL_SCALE_DEG),
-            encode_axis(pose.pitch_deg, PITCH_FULL_SCALE_DEG),
-            encode_axis(pose.roll_deg, ROLL_FULL_SCALE_DEG),
+            encode_axis(
+                r.shape(pose.yaw_deg, 0, YAW_FULL_SCALE_DEG),
+                YAW_FULL_SCALE_DEG,
+            ),
+            encode_axis(
+                r.shape(pose.pitch_deg, 1, PITCH_FULL_SCALE_DEG),
+                PITCH_FULL_SCALE_DEG,
+            ),
+            encode_axis(
+                r.shape(pose.roll_deg, 2, ROLL_FULL_SCALE_DEG),
+                ROLL_FULL_SCALE_DEG,
+            ),
             self.last_gaze[0],
             self.last_gaze[1],
         ])?;
@@ -515,6 +594,11 @@ impl JoystickHandle {
     pub fn new(device: UinputJoystick) -> Self {
         JoystickHandle(Rc::new(RefCell::new(device)))
     }
+
+    /// Re-tune the shared device — see [`UinputJoystick::set_response`].
+    pub fn set_response(&self, response: Response) {
+        self.0.borrow_mut().set_response(response);
+    }
 }
 
 impl Sink for JoystickHandle {
@@ -556,6 +640,70 @@ mod tests {
         assert_eq!(UI_SET_EVBIT, 0x4004_5564);
         assert_eq!(UI_SET_KEYBIT, 0x4004_5565);
         assert_eq!(UI_SET_ABSBIT, 0x4004_5567);
+    }
+
+    /// Without the response stage a real head only reaches a third of the
+    /// axis, which is the difference between a usable bind and one the user
+    /// concludes is broken.
+    #[test]
+    fn the_response_stage_is_what_makes_the_range_reachable() {
+        let r = Response::default();
+        // Extended View at "Normal" contributes up to 45 degrees of yaw; add a
+        // 20 degree head turn, which is about as far as the ET5 can follow
+        // before it loses an eye.
+        let composed = 65.0;
+        let raw_fraction = composed / YAW_FULL_SCALE_DEG;
+        let shaped_fraction = r.shape(composed, 0, YAW_FULL_SCALE_DEG) / YAW_FULL_SCALE_DEG;
+        assert!(
+            raw_fraction < 0.4,
+            "premise: unshaped, a full deliberate look is a third of the axis"
+        );
+        assert!(
+            shaped_fraction > 0.85,
+            "a full deliberate look should be most of the axis, got {:.0}%",
+            shaped_fraction * 100.0
+        );
+
+        // Roll is the worst case: no Extended View contributes to it at all.
+        let tilt = 15.0;
+        assert!(
+            r.shape(tilt, 2, ROLL_FULL_SCALE_DEG) / ROLL_FULL_SCALE_DEG > 0.6,
+            "a 15 degree head tilt is 8% of the axis unshaped"
+        );
+    }
+
+    /// Amplifying must not wrap or overshoot: past the configured head angle
+    /// the axis saturates, and saturation must land exactly on the end stop.
+    #[test]
+    fn past_the_configured_head_angle_the_axis_saturates_exactly() {
+        let r = Response::default();
+        for (axis, full) in [
+            (0, YAW_FULL_SCALE_DEG),
+            (1, PITCH_FULL_SCALE_DEG),
+            (2, ROLL_FULL_SCALE_DEG),
+        ] {
+            assert_eq!(r.shape(1e6, axis, full), full);
+            assert_eq!(r.shape(-1e6, axis, full), -full);
+            assert_eq!(encode_axis(r.shape(1e6, axis, full), full), AXIS_MAX);
+            assert_eq!(encode_axis(r.shape(-1e6, axis, full), full), AXIS_MIN);
+        }
+        // Centre stays centre — a soft or offset centre is the one thing a
+        // head tracker must not have.
+        assert_eq!(
+            encode_axis(r.shape(0.0, 0, YAW_FULL_SCALE_DEG), YAW_FULL_SCALE_DEG),
+            AXIS_CENTRE
+        );
+    }
+
+    /// A nonsensical setting must not divide by zero or emit a NaN into an
+    /// ioctl — the kernel would take it and the axis would pin wherever
+    /// `NaN as i32` lands.
+    #[test]
+    fn a_zero_or_non_finite_setting_reports_centre() {
+        for bad in [0.0, -10.0, f64::NAN, f64::INFINITY] {
+            let r = Response { full_deg: [bad; 3] };
+            assert_eq!(r.shape(30.0, 0, YAW_FULL_SCALE_DEG), 0.0, "full_deg {bad}");
+        }
     }
 
     /// An axis whose halves differ in length reads as a permanent offset in
@@ -799,9 +947,15 @@ mod tests {
                 .map(|(_, v)| *v)
                 .unwrap_or_else(|| panic!("no report for axis {code:#x} in {seen:?}"))
         };
+        // Through the response stage, which is what the sink applies — the
+        // round trip is only meaningful against what the sink actually encodes.
+        let expected = encode_axis(
+            Response::default().shape(yaw_deg, 0, YAW_FULL_SCALE_DEG),
+            YAW_FULL_SCALE_DEG,
+        );
         assert_eq!(
             value_of(ABS_RX),
-            encode_axis(yaw_deg, YAW_FULL_SCALE_DEG),
+            expected,
             "yaw did not survive the round trip"
         );
         assert_eq!(value_of(ABS_THROTTLE), AXIS_MAX, "gaze x at the right edge");

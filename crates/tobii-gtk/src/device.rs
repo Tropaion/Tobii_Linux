@@ -8,7 +8,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tobii_output::sinks::{JoystickHandle, UinputJoystick};
+use tobii_output::sinks::{uinput_joystick::Response, JoystickHandle, UinputJoystick};
 use tobii_protocol::camera::decode_camera_frame;
 use tobii_protocol::frame::OP_GAZE_NOTIFY;
 use tobii_protocol::{CameraFrame, DisplayCorners, EnabledEye, GazeSample};
@@ -1101,7 +1101,9 @@ impl GameSide {
                         "game output: virtual joystick created — bind its axes in your game",
                     );
                     self.warned = false;
-                    self.joystick = Some(JoystickHandle::new(js));
+                    let handle = JoystickHandle::new(js);
+                    handle.set_response(Response::from_config(cfg));
+                    self.joystick = Some(handle);
                     *self.status.lock().unwrap() = JoystickStatus::Present;
                 }
                 Err(e) => {
@@ -1130,7 +1132,14 @@ impl GameSide {
             // nothing exists, so a failure that later stops being wanted does
             // not leave its reason on screen for ever.
             (false, false) => *self.status.lock().unwrap() = JoystickStatus::Off,
-            (true, true) => {}
+            // Re-tuned in place rather than recreated: taking the controller
+            // out of a running game's bind list to apply a number would be a
+            // worse cure than the disease.
+            (true, true) => {
+                if let Some(h) = &self.joystick {
+                    h.set_response(Response::from_config(cfg));
+                }
+            }
         }
     }
 }

@@ -2019,7 +2019,12 @@ fn headpose(args: &[String]) -> CmdResult {
             );
         } else {
             match tobii_output::sinks::UinputJoystick::open() {
-                Ok(s) => router.add(Box::new(s)),
+                Ok(mut s) => {
+                    s.set_response(tobii_output::sinks::uinput_joystick::Response::from_config(
+                        &cfg,
+                    ));
+                    router.add(Box::new(s));
+                }
                 Err(e) => eprintln!("not presenting a virtual joystick: {e}"),
             }
         }
