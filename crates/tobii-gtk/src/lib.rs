@@ -730,7 +730,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // to fit the *smaller* constraint — which is why it stayed small in a wide
     // window.
     {
-        const MAX_H: i32 = 300;
+        // Capped lower than the card could give it. Side by side with the
+        // sensor view, this widget's height IS the live band's height — the
+        // camera stretches to match it — and the band sits above everything
+        // else rather than beside it, so every pixel here is a pixel of window.
+        const MAX_H: i32 = 260;
         area.connect_resize(move |a, w, _h| {
             let want = golden_height(w).clamp(min_h, MAX_H);
             if a.content_height() != want {
@@ -832,23 +836,39 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let spacer = Label::new(Some(" "));
     readout.attach(&spacer, 2, 0, 1, 1);
 
-    // --- The instrument, as one card: trackbox, readout, camera. ---
-    let instrument = gtk::Box::new(Orientation::Vertical, 12);
+    // --- Live data, as one card: the two views SIDE BY SIDE. ---
+    //
+    // Stacked, these two made the instrument twice as tall as any control
+    // column, and no amount of balancing the columns beside it could fix a
+    // window whose height one card decided. Across the top instead, the card is
+    // about as tall as a single view and the whole hub gets shorter — which is
+    // what the split into columns was for in the first place.
+    let gaze_side = gtk::Box::new(Orientation::Vertical, 12);
+    gaze_side.set_hexpand(true);
+    gaze_side.append(&eye_title);
+    gaze_side.append(&area);
+
+    // The numbers go BESIDE the box they describe, not under it. Under it they
+    // added their own full height to a band that is now the top of the window,
+    // and they are a narrow block of text next to a wide one — which is the
+    // shape that fits in the space the trackbox cannot use anyway.
+    let readout_side = gtk::Box::new(Orientation::Vertical, 12);
+    readout_side.set_valign(Align::Center);
+    readout_side.append(&readout);
+
+    let cam_side = gtk::Box::new(Orientation::Vertical, 12);
+    cam_side.set_hexpand(true);
+    cam_side.append(&cam_title);
+    cam_side.append(&cam_area);
+
+    let instrument = gtk::Box::new(Orientation::Horizontal, 20);
     instrument.add_css_class("surface");
     instrument.add_css_class("panel-pad");
     instrument.set_hexpand(true);
-    // Both columns are the same height — two cards of different heights side by
-    // side look like a mistake. The slack that used to sit empty below the
-    // sensor view is absorbed by the sensor view itself, which expands into it.
-    instrument.set_vexpand(true);
-    instrument.append(&eye_title);
-    instrument.append(&area);
-    instrument.append(&hairline());
-    instrument.append(&readout);
-    instrument.append(&hairline());
-    instrument.append(&cam_title);
-    instrument.append(&cam_area);
-    let left = instrument;
+    instrument.append(&gaze_side);
+    instrument.append(&readout_side);
+    instrument.append(&cam_side);
+    let live = instrument;
 
     // --- Right column: settings sections (original wording) ---
     let b_setup = crate::widget::button("Set up display");
@@ -996,31 +1016,30 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         });
     }
 
-    let right = gtk::Box::new(Orientation::Vertical, 12);
-    right.set_size_request(COLUMN_WIDTH, -1);
-    // Fill, not Start: the column takes the whole height of the grid row — which
-    // is the tallest column — and the expanding gaps added by `justify_column`
-    // below share out the difference. See there for why the gaps and not the
-    // cards.
-    right.set_valign(Align::Fill);
-    // Explicit, at build time. Left to the breakpoint handler alone this was
-    // never set before the first layout, so the control rack absorbed every
-    // spare pixel and the instrument — the thing the window is for — stayed at
-    // its minimum in a wide window.
-    right.set_hexpand(false);
-    right.append(&section(
+    // The controls sit in three columns BENEATH the live data: the two setup
+    // wizards, the two things the tracker measures, and the two places the
+    // result goes.
+    //
+    // The grouping is also what makes them the same height, and that is not a
+    // coincidence — it was chosen from the measured cards (180/141/161/120/
+    // 213/222) so no column runs away with the row. The obvious grouping put
+    // both game sections together at 447 against 293, and a row is as tall as
+    // its tallest column.
+    //
+    // Fill, not Start: each column takes the whole height of its grid row and
+    // the expanding gaps added by `justify_column` share out the difference.
+    // See there for why the gaps and not the cards.
+    let col_calib = gtk::Box::new(Orientation::Vertical, 12);
+    col_calib.set_size_request(COLUMN_WIDTH, -1);
+    col_calib.set_valign(Align::Fill);
+    col_calib.set_hexpand(true);
+    col_calib.append(&section(
         "Improve my calibration",
         "If the light conditions change or if you experience less tracker precision, you might \
          benefit from improving your calibration.",
         &b_cal,
     ));
-    right.append(&section(
-        "Select eyes to detect",
-        "If you typically squint or have poor sight in one eye, you can make the eye tracker \
-         detect one eye only.",
-        &eyes_ctl,
-    ));
-    right.append(&section(
+    col_calib.append(&section(
         "Change screen",
         "If you move the sensor to a different monitor, you'll need to set up the new display.",
         &b_setup,
@@ -1077,33 +1096,37 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         });
     }
 
-    // --- The third column: everything about sending tracking OUT ----------
-    // Split off the control rack because the rack was the tallest thing in the
-    // window and this is the half of it that is about other programs rather
-    // than about the tracker. It also groups: what the two game sections do is
-    // one subject, and they were previously separated by "Preview my gaze".
-    let games_col = gtk::Box::new(Orientation::Vertical, 12);
-    games_col.set_size_request(COLUMN_WIDTH, -1);
-    games_col.set_valign(Align::Fill);
-    games_col.set_hexpand(false);
-    games_col.append(&section(
+    // What the tracker measures: which eyes to look for, and head pose.
+    let col_display = gtk::Box::new(Orientation::Vertical, 12);
+    col_display.set_size_request(COLUMN_WIDTH, -1);
+    col_display.set_valign(Align::Fill);
+    col_display.set_hexpand(true);
+    col_display.append(&section(
+        "Select eyes to detect",
+        "If you typically squint or have poor sight in one eye, you can make the eye tracker \
+         detect one eye only.",
+        &eyes_ctl,
+    ));
+    col_display.append(&section(
         "Head tracking",
         "Sends your head position and angle to games and apps, over opentrack.",
         &head_model::control(state.clone(), cmd_tx.clone()),
     ));
-    // Beside "Head tracking" rather than in the cogwheel: it is about what the
-    // tracker does, not about how this program behaves.
-    let games_row = crate::games::GamesRow::build(joystick_status);
-    // With the two game sections rather than with calibration: this column is
-    // the things the tracker DRIVES, and the gaze overlay is one of them. It
-    // also evens the two racks out, and the window is as tall as its tallest
-    // column — which is the height this split exists to reduce.
-    games_col.append(&section(
+
+    // Where the result goes: onto the screen, and out to a game.
+    let col_games = gtk::Box::new(Orientation::Vertical, 12);
+    col_games.set_size_request(COLUMN_WIDTH, -1);
+    col_games.set_valign(Align::Fill);
+    col_games.set_hexpand(true);
+    col_games.append(&section(
         "Preview my gaze",
         "Shows you a visual trail of your gaze.",
         &sw_preview,
     ));
-    games_col.append(&section(
+    // Beside "Head tracking" rather than in the cogwheel: it is about what the
+    // tracker does, not about how this program behaves.
+    let games_row = crate::games::GamesRow::build(joystick_status);
+    col_games.append(&section(
         "Head tracking for games",
         "Sends head tracking and gaze to a game. Wrap the game with \
          `tobii game -- <command>` — in Steam, put that in Launch Options.",
@@ -1113,8 +1136,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // Level bottoms. Both racks are shorter than the instrument, and three
     // stacks ending within ~100px of each other read as a misalignment rather
     // than as a deliberate stagger.
-    justify_column(&right);
-    justify_column(&games_col);
+    justify_column(&col_calib);
+    justify_column(&col_display);
+    justify_column(&col_games);
 
     // --- Responsive split -------------------------------------------------
     // Side by side when there is room, stacked when there is not. GTK4 has no
@@ -1142,9 +1166,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // the window's opening height is MEASURED from this tree further down, and
     // measuring an empty grid gave a window the height of its header with every
     // card clipped off the bottom.
-    split.attach(&left, 0, 0, 1, 1);
-    split.attach(&right, 1, 0, 1, 1);
-    split.attach(&games_col, 2, 0, 1, 1);
+    split.attach(&live, 0, 0, 3, 1);
+    split.attach(&col_calib, 0, 1, 1, 1);
+    split.attach(&col_display, 1, 1, 1, 1);
+    split.attach(&col_games, 2, 1, 1, 1);
 
     // What three columns ACTUALLY need, asked of the widgets rather than added
     // up by hand. The hand-added version — instrument floor, two columns, two
@@ -1217,8 +1242,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // Both used to leave the window at whatever height it was born with, so
     // larger text was clipped and a banner pushed the last card out of view.
     {
-        let window = window.clone();
+        let win = window.clone();
         let root = root.clone();
+        let window = win.clone();
         let fit: Rc<dyn Fn()> = Rc::new(move || {
             // Never on a window the user has sized themselves. Maximised or
             // fullscreen, the height is not ours to choose; and re-fitting a
@@ -1233,6 +1259,25 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             }
         });
         *refit.borrow_mut() = Some(fit.clone());
+
+        // Once, when the window first appears. `natural_height` above is
+        // measured against a widget tree that has never been laid out, and it
+        // comes out a little short — the cards' padding is not all accounted
+        // for until they have been allocated once. Re-fitting on the first map
+        // costs one measurement and means the window opens at the height its
+        // content actually needs rather than a close guess.
+        {
+            let fit = fit.clone();
+            win.connect_map(move |_| {
+                // One idle later, not inline: `map` runs BEFORE the first
+                // allocation, so measuring here returns the same slightly-short
+                // answer `natural_height` already got. After one turn of the
+                // main loop the tree has been laid out once and the measurement
+                // is the real one.
+                let fit = fit.clone();
+                glib::idle_add_local_once(move || fit());
+            });
+        }
 
         // Watched rather than called from the code that shows them: both
         // banners are shown from several places (a timeout, a dismiss, the
@@ -1257,16 +1302,17 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // any of those changes; these do not.
     let breakpoint: Rc<dyn Fn(i32)> = {
         const GUTTER: i32 = 16;
-        // Measured above, plus the page margins either side. Dropping one
-        // column frees exactly its width and the gutter beside it, which is the
-        // one part of this that IS simple arithmetic.
+        // Measured above, plus the page margins either side. Dropping a column
+        // frees exactly its width and the gutter beside it, which is the one
+        // part of this that IS simple arithmetic.
         let three_below = three_col_min + PAGE_MARGIN * 2;
         let two_below = three_below - GUTTER - COLUMN_WIDTH;
 
         let split = split.clone();
-        let left_bp = left.clone();
-        let right_bp = right.clone();
-        let games_bp = games_col.clone();
+        let live_bp = live.clone();
+        let calib_bp = col_calib.clone();
+        let display_bp = col_display.clone();
+        let games_bp = col_games.clone();
         // Three, because that is how the children were attached above — so a
         // window that opens wide enough is not needlessly torn down and rebuilt
         // before it is first drawn.
@@ -1283,35 +1329,43 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 return;
             }
             columns_now.set(columns);
-            split.remove(&left_bp);
-            split.remove(&right_bp);
+            split.remove(&live_bp);
+            split.remove(&calib_bp);
+            split.remove(&display_bp);
             split.remove(&games_bp);
+            // The live data always spans the full width, whatever that is: it
+            // is one card and splitting it across rows would put the two views
+            // in different places depending on the window size.
             match columns {
-                // Instrument, tracking, games — the wide layout this exists for.
                 3 => {
-                    split.attach(&left_bp, 0, 0, 1, 1);
-                    split.attach(&right_bp, 1, 0, 1, 1);
-                    split.attach(&games_bp, 2, 0, 1, 1);
+                    split.attach(&live_bp, 0, 0, 3, 1);
+                    split.attach(&calib_bp, 0, 1, 1, 1);
+                    split.attach(&display_bp, 1, 1, 1, 1);
+                    split.attach(&games_bp, 2, 1, 1, 1);
                 }
-                // The games column drops under the tracking one rather than
-                // under the instrument: they are one rack, and keeping them in
-                // the same column keeps the reading order intact.
+                // Games spans both columns rather than sitting under one of
+                // them: it is the widest card of the three, and a half-width
+                // hole beside it would read as something missing.
                 2 => {
-                    split.attach(&left_bp, 0, 0, 1, 2);
-                    split.attach(&right_bp, 1, 0, 1, 1);
-                    split.attach(&games_bp, 1, 1, 1, 1);
+                    split.attach(&live_bp, 0, 0, 2, 1);
+                    split.attach(&calib_bp, 0, 1, 1, 1);
+                    split.attach(&display_bp, 1, 1, 1, 1);
+                    split.attach(&games_bp, 0, 2, 2, 1);
                 }
                 _ => {
-                    split.attach(&left_bp, 0, 0, 1, 1);
-                    split.attach(&right_bp, 0, 1, 1, 1);
-                    split.attach(&games_bp, 0, 2, 1, 1);
+                    split.attach(&live_bp, 0, 0, 1, 1);
+                    split.attach(&calib_bp, 0, 1, 1, 1);
+                    split.attach(&display_bp, 0, 2, 1, 1);
+                    split.attach(&games_bp, 0, 3, 1, 1);
                 }
             }
-            // Stacked, a rack has the full width to itself and should use it;
-            // beside the instrument it must not crowd it.
-            let stacked = columns == 1;
-            right_bp.set_hexpand(stacked);
-            games_bp.set_hexpand(stacked);
+            // Stacked, the two live views go one above the other — side by side
+            // in a narrow window each would be too small to read.
+            live_bp.set_orientation(if columns == 1 {
+                Orientation::Vertical
+            } else {
+                Orientation::Horizontal
+            });
         };
         // Shared, because one signal is not enough to be sure. `default-width`
         // does not fire for every way a window can change size (tiling and
