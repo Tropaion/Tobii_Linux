@@ -349,6 +349,75 @@ fn hint_font_metrics() {
     }
 }
 
+/// Every `font-size: Npx` in `css`, multiplied by `scale`.
+///
+/// # Why the stylesheet is rewritten rather than a root size set
+///
+/// The obvious way to scale text in GTK is a `font-size` on the root, or the
+/// `gtk-xft-dpi` setting. Neither works here on its own: this stylesheet states
+/// every size in **absolute px**, and an absolute size is exactly what refuses
+/// to inherit from a root rule or to follow a font DPI. So the sizes themselves
+/// are what move, and the relative proportions the design was drawn with —
+/// 20px title against 10px eyebrow — are preserved by construction.
+///
+/// `gtk-xft-dpi` is still set alongside this, for the text that has no class
+/// and therefore no px size of its own; see [`apply_text_scale`].
+///
+/// Rounded to whole pixels, and never below 1: a fractional font-size is legal
+/// CSS but lands on a half-pixel baseline, which is the fuzz this project has
+/// already chased once.
+fn scaled_css(css: &str, scale: f64) -> String {
+    const KEY: &str = "font-size: ";
+    if !scale.is_finite() || (scale - 1.0).abs() < f64::EPSILON {
+        return css.to_string();
+    }
+    let mut out = String::with_capacity(css.len() + 64);
+    let mut rest = css;
+    while let Some(at) = rest.find(KEY) {
+        let (before, after) = rest.split_at(at + KEY.len());
+        out.push_str(before);
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        match after[digits.len()..].strip_prefix("px") {
+            // A size in some other unit, or none at all: copied through
+            // untouched rather than guessed at.
+            None => rest = after,
+            Some(tail) => {
+                let px: f64 = digits.parse().unwrap_or(0.0);
+                out.push_str(&format!("{}px", ((px * scale).round() as i64).max(1)));
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The provider this app's stylesheet is loaded into.
+///
+/// Kept so the sheet can be replaced when the text scale changes. Loading a
+/// second provider instead would leave the old sizes in the cascade at equal
+/// priority, where the winner is whichever was added last — which works until
+/// something else adds one.
+///
+/// Thread-local because a `CssProvider` is a GObject and therefore neither
+/// `Send` nor `Sync` — which is not a limitation to work around: everything
+/// that touches it runs on the GTK main thread by definition.
+fn with_css_provider<T>(f: impl FnOnce(&gtk::CssProvider) -> T) -> T {
+    thread_local! {
+        static PROVIDER: std::cell::OnceCell<gtk::CssProvider> = const {
+            std::cell::OnceCell::new()
+        };
+    }
+    PROVIDER.with(|p| f(p.get_or_init(gtk::CssProvider::new)))
+}
+
+/// How wide a control column is.
+///
+/// Both control columns share it, so they read as one rack that happens to be
+/// split rather than as two panels that disagree — and the breakpoints below
+/// are arithmetic on this rather than three hand-tuned numbers that drift.
+const COLUMN_WIDTH: i32 = 360;
+
 /// Install this app's stylesheet on the default display.
 ///
 /// Public so a dialog can be rendered outside the hub for a visual check —
@@ -356,14 +425,38 @@ fn hint_font_metrics() {
 /// a compositor screenshot, which is how this dialog's width bug was found.
 pub fn load_css() {
     hint_font_metrics();
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(CSS);
     if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+        with_css_provider(|provider| {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        });
+    }
+    apply_text_scale(tobii_config::text_scale());
+}
+
+/// Re-render the stylesheet at `scale` and apply it live.
+///
+/// Two halves, because they cover different text. The stylesheet carries every
+/// size this app states itself; `gtk-xft-dpi` carries the default font, which
+/// is what any label without a style class is drawn in. Scaling only one of
+/// them makes the UI grow unevenly, which looks like a bug rather than a
+/// setting.
+pub fn apply_text_scale(scale: f64) {
+    with_css_provider(|p| p.load_from_string(&scaled_css(CSS, scale)));
+    if let Some(settings) = gtk::Settings::default() {
+        // Relative to whatever this desktop already asked for, not an absolute
+        // DPI: a user on a HiDPI session has a large value here already, and
+        // replacing it would undo their own scaling in this one app.
+        thread_local! {
+            static BASE_DPI: std::cell::OnceCell<i32> = const { std::cell::OnceCell::new() };
+        }
+        let base = BASE_DPI.with(|b| *b.get_or_init(|| settings.gtk_xft_dpi()));
+        if base > 0 {
+            settings.set_gtk_xft_dpi((f64::from(base) * scale).round() as i32);
+        }
     }
 }
 
@@ -804,7 +897,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     }
 
     let right = gtk::Box::new(Orientation::Vertical, 12);
-    right.set_size_request(360, -1);
+    right.set_size_request(COLUMN_WIDTH, -1);
     right.set_valign(Align::Start);
     // Explicit, at build time. Left to the breakpoint handler alone this was
     // never set before the first layout, so the control rack absorbed every
@@ -816,25 +909,6 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         "If the light conditions change or if you experience less tracker precision, you might \
          benefit from improving your calibration.",
         &b_cal,
-    ));
-    right.append(&section(
-        "Head tracking",
-        "Sends your head position and angle to games and apps, over opentrack.",
-        &head_model::control(state.clone(), cmd_tx.clone()),
-    ));
-    // Beside "Head tracking" rather than in the cogwheel: it is about what the
-    // tracker does, not about how this program behaves.
-    let games_row = crate::games::GamesRow::build(joystick_status);
-    right.append(&section(
-        "Head tracking for games",
-        "Sends head tracking and gaze to a game. Wrap the game with \
-         `tobii game -- <command>` — in Steam, put that in Launch Options.",
-        &games_row.controls,
-    ));
-    right.append(&section(
-        "Preview my gaze",
-        "Shows you a visual trail of your gaze.",
-        &sw_preview,
     ));
     right.append(&section(
         "Select eyes to detect",
@@ -899,6 +973,39 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         });
     }
 
+    // --- The third column: everything about sending tracking OUT ----------
+    // Split off the control rack because the rack was the tallest thing in the
+    // window and this is the half of it that is about other programs rather
+    // than about the tracker. It also groups: what the two game sections do is
+    // one subject, and they were previously separated by "Preview my gaze".
+    let games_col = gtk::Box::new(Orientation::Vertical, 12);
+    games_col.set_size_request(COLUMN_WIDTH, -1);
+    games_col.set_valign(Align::Start);
+    games_col.set_hexpand(false);
+    games_col.append(&section(
+        "Head tracking",
+        "Sends your head position and angle to games and apps, over opentrack.",
+        &head_model::control(state.clone(), cmd_tx.clone()),
+    ));
+    // Beside "Head tracking" rather than in the cogwheel: it is about what the
+    // tracker does, not about how this program behaves.
+    let games_row = crate::games::GamesRow::build(joystick_status);
+    // With the two game sections rather than with calibration: this column is
+    // the things the tracker DRIVES, and the gaze overlay is one of them. It
+    // also evens the two racks out, and the window is as tall as its tallest
+    // column — which is the height this split exists to reduce.
+    games_col.append(&section(
+        "Preview my gaze",
+        "Shows you a visual trail of your gaze.",
+        &sw_preview,
+    ));
+    games_col.append(&section(
+        "Head tracking for games",
+        "Sends head tracking and gaze to a game. Wrap the game with \
+         `tobii game -- <command>` — in Steam, put that in Launch Options.",
+        &games_row.controls,
+    ));
+
     // --- Responsive split -------------------------------------------------
     // Side by side when there is room, stacked when there is not. GTK4 has no
     // media queries, so the breakpoint is watched on the window's width and the
@@ -920,8 +1027,22 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     split.set_valign(Align::Start);
     split.set_column_spacing(16);
     split.set_row_spacing(16);
+    // Attached here in the widest layout, and re-placed by the breakpoint below
+    // if the window turns out to be narrower. Not left to the breakpoint alone:
+    // the window's opening height is MEASURED from this tree further down, and
+    // measuring an empty grid gave a window the height of its header with every
+    // card clipped off the bottom.
     split.attach(&left, 0, 0, 1, 1);
     split.attach(&right, 1, 0, 1, 1);
+    split.attach(&games_col, 2, 0, 1, 1);
+
+    // What three columns ACTUALLY need, asked of the widgets rather than added
+    // up by hand. The hand-added version — instrument floor, two columns, two
+    // gutters — was 56px short of the truth, because a card's padding and
+    // border are not in any of those numbers. GTK then warned that it was being
+    // measured for less width than it needs, and the window opened one column
+    // short of what it had been sized for.
+    let (three_col_min, _, _, _) = split.measure(Orientation::Horizontal, -1);
 
     let header = gtk::Box::new(Orientation::Horizontal, 12);
     title.set_hexpand(true);
@@ -944,8 +1065,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
 
     // How tall the content wants to be at the width the window will open at.
     // Measured before the window exists, so the window can be built around it.
-    const DEFAULT_WIDTH: i32 = 1040;
-    let (_, natural_height, _, _) = root.measure(Orientation::Vertical, DEFAULT_WIDTH);
+    // Wide enough to open in the three-column layout, from what the columns
+    // measured rather than from a number. The slack above their minimum goes to
+    // the instrument, which is the only thing here that benefits from more.
+    let default_width = (three_col_min + PAGE_MARGIN * 2).max(1180);
+    let (_, natural_height, _, _) = root.measure(Orientation::Vertical, default_width);
 
     // Scroll rather than clip: a short window (or a stacked narrow one) must
     // still be able to reach the controls at the bottom.
@@ -957,7 +1081,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Tobii Configuration")
-        .default_width(DEFAULT_WIDTH)
+        .default_width(default_width)
         // Measured, not chosen. Asking the content how tall it wants to be at
         // this width means the background below the last card is exactly
         // `PAGE_MARGIN`, matching the sides — and it stays that way if the
@@ -967,40 +1091,75 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         .build();
     window.set_child(Some(&scroller));
     // A floor, kept deliberately low. Width is the constraint that carries
-    // meaning — below ~800 the two columns stop fitting side by side, which the
-    // breakpoint handles by stacking them — while height only decides how much
-    // scrolling there is, so there is no reason to stop the user shrinking it.
-    window.set_size_request(820, 340);
+    // meaning — the breakpoints below drop from three columns to two to one as
+    // it shrinks — while height only decides how much scrolling there is, so
+    // there is no reason to stop the user shrinking it. 760 is just above where
+    // even one control column stops fitting beside the instrument.
+    window.set_size_request(760, 340);
 
-    // The breakpoint. 820 is where the instrument's 340px floor plus the
-    // control column's 360px floor plus margins stop fitting side by side.
+    // The breakpoints. Three layouts, chosen by width alone.
+    //
+    // Arithmetic on the real floors rather than three tuned numbers: the
+    // instrument's 340px, plus a control column per tier, plus the 16px gutters
+    // and the 20px page margins either side. Tuned constants drift the moment
+    // any of those changes; these do not.
     let breakpoint: Rc<dyn Fn(i32)> = {
-        // 820 is where the instrument's 320px floor and the control rack's
-        // 360px floor stop fitting side by side with the margins.
-        const STACK_BELOW: i32 = 820;
+        const GUTTER: i32 = 16;
+        // Measured above, plus the page margins either side. Dropping one
+        // column frees exactly its width and the gutter beside it, which is the
+        // one part of this that IS simple arithmetic.
+        let three_below = three_col_min + PAGE_MARGIN * 2;
+        let two_below = three_below - GUTTER - COLUMN_WIDTH;
+
         let split = split.clone();
         let left_bp = left.clone();
         let right_bp = right.clone();
-        let stacked_now = std::cell::Cell::new(None::<bool>);
+        let games_bp = games_col.clone();
+        // Three, because that is how the children were attached above — so a
+        // window that opens wide enough is not needlessly torn down and rebuilt
+        // before it is first drawn.
+        let columns_now = std::cell::Cell::new(3i32);
         let apply = move |width: i32| {
-            let stacked = width < STACK_BELOW;
-            if stacked_now.get() == Some(stacked) {
+            let columns = if width >= three_below {
+                3
+            } else if width >= two_below {
+                2
+            } else {
+                1
+            };
+            if columns_now.get() == columns {
                 return;
             }
-            stacked_now.set(Some(stacked));
-            // Re-place both children: side by side, or one above the other.
+            columns_now.set(columns);
             split.remove(&left_bp);
             split.remove(&right_bp);
-            if stacked {
-                split.attach(&left_bp, 0, 0, 1, 1);
-                split.attach(&right_bp, 0, 1, 1, 1);
-            } else {
-                split.attach(&left_bp, 0, 0, 1, 1);
-                split.attach(&right_bp, 1, 0, 1, 1);
+            split.remove(&games_bp);
+            match columns {
+                // Instrument, tracking, games — the wide layout this exists for.
+                3 => {
+                    split.attach(&left_bp, 0, 0, 1, 1);
+                    split.attach(&right_bp, 1, 0, 1, 1);
+                    split.attach(&games_bp, 2, 0, 1, 1);
+                }
+                // The games column drops under the tracking one rather than
+                // under the instrument: they are one rack, and keeping them in
+                // the same column keeps the reading order intact.
+                2 => {
+                    split.attach(&left_bp, 0, 0, 1, 2);
+                    split.attach(&right_bp, 1, 0, 1, 1);
+                    split.attach(&games_bp, 1, 1, 1, 1);
+                }
+                _ => {
+                    split.attach(&left_bp, 0, 0, 1, 1);
+                    split.attach(&right_bp, 0, 1, 1, 1);
+                    split.attach(&games_bp, 0, 2, 1, 1);
+                }
             }
-            // Stacked, the rack has the full width to itself and should use it;
-            // side by side it must not crowd the instrument.
+            // Stacked, a rack has the full width to itself and should use it;
+            // beside the instrument it must not crowd it.
+            let stacked = columns == 1;
             right_bp.set_hexpand(stacked);
+            games_bp.set_hexpand(stacked);
         };
         // Shared, because one signal is not enough to be sure. `default-width`
         // does not fire for every way a window can change size (tiling and
@@ -1442,6 +1601,76 @@ fn settings_button(quitting: &Rc<Cell<bool>>) -> gtk::MenuButton {
 }
 
 /// The contents of that popover.
+/// The text-size control: minus, the current percentage, plus.
+///
+/// Buttons rather than a slider. The range that is useful is small and the
+/// steps are meaningful, so a slider would offer a hundred positions to choose
+/// between five — and a slider is the harder thing to hit for exactly the user
+/// who is here because the text is too small to read.
+fn text_size_row() -> gtk::Box {
+    /// One press. Large enough to be worth pressing, small enough that the
+    /// range is not crossed in two.
+    const STEP: f64 = 0.1;
+
+    let minus = crate::widget::button("−");
+    minus.add_css_class("quiet");
+    let plus = crate::widget::button("+");
+    plus.add_css_class("quiet");
+    let current = Label::new(None);
+    current.add_css_class("status");
+    current.set_width_chars(5);
+
+    let controls = gtk::Box::new(Orientation::Horizontal, 6);
+    controls.set_valign(Align::Center);
+    controls.append(&minus);
+    controls.append(&current);
+    controls.append(&plus);
+
+    // Shared by both buttons and the label, so the three cannot disagree about
+    // what the current scale is.
+    let refresh = {
+        let current = current.clone();
+        let minus = minus.clone();
+        let plus = plus.clone();
+        move |scale: f64| {
+            current.set_text(&format!("{:.0}%", scale * 100.0));
+            // Greyed at the ends rather than silently doing nothing, so a
+            // press that cannot help says so before it is made.
+            minus.set_sensitive(scale > tobii_config::TEXT_SCALE_MIN + f64::EPSILON);
+            plus.set_sensitive(scale < tobii_config::TEXT_SCALE_MAX - f64::EPSILON);
+        }
+    };
+    refresh(tobii_config::text_scale());
+
+    let bump = {
+        let refresh = refresh.clone();
+        move |by: f64| {
+            let next = (tobii_config::text_scale() + by)
+                .clamp(tobii_config::TEXT_SCALE_MIN, tobii_config::TEXT_SCALE_MAX);
+            // Applied before it is saved: the change is visible instantly, and
+            // a read-only config directory costs the user the persistence
+            // rather than the feature.
+            apply_text_scale(next);
+            if let Err(e) = tobii_config::save_text_scale(next) {
+                tobii_diagnostics::log::warn(&format!("could not save the text size: {e}"));
+            }
+            refresh(next);
+        }
+    };
+    {
+        let bump = bump.clone();
+        minus.connect_clicked(move |_| bump(-STEP));
+    }
+    plus.connect_clicked(move |_| bump(STEP));
+
+    settings_row(
+        "Text size",
+        "Scales this window's text. The tracker, the games and everything else \
+         are unaffected — this is only how large the program draws itself.",
+        &controls,
+    )
+}
+
 fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
     let list = gtk::Box::new(Orientation::Vertical, 4);
     // An explicit width rather than one negotiated from the longest sentence.
@@ -1478,6 +1707,8 @@ fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
          choose to update.",
         &update_check_switch(),
     ));
+    list.append(&hairline());
+    list.append(&text_size_row());
     list.append(&hairline());
 
     list.append(&diagnostics_row());
@@ -1828,4 +2059,71 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
     b.append(&d);
     b.append(control);
     b
+}
+
+#[cfg(test)]
+mod tests {
+    /// Scaling rewrites the sizes themselves, because they are absolute px and
+    /// an absolute size is exactly what will not inherit from a root rule.
+    #[test]
+    fn the_stylesheet_scales_every_font_size_it_states() {
+        let css = ".a { font-size: 20px; } .b { color: red; font-size: 10px; }";
+        assert_eq!(
+            super::scaled_css(css, 1.5),
+            ".a { font-size: 30px; } .b { color: red; font-size: 15px; }"
+        );
+        // Identity is byte-for-byte untouched, so the default look cannot be
+        // changed by a rounding decision made for the scaled path.
+        assert_eq!(super::scaled_css(css, 1.0), css);
+        assert_eq!(super::scaled_css(css, f64::NAN), css);
+    }
+
+    /// The design's proportions must survive scaling: a 20px title against a
+    /// 10px eyebrow is the hierarchy the layout is read by, and losing it at
+    /// anything but 100% would make the setting cost more than it gives.
+    #[test]
+    fn scaling_preserves_the_relative_sizes_and_never_rounds_to_nothing() {
+        let size_of = |css: &str| -> f64 {
+            css.split("font-size: ")
+                .nth(1)
+                .and_then(|t| t.split("px").next())
+                .and_then(|n| n.parse().ok())
+                .expect("a px size")
+        };
+        for scale in [0.8, 1.0, 1.2, 1.6] {
+            let title = size_of(&super::scaled_css(".t { font-size: 20px; }", scale));
+            let eyebrow = size_of(&super::scaled_css(".e { font-size: 10px; }", scale));
+            assert!(
+                (title / eyebrow - 2.0).abs() < 0.35,
+                "the 2:1 ratio must survive scale {scale}: {title} vs {eyebrow}"
+            );
+
+            // The whole real sheet, at the smallest scale, must still state
+            // sizes a person can see.
+            let out = super::scaled_css(super::CSS, scale);
+            let mut sizes = out.match_indices("font-size: ").map(|(i, k)| {
+                out[i + k.len()..]
+                    .split("px")
+                    .next()
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .unwrap_or(0)
+            });
+            assert!(
+                sizes.all(|s| s >= 1),
+                "a size rounded away at scale {scale}"
+            );
+        }
+    }
+
+    /// A size in a unit this does not understand is copied through, not guessed
+    /// at: silently reinterpreting `1.2em` as pixels would be a worse bug than
+    /// not scaling it.
+    #[test]
+    fn a_size_in_another_unit_is_left_alone() {
+        let css = ".a { font-size: 1.2em; } .b { font-size: 12px; }";
+        assert_eq!(
+            super::scaled_css(css, 2.0),
+            ".a { font-size: 1.2em; } .b { font-size: 24px; }"
+        );
+    }
 }

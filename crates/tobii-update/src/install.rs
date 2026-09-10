@@ -430,6 +430,28 @@ pub fn package_owner(path: &Path) -> Ownership {
     Ownership::None
 }
 
+/// Who owns the binaries an install into `dir` would replace.
+///
+/// BOTH binaries, not just the first. A package can own one and not the other —
+/// a half-replaced install, a distribution that splits the CLI from the GUI —
+/// and overwriting the owned one is the damage this gate exists to prevent,
+/// whichever of the two it is. So the first answer that is not
+/// [`Ownership::None`] wins.
+///
+/// Public so a caller can ask *before* it offers a button that
+/// [`install_release`] would only refuse. Nothing about the refusal rests on
+/// that: `install_release` asks again, on its own thread, and refuses on its
+/// own answer.
+pub fn ownership_of(dir: &Path) -> Ownership {
+    for name in BINARIES {
+        match package_owner(&dir.join(name)) {
+            Ownership::None => {}
+            owned => return owned,
+        }
+    }
+    Ownership::None
+}
+
 /// The command a person actually updates with, given the one that answered.
 fn updater_for(query_tool: &str) -> &str {
     match query_tool {
@@ -547,6 +569,129 @@ pub fn digest_for(sums: &str, name: &str) -> Option<String> {
     None
 }
 
+/// Fetch `files` from `release` into a folder under `into`, checking each one
+/// against the release's `SHA256SUMS`. Nothing is installed.
+///
+/// This is the path for a copy this program must not update itself: a
+/// package-managed install has to be updated by its package manager, and a
+/// package manager needs the file on disk. The download and the checksum check
+/// are the installer's — see the module docs for what that check is worth — and
+/// the last step, the one that writes to the install directory, is simply not
+/// taken.
+///
+/// The files land in `<into>/tobii-linux-<version>/` rather than straight into
+/// the folder the user picked. Two of the names this can fetch are `PKGBUILD`
+/// and `tobii-linux.install`, generic enough that writing them into a folder an
+/// Arch user keeps their own packaging in would overwrite theirs; the
+/// subdirectory also keeps that pair together in one directory, which is what
+/// `makepkg` needs.
+///
+/// Nothing this call wrote survives a failure, the file whose digest did not
+/// match included. A `.deb` left in a Downloads folder is something a person
+/// installs by hand later, and half a PKGBUILD pair does not build at all —
+/// both are worse than an empty folder and a message.
+pub fn download_release_files(
+    release: &Release,
+    files: &[&crate::release::Asset],
+    into: &Path,
+    progress: &dyn Fn(&str),
+) -> Result<Vec<PathBuf>, InstallError> {
+    if files.is_empty() {
+        return Err(InstallError::NoBuildForTarget(Target::triple()));
+    }
+    for a in files {
+        if !is_plain_file_name(&a.name) {
+            return Err(InstallError::UnsafeName(a.name.clone()));
+        }
+    }
+    let sums_asset = release.checksums().ok_or(InstallError::NoChecksums)?;
+
+    progress("the checksums");
+    let sums = net::get(&sums_asset.url)?;
+    let sums = String::from_utf8_lossy(&sums).into_owned();
+    // Every digest is looked up before anything is written, so a release that
+    // lists one of these files and not another fails while the user's folder is
+    // still untouched.
+    for a in files {
+        if digest_for(&sums, &a.name).is_none() {
+            return Err(InstallError::NotListed(a.name.clone()));
+        }
+    }
+
+    let dir = into.join(format!("tobii-linux-{}", release.version));
+    std::fs::create_dir_all(&dir)?;
+    let mut written = Vec::new();
+    match fetch_each(
+        files,
+        &dir,
+        &sums,
+        progress,
+        &|url, dest| net::download(url, dest),
+        &mut written,
+    ) {
+        Ok(()) => Ok(written),
+        Err(e) => {
+            discard(&written, &dir);
+            Err(e)
+        }
+    }
+}
+
+/// Remove what a failed download wrote, and the folder if that empties it.
+///
+/// `remove_dir` and not `remove_dir_all`: it only ever succeeds on an empty
+/// directory, so a second attempt that fails after a first one succeeded cannot
+/// take the first download away with it, and neither can anything else the user
+/// put there.
+fn discard(written: &[PathBuf], dir: &Path) {
+    for p in written {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Fetch each file into `dir` and check it, recording every path written.
+///
+/// `fetch` is a parameter so the checking and the cleanup can be exercised
+/// against known bytes without a network — that is the half of this worth
+/// testing, and the half a real download cannot be made to fail on demand. The
+/// only caller passes [`net::download`], which is what puts every URL through
+/// [`net::is_trusted`].
+///
+/// `written` is an out-parameter rather than a return value because the caller
+/// has to delete what was written *on the failure path*, when there is no
+/// return value to read it out of.
+fn fetch_each(
+    files: &[&crate::release::Asset],
+    dir: &Path,
+    sums: &str,
+    progress: &dyn Fn(&str),
+    fetch: &dyn Fn(&str, &Path) -> Result<(), net::NetError>,
+    written: &mut Vec<PathBuf>,
+) -> Result<(), InstallError> {
+    for a in files {
+        progress(&a.name);
+        // Safe to join: the caller checked every name is a single component.
+        let dest = dir.join(&a.name);
+        fetch(&a.url, &dest)?;
+        written.push(dest.clone());
+        let expected = digest_for(sums, &a.name).ok_or_else(|| {
+            // Unreachable through `download_release_files`, which looks every
+            // digest up before the first byte is fetched.
+            InstallError::NotListed(a.name.clone())
+        })?;
+        let found = sha256::hex_digest(&std::fs::read(&dest)?);
+        if found != expected {
+            return Err(InstallError::Digest {
+                name: a.name.clone(),
+                expected,
+                found,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Download, verify and install `release`, replacing the binaries in place.
 ///
 /// `progress` is called with a short line per step, so a CLI can print it and a
@@ -570,23 +715,16 @@ pub fn install_release(
     // Asked before writability, because the two failures need opposite advice:
     // "you need permission" invites `sudo`, which is exactly the wrong thing to
     // do to a package-managed file.
-    //
-    // BOTH binaries, not just the first. A package can own one and not the
-    // other — a half-replaced install, a distribution that splits the CLI from
-    // the GUI — and overwriting the owned one is the damage this gate exists to
-    // prevent, whichever of the two it is.
-    for name in BINARIES {
-        match package_owner(&dir.join(name)) {
-            Ownership::Package { manager, package } => {
-                return Err(InstallError::PackageManaged { manager, package })
-            }
-            // Could not tell. Refuse: the alternative is overwriting a packaged
-            // file on the strength of a query that failed.
-            Ownership::Unknown { manager, why } => {
-                return Err(InstallError::OwnerUnknown { manager, why })
-            }
-            Ownership::None => {}
+    match ownership_of(&dir) {
+        Ownership::Package { manager, package } => {
+            return Err(InstallError::PackageManaged { manager, package })
         }
+        // Could not tell. Refuse: the alternative is overwriting a packaged
+        // file on the strength of a query that failed.
+        Ownership::Unknown { manager, why } => {
+            return Err(InstallError::OwnerUnknown { manager, why })
+        }
+        Ownership::None => {}
     }
     if !is_writable(&dir) {
         return Err(InstallError::NotWritable(dir));
@@ -1548,6 +1686,169 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         set_executable(&fails).unwrap();
         let e = probe(&fails).expect_err("a non-zero exit is a failure");
         assert!(e.contains("boom"), "the reason should be reported: {e}");
+    }
+
+    fn asset(name: &str) -> crate::release::Asset {
+        crate::release::Asset {
+            name: name.to_string(),
+            url: format!("https://github.com/a/b/{name}"),
+        }
+    }
+
+    /// A download that hands back exactly the bytes it is told to, so the
+    /// checking and the cleanup can be run without a network.
+    fn canned(
+        bytes: &'static [(&'static str, &'static [u8])],
+    ) -> impl Fn(&str, &Path) -> Result<(), net::NetError> {
+        move |_url, dest| {
+            let name = dest.file_name().unwrap().to_string_lossy().to_string();
+            let body = bytes
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, b)| *b)
+                .unwrap_or(b"unexpected");
+            std::fs::write(dest, body).unwrap();
+            Ok(())
+        }
+    }
+
+    /// The whole reason a download is checked at all: a file that is not what
+    /// the release published must not be left sitting in somebody's Downloads
+    /// folder, where they would install it by hand tomorrow.
+    #[test]
+    fn a_download_that_does_not_match_its_checksum_is_deleted_and_reported() {
+        let s = Scratch::new("download-bad");
+        let good = sha256::hex_digest(b"the real thing");
+        let sums = format!("{good}  PKGBUILD\n{good}  tobii-linux.install\n");
+        let files = [asset("PKGBUILD"), asset("tobii-linux.install")];
+        let files: Vec<&crate::release::Asset> = files.iter().collect();
+
+        // The second file arrives corrupted.
+        let mut written = Vec::new();
+        let e = fetch_each(
+            &files,
+            s.path(),
+            &sums,
+            &|_| {},
+            &canned(&[
+                ("PKGBUILD", b"the real thing"),
+                ("tobii-linux.install", b"truncated"),
+            ]),
+            &mut written,
+        )
+        .expect_err("a wrong digest must fail");
+        match &e {
+            InstallError::Digest { name, .. } => assert_eq!(name, "tobii-linux.install"),
+            other => panic!("expected a digest failure, got {other:?}"),
+        }
+        // Both are reported as written, because both are on disk and the
+        // caller has to remove them — including the bad one.
+        assert_eq!(written.len(), 2, "the bad file must be reported as written");
+        for p in &written {
+            assert!(p.exists(), "fetch_each does not delete; its caller does");
+        }
+        assert!(e.to_string().contains("tobii-linux.install"), "{e}");
+    }
+
+    /// The happy path, and the property the Arch download depends on: both
+    /// halves of the pair land in one directory, under their own names.
+    #[test]
+    fn a_download_that_matches_is_kept_under_its_published_name() {
+        let s = Scratch::new("download-good");
+        let a = sha256::hex_digest(b"pkgbuild bytes");
+        let b = sha256::hex_digest(b"hook bytes");
+        let sums = format!("{a}  PKGBUILD\n{b}  tobii-linux.install\n");
+        let files = [asset("PKGBUILD"), asset("tobii-linux.install")];
+        let files: Vec<&crate::release::Asset> = files.iter().collect();
+
+        // `progress` is an `Fn`, so what it collects into has to be shared
+        // rather than borrowed mutably.
+        let steps = std::cell::RefCell::new(Vec::new());
+        let mut written = Vec::new();
+        fetch_each(
+            &files,
+            s.path(),
+            &sums,
+            &|step| steps.borrow_mut().push(step.to_string()),
+            &canned(&[
+                ("PKGBUILD", b"pkgbuild bytes"),
+                ("tobii-linux.install", b"hook bytes"),
+            ]),
+            &mut written,
+        )
+        .expect("matching digests download cleanly");
+        assert_eq!(
+            written,
+            vec![
+                s.path().join("PKGBUILD"),
+                s.path().join("tobii-linux.install")
+            ]
+        );
+        assert_eq!(
+            std::fs::read(s.path().join("PKGBUILD")).unwrap(),
+            b"pkgbuild bytes"
+        );
+        assert_eq!(
+            steps.into_inner(),
+            vec!["PKGBUILD", "tobii-linux.install"],
+            "each file should be named as it is fetched"
+        );
+    }
+
+    /// A package can own one binary and not the other — a split package, or an
+    /// install half-replaced by hand. Asking only about the first is how an
+    /// owned file gets overwritten while the check appears to have run.
+    #[test]
+    fn ownership_is_asked_about_every_binary_not_just_the_first() {
+        let owns_the_gui = "case \"$*\" in \
+             *tobii-gtk) echo 'tobii-linux: /usr/bin/tobii-gtk'; exit 0;; \
+             esac; exit 1";
+        let o = with_stub("dpkg", owns_the_gui, || ownership_of(Path::new("/usr/bin")));
+        assert_eq!(
+            o,
+            Ownership::Package {
+                manager: "dpkg".into(),
+                package: "tobii-linux".into()
+            },
+            "the second binary being owned is still ownership"
+        );
+
+        // Nobody owns either: the one answer that lets an install proceed.
+        let none = with_stub("dpkg", "exit 1", || ownership_of(Path::new("/usr/bin")));
+        assert_eq!(none, Ownership::None);
+    }
+
+    /// What the caller does with the failure: the corrupted file goes, and so
+    /// does the folder — unless the folder holds something this download did
+    /// not put there.
+    #[test]
+    fn a_failed_download_leaves_nothing_of_its_own_behind() {
+        let s = Scratch::new("discard");
+        let dir = s.path().join("tobii-linux-0.3.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = vec![dir.join("PKGBUILD"), dir.join("tobii-linux.install")];
+        for p in &written {
+            std::fs::write(p, b"half a download").unwrap();
+        }
+        discard(&written, &dir);
+        assert!(!dir.exists(), "an emptied download folder should go too");
+
+        // The same failure in a folder that already held something else: the
+        // download's own files go, the stranger stays, and so does the folder.
+        std::fs::create_dir_all(&dir).unwrap();
+        let theirs = dir.join("notes.txt");
+        std::fs::write(&theirs, b"mine").unwrap();
+        for p in &written {
+            std::fs::write(p, b"half a download").unwrap();
+        }
+        discard(&written, &dir);
+        for p in &written {
+            assert!(!p.exists(), "{} should have been removed", p.display());
+        }
+        assert!(
+            theirs.exists(),
+            "a file this download did not write must stay"
+        );
     }
 
     /// The version reported to the user comes from the binary that is now

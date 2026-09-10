@@ -303,6 +303,58 @@ pub fn save_update_check_to(path: &Path, enabled: bool) -> io::Result<()> {
     write_atomic(path, if enabled { b"on\n" } else { b"off\n" })
 }
 
+/// Path to the persisted text scale, beside `config.toml`.
+pub fn text_scale_path() -> PathBuf {
+    config_path().with_file_name("text_scale")
+}
+
+/// The smallest and largest text scale the UI will apply.
+///
+/// Not a matter of taste. Below the floor the 10px eyebrow labels stop being
+/// legible at all; above the ceiling the control column no longer fits beside
+/// the instrument at the window's minimum width, so the layout stacks and the
+/// user has traded readable text for a window they must scroll. Both ends are
+/// reachable from the buttons, so neither is a wall the user hits by accident.
+pub const TEXT_SCALE_MIN: f64 = 0.8;
+pub const TEXT_SCALE_MAX: f64 = 1.6;
+
+/// How much larger or smaller than designed the UI's text should be.
+///
+/// `1.0` is the size the stylesheet specifies. Anything unreadable, out of
+/// range or absent means `1.0`: a corrupt preference here would otherwise be
+/// able to render the program unusable, and the recovery — a settings control
+/// the user cannot read — would be inside the thing it broke.
+pub fn text_scale() -> f64 {
+    text_scale_at(&text_scale_path())
+}
+
+/// [`text_scale`] against a given path.
+pub fn text_scale_at(path: &Path) -> f64 {
+    match read_opt(path) {
+        Ok(Some(b)) => std::str::from_utf8(&b)
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (TEXT_SCALE_MIN..=TEXT_SCALE_MAX).contains(v))
+            .unwrap_or(1.0),
+        _ => 1.0,
+    }
+}
+
+/// Persist the text scale, clamped to the range the UI can render.
+pub fn save_text_scale(scale: f64) -> io::Result<()> {
+    save_text_scale_to(&text_scale_path(), scale)
+}
+
+/// [`save_text_scale`] to a given path, for tests.
+pub fn save_text_scale_to(path: &Path, scale: f64) -> io::Result<()> {
+    let clamped = if scale.is_finite() {
+        scale.clamp(TEXT_SCALE_MIN, TEXT_SCALE_MAX)
+    } else {
+        1.0
+    };
+    write_atomic(path, format!("{clamped}\n").as_bytes())
+}
+
 /// Path to the persisted head-pose pitch offset, beside `config.toml`.
 pub fn pitch_offset_path() -> PathBuf {
     config_path().with_file_name("headpose_pitch_offset")
@@ -392,6 +444,44 @@ pub fn load_setup_monitor_id() -> io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A corrupt or out-of-range text scale must fall back to 1.0 rather than
+    /// render the program unreadable — the control that would fix it is inside
+    /// the UI it would have broken.
+    #[test]
+    fn an_unusable_text_scale_falls_back_to_normal() {
+        let dir = std::env::temp_dir().join(format!("tobii-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let p = dir.join("text_scale");
+
+        for bad in ["", "  ", "abc", "0", "-1", "99", "NaN", "inf"] {
+            std::fs::write(&p, bad).expect("write");
+            assert_eq!(text_scale_at(&p), 1.0, "{bad:?} must not be applied");
+        }
+        assert_eq!(text_scale_at(&dir.join("absent")), 1.0);
+
+        std::fs::write(&p, "1.25\n").expect("write");
+        assert_eq!(text_scale_at(&p), 1.25);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Saving clamps, so a caller cannot persist a value the reader would then
+    /// reject and silently replace with 1.0 — which would read as the setting
+    /// not sticking.
+    #[test]
+    fn saving_clamps_into_the_range_the_reader_accepts() {
+        let dir = std::env::temp_dir().join(format!("tobii-scale-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let p = dir.join("text_scale");
+
+        save_text_scale_to(&p, 99.0).expect("save");
+        assert_eq!(text_scale_at(&p), TEXT_SCALE_MAX);
+        save_text_scale_to(&p, 0.01).expect("save");
+        assert_eq!(text_scale_at(&p), TEXT_SCALE_MIN);
+        save_text_scale_to(&p, f64::NAN).expect("save");
+        assert_eq!(text_scale_at(&p), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The default has to be on — a user who never touches the setting should
     /// still hear about a fix — but an unreadable or unexpected file must not

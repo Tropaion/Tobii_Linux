@@ -35,6 +35,97 @@ impl Release {
     pub fn checksums(&self) -> Option<&Asset> {
         self.assets.iter().find(|a| a.name == "SHA256SUMS")
     }
+
+    /// What somebody whose copy belongs to `manager` should be handed.
+    ///
+    /// `manager` is the tool that *answered* the ownership question — `dpkg`,
+    /// `rpm` or `pacman`, the three [`crate::install::package_owner`] asks —
+    /// not the command a person upgrades with.
+    ///
+    /// The channels are not interchangeable. A packaged install lives in
+    /// `/usr/bin` and is recorded in a package database; the `.tar.gz` unpacks
+    /// into `~/.local/bin` and is recorded nowhere. Handing the archive to
+    /// somebody who installed the `.deb` gives them a second copy shadowing the
+    /// first, which is why the manager decides the file rather than the file
+    /// deciding itself.
+    ///
+    /// Falls back to the archive when this release publishes no package for
+    /// that manager *and* this machine: an archive is at least installable by
+    /// hand, where a `.deb` built for another architecture is not.
+    pub fn offer_for(&self, manager: &str, triple: &str) -> Option<Offer<'_>> {
+        let arch = triple.split('-').next().unwrap_or_default();
+        let ending = |suffix: String| -> Vec<&Asset> {
+            self.assets
+                .iter()
+                .filter(|a| a.name.ends_with(&suffix))
+                .collect()
+        };
+        let (channel, files) = match manager {
+            "dpkg" => (Channel::Deb, ending(format!("_{}.deb", deb_arch(arch)))),
+            "rpm" => (Channel::Rpm, ending(format!(".{arch}.rpm"))),
+            "pacman" => (Channel::Pkgbuild, self.pkgbuild_pair()),
+            _ => (Channel::Archive, Vec::new()),
+        };
+        if !files.is_empty() {
+            return Some(Offer { channel, files });
+        }
+        self.archive_for(triple).map(|a| Offer {
+            channel: Channel::Archive,
+            files: vec![a],
+        })
+    }
+
+    /// `PKGBUILD` and the hook `makepkg` reads from beside it.
+    ///
+    /// Both or neither: the PKGBUILD's `install=` names the second file, and
+    /// `makepkg` stops with "install scriptlet not found" when it is missing.
+    /// Half the pair looks like a download that worked and is not one.
+    fn pkgbuild_pair(&self) -> Vec<&Asset> {
+        let named = |n: &str| self.assets.iter().find(|a| a.name == n);
+        match (named(PKGBUILD), named(PKGBUILD_INSTALL)) {
+            (Some(p), Some(i)) => vec![p, i],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The PKGBUILD `scripts/package.sh` publishes, and its install hook.
+const PKGBUILD: &str = "PKGBUILD";
+const PKGBUILD_INSTALL: &str = "tobii-linux.install";
+
+/// Debian's name for a machine architecture.
+///
+/// `.deb` files are labelled `amd64` and `arm64` where a target triple says
+/// `x86_64` and `aarch64` — `scripts/package.sh` does this same mapping when it
+/// names the file — so matching an asset name against the triple's own word
+/// finds nothing at all on the one architecture this project actually ships.
+fn deb_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Which channel a set of assets came from, and so how it is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// A `.deb`, for `apt` and friends.
+    Deb,
+    /// An `.rpm`, for `dnf` or `zypper`.
+    Rpm,
+    /// A `PKGBUILD` and its install hook, built with `makepkg`.
+    Pkgbuild,
+    /// The release archive, unpacked and installed by hand.
+    Archive,
+}
+
+/// The files to hand a user, and what they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Offer<'a> {
+    pub channel: Channel,
+    /// Never empty, in the order they should be downloaded.
+    pub files: Vec<&'a Asset>,
 }
 
 #[derive(Debug)]
@@ -399,6 +490,107 @@ mod tests {
             decide(Some(full("v0.1.0")), &running, "mips-unknown-none"),
             Check::UpToDate
         );
+    }
+
+    /// Everything `scripts/release.sh` and `scripts/package.sh` publish, plus
+    /// the packages for the *other* architecture, which a release built on two
+    /// runners carries.
+    fn packaged() -> Release {
+        rel(
+            "v0.3.0",
+            &[
+                (
+                    &format!("tobii-linux-0.3.0-{TRIPLE}.tar.gz"),
+                    "https://github.com/a/b/t.tar.gz",
+                ),
+                ("tobii-linux_0.3.0_amd64.deb", "https://github.com/a/b/d"),
+                ("tobii-linux_0.3.0_arm64.deb", "https://github.com/a/b/d64"),
+                ("tobii-linux-0.3.0-1.x86_64.rpm", "https://github.com/a/b/r"),
+                (
+                    "tobii-linux-0.3.0-1.aarch64.rpm",
+                    "https://github.com/a/b/r64",
+                ),
+                ("PKGBUILD", "https://github.com/a/b/p"),
+                ("tobii-linux.install", "https://github.com/a/b/i"),
+                ("SHA256SUMS", "https://github.com/a/b/s"),
+            ],
+        )
+    }
+
+    fn names<'a>(o: &Offer<'a>) -> Vec<&'a str> {
+        o.files.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    /// The whole point of the split: the file offered is decided by the package
+    /// manager that owns the copy, and by the architecture — a `.deb` for the
+    /// wrong machine is not an answer.
+    #[test]
+    fn each_package_manager_is_offered_its_own_format_for_this_machine() {
+        let r = packaged();
+
+        let deb = r.offer_for("dpkg", TRIPLE).expect("a deb");
+        assert_eq!(deb.channel, Channel::Deb);
+        assert_eq!(names(&deb), ["tobii-linux_0.3.0_amd64.deb"]);
+
+        let rpm = r.offer_for("rpm", TRIPLE).expect("an rpm");
+        assert_eq!(rpm.channel, Channel::Rpm);
+        assert_eq!(names(&rpm), ["tobii-linux-0.3.0-1.x86_64.rpm"]);
+
+        // Same release, other machine: the arm64/aarch64 packages, not the
+        // x86_64 ones that happen to be listed first.
+        let arm = "aarch64-unknown-linux-gnu";
+        assert_eq!(
+            names(&r.offer_for("dpkg", arm).unwrap()),
+            ["tobii-linux_0.3.0_arm64.deb"]
+        );
+        assert_eq!(
+            names(&r.offer_for("rpm", arm).unwrap()),
+            ["tobii-linux-0.3.0-1.aarch64.rpm"]
+        );
+    }
+
+    /// `makepkg` reads the install hook by name from beside the PKGBUILD, so
+    /// the pair travels together or not at all.
+    #[test]
+    fn arch_gets_the_pkgbuild_and_its_install_hook_together() {
+        let all = packaged();
+        let o = all.offer_for("pacman", TRIPLE).expect("a PKGBUILD");
+        assert_eq!(o.channel, Channel::Pkgbuild);
+        assert_eq!(names(&o), ["PKGBUILD", "tobii-linux.install"]);
+
+        // Half of it is not a smaller version of it: without the hook the
+        // PKGBUILD does not build, so this falls back to the archive.
+        let mut half = packaged();
+        half.assets.retain(|a| a.name != "tobii-linux.install");
+        let o = half.offer_for("pacman", TRIPLE).expect("the archive");
+        assert_eq!(o.channel, Channel::Archive);
+        assert_eq!(names(&o), [format!("tobii-linux-0.3.0-{TRIPLE}.tar.gz")]);
+    }
+
+    /// A manager this project has never packaged for, and a release that
+    /// carries no packages at all, both land on the archive rather than on
+    /// nothing.
+    #[test]
+    fn anything_unpackaged_falls_back_to_the_archive_for_this_machine() {
+        let archive = format!("tobii-linux-0.3.0-{TRIPLE}.tar.gz");
+
+        let all = packaged();
+        let o = all.offer_for("nix", TRIPLE).expect("the archive");
+        assert_eq!(o.channel, Channel::Archive);
+        assert_eq!(names(&o), [archive.as_str()]);
+
+        let tarball_only = full("v0.3.0");
+        for manager in ["dpkg", "rpm", "pacman", ""] {
+            let o = tarball_only
+                .offer_for(manager, TRIPLE)
+                .unwrap_or_else(|| panic!("{manager} should still get the archive"));
+            assert_eq!(o.channel, Channel::Archive);
+            assert_eq!(names(&o), [archive.as_str()]);
+        }
+
+        // Nothing for this machine at all: no offer, rather than a file from
+        // somebody else's architecture.
+        assert_eq!(all.offer_for("dpkg", "mips-unknown-none"), None);
     }
 
     #[test]
