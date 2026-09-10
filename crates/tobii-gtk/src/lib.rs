@@ -473,6 +473,31 @@ fn tray_is_published() -> bool {
     TRAY.with(|c| c.borrow().is_some())
 }
 
+/// Share a column's spare height out between its cards, rather than inside one.
+///
+/// The alternative — letting the last card expand — puts the empty space
+/// *inside* a card, where it reads as content that failed to load. Growing the
+/// gaps instead keeps every card exactly as tall as what it contains, which is
+/// the thing a card is supposed to communicate.
+///
+/// Only takes effect when a column is shorter than the row it sits in; the
+/// tallest column's spacers get nothing and it looks exactly as it did.
+fn justify_column(col: &gtk::Box) {
+    let mut child = col.first_child();
+    let mut cards = Vec::new();
+    while let Some(w) = child {
+        child = w.next_sibling();
+        cards.push(w);
+    }
+    // Between the cards, never before the first or after the last: leading or
+    // trailing slack would move the whole stack instead of spreading it.
+    for card in cards.iter().skip(1) {
+        let gap = gtk::Box::new(Orientation::Vertical, 0);
+        gap.set_vexpand(true);
+        col.insert_child_after(&gap, card.prev_sibling().as_ref());
+    }
+}
+
 /// A "fit the window to its content" callback, filled once the window exists.
 ///
 /// Late-bound because the cogwheel — which is what changes the text size — is
@@ -747,7 +772,13 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // frame, so extra height makes the image bigger rather than adding black
     // bands — which is what lets this soak up the card's spare height instead of
     // leaving an empty gap under it.
-    cam_area.set_size_request(230, 230);
+    // A floor, not a size. It is low enough that the instrument column does not
+    // decide the window's height on its own — with 230 it was 141px taller than
+    // the shortest rack, which is the "almost aligned" gap that reads as a
+    // mistake — and `vexpand` above means the view grows straight back into
+    // whatever the tallest column turns out to need. So the image is as large
+    // as the layout can afford rather than a number chosen in advance.
+    cam_area.set_size_request(230, 180);
     cam_area.set_hexpand(true);
     cam_area.set_vexpand(true);
     {
@@ -967,7 +998,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
 
     let right = gtk::Box::new(Orientation::Vertical, 12);
     right.set_size_request(COLUMN_WIDTH, -1);
-    right.set_valign(Align::Start);
+    // Fill, not Start: the column takes the whole height of the grid row — which
+    // is the tallest column — and the expanding gaps added by `justify_column`
+    // below share out the difference. See there for why the gaps and not the
+    // cards.
+    right.set_valign(Align::Fill);
     // Explicit, at build time. Left to the breakpoint handler alone this was
     // never set before the first layout, so the control rack absorbed every
     // spare pixel and the instrument — the thing the window is for — stayed at
@@ -1049,7 +1084,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // one subject, and they were previously separated by "Preview my gaze".
     let games_col = gtk::Box::new(Orientation::Vertical, 12);
     games_col.set_size_request(COLUMN_WIDTH, -1);
-    games_col.set_valign(Align::Start);
+    games_col.set_valign(Align::Fill);
     games_col.set_hexpand(false);
     games_col.append(&section(
         "Head tracking",
@@ -1074,6 +1109,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
          `tobii game -- <command>` — in Steam, put that in Launch Options.",
         &games_row.controls,
     ));
+
+    // Level bottoms. Both racks are shorter than the instrument, and three
+    // stacks ending within ~100px of each other read as a misalignment rather
+    // than as a deliberate stagger.
+    justify_column(&right);
+    justify_column(&games_col);
 
     // --- Responsive split -------------------------------------------------
     // Side by side when there is room, stacked when there is not. GTK4 has no
