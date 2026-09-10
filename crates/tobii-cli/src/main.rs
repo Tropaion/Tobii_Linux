@@ -1925,7 +1925,9 @@ fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
             println!("{key} = {value}");
             Ok(())
         }
-        Some(other) => Err(format!("unknown: tobii games {other} (try: tobii games set KEY VALUE)").into()),
+        Some(other) => {
+            Err(format!("unknown: tobii games {other} (try: tobii games set KEY VALUE)").into())
+        }
     }
 }
 

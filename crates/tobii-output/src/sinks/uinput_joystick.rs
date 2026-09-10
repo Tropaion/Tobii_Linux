@@ -372,10 +372,7 @@ impl UinputJoystick {
         // SAFETY: `events` is a live array of `#[repr(C)]` structs with no
         // padding bytes read as anything but bytes, and the length is exact.
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                events.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(&events),
-            )
+            std::slice::from_raw_parts(events.as_ptr().cast::<u8>(), std::mem::size_of_val(&events))
         };
         self.fd.write_all(bytes)
     }
@@ -668,9 +665,7 @@ mod tests {
                         };
                         let kind = u16::from_ne_bytes([chunk[16], chunk[17]]);
                         let code = u16::from_ne_bytes([chunk[18], chunk[19]]);
-                        let value = i32::from_ne_bytes(
-                            chunk[20..24].try_into().expect("4 bytes"),
-                        );
+                        let value = i32::from_ne_bytes(chunk[20..24].try_into().expect("4 bytes"));
                         if kind == EV_ABS {
                             seen.push((code, value));
                         } else if kind == EV_SYN {
@@ -695,6 +690,10 @@ mod tests {
         );
         assert_eq!(value_of(ABS_THROTTLE), AXIS_MAX, "gaze x at the right edge");
         assert_eq!(value_of(ABS_RUDDER), AXIS_MIN, "gaze y at the top");
-        println!("read back {} axis values through {}", seen.len(), dev.display());
+        println!(
+            "read back {} axis values through {}",
+            seen.len(),
+            dev.display()
+        );
     }
 }

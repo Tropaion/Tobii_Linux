@@ -8,10 +8,10 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tobii_output::sinks::{JoystickHandle, UinputJoystick};
 use tobii_protocol::camera::decode_camera_frame;
 use tobii_protocol::frame::OP_GAZE_NOTIFY;
 use tobii_protocol::{CameraFrame, DisplayCorners, EnabledEye, GazeSample};
-use tobii_output::sinks::{JoystickHandle, UinputJoystick};
 use tobii_usb::{Connection, Transport, UsbError, UsbTransport};
 
 /// The eye-camera stream mirrored into the hub preview (one of the stereo pair).
