@@ -443,13 +443,22 @@ FreeTrack, which means a DLL inside the prefix and a shared-memory block — so
 there is a small Windows-side bridge:
 
 ```sh
-scripts/build-bridge.sh                     # needs mingw-w64 + the rust win target
-tobii bridge install --prefix /path/to/prefix
-tobii bridge run     --prefix /path/to/prefix   # leave running while you play
+scripts/build-bridge.sh                  # needs mingw-w64 + the rust win target
+tobii bridge games                       # what is installed, and what has a prefix
+tobii bridge install --steam elite       # by name, or by app id
+tobii bridge install --prefix /path/to/prefix   # anything not Steam
 ```
 
-The hub sends frames to the provider over loopback UDP, the provider writes
-`FT_SharedMem` inside the prefix, and the game's client DLL reads it.
+**Nothing has to be left running.** The client DLL the game loads receives the
+tracking itself, in a background thread inside the game's own process, and
+publishes it into `FT_SharedMem` where the game reads it. A second executable
+would have to run inside the game's own wineserver session, which for a Steam
+game means reproducing Proton's entire launch environment; the DLL is already
+in there.
+
+`install --steam` finds the prefix from Steam's own library files and writes the
+registry with **the Proton build the prefix records**, not whatever `wine` is on
+your `$PATH` — a foreign wine would upgrade the prefix out from under the game.
 
 **TrackIR is pointed at an already-installed client** (opentrack's, if you have
 it) rather than at ours, because games verify NaturalPoint's signature and a
@@ -463,11 +472,12 @@ Nothing is copied — our provider still supplies the data behind it.
 has no signature at all, so a game that speaks FreeTrack works with our own DLL
 today.
 
-Verified end to end on a Wine 11.17 prefix: the bridge's own probe loads the DLL
-the way a game does (`LoadLibrary` + `GetProcAddress`), and a pose sent as
-`(11, 22, 633) mm, yaw 7.5°, pitch −3.25°, roll 1.5°` reads back as
-`pos=(11.0, 22.0, 633.0)`, `yaw=0.1309 rad`, `pitch=-0.0567`, `roll=0.0262` —
-the same angles in radians — with the frame counter advancing while data flows.
+Verified end to end on a real Elite Dangerous Proton prefix with **no provider
+running**: the game's own load path (`LoadLibrary` on the registry-supplied
+directory, then `GetProcAddress`) resolved all five FreeTrack exports, and a pose
+sent from Linux as `yaw 7.5°, pitch −3.25°, roll 1.5°, (11, 22, 33) mm` read back
+through `FTGetData` as `yaw=0.1309, pitch=-0.0567, roll=0.0262` radians and
+`pos=(11.0, 22.0, 33.0)`, with `DataID` advancing.
 
 `tobii bridge uninstall --prefix PATH` removes it again.
 

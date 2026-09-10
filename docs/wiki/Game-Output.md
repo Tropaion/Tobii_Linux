@@ -6,9 +6,9 @@ of the user.
 | Route | Needs installed | Reaches |
 |---|---|---|
 | **Virtual joystick** | nothing | native Linux games, Proton games, emulators — anything that binds an **absolute** view axis (see the rate trap below) |
-| **opentrack UDP** | opentrack | whatever opentrack is configured to drive |
-| **FreeTrack (Wine)** | a Wine prefix + our bridge | Windows games that speak FreeTrack |
-| **TrackIR (Wine)** | a Wine prefix + a signed client DLL | Windows games that speak TrackIR |
+| **opentrack UDP** | opentrack, *or nothing* | whatever opentrack drives — **and X-Plane 12 directly**, see below |
+| **FreeTrack (Wine/Proton)** | one `tobii bridge install` | Windows games that speak FreeTrack |
+| **TrackIR (Wine/Proton)** | that, plus a signed client DLL | Windows games that speak TrackIR |
 
 All four are fed from the same [`FramePipeline`](../../crates/tobii-output/src/pipeline.rs)
 and fanned out by the same `Router`, so no two of them can disagree about what a
@@ -220,6 +220,86 @@ uinput           /dev/uinput MISSING — the uinput module is not loaded …
 uinput           /dev/uinput NOT WRITABLE — … install 60-tobii.rules and log out …
 ```
 
+## X-Plane 11/12 — already works, no extra sink
+
+The X-Plane plugin Linux users actually run is
+[`amyinorbit/headtrack`](https://github.com/amyinorbit/headtrack) (MIT), whose
+own source calls itself "an implementation of a basic OpenTrack protocol
+receiver". It binds UDP `0.0.0.0:4242` and reads a 48-byte payload of six
+`double`s, then writes `sim/graphics/view/pilots_head_{x,y,z}` in **centimetres**
+and `pilots_head_{psi,the,phi}` in **degrees**.
+
+That is byte-for-byte what our opentrack sink already emits, on the port we
+already default to. So:
+
+```sh
+tobii games set enabled true      # opentrack sink is on by default at 127.0.0.1:4242
+```
+
+install the plugin, and it works — no opentrack, no bridge, no new code.
+
+This matters because the virtual joystick genuinely *cannot* reach X-Plane:
+Laminar's own developer documentation is explicit that a joystick axis cannot be
+bound to a dataref, and the built-in "view left/right" assignments pan while
+deflected and recentre on release — a rate, not an angle. See the rate trap
+above.
+
+## The Wine bridge
+
+```sh
+tobii bridge games                      # what is installed, and what has a prefix
+tobii bridge install --steam elite      # by name, or by app id
+tobii bridge install --prefix /path/to/prefix   # anything not Steam
+```
+
+Nothing has to be left running. The client DLL the game loads **receives the
+tracking itself**, in a background thread inside the game's own process, and
+publishes it into `FT_SharedMem` where the game reads it.
+
+### Why the DLL feeds itself
+
+The original shape was one `tobii-bridge.exe` per prefix, started by hand and
+left running, with the DLLs as pure consumers. That works when you own the
+prefix and can run things in it — and it does not work at all for a Steam game.
+
+A Proton title runs under **its own wineserver**, with its own prefix, Proton
+build and environment. A `tobii bridge run` started from a terminal with system
+Wine is a different session: its `FT_SharedMem` is a different object in a
+different server, and the game never sees it. Getting a second executable into
+the game's session means reproducing Proton's entire launch environment.
+
+The DLL is already inside the game's process. So the receive loop lives there:
+same wineserver by construction, no second process, no environment to
+reproduce. Wine's winsock is a thin shim over host sockets, so a datagram from
+the Linux hub reaches it directly.
+
+Whoever binds the port first wins, and everyone else is a plain consumer. That
+one rule covers a standalone provider already running, both of our DLLs loaded
+into one game, and the ordinary single-DLL case.
+
+`tobii-bridge.exe` is still installed, and is now a **diagnostic**: it gives you
+a console that says what is arriving and what is being rejected, which is the
+difference between "the game sees nothing" and "the game sees nothing *because
+the frames never arrive*".
+
+### Which wine writes the registry matters
+
+`install` uses the Proton build recorded in the prefix's own
+`compatdata/<appid>/config_info`, not whatever `wine` is on `$PATH`. A prefix
+records the version that built it, and a different wine touching it runs
+`wineboot -u` and upgrades it — so reaching for the system wine to write two
+registry values could rewrite a Proton prefix out from under the game that owns
+it.
+
+### Verified
+
+On a real Elite Dangerous Proton prefix, with **no provider running**: the game's
+own load path (`LoadLibrary` on the registry-supplied directory, then
+`GetProcAddress`) resolved all five FreeTrack exports, and a pose sent from Linux
+as `yaw 7.5°, pitch −3.25°, roll 1.5°, (11, 22, 33) mm` read back through
+`FTGetData` as `yaw=0.1309, pitch=-0.0567, roll=0.0262` radians and
+`pos=(11.0, 22.0, 33.0)`, with `DataID` advancing.
+
 ## TrackIR and the signature
 
 FreeTrack and TrackIR read the *same* shared memory block — `FT_SharedMem`,
@@ -238,9 +318,14 @@ stating plainly because the absence of that string looks at first like evidence
 that the check is not real.
 
 We do not ship it. `tobii bridge install` therefore points TrackIR at an
-already-installed client DLL (opentrack's, if present) and supplies the data
-behind it from our own provider; `--npclient ours` overrides that for a game
-that does not check.
+already-installed client DLL (opentrack's, if present); `--npclient ours`
+overrides that for a game that does not check.
+
+**That is the one configuration that still needs `tobii bridge run`.** A
+third-party client is a pure consumer of `FT_SharedMem`. Our DLLs are what
+create and feed that mapping, and a TrackIR-only game never loads ours — so
+something has to fill it. `install` says so when it sets that up. FreeTrack
+games need nothing running.
 
 **[UNKNOWN]** Two things about our own `NPClient64.dll` are unmeasured because
 no game has yet consumed it:

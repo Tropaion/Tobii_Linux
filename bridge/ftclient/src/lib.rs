@@ -4,9 +4,16 @@
 //! from a registry-supplied path and calls `LoadLibrary` on it, which Wine's
 //! builtin `.dll.so` name resolution does not cover.
 //!
-//! A pure consumer: it opens the mapping the provider exe created and copies out
-//! whatever is there. If no provider is running it reports no data and returns
-//! cleanly, because a game started before the bridge is ordinary, not an error.
+//! It feeds itself. On the game's first data call it starts a background thread
+//! that receives frames from the Linux hub and publishes them into
+//! `FT_SharedMem`, then reads that mapping like any other consumer — see
+//! [`feeder`](tobii_bridge_core::feeder) for why the receive loop belongs here
+//! rather than in a separate executable. If something else already holds the
+//! port (a standalone `tobii-bridge.exe`, or our own TrackIR DLL loaded into the
+//! same game) it steps aside and reads their mapping instead.
+//!
+//! With nothing sending, it reports no data and returns cleanly, because a game
+//! started before the hub is ordinary, not an error.
 //!
 //! The export set matches what the published protocol defines and what
 //! opentrack's own build exports, established by reading its export table with
@@ -16,7 +23,7 @@ use std::sync::OnceLock;
 
 use tobii_output::freetrack::{offset, FT_DATA_LEN, FT_HEAP_LEN};
 
-use tobii_bridge_core::shm::Consumer;
+use tobii_bridge_core::{feeder, shm::Consumer};
 
 /// The `FTData` structure a game passes in for us to fill.
 ///
@@ -60,6 +67,10 @@ const _: () = assert!(std::mem::size_of::<FtData>() == FT_DATA_LEN);
 static SHM: OnceLock<Option<Consumer>> = OnceLock::new();
 
 fn shm() -> Option<&'static Consumer> {
+    // Ordered, not incidental: the feeder is what creates the mapping, and
+    // `SHM` caches its answer for the life of the process. Opening first would
+    // cache `None` and report "no data" for ever.
+    feeder::ensure_started();
     SHM.get_or_init(Consumer::open).as_ref()
 }
 

@@ -1,17 +1,32 @@
-//! `tobii bridge` — put the Wine-side bridge into a game's prefix and run it.
+//! `tobii bridge` — put the Wine-side bridge into a game's prefix.
 //!
-//! # The thing that is easy to get wrong
+//! # The thing that was easy to get wrong, and how it stopped mattering
 //!
-//! **Which `wine` binary.** A Wine prefix is served by a `wineserver`, and named
-//! kernel objects like `FT_SharedMem` live inside one server's session. Launch
-//! the bridge with `/usr/bin/wine` against a prefix whose game runs under a
-//! bundled tkg runner and you get a *second* wineserver: the bridge starts, says
-//! everything worked, creates its mapping — and the game never sees it, because
-//! it is looking at a different session's namespace.
+//! A Wine prefix is served by a `wineserver`, and named kernel objects like
+//! `FT_SharedMem` live inside one server's session. The bridge used to be a
+//! separate `tobii-bridge.exe` you left running, and launching it with
+//! `/usr/bin/wine` against a prefix whose game runs under a bundled runner gave
+//! you a *second* wineserver: the bridge started, said everything worked,
+//! created its mapping — and the game never saw it, because it was looking at a
+//! different session's namespace. Nothing about that failure pointed at its
+//! cause, and for a Steam/Proton title it was not a mistake but the only
+//! possible outcome, short of reproducing Proton's whole launch environment.
 //!
-//! Nothing about that failure points at its cause. So the wine binary is
-//! resolved from the prefix itself wherever possible, and a mismatch is a loud
-//! warning rather than a silent success.
+//! The receive loop lives in the client DLL now, inside the game's own process,
+//! so the sessions match by construction and there is nothing to leave running.
+//! See `tobii_bridge_core::feeder`.
+//!
+//! **Which `wine` binary still matters here**, for two narrower reasons:
+//!
+//! * Writing the registry. A prefix records the version that built it, and a
+//!   different wine touching it runs `wineboot -u` and upgrades it — so using
+//!   the system wine to write two values could rewrite a Proton prefix out from
+//!   under the game that owns it. Steam records the answer in the prefix's own
+//!   `config_info`, and that is what [`wine_from_steam_config_info`] reads.
+//! * The one remaining case that needs `tobii bridge run`: a TrackIR game
+//!   pointed at a third-party client DLL. That DLL is a pure consumer of
+//!   `FT_SharedMem`, and a TrackIR-only game never loads ours — so something
+//!   must fill the mapping, in the game's own session.
 
 use std::path::{Path, PathBuf};
 
@@ -97,10 +112,14 @@ fn find_installed_npclient() -> Option<PathBuf> {
         .find(|d| d.join("NPClient64.dll").is_file())
 }
 
-/// Artifacts copied into the prefix. Missing optional ones are skipped, so the
-/// bridge is usable before every DLL exists.
+/// What `install` copies, and whether its absence is fatal.
+///
+/// The DLLs are the product. `tobii-bridge.exe` used to be required, because it
+/// was the thing that received frames and created `FT_SharedMem`; the DLLs feed
+/// themselves now, so it is a diagnostic — a console that says what is arriving
+/// — and a prefix without it works.
 const ARTIFACTS: [(&str, bool); 3] = [
-    ("tobii-bridge.exe", true),
+    ("tobii-bridge.exe", false),
     ("freetrackclient64.dll", true),
     ("NPClient64.dll", false),
 ];
@@ -200,12 +219,212 @@ fn on_path(cmd: &str) -> Option<PathBuf> {
 }
 
 /// Resolve the prefix: `--prefix`, else `$WINEPREFIX`, else `~/.wine`.
+/// The Proton build a Steam prefix was made with, from its `config_info`.
+///
+/// # Why this matters more than a convenience
+///
+/// Writing the registry with the *wrong* wine is not a neutral act. A prefix
+/// records the version that built it, and a different wine touching it runs
+/// `wineboot -u` and upgrades it — so reaching for the system wine to write two
+/// registry values could rewrite a Proton prefix out from under the game that
+/// owns it.
+///
+/// Steam records the answer next to the prefix. `compatdata/<appid>/config_info`
+/// is a plain list of lines whose second and third name paths inside the Proton
+/// build; the build root is the directory containing `files/`, and its wine is
+/// `files/bin/wine`. Older Proton laid this out as `dist/` instead, so both are
+/// tried.
+pub fn wine_from_steam_config_info(prefix: &Path) -> Option<PathBuf> {
+    // `prefix` is `<compatdata>/<appid>/pfx`; the file sits beside it.
+    let info = prefix.parent()?.join("config_info");
+    let text = std::fs::read_to_string(info).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        for marker in ["/files/", "/dist/"] {
+            if let Some(cut) = line.find(marker) {
+                let root = Path::new(&line[..cut]);
+                for sub in ["files/bin/wine", "dist/bin/wine"] {
+                    let candidate = root.join(sub);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Steam's install roots, in the order they are worth trying.
+///
+/// `~/.steam/steam` is the symlink Steam maintains to wherever it actually
+/// lives, so it wins; the others are the layouts it has used and the one
+/// Flatpak uses.
+const STEAM_ROOTS: [&str; 4] = [
+    ".steam/steam",
+    ".local/share/Steam",
+    ".steam/root",
+    ".var/app/com.valvesoftware.Steam/data/Steam",
+];
+
+/// Add `path` if it is a library and not already listed.
+///
+/// Canonicalised first: `~/.steam/steam` and `~/.steam/root` are both symlinks
+/// to the real install, so a plain path comparison reports the same library
+/// three times and would then install into it three times.
+fn push_library(out: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.join("steamapps").is_dir() {
+        return;
+    }
+    let real = path.canonicalize().unwrap_or(path);
+    if !out.contains(&real) {
+        out.push(real);
+    }
+}
+
+/// Every Steam library on this machine.
+///
+/// The libraries live in `libraryfolders.vdf`, which is Valve's own nested
+/// key-value format. It is parsed here by pulling out `"path"` lines rather
+/// than by understanding VDF, because that is the only key this needs and a
+/// real parser would be a dependency and a maintenance burden for one string.
+pub fn steam_libraries(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in STEAM_ROOTS {
+        let root = home.join(root);
+        let vdf = root.join("steamapps/libraryfolders.vdf");
+        let Ok(text) = std::fs::read_to_string(&vdf) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("\"path\"") else {
+                continue;
+            };
+            if let Some(p) = rest.trim().trim_matches('"').split('"').next() {
+                push_library(&mut out, PathBuf::from(p.replace("\\\\", "/")));
+            }
+        }
+        // The root is a library itself even when the file does not say so.
+        push_library(&mut out, root);
+    }
+    out
+}
+
+/// The installed games, as `(appid, name)`.
+pub fn steam_apps(home: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for lib in steam_libraries(home) {
+        let Ok(dir) = std::fs::read_dir(lib.join("steamapps")) else {
+            continue;
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let field = |key: &str| {
+                text.lines()
+                    .find_map(|l| l.trim().strip_prefix(&format!("\"{key}\"")))
+                    .and_then(|r| r.trim().trim_start_matches('"').split('"').next())
+                    .map(str::to_string)
+            };
+            if let (Some(id), Some(n)) = (field("appid"), field("name")) {
+                out.push((id, n));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The Proton prefix for `appid`, if the game has ever been run.
+///
+/// Proton creates `steamapps/compatdata/<appid>/pfx` the first time a title
+/// launches. Its absence is the commonest reason this fails and is worth saying
+/// out loud rather than reporting as "not found".
+pub fn steam_prefix(home: &Path, appid: &str) -> Option<PathBuf> {
+    steam_libraries(home)
+        .into_iter()
+        .map(|lib| lib.join("steamapps/compatdata").join(appid).join("pfx"))
+        .find(|p| p.join("drive_c").is_dir())
+}
+
+/// Turn `--steam <appid|name fragment>` into a prefix path.
+///
+/// A name is matched case-insensitively as a substring, because nobody types
+/// "Elite Dangerous" with the right capitalisation twice. An ambiguous fragment
+/// lists what it matched rather than picking one.
+fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
+    let apps = steam_apps(home);
+    let appid = if wanted.chars().all(|c| c.is_ascii_digit()) {
+        wanted.to_string()
+    } else {
+        let needle = wanted.to_lowercase();
+        let hits: Vec<&(String, String)> = apps
+            .iter()
+            .filter(|(_, n)| n.to_lowercase().contains(&needle))
+            .collect();
+        match hits.as_slice() {
+            [] => {
+                let mut msg = format!("no installed Steam game matches {wanted:?}");
+                if apps.is_empty() {
+                    msg.push_str(" (no Steam libraries found)");
+                } else {
+                    msg.push_str("\ninstalled:");
+                    for (id, n) in &apps {
+                        msg.push_str(&format!("\n  {id:<10} {n}"));
+                    }
+                }
+                return Err(msg);
+            }
+            [one] => one.0.clone(),
+            many => {
+                let list: Vec<String> = many
+                    .iter()
+                    .map(|(id, n)| format!("  {id:<10} {n}"))
+                    .collect();
+                return Err(format!(
+                    "{wanted:?} matches more than one game; pass the app id:\n{}",
+                    list.join("\n")
+                ));
+            }
+        }
+    };
+    steam_prefix(home, &appid).ok_or_else(|| {
+        let name = apps
+            .iter()
+            .find(|(id, _)| *id == appid)
+            .map(|(_, n)| n.as_str())
+            .unwrap_or("that app");
+        format!(
+            "no Proton prefix for {appid} ({name}). Proton creates it the first \
+             time the game runs — start the game once, then run this again.\n\
+             If it is set to run natively rather than through Proton, there is \
+             no prefix and no Windows DLL to install into."
+        )
+    })
+}
+
 fn resolve_prefix(args: &[String]) -> Result<PathBuf, String> {
+    if let Some(wanted) = crate::flag_value(args, "--steam") {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or("HOME is not set, so Steam's libraries cannot be found")?;
+        let p = steam_prefix_for(&home, wanted)?;
+        eprintln!("Steam prefix: {}", p.display());
+        return Ok(p);
+    }
     let raw = crate::flag_value(args, "--prefix")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("WINEPREFIX").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".wine")))
-        .ok_or("could not determine a Wine prefix; pass --prefix PATH")?;
+        .ok_or("could not determine a Wine prefix; pass --prefix PATH or --steam <game>")?;
     if !raw.join("drive_c").is_dir() {
         return Err(format!(
             "{} does not look like a Wine prefix (no drive_c)",
@@ -217,9 +436,12 @@ fn resolve_prefix(args: &[String]) -> Result<PathBuf, String> {
 
 /// Resolve the wine binary for `prefix`, reporting any warning to stderr.
 fn resolve_wine(prefix: &Path, args: &[String]) -> Result<PathBuf, String> {
+    // Proton's own build first among the non-explicit sources: it is the only
+    // one that is *recorded* as belonging to this prefix rather than inferred,
+    // and using any other would upgrade the prefix.
     let (wine, warning) = choose_wine(
         crate::flag_value(args, "--wine").map(PathBuf::from),
-        wine_from_launch_script(prefix),
+        wine_from_steam_config_info(prefix).or_else(|| wine_from_launch_script(prefix)),
         &wines_from_runners(prefix),
         on_path("wine"),
     )?;
@@ -301,6 +523,7 @@ fn install(args: &[String]) -> CmdResult {
     // nothing stands between it and our data.
     set_key(&wine, &prefix, FT_KEY, INSTALL_WIN_DIR)?;
 
+    let mut third_party_np = false;
     let explicit_np = crate::flag_value(args, "--npclient");
     match choose_npclient(explicit_np, find_installed_npclient())? {
         NpSource::Ours => {
@@ -311,7 +534,8 @@ fn install(args: &[String]) -> CmdResult {
                     "\nnote: no third-party NPClient64.dll was found. Games that verify\n      \
                      NaturalPoint's signature — Star Citizen among them — will load our\n      \
                      DLL, reject it, and never ask for data again. Installing opentrack\n      \
-                     provides a client that passes; our provider still supplies the data."
+                     provides a client that passes. FreeTrack has no signature check,\n      \
+                     so a game that speaks FreeTrack works with ours today."
                 );
             }
         }
@@ -323,12 +547,35 @@ fn install(args: &[String]) -> CmdResult {
             println!(
                 "\nTrackIR points at the client already installed there, because games\n\
                  verify NaturalPoint's signature and a clean-room DLL cannot answer it.\n\
-                 Nothing was copied; our provider still supplies the data behind it.\n\
-                 Override with `--npclient ours`."
+                 Nothing was copied."
             );
+            // Load-bearing, and easy to miss: a third-party client is a pure
+            // consumer of FT_SharedMem. Our DLLs create and feed that mapping,
+            // and a TrackIR-only game never loads ours — so this is the one
+            // configuration that still needs the provider running.
+            third_party_np = true;
         }
     }
-    println!("\nnow run:  tobii bridge run --prefix {}", prefix.display());
+
+    println!();
+    if third_party_np {
+        println!(
+            "For TrackIR through that third-party client you must also run:\n  \
+             tobii bridge run --prefix {}\n\
+             It is a plain consumer of the shared memory our own DLLs create, and a\n\
+             TrackIR-only game never loads ours — so something has to fill it.\n\
+             FreeTrack games need nothing running.",
+            prefix.display()
+        );
+    } else {
+        println!(
+            "Nothing else to run. The DLL receives tracking itself, inside the game's\n\
+             own process — no second program, no prefix to match.\n\n\
+             Turn game output on (the hub's switch, or `tobii games set enabled true`),\n\
+             then launch the game through the wrapper so the tracker comes on:\n  \
+             tobii game -- %command%      (Steam: paste into Launch Options)"
+        );
+    }
     Ok(())
 }
 
@@ -392,13 +639,49 @@ fn uninstall(args: &[String]) -> CmdResult {
 }
 
 /// Dispatch `tobii bridge ...`.
+/// `tobii bridge games` — what is installed and which titles have a prefix.
+fn list_steam_games() -> CmdResult {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is not set, so Steam's libraries cannot be found")?;
+    let libs = steam_libraries(&home);
+    if libs.is_empty() {
+        return Err("no Steam libraries found".into());
+    }
+    for lib in &libs {
+        println!("library: {}", lib.display());
+    }
+    let apps = steam_apps(&home);
+    if apps.is_empty() {
+        return Err("no installed Steam games found".into());
+    }
+    println!();
+    for (id, name) in &apps {
+        // A title with no prefix has never been run under Proton, which is the
+        // one thing that stops `--steam` working — so it is shown, not hidden.
+        let mark = if steam_prefix(&home, id).is_some() {
+            "proton"
+        } else {
+            "  --  "
+        };
+        println!("  {mark}  {id:<10} {name}");
+    }
+    println!(
+        "\ninstall into one with:  tobii bridge install --steam <app id or name>\n\
+         titles marked `--` have no Proton prefix yet — run them once first."
+    );
+    Ok(())
+}
+
 pub fn bridge(args: &[String]) -> CmdResult {
     match args.get(2).map(String::as_str) {
+        Some("games") => list_steam_games(),
         Some("install") => install(args),
         Some("run") => run(args),
         Some("uninstall") => uninstall(args),
         other => Err(format!(
-            "usage: tobii bridge install|run|uninstall [--prefix PATH] [--wine PATH] \
+            "usage: tobii bridge games|install|run|uninstall \n  \
+             [--steam <app id or name> | --prefix PATH] [--wine PATH] \
              [--artifacts DIR] [--port PORT]{}",
             match other {
                 Some(o) => format!("\nunknown argument `{o}`"),
@@ -491,19 +774,64 @@ mod tests {
         assert!(err.contains("--wine"), "{err}");
     }
 
-    /// NPClient64.dll does not exist until spike S2 has run, and the bridge is
-    /// useful without it — FreeTrack games work either way.
+    /// Only the FreeTrack DLL is required, and that is the whole architecture
+    /// in one assertion.
+    ///
+    /// `tobii-bridge.exe` used to be required, because it was the thing that
+    /// received frames and created `FT_SharedMem`. The DLLs feed themselves
+    /// now, so a prefix without the exe works and the exe is a diagnostic. If
+    /// this ever goes back to requiring it, the self-feeding path has been
+    /// broken and nobody would otherwise notice until a game saw nothing.
     #[test]
-    fn only_the_provider_and_the_freetrack_dll_are_required() {
+    fn only_the_freetrack_dll_is_required() {
         let required: Vec<&str> = ARTIFACTS
             .iter()
             .filter(|(_, req)| *req)
             .map(|(n, _)| *n)
             .collect();
-        assert_eq!(required, vec!["tobii-bridge.exe", "freetrackclient64.dll"]);
-        assert!(ARTIFACTS
-            .iter()
-            .any(|(n, req)| *n == "NPClient64.dll" && !req));
+        assert_eq!(required, vec!["freetrackclient64.dll"]);
+        for optional in ["tobii-bridge.exe", "NPClient64.dll"] {
+            assert!(
+                ARTIFACTS.iter().any(|(n, req)| *n == optional && !req),
+                "{optional} must be optional"
+            );
+        }
+    }
+
+    /// Steam records the Proton build a prefix belongs to, and using any other
+    /// wine on it runs `wineboot -u` and upgrades the prefix — so this must
+    /// read the recorded one rather than fall back to `$PATH`.
+    #[test]
+    fn the_proton_build_is_read_from_the_prefix_it_belongs_to() {
+        let tmp = std::env::temp_dir().join(format!("tobii-cfginfo-{}", std::process::id()));
+        let proton = tmp.join("common/Proton - Experimental");
+        let pfx = tmp.join("compatdata/359320/pfx");
+        std::fs::create_dir_all(proton.join("files/bin")).expect("proton dir");
+        std::fs::create_dir_all(&pfx).expect("prefix dir");
+        std::fs::write(proton.join("files/bin/wine"), b"#!/bin/sh\n").expect("wine");
+        std::fs::write(
+            pfx.parent().expect("compatdata entry").join("config_info"),
+            format!(
+                "11.0-100\n{}/files/share/fonts/\n{}/files/lib/\n",
+                proton.display(),
+                proton.display()
+            ),
+        )
+        .expect("config_info");
+
+        assert_eq!(
+            wine_from_steam_config_info(&pfx),
+            Some(proton.join("files/bin/wine")),
+            "the Proton build named in config_info must win"
+        );
+
+        // A prefix that is not a Steam one has no config_info and must simply
+        // decline, leaving the existing sources to answer.
+        assert_eq!(
+            wine_from_steam_config_info(&tmp.join("not-a-steam-prefix")),
+            None
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// The whole point of the interop route: when a client that can answer

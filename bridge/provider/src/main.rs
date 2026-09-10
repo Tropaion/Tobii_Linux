@@ -1,8 +1,15 @@
 //! The provider: receive tracking frames from Linux, publish them to games.
 //!
-//! Runs inside the game's Wine prefix. Creates `FT_SharedMem`, points both
-//! client registries at itself, then copies each arriving frame into the mapping
-//! where `NPClient64.dll` and `freetrackclient64.dll` read it.
+//! **Optional now, and mostly a diagnostic.** The client DLLs feed themselves —
+//! see [`feeder`](tobii_bridge_core::feeder) — so nothing has to be left running
+//! for a game to get tracking. What this still gives you is a console: it prints
+//! what arrives and what is rejected, which is the difference between "the game
+//! sees nothing" and "the game sees nothing *because the frames never arrive*".
+//! It also writes the registry keys, so it doubles as a repair tool for a prefix
+//! whose keys were clobbered.
+//!
+//! Whoever binds the port first wins; if this is running, the DLLs read the
+//! mapping it creates instead of making their own.
 
 use std::net::UdpSocket;
 
@@ -10,17 +17,8 @@ use tobii_bridge_core::{register, shm::Provider, INSTALL_DIR};
 use tobii_output::frame::FRAME_LEN;
 use tobii_output::TrackingFrame;
 
-/// Default loopback port, matching `tobii-output`'s bridge sink.
-const DEFAULT_PORT: u16 = 4243;
-
-/// The game profile id reported to consumers until a game announces its own.
-///
-/// Zero means "unknown", which is what the FreeTrack protocol expects before
-/// `NP_RegisterProgramProfileID` has been called.
-const DEFAULT_GAME_ID: i32 = 0;
-
 fn main() {
-    let mut port = DEFAULT_PORT;
+    let mut port = tobii_bridge_core::feeder::port();
     let mut dir = INSTALL_DIR.to_string();
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -85,7 +83,10 @@ fn main() {
         match TrackingFrame::decode(&buf[..n]) {
             Ok(frame) => {
                 received += 1;
-                provider.publish(&frame, DEFAULT_GAME_ID);
+                provider.publish(
+                    &frame,
+                    tobii_bridge_core::feeder::GAME_ID.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 if received == 1 {
                     println!("first frame received ({n} bytes); publishing to FT_SharedMem");
                 }

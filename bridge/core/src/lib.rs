@@ -4,15 +4,22 @@
 //! that data through the two interfaces Windows games already know:
 //!
 //! ```text
-//!   Linux: tobii serve ──UDP 127.0.0.1:4243──► tobii-bridge.exe
-//!                                                    │
-//!                                              FT_SharedMem
-//!                                                ▲        ▲
-//!                                       NPClient64.dll   freetrackclient64.dll
-//!                                            (TrackIR)        (FreeTrack)
-//!                                                ▲
-//!                                            the game
+//!   Linux: the hub ──UDP 127.0.0.1:4243──►┐
+//!                                         │   inside the game's own process
+//!                                         ▼
+//!                              NPClient64.dll / freetrackclient64.dll
+//!                                    feeder thread ──► FT_SharedMem
+//!                                                            │
+//!                                                            ▼
+//!                                                        the game
 //! ```
+//!
+//! The client DLL the game already loaded is what receives the frames — see
+//! [`feeder`]. A standalone `tobii-bridge.exe` can still take the port instead,
+//! which is useful for watching what arrives, but nothing requires it: a second
+//! executable would have to run inside the game's own wineserver session, and
+//! for a Steam/Proton game that means reproducing Proton's entire launch
+//! environment.
 //!
 //! # Why UDP crosses the boundary
 //!
@@ -33,6 +40,7 @@
 //! **same tested code** as on the Linux side rather than an untested
 //! re-implementation in the hardest place to debug.
 
+pub mod feeder;
 pub mod shm;
 pub mod winapi;
 
