@@ -99,10 +99,21 @@ const BTN_THUMB: u16 = 0x121;
 
 /// `BUS_USB`, not `BUS_VIRTUAL`.
 ///
-/// Nothing about this device is a USB device, but SDL and Wine both have
-/// enumeration paths that treat a virtual-bus device as something other than a
-/// game controller. Claiming the bus every real joystick claims is the
-/// difference between a game listing the device and not.
+/// Nothing about this device is a USB device. Bus 3 is what opentrack's
+/// `proto-libevdev` sets and what every USB joystick reports.
+///
+/// The first version of this comment said SDL and Wine treat a virtual-bus
+/// device as something other than a game controller. They do not — SDL
+/// whitelists the virtual bus alongside real ones when parsing a joystick GUID,
+/// and neither classifies by bus at all: SDL goes by `ID_INPUT_JOYSTICK`, and
+/// Wine's `winebus` by vendor/product and axis and button counts.
+///
+/// The bus is still visible through both, which is the real reason to claim the
+/// ordinary one: it is the leading field of the SDL joystick GUID that a
+/// `gamecontrollerdb` entry or a saved in-game binding matches on, and it picks
+/// Wine's device-instance-id prefix (`USB\VID_…` rather than `WINEBUS\VID_…`).
+/// Looking like every other joystick costs nothing and is one fewer thing for a
+/// game's device filter to trip over.
 const BUS_USB: u16 = 0x03;
 
 /// Vendor and product for the virtual device.
@@ -199,10 +210,26 @@ pub const AXIS_MIN: i32 = 0;
 pub const AXIS_CENTRE: i32 = 32767;
 /// Highest value any axis reports.
 ///
-/// `65534`, not `65535`, so the axis is exactly symmetric about
-/// [`AXIS_CENTRE`]. An axis whose halves differ by one step reads as a
-/// permanent fractional offset in games that normalise to `[-1, 1]`, which
-/// presents as slow drift with nothing to point at as the cause.
+/// `65534`, not `65535`, because [`encode_axis`] emits
+/// `AXIS_CENTRE ± AXIS_CENTRE`: an odd span would declare a maximum the encoder
+/// can never actually reach.
+///
+/// It does **not** buy a centred axis in every consumer, and this was measured
+/// rather than assumed — the first version of this comment claimed it avoided
+/// "a permanent fractional offset in games that normalise to `[-1, 1]`", and
+/// that is not what either consumer does:
+///
+/// * joydev rescales to `[-32767, 32767]` and reports exactly `0` at rest for
+///   a 65534 span *and* for a 65535 one, so it does not discriminate.
+/// * SDL2 maps the span onto its own asymmetric `[-32768, 32767]` and reports
+///   `-1` at rest. With this span SDL's `0` is unreachable: raw 32767 reads
+///   `-1` and raw 32768 reads `+1`. The span rejected here, paired with centre
+///   32768, is the one that would give SDL an exact zero.
+///
+/// One step in 32767 is about 0.005° of a ±180° axis — below any deadzone a
+/// game offers, and far below the tracker's own noise. So the choice is made on
+/// the encoder's arithmetic, which is real, rather than on a centring benefit,
+/// which is not.
 pub const AXIS_MAX: i32 = AXIS_CENTRE * 2;
 
 /// What one end of a rotation axis *means*, in degrees.
@@ -312,6 +339,23 @@ pub fn encode_unit(value: f64) -> i32 {
     (value.clamp(0.0, 1.0) * AXIS_MAX as f64).round() as i32
 }
 
+/// The gaze axes' value for this frame, holding the last one through a blink.
+///
+/// Gaze vanishes for 100-400 ms every few seconds. Reporting centre for those
+/// frames would twitch both gaze axes several times a minute; holding the last
+/// value makes a blink invisible, which is what the Extended View path does for
+/// the same reason.
+///
+/// A free function rather than a branch inside `emit` so it can be tested
+/// without `/dev/uinput` — it had no test at all, under a doc comment on a
+/// different test that claimed otherwise.
+fn hold_gaze(last: [i32; 2], gaze: Option<[f64; 2]>) -> [i32; 2] {
+    match gaze {
+        Some([gx, gy]) => [encode_unit(gx), encode_unit(gy)],
+        None => last,
+    }
+}
+
 /// The axes this device declares, in report order.
 ///
 /// Gaze occupies `ABS_THROTTLE` and `ABS_RUDDER` because those two are already
@@ -369,17 +413,38 @@ impl UinputJoystick {
                 io::Error::new(
                     e.kind(),
                     format!(
+                        // Deliberately NOT "re-plug", which the otherwise
+                        // identical message in `tobii_usb::transport` does say.
+                        // That is right for the tracker and wrong here:
+                        // /dev/uinput is a virtual misc device with no USB
+                        // parent, so unplugging the ET5 never re-events it and
+                        // the uaccess ACL never lands. `tobii debug` already
+                        // prints the correct remedy; these two must agree.
                         "/dev/uinput: {e}\n\
                          The virtual joystick needs write access to /dev/uinput. \
-                         Install the packaged udev rule (60-tobii.rules) and re-plug, \
-                         or run: sudo modprobe uinput"
+                         Install the packaged udev rule (60-tobii.rules) and log out \
+                         and back in — the grant is a logind ACL applied at session \
+                         start, so re-plugging the tracker does not apply it. \
+                         If the node does not exist at all: sudo modprobe uinput"
                     ),
                 )
             })?;
         let raw = fd.as_raw_fd();
 
-        // SAFETY: `raw` is a live fd from the `File` above, every request is a
-        // uinput request taking an `int`, and each argument is a valid `i32`.
+        // SAFETY: `raw` is a live fd from the `File` above, and this block makes
+        // three shapes of uinput request, not one. The `UI_SET_*BIT` calls take
+        // an `int` by value, and each argument is a valid `i32`. `UI_ABS_SETUP`
+        // and `UI_DEV_SETUP` take a POINTER to a `#[repr(C)]` struct matching
+        // the kernel's `uinput_abs_setup` / `uinput_setup` — fully initialised
+        // on this stack frame and live across the call — and the byte count the
+        // kernel copies is the `size_of` baked into the request number where it
+        // is defined above, so the two cannot drift apart. `UI_DEV_CREATE` is an
+        // `_IO` and takes no argument at all.
+        //
+        // The pointer arguments are the ones that could actually corrupt
+        // memory, and they were the ones the first version of this comment did
+        // not mention: it said "every request is a uinput request taking an
+        // `int`", which is true of `set_bit` alone and was never widened.
         unsafe {
             set_bit(raw, UI_SET_EVBIT, EV_ABS as i32)?;
             set_bit(raw, UI_SET_EVBIT, EV_KEY as i32)?;
@@ -514,9 +579,7 @@ impl Sink for UinputJoystick {
         let Some(pose) = frame.pose else {
             return Ok(());
         };
-        if let Some([gx, gy]) = frame.gaze {
-            self.last_gaze = [encode_unit(gx), encode_unit(gy)];
-        }
+        self.last_gaze = hold_gaze(self.last_gaze, frame.gaze);
         let r = &self.response;
         self.report([
             encode_axis(pose.x_mm, TRANSLATION_FULL_SCALE_MM),
@@ -727,12 +790,27 @@ mod tests {
         assert_eq!(encode_unit(-1.0), AXIS_MIN);
     }
 
-    /// `NaN as i32` is 0 in Rust, so an unguarded non-finite pose would pin
-    /// every axis hard left rather than doing nothing.
+    /// The two encoders fail differently, and the difference is why this test
+    /// has the assertions it does.
+    ///
+    /// It used to say only "`NaN as i32` is 0 in Rust, so an unguarded
+    /// non-finite pose would pin every axis hard left". That is true of
+    /// [`encode_unit`], which maps straight onto the range — with its guard
+    /// gone, a NaN gaze pins hard at [`AXIS_MIN`]. It is *not* true of
+    /// [`encode_axis`], which returns `AXIS_CENTRE + delta`: a NaN survives the
+    /// clamp (`f64::clamp` propagates NaN rather than clamping it), `NaN as
+    /// i32` saturates to 0, and centre plus zero is centre. So two of the four
+    /// assertions passed with the guard deleted.
+    ///
+    /// What `encode_axis`'s guard actually saves is a non-finite **full scale**,
+    /// which would make the ratio NaN by division — and that case does fail
+    /// without it.
     #[test]
     fn a_non_finite_pose_reports_centre_rather_than_a_hard_deflection() {
+        // Records intent; would pass without the guard, for the reason above.
         assert_eq!(encode_axis(f64::NAN, 180.0), AXIS_CENTRE);
         assert_eq!(encode_axis(f64::INFINITY, 180.0), AXIS_CENTRE);
+        // These two are the ones that catch a regression.
         assert_eq!(encode_axis(1.0, f64::NAN), AXIS_CENTRE);
         assert_eq!(encode_unit(f64::NAN), AXIS_CENTRE);
     }
@@ -749,14 +827,41 @@ mod tests {
         );
     }
 
-    /// Gaze is held through a blink. Reporting centre instead would twitch the
-    /// two gaze axes several times a minute.
+    /// The axis set alone has to satisfy udev's joystick test, independently of
+    /// the key bits — see the four-way experiment in the module docs.
     #[test]
     fn the_axis_set_is_classified_as_a_joystick() {
         // ABS_X and ABS_Y plus any of ABS_RX/RY/RZ or a key bit in the joystick
         // range is what systemd's input_id builtin looks for.
         assert!(AXES.contains(&ABS_X) && AXES.contains(&ABS_Y));
         assert!(AXES.contains(&ABS_RX));
+    }
+
+    /// Gaze is held through a blink. Reporting centre instead would twitch the
+    /// two gaze axes several times a minute.
+    ///
+    /// This sentence used to sit above the test above it, which does not
+    /// exercise the hold at all — so the behaviour had no test, under a comment
+    /// claiming it did. Deleting the hold now fails here.
+    #[test]
+    fn a_blink_holds_the_last_gaze_rather_than_reporting_centre() {
+        let looking = hold_gaze([AXIS_CENTRE; 2], Some([1.0, 0.0]));
+        assert_eq!(
+            looking,
+            [AXIS_MAX, AXIS_MIN],
+            "gaze at the top-right corner"
+        );
+
+        let blink = hold_gaze(looking, None);
+        assert_eq!(blink, looking, "a blink must hold, not recentre");
+        assert_ne!(
+            blink, [AXIS_CENTRE; 2],
+            "reporting centre through a blink is the twitch this prevents"
+        );
+
+        // And a real look back to the middle still moves — the hold applies
+        // only when gaze is absent, never when it is present and central.
+        assert_eq!(hold_gaze(looking, Some([0.5, 0.5])), [AXIS_CENTRE; 2]);
     }
 
     /// The only test that proves any of this works, end to end.

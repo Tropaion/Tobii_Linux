@@ -233,7 +233,20 @@ impl OutputConfig {
                 None => return false,
             },
             // An empty address is how the file spells "do not send there".
+            //
+            // A newline is refused rather than escaped. `to_toml` writes this
+            // into a quoted string on one line and `from_toml` reads one line at
+            // a time, so an embedded newline does not merely corrupt the
+            // address: the injected second line can begin with `[`, which turns
+            // `in_games` off and makes the parser silently discard every key
+            // written after this one — the bridge port, the joystick settings
+            // and all twelve Extended View values, reverted to defaults with no
+            // error anywhere. Quotes and `#` need no such guard; both already
+            // round-trip, which `a_quoted_value_keeps_a_hash_inside_it` covers.
             "opentrack" => {
+                if value.contains(['\n', '\r']) {
+                    return false;
+                }
                 self.opentrack = (!value.is_empty()).then(|| value.to_string());
             }
             // Port 0 is never a real destination, so it doubles as "disabled".
@@ -507,6 +520,33 @@ mod tests {
     fn comments_and_blank_lines_are_tolerated() {
         let text = "\n# a comment\n\n[games]\n\n  enabled = true  # trailing\n\n";
         assert!(OutputConfig::from_toml(text).enabled);
+    }
+
+    /// A value that would break the file's one-key-per-line shape is refused,
+    /// because the damage is silent and reaches far past the value itself.
+    #[test]
+    fn a_value_containing_a_newline_is_refused_rather_than_written() {
+        let mut c = OutputConfig::default();
+        assert!(!c.apply_key("opentrack", "127.0.0.1:4242\n[other]"));
+        assert_eq!(
+            c.opentrack.as_deref(),
+            Some(DEFAULT_OPENTRACK_ADDR),
+            "a refused value must leave the old one in place"
+        );
+        assert!(!c.apply_key("opentrack", "a\rb"));
+
+        // The damage it prevents: a `[` on the injected line ends the section,
+        // and every key `to_toml` writes after `opentrack` is then dropped.
+        let injected = OutputConfig {
+            opentrack: Some("host\n[x]".to_string()),
+            joystick: false,
+            ..OutputConfig::default()
+        };
+        let back = OutputConfig::from_toml(&injected.to_toml());
+        assert_ne!(
+            back.joystick, injected.joystick,
+            "premise: an injected section header silently reverts later keys"
+        );
     }
 
     /// A quoted value must survive a `#` inside it — stripping comments blindly

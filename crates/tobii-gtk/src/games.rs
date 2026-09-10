@@ -115,6 +115,14 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStat
 pub struct GamesRow {
     pub controls: gtk::Box,
     status: Label,
+    /// The controls, held so [`GamesRow::refresh`] can put them back in step
+    /// with the file. They are not only built and forgotten: `tobii games set`
+    /// and the hub edit the same settings, and the status line under these
+    /// controls is driven from the file — so a control that never re-reads it
+    /// ends up contradicting the sentence directly beneath it.
+    enabled: Switch,
+    joy: CheckButton,
+    strength: Vec<CheckButton>,
     joystick: Arc<Mutex<JoystickStatus>>,
 }
 
@@ -256,6 +264,9 @@ impl GamesRow {
         let row = GamesRow {
             controls,
             status,
+            enabled: sw,
+            joy,
+            strength: buttons,
             joystick,
         };
         row.refresh(false);
@@ -269,9 +280,28 @@ impl GamesRow {
     /// reopening the window, which is exactly how somebody setting this up for
     /// the first time is working.
     pub fn refresh(&self, tracker_on: bool) {
+        let cfg = load_output_config();
+
+        // Compared before writing, which is what makes this safe to call from
+        // the 33 ms hub tick: GTK emits `state-set` and `toggled` only on an
+        // actual change, so an equal write is silent and cannot re-enter the
+        // save handlers that are listening to these very widgets.
+        if self.enabled.is_active() != cfg.enabled {
+            self.enabled.set_active(cfg.enabled);
+        }
+        if self.joy.is_active() != cfg.joystick {
+            self.joy.set_active(cfg.joystick);
+        }
+        if let Some(i) = strength_index(&cfg) {
+            if let Some(b) = self.strength.get(i) {
+                if !b.is_active() {
+                    b.set_active(true);
+                }
+            }
+        }
+
         let js = self.joystick.lock().unwrap().clone();
-        self.status
-            .set_text(&status_text(&load_output_config(), tracker_on, &js));
+        self.status.set_text(&status_text(&cfg, tracker_on, &js));
     }
 }
 

@@ -402,13 +402,15 @@ fn uinput() -> String {
     const NODE: &str = "/dev/uinput";
     if !Path::new(NODE).exists() {
         return format!(
-            "{NODE} MISSING — the uinput module is not loaded and no rule creates              the node; install 60-tobii.rules, or run: sudo modprobe uinput"
+            "{NODE} MISSING — the uinput module is not loaded and no rule creates \
+             the node; install 60-tobii.rules, or run: sudo modprobe uinput"
         );
     }
     match std::fs::OpenOptions::new().write(true).open(NODE) {
         Ok(_) => "writable — the virtual joystick can be created".into(),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => format!(
-            "{NODE} NOT WRITABLE — the virtual joystick cannot be created;              install 60-tobii.rules and log out and back in"
+            "{NODE} NOT WRITABLE — the virtual joystick cannot be created; \
+             install 60-tobii.rules and log out and back in"
         ),
         Err(e) => format!("{NODE} unusable ({e})"),
     }
@@ -781,6 +783,31 @@ fn first_line(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The report is written to be pasted into an issue, so a run of stray
+    /// spaces in the middle of a sentence is a real defect in it.
+    ///
+    /// This is a guard against a specific way it happens rather than a style
+    /// rule: these messages are written with `\` line continuations, and
+    /// `cargo fmt` will happily join such a literal back into one line and keep
+    /// the continuation's indentation as literal spaces. That is exactly what
+    /// had happened to both `uinput()` branches — fourteen spaces mid-sentence,
+    /// invisible in the source, printed in every report.
+    ///
+    /// The label column is padded to 16 and legitimately contains runs, so only
+    /// the value part of each line is examined.
+    #[test]
+    fn no_line_of_the_report_has_a_gap_in_the_middle_of_a_sentence() {
+        for line in report().lines() {
+            let Some(value) = line.get(20..) else {
+                continue;
+            };
+            assert!(
+                !value.contains("   "),
+                "a run of spaces inside a value: {line:?}"
+            );
+        }
+    }
     use super::*;
 
     /// A home directory worth testing against, normalised.
