@@ -18,3 +18,4 @@ target/
 # Release artifacts built by scripts/release.sh
 dist/
 /dist/
+bridge/target/

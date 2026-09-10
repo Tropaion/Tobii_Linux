@@ -1,0 +1,14 @@
+[package]
+name = "tobii-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Receives tracking frames from Linux and publishes them into FT_SharedMem."
+
+[[bin]]
+name = "tobii-bridge"
+path = "src/main.rs"
+
+[dependencies]
+tobii-output.workspace = true
+tobii-bridge-core.workspace = true

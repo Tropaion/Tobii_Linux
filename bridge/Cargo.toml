@@ -1,0 +1,32 @@
+# The Wine-side bridge — its own workspace.
+#
+# Separate from the repo's root workspace, and excluded from it, because
+# everything here targets x86_64-pc-windows-gnu:
+# `cargo clippy --workspace --all-targets` is a hard gate at the root and would
+# otherwise try to compile Windows API code for the host. `cargo build` at the
+# repo root does not see this directory at all, so anyone without the mingw
+# toolchain is unaffected.
+#
+# Four crates rather than one because a Cargo package produces a single library
+# artifact, and the games need two DLLs under two specific published names.
+[workspace]
+resolver = "2"
+members = ["core", "ftclient", "npclient", "provider"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+# The one shared dependency, by path, and the reason this is Rust rather than C:
+# the FreeTrack byte layout, the degrees-to-radians conversion and the frame
+# decoder are already written and tested on the Linux side, so they run here as
+# the same code rather than as an untested re-implementation in the place that
+# is hardest to debug.
+tobii-output = { path = "../crates/tobii-output" }
+tobii-bridge-core = { path = "core" }
+
+[profile.release]
+opt-level = "s"
+strip = true

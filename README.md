@@ -391,6 +391,35 @@ Steam's `%command%`, Lutris's and Heroic's wrapper fields, and a plain shell
 script all work with no further support, which is why this is a wrapper rather
 than a setting.
 
+### Games that speak TrackIR or FreeTrack (Wine)
+
+opentrack is not the only protocol. Windows games under Wine ask for TrackIR or
+FreeTrack, which means a DLL inside the prefix and a shared-memory block — so
+there is a small Windows-side bridge:
+
+```sh
+scripts/build-bridge.sh                     # needs mingw-w64 + the rust win target
+tobii bridge install --prefix /path/to/prefix
+tobii bridge run     --prefix /path/to/prefix   # leave running while you play
+```
+
+The hub sends frames to the provider over loopback UDP, the provider writes
+`FT_SharedMem` inside the prefix, and the game's client DLL reads it.
+
+**TrackIR is pointed at an already-installed client** (opentrack's, if you have
+it) rather than at ours, because games verify NaturalPoint's signature and a
+clean-room DLL cannot answer it. Nothing is copied — our provider still supplies
+the data behind it. `--npclient ours` overrides that for a game that does not
+check.
+
+Verified end to end on a Wine 11.17 prefix: the bridge's own probe loads the DLL
+the way a game does (`LoadLibrary` + `GetProcAddress`), and a pose sent as
+`(11, 22, 633) mm, yaw 7.5°, pitch −3.25°, roll 1.5°` reads back as
+`pos=(11.0, 22.0, 633.0)`, `yaw=0.1309 rad`, `pitch=-0.0567`, `roll=0.0262` —
+the same angles in radians — with the frame counter advancing while data flows.
+
+`tobii bridge uninstall --prefix PATH` removes it again.
+
 ### Closing the window does not quit
 
 Pressing **X** minimises the hub to the taskbar and leaves it running. That is

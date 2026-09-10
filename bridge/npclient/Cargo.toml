@@ -1,0 +1,24 @@
+[package]
+name = "NPClient64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TrackIR client DLL presenting Tobii tracking to Windows games."
+
+# The published name a TrackIR game loads, confirmed present in StarCitizen.exe.
+# Cargo names a cdylib after the crate, so the crate is named for the file.
+[lib]
+name = "NPClient64"
+crate-type = ["cdylib"]
+
+[features]
+# Spike S2: log every call with its arguments and return NP_OK, instead of
+# serving data. Built separately and never shipped — it exists to measure what
+# the game actually does, since the TRACKIRDATA scaling, the axis signs and the
+# staleness rule are all unmeasured and coding against a guess is invisible.
+default = []
+spike-log = []
+
+[dependencies]
+tobii-output.workspace = true
+tobii-bridge-core.workspace = true

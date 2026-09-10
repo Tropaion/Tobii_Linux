@@ -15,6 +15,8 @@ use tobii_usb::{Connection, UsbTransport};
 
 type CmdResult = Result<(), Box<dyn std::error::Error>>;
 
+mod bridge;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let sub = args.get(1).map(String::as_str);
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
         // to be transparent to whatever launched it, and a launcher reads the
         // status of the thing it launched.
         (Some("game"), _) => return game(&args),
+        (Some("bridge"), _) => bridge::bridge(&args),
         (Some("headpose"), Some("--model-status")) => model_status(),
         (Some("headpose"), Some("--fetch-model")) => fetch_model(&args),
         (Some("headpose"), Some("--check-update")) => check_model_update(),
@@ -68,6 +71,8 @@ fn main() -> ExitCode {
                  tobii update [--install]\n  \
                  tobii stream [--json] [--eyes]\n  \
                  tobii game -- <command> [args...]\n  \
+                 tobii bridge install --prefix PATH\n  \
+                 tobii bridge run --prefix PATH\n  \
                  tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE]\n  \
                  tobii headpose --check [--calibrate-pitch [SECS]]\n  \
                  tobii headpose --model-status\n  \

@@ -1,0 +1,9 @@
+[package]
+name = "tobii-bridge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared Wine-side plumbing: winapi shim, FT_SharedMem provider/consumer, registry."
+
+[dependencies]
+tobii-output.workspace = true

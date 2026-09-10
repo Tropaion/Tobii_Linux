@@ -1,0 +1,16 @@
+[package]
+name = "freetrackclient64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FreeTrack client DLL presenting Tobii tracking to Windows games."
+
+# The published name a FreeTrack game loads. Cargo names a cdylib after the
+# crate, so the crate is named for the file rather than the other way round.
+[lib]
+name = "freetrackclient64"
+crate-type = ["cdylib"]
+
+[dependencies]
+tobii-output.workspace = true
+tobii-bridge-core.workspace = true
