@@ -156,6 +156,19 @@ fn game(args: &[String]) -> ExitCode {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| cmd[0].clone());
 
+    // Reaching the hub is not the same as the hub sending anything. With game
+    // output off, this wrapper works perfectly — the tracker comes on, the hub
+    // gets frames — and the game receives nothing, because nothing is routed
+    // anywhere. That presents as "head tracking does not work" with a lit
+    // tracker as evidence that it should, which is the worst combination to
+    // debug. The hub's games row names this state; the wrapper has to as well.
+    if !tobii_output::games::load_output_config().enabled {
+        eprintln!(
+            "note: game output is off, so {name} will receive nothing even though \
+             the tracker comes on. Turn it on in the hub, or: tobii games set enabled true"
+        );
+    }
+
     // Held for exactly as long as the child lives. Dropping it is what releases
     // the tracker, so it is deliberately still in scope below the wait.
     let client = match tobii_ipc::Client::connect(tobii_ipc::subs::POSE, &name) {
@@ -1906,18 +1919,14 @@ fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
             };
             let mut cfg = load_output_config();
             if !cfg.apply_key(key, value) {
-                // The valid spellings are exactly the keys the file writes, so
-                // they are listed from a serialized config rather than from a
-                // second hand-maintained list that could drift from it.
-                let doc = cfg.to_toml();
-                let keys: Vec<&str> = doc
-                    .lines()
-                    .filter(|l| !l.trim_start().starts_with('#'))
-                    .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim()))
-                    .collect();
+                // `OutputConfig::keys()` is the one list. It is hand-written
+                // and pinned by a test to exactly what `to_toml` emits —
+                // scraping a second list out of `to_toml` here, which is what
+                // this did at first, was itself the duplication it claimed to
+                // be avoiding.
                 return Err(format!(
                     "{key} = {value:?} was not accepted.\nvalid keys: {}",
-                    keys.join(", ")
+                    tobii_output::games::OutputConfig::keys().join(", ")
                 )
                 .into());
             }
@@ -1996,9 +2005,23 @@ fn headpose(args: &[String]) -> CmdResult {
         // the udev rule, a config with `enabled = true` stops `tobii headpose`
         // from running at all — taking opentrack and the bridge down with it
         // over an optional third sink that neither of them needs.
-        match tobii_output::sinks::UinputJoystick::open() {
-            Ok(s) => router.add(Box::new(s)),
-            Err(e) => eprintln!("not presenting a virtual joystick: {e}"),
+        if tobii_output::sinks::uinput_joystick::already_present() {
+            // Almost always the hub: it holds a device for as long as game
+            // output is on, whether or not it currently has the tracker. A
+            // second one under the same name would put two identical
+            // controllers in the game's bind list with only one of them
+            // moving — and while this command holds the device, the hub's is
+            // the frozen one.
+            eprintln!(
+                "not presenting a virtual joystick: one with this name already \
+                 exists — the hub owns it. Close the hub, or turn its game output \
+                 off, to use this command's own joystick."
+            );
+        } else {
+            match tobii_output::sinks::UinputJoystick::open() {
+                Ok(s) => router.add(Box::new(s)),
+                Err(e) => eprintln!("not presenting a virtual joystick: {e}"),
+            }
         }
     }
 

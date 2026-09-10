@@ -255,6 +255,13 @@ impl OutputConfig {
     }
 
     /// Every settable key, for `tobii games` output and error messages.
+    ///
+    /// A hand-written list, guarded by
+    /// `the_advertised_keys_are_exactly_the_keys_the_file_writes` rather than
+    /// derived — because it drifted the moment it was not. `joystick` was added
+    /// to the struct, to `to_toml`, to `apply_key` and to the GUI, and not
+    /// here; the CLI meanwhile grew a second list scraped out of `to_toml`,
+    /// under a comment claiming it existed so there would not be two lists.
     pub fn keys() -> &'static [&'static str] {
         &[
             "enabled",
@@ -262,6 +269,7 @@ impl OutputConfig {
             "filter_alpha",
             "opentrack",
             "bridge_port",
+            "joystick",
             "extended_view",
             "ev_hold_ms",
             "ev_yaw_deadzone_deg",
@@ -455,12 +463,31 @@ mod tests {
         assert_eq!(c.opentrack.as_deref(), Some("host#1:4242"));
     }
 
+    /// The list and the file must name the same set. Adding a field to
+    /// `OutputConfig` touches five places, and this is the one with nothing to
+    /// remind you: a missing key is not a compile error, it just quietly stops
+    /// being mentioned by `tobii games` and by the error a bad key prints.
+    #[test]
+    fn the_advertised_keys_are_exactly_the_keys_the_file_writes() {
+        let doc = OutputConfig::default().to_toml();
+        let written: Vec<&str> = doc
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim()))
+            .collect();
+        assert_eq!(
+            written,
+            OutputConfig::keys(),
+            "`keys()` and `to_toml` disagree — one of them was not updated"
+        );
+    }
+
     #[test]
     fn every_advertised_key_is_actually_settable() {
         let mut c = OutputConfig::default();
         for key in OutputConfig::keys() {
             let value = match *key {
-                "enabled" | "extended_view" => "true",
+                "enabled" | "extended_view" | "joystick" => "true",
                 "opentrack" => "127.0.0.1:9999",
                 "bridge_port" => "4243",
                 "ev_hold_ms" => "150",

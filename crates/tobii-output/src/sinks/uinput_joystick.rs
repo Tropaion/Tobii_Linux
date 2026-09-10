@@ -11,9 +11,16 @@
 //!
 //! A uinput device is read by everything that reads a joystick: SDL, evdev,
 //! the legacy `/dev/input/js*` interface, and — because Wine's `winebus`
-//! enumerates evdev devices — DirectInput and XInput inside Proton. So one
+//! enumerates evdev devices — DirectInput inside Wine and Proton. So one
 //! ~200-line sink covers native games, Proton games, and emulators at once,
 //! for the price of a udev rule.
+//!
+//! **DirectInput, not XInput.** Measured under wine 11.17 with a probe built
+//! against `dinput8` and another against `xinput1_4`: DirectInput enumerates
+//! this device as `DI8DEVTYPE_JOYSTICK`, and `XInputGetState` reports zero
+//! controllers in all four slots, with and without the device present. XInput's
+//! fixed two-stick layout has nowhere to put eight axes, so a game that speaks
+//! only XInput cannot use this sink — it needs the Wine bridge or opentrack.
 //!
 //! # What was taken from opentrack, and what was not
 //!
@@ -21,19 +28,37 @@
 //! working implementation, and two facts were taken from reading it because
 //! they are not discoverable from the uinput documentation:
 //!
-//! * **A device with only absolute axes is not a joystick.** opentrack's source
-//!   says only "do not remove next 3 lines or udev scripts won't assign 0664
-//!   permissions", so the mechanism was measured here rather than assumed:
-//!   dropping the two key bits and creating the device again produced
-//!   `ID_INPUT_ACCELEROMETER=1` and no `ID_INPUT_JOYSTICK` at all. systemd's
-//!   `input_id` builtin reads absolute axes with no buttons as an
-//!   accelerometer, and SDL — which is what Proton and most Linux games
-//!   enumerate through — skips anything not tagged `ID_INPUT_JOYSTICK`.
-//!   [`BTN_TRIGGER`] and [`BTN_THUMB`] exist only to prevent that, and are
-//!   never pressed.
+//! * **A device that declares no key capability is an accelerometer.**
+//!   opentrack's source says only "do not remove next 3 lines or udev scripts
+//!   won't assign 0664 permissions", so the mechanism was measured here by
+//!   building the device four ways and reading udev's verdict out of
+//!   `/run/udev/data/`:
+//!
+//!   | built with | udev says |
+//!   |---|---|
+//!   | `EV_KEY` + [`BTN_TRIGGER`]/[`BTN_THUMB`] + all eight axes | `ID_INPUT_JOYSTICK=1` |
+//!   | `EV_KEY` declared, **no** key codes | `ID_INPUT_JOYSTICK=1` |
+//!   | `EV_KEY` + buttons, only `ABS_X`/`Y`/`Z` | `ID_INPUT_JOYSTICK=1` |
+//!   | **no `EV_KEY` at all** | `ID_INPUT_ACCELEROMETER=1`, `IIO_SENSOR_PROXY_TYPE=input-accel`, `SYSTEMD_WANTS=iio-sensor-proxy.service` |
+//!
+//!   So the load-bearing thing is the bare `EV_KEY` capability, not the button
+//!   codes: systemd's `input_id` reads `ABS_X`/`Y`/`Z` with no key capability
+//!   as an accelerometer — and then hands it to `iio-sensor-proxy`, which is
+//!   the service that rotates laptop screens. Given `EV_KEY`, either the button
+//!   codes **or** `ABS_RX`/`RY`/`RZ` independently satisfy its joystick test,
+//!   and this device has both.
+//!
+//!   The buttons are kept anyway, and are never pressed: SDL skips anything
+//!   not tagged `ID_INPUT_JOYSTICK`, and Steam's container runtime has a
+//!   fallback path that classifies from evdev capabilities directly when udev
+//!   properties are unavailable, which does require a code in the
+//!   `BTN_JOYSTICK..BTN_GAMEPAD` range. Cheap insurance for a case that cannot
+//!   be reproduced outside a container.
 //! * **Which axes.** Translation on `ABS_X`/`Y`/`Z` and rotation on
 //!   `ABS_RX`/`RY`/`RZ` is the layout every head-tracking guide and game profile
-//!   in circulation already assumes.
+//!   in circulation already assumes. Contiguity matters beyond convention:
+//!   Wine's SDL backend builds its HID report descriptor by SDL *axis index*,
+//!   so a gap in the ABS codes would silently shift every axis after it.
 //!
 //! The code is ours: opentrack calls `libevdev`, and this talks to the kernel
 //! directly so the crate keeps its "no C dependencies" property. The full-scale
@@ -432,6 +457,29 @@ impl Sink for UinputJoystick {
     }
 }
 
+/// Whether a virtual joystick made by this program already exists.
+///
+/// Two producers can want one: the hub, which keeps a device alive for as long
+/// as the setting is on — including while the tracker is dark — and
+/// `tobii headpose`. They would use the same [`DEVICE_NAME`], [`VENDOR`] and
+/// [`PRODUCT`], so a second one is not a second input: it is two identical
+/// entries in the game's bind list, of which only one moves, with nothing to
+/// tell them apart. Worse, the frozen one is as likely to be picked as the
+/// live one, since the hub's is usually enumerated first.
+///
+/// Scanned from sysfs rather than tracked in a process-wide flag, because the
+/// two producers are different processes.
+pub fn already_present() -> bool {
+    let Ok(dir) = std::fs::read_dir("/sys/class/input") else {
+        // No sysfs to consult is not evidence of absence, but reporting
+        // "present" would disable the sink on a system where it might work.
+        return false;
+    };
+    dir.flatten().any(|e| {
+        std::fs::read_to_string(e.path().join("device/name")).is_ok_and(|n| n.trim() == DEVICE_NAME)
+    })
+}
+
 /// A shared reference to a joystick whose lifetime is owned elsewhere.
 ///
 /// # Why the device must outlive the tracking session
@@ -563,10 +611,10 @@ mod tests {
     /// Everything above checks arithmetic against numbers this file also
     /// chose. Three things it cannot reach: whether the kernel accepts this
     /// sequence of ioctls, whether udev then classifies the result as a
-    /// joystick rather than as some unrecognised absolute-axis device, and
-    /// whether the values a reader sees are the values that were encoded. All
-    /// three need a real device, which needs write access to `/dev/uinput` —
-    /// hence `#[ignore]` rather than running by default.
+    /// joystick rather than as an accelerometer, and whether the values a
+    /// reader sees are the values that were encoded. All three need a real
+    /// device, which needs write access to `/dev/uinput` — hence `#[ignore]`
+    /// rather than running by default.
     ///
     /// `cargo test -p tobii-output -- --ignored --nocapture`
     #[test]
@@ -592,6 +640,12 @@ mod tests {
                 .collect()
         }
 
+        // Stamped before the device exists, so the udev record read below can
+        // be proved to be about THIS device. Minor numbers are reused: a record
+        // left by a previous run of this very test sits at the same path and
+        // reads as a pass, which is how the first version of this assertion
+        // passed with the key bits deleted.
+        let created_at = std::time::SystemTime::now();
         let mut js = UinputJoystick::open().expect("create the device");
 
         // udev has to run its rules before the nodes exist.
@@ -608,13 +662,70 @@ mod tests {
             })
         };
 
-        // Classification: without a key bit in the joystick range there is no
-        // js node at all, and nothing enumerates the device. See module docs.
-        let js_node = named("js").unwrap_or_else(|| {
-            panic!("no js* node for {DEVICE_NAME:?} — it was not classified as a joystick")
-        });
         let event_node = named("event").expect("an event node").clone();
-        println!("classified as a joystick: {}", js_node.display());
+
+        // Classification, asserted where udev actually records it.
+        //
+        // This used to assert that a `/dev/input/js*` node existed and call
+        // that the classification check. It is not one: `joydev` binds to any
+        // device with absolute axes, so the js node appears even for a device
+        // udev has decided is an accelerometer — which is exactly what the
+        // no-buttons experiment in the module docs produced, js node and all.
+        // The assertion could not fail, and its comment said the opposite of
+        // the truth.
+        //
+        // `/run/udev/data/c<major>:<minor>` is where udev keeps the properties
+        // it computed, world-readable, with no `udevadm` to shell out to.
+        //
+        // Retried, for the same reason the evdev open below is: the sysfs entry
+        // exists the instant the kernel creates the device, and udev writes its
+        // verdict afterwards.
+        let dev = std::fs::read_to_string(event_node.join("dev")).expect("the dev node numbers");
+        let record = format!("/run/udev/data/c{}", dev.trim());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let fresh = |path: &str| -> bool {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                // A record written in the same second as `created_at` can carry
+                // a marginally earlier timestamp than the SystemTime read;
+                // a second of slack keeps that from flaking without letting a
+                // record from a previous run through.
+                .map(|m| m + Duration::from_secs(1) >= created_at)
+                .unwrap_or(false)
+        };
+        let props = loop {
+            match std::fs::read_to_string(&record) {
+                Ok(p) if p.contains("E:ID_INPUT") && fresh(&record) => break p,
+                other => {
+                    if Instant::now() >= deadline {
+                        panic!(
+                            "no fresh udev verdict at {record} after 3s \
+                             (a stale record from a previous device with the same \
+                             minor does not count): {other:?}"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        assert!(
+            props.lines().any(|l| l == "E:ID_INPUT_JOYSTICK=1"),
+            "udev did not classify this as a joystick, so SDL will skip it.\n{props}"
+        );
+        assert!(
+            !props
+                .lines()
+                .any(|l| l.starts_with("E:ID_INPUT_ACCELEROMETER")),
+            "classified as an accelerometer — the key bits are what prevent \
+             that, see the module docs.\n{props}"
+        );
+        // Kept, but for what it actually shows: that joydev bound to the
+        // device and the legacy interface works.
+        let js_node = named("js").expect("a js* node — joydev did not bind");
+        println!(
+            "udev: ID_INPUT_JOYSTICK=1; joydev bound at {}",
+            js_node.display()
+        );
 
         // Read back through evdev. Opened before emitting: an evdev node
         // delivers nothing that happened before it was opened.

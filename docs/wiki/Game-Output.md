@@ -5,7 +5,7 @@ of the user.
 
 | Route | Needs installed | Reaches |
 |---|---|---|
-| **Virtual joystick** | nothing | native Linux games, Proton games, emulators — anything that binds an axis |
+| **Virtual joystick** | nothing | native Linux games, Proton games, emulators — anything that binds an **absolute** view axis (see the rate trap below) |
 | **opentrack UDP** | opentrack | whatever opentrack is configured to drive |
 | **FreeTrack (Wine)** | a Wine prefix + our bridge | Windows games that speak FreeTrack |
 | **TrackIR (Wine)** | a Wine prefix + a signed client DLL | Windows games that speak TrackIR |
@@ -33,7 +33,21 @@ resuming from a second-old pose swings the camera across the room.
 
 `/dev/uinput`, eight absolute axes, no other software. Because it is an ordinary
 evdev joystick, SDL reads it, the legacy `/dev/input/js*` interface reads it,
-and Wine's `winebus` enumerates it — so a Proton game sees a normal controller.
+and Wine's `winebus` enumerates it — so a Wine or Proton game sees a normal
+controller. Measured, rather than inferred from documentation:
+
+| consumer | result |
+|---|---|
+| SDL2 2.32 | 8 axes, 2 buttons, correct name; `SDL_IsGameController` false — it is a joystick, not a gamepad, which is what flight and space sims read |
+| joydev (`/dev/input/js*`) | every axis exactly `0` at rest |
+| Wine 11.17 DirectInput8 | enumerated as `DI8DEVTYPE_JOYSTICK` |
+| Wine 11.17 XInput | **nothing**, in all four slots, with and without the device present |
+
+XInput's fixed two-stick layout has nowhere to put eight axes, so a game that
+speaks only XInput cannot use this sink and needs the Wine bridge or opentrack
+instead. A known-value pose survived the whole chain into SDL exactly: yaw +90°
+of ±180 arrived as `16384` (half scale), pitch −45° of ±90 as `−16385`, gaze at
+the right-hand screen edge as `32767`.
 
 | Axis | Carries | Full scale |
 |---|---|---|
@@ -53,25 +67,65 @@ presents as slow drift with nothing to point at as the cause. Confirmed through
 `joydev`, which rescales to `[-32767, 32767]` and reported every axis at exactly
 `0` at rest.
 
-### Why the device declares buttons it never presses
+### Why the device declares a key capability it never uses
 
-`BTN_TRIGGER` and `BTN_THUMB` are declared purely to be classified. opentrack's
-source says only *"do not remove next 3 lines or udev scripts won't assign 0664
-permissions"*, so the mechanism was measured here rather than assumed: dropping
-the two key bits and creating the device again produced
+opentrack's source says only *"do not remove next 3 lines or udev scripts won't
+assign 0664 permissions"*. That is not a mechanism, so it was measured here —
+four builds of the device, reading udev's verdict out of `/run/udev/data/`:
 
-```
-ID_INPUT=1 ID_INPUT_ACCELEROMETER=1
-```
+| built with | udev says |
+|---|---|
+| `EV_KEY` + `BTN_TRIGGER`/`BTN_THUMB` + all eight axes | `ID_INPUT_JOYSTICK=1` |
+| `EV_KEY` declared, **no** key codes | `ID_INPUT_JOYSTICK=1` |
+| `EV_KEY` + buttons, only `ABS_X`/`Y`/`Z` | `ID_INPUT_JOYSTICK=1` |
+| **no `EV_KEY` at all** | `ID_INPUT_ACCELEROMETER=1`, `IIO_SENSOR_PROXY_TYPE=input-accel`, `SYSTEMD_WANTS=iio-sensor-proxy.service` |
 
-with no `ID_INPUT_JOYSTICK` at all. systemd's `input_id` builtin reads absolute
-axes with no buttons as an accelerometer, and SDL — which is what Proton and
-most Linux games enumerate through — skips anything not tagged
-`ID_INPUT_JOYSTICK`. With the buttons declared:
+So the load-bearing thing is the bare `EV_KEY` capability, not the button codes.
+Without it, `input_id` reads `ABS_X`/`Y`/`Z` as an accelerometer and hands the
+device to `iio-sensor-proxy` — the service that rotates laptop screens. Given
+`EV_KEY`, either the button codes **or** `ABS_RX`/`RY`/`RZ` independently
+satisfy the joystick test, and this device has both.
 
-```
-ID_INPUT_JOYSTICK=1  TAGS=:seat:uaccess:
-```
+The buttons are kept anyway and never pressed: SDL skips anything not tagged
+`ID_INPUT_JOYSTICK`, and Steam's container runtime has a fallback that
+classifies straight from evdev capabilities when udev properties are
+unavailable, which does want a code in the `BTN_JOYSTICK..BTN_GAMEPAD` range.
+Cheap insurance for a case that cannot be reproduced outside a container.
+
+Nobody should "tidy" the buttons away later on the grounds that the axes alone
+classify correctly — they do, and the container path still wants the buttons.
+
+### The rate trap: binding is not working
+
+The most important thing to know before binding an axis. Many games' "look"
+axis is a **rate** input — the camera keeps rotating for as long as the axis is
+deflected — not a position. Bind a head tracker to one of those and the view
+spins away and never comes back, faster the further you turn your head.
+
+The bind takes. The axis moves in the game's test display. It still does not
+work. Games where the joystick route is genuinely fine name it explicitly:
+Elite Dangerous has *Headlook Axis Mode: **Direct***, which exists precisely
+because its default is incremental. Where a game offers only a rate axis
+(BeamNG's `evdev` binding, X-Plane's "View left/right", ETS2's UI-bindable
+`j_look_lr`), the joystick sink cannot drive the view no matter how it is
+tuned — those need the Wine bridge, a native protocol, or a config-file edit.
+
+### Steam Input can take the device away, silently
+
+Steam's controller layer enumerates anything that looks like a joystick. For a
+device it does not recognise it either presents it to the game as a generic
+Xbox pad — discarding every axis that does not fit that shape and adding a dead
+zone — or hides it from the game with no replacement. Both look from inside the
+game exactly like "the Tobii controller is not in the bind list", and both are
+on the default path for a Steam-launched game.
+
+The fix is per-game: **Properties → Controller → Disable Steam Input**. Failing
+that, Settings → Controller → turn off generic-gamepad support, or launch the
+game outside Steam.
+
+This is also a second, independent reason the device follows the setting rather
+than the tracking session: Steam does not reliably hot-plug uinput devices, so
+the device has to exist before Steam looks.
 
 ### The device follows the setting, not the tracking session
 
@@ -101,7 +155,11 @@ checkbox makes the controller appear without waiting for anything to wake the
 tracker.
 
 `tobii headpose` is the exception and deliberately so: it is a foreground
-command, so its device lives exactly as long as the command does.
+command, so its device lives exactly as long as the command does — and it
+declines to create one at all when the hub already has one, because both would
+use the same name, vendor and product. Two identical entries in a bind list of
+which only one moves is worse than one, especially since while `tobii headpose`
+holds the tracker, the hub's is the frozen one.
 
 ### Permissions
 

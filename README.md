@@ -411,9 +411,18 @@ It appears as **Tobii Eye Tracker 5 head tracking**, an eight-axis controller:
 
 Nothing else has to be installed — no opentrack, no Wine. Because it is an
 ordinary evdev joystick it is read by SDL, by the legacy `/dev/input/js*`
-interface, and by Wine's `winebus`, so **Proton games see it as a normal game
-controller** too. The last two axes are gaze, which no other head tracker
-offers; bind them to a free-look axis and the camera follows your eyes.
+interface, and by Wine's `winebus`, so **Proton games see it as a DirectInput
+joystick** too (not XInput — measured under Wine 11.17; XInput's two-stick
+layout has nowhere to put eight axes). The last two axes are gaze, which no
+other head tracker offers; bind them to a free-look axis and the camera follows
+your eyes.
+
+Two things to know before you bind it, both covered in
+[`docs/wiki/Game-Output.md`](docs/wiki/Game-Output.md): some games' "look" axis
+is a **rate** control rather than a position, and binding a head tracker to one
+of those makes the view spin away rather than follow your head; and **Steam
+Input** can quietly take the device away from a Steam-launched game, which is
+fixed per-game with Properties → Controller → Disable Steam Input.
 
 This needs write access to `/dev/uinput`, which the packaged udev rule grants —
 `tobii debug` reports whether it is there. The rule is one line and the file
