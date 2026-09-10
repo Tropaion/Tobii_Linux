@@ -19,11 +19,9 @@
 //! opentrack's own build exports, established by reading its export table with
 //! `winedump -j export` — an interface fact, not implementation.
 
-use std::sync::OnceLock;
-
 use tobii_output::freetrack::{offset, FT_DATA_LEN, FT_HEAP_LEN};
 
-use tobii_bridge_core::{feeder, shm::Consumer};
+use tobii_bridge_core::feeder;
 
 /// The `FTData` structure a game passes in for us to fill.
 ///
@@ -60,20 +58,6 @@ pub struct FtData {
 // field would be off by some amount nobody could see from in-game symptoms.
 const _: () = assert!(std::mem::size_of::<FtData>() == FT_DATA_LEN);
 
-/// The provider's mapping, opened once and reused.
-///
-/// A game polls `FTGetData` every frame, so re-opening the mapping each call
-/// would be a syscall per frame for no benefit.
-static SHM: OnceLock<Option<Consumer>> = OnceLock::new();
-
-fn shm() -> Option<&'static Consumer> {
-    // Ordered, not incidental: the feeder is what creates the mapping, and
-    // `SHM` caches its answer for the life of the process. Opening first would
-    // cache `None` and report "no data" for ever.
-    feeder::ensure_started();
-    SHM.get_or_init(Consumer::open).as_ref()
-}
-
 /// Read a little-endian `f32` out of the raw heap bytes.
 fn f32_at(buf: &[u8; FT_HEAP_LEN], off: usize) -> f32 {
     f32::from_le_bytes(buf[off..off + 4].try_into().expect("4-byte slice"))
@@ -89,19 +73,12 @@ pub unsafe extern "system" fn FTGetData(data: *mut FtData) -> bool {
     if data.is_null() {
         return false;
     }
-    let Some(shm) = shm() else {
+    // Starts the feeder before reading, and answers `None` both when there is
+    // no mapping and when nothing has ever been published into one — see
+    // `feeder::published_frame`, which holds the reasoning for both.
+    let Some(raw) = feeder::published_frame() else {
         return false;
     };
-    let raw = shm.read();
-    // A mapping that has never been written reads as a valid all-zero frame,
-    // which in a game is a live tracker sitting at dead centre — worse than no
-    // tracker, because nothing looks wrong. Since this DLL creates the mapping
-    // itself now, that state is ordinary whenever nothing is sending yet, so
-    // `DataID == 0` is reserved to mean exactly it (see
-    // `tobii_output::freetrack::next_data_id`).
-    if u32::from_le_bytes(raw[0..4].try_into().expect("4-byte slice")) == 0 {
-        return false;
-    }
     let out = &mut *data;
     out.data_id = u32::from_le_bytes(raw[0..4].try_into().expect("4-byte slice"));
     out.cam_width = i32::from_le_bytes(raw[4..8].try_into().expect("4-byte slice"));

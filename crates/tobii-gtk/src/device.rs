@@ -1091,6 +1091,16 @@ impl GameSide {
         changed
     }
 
+    /// The game-output router the current settings ask for, with this
+    /// joystick plugged into it.
+    ///
+    /// The handle is cloned rather than moved: the device belongs here and
+    /// outlives every router built from it, which is the whole reason it is
+    /// owned by the thread rather than by a session.
+    fn output(&self) -> Option<crate::outputs::GameOutput> {
+        crate::outputs::GameOutput::for_session(self.joystick.clone())
+    }
+
     /// Create or destroy the device to match the setting.
     fn sync_joystick(&mut self, cfg: &tobii_output::games::OutputConfig) {
         let wanted = cfg.enabled && cfg.joystick;
@@ -1261,7 +1271,7 @@ fn device_session(
                 // whole life of a game started with `tobii game`, so the
                 // settings were frozen for exactly as long as somebody was
                 // there to change them. See `GameSide`.
-                let mut games = crate::outputs::GameOutput::for_session(game_side.joystick.clone());
+                let mut games = game_side.output();
 
                 let mut quiet_since = Instant::now();
                 // Anything queued while the tracker was off is applied now that
@@ -1278,7 +1288,7 @@ fn device_session(
                     // Rate-limited to once a second inside `poll`, so this
                     // costs one small file read per second while a game runs.
                     if game_side.poll() {
-                        games = crate::outputs::GameOutput::for_session(game_side.joystick.clone());
+                        games = game_side.output();
                     }
                     if demand.active() {
                         idle_since = None;

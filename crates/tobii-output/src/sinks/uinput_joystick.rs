@@ -69,6 +69,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::{Sink, SinkError, TrackingFrame};
@@ -200,6 +201,19 @@ struct InputEvent {
     kind: u16,
     code: u16,
     value: i32,
+}
+
+impl InputEvent {
+    /// One event, with the timestamp zeroed for the reason above.
+    const fn new(kind: u16, code: u16, value: i32) -> InputEvent {
+        InputEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            kind,
+            code,
+            value,
+        }
+    }
 }
 
 // ------------------------------------------------------------- encoding
@@ -400,6 +414,18 @@ fn last_error(what: &str) -> io::Error {
     io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
+/// One ioctl's return value, named by the request that produced it.
+///
+/// Every uinput request below signals failure the same way — a negative return
+/// with the reason in `errno` — so the check is written once and each call site
+/// carries only the name that ends up in the message.
+fn checked(ret: libc::c_int, what: &str) -> io::Result<()> {
+    if ret < 0 {
+        return Err(last_error(what));
+    }
+    Ok(())
+}
+
 impl UinputJoystick {
     /// Create the device.
     ///
@@ -473,9 +499,7 @@ impl UinputJoystick {
                         resolution: 0,
                     },
                 };
-                if libc::ioctl(raw, UI_ABS_SETUP as _, &setup) < 0 {
-                    return Err(last_error("UI_ABS_SETUP"));
-                }
+                checked(libc::ioctl(raw, UI_ABS_SETUP as _, &setup), "UI_ABS_SETUP")?;
             }
 
             let mut name = [0u8; 80];
@@ -492,12 +516,8 @@ impl UinputJoystick {
                 name,
                 ff_effects_max: 0,
             };
-            if libc::ioctl(raw, UI_DEV_SETUP as _, &setup) < 0 {
-                return Err(last_error("UI_DEV_SETUP"));
-            }
-            if libc::ioctl(raw, UI_DEV_CREATE as _) < 0 {
-                return Err(last_error("UI_DEV_CREATE"));
-            }
+            checked(libc::ioctl(raw, UI_DEV_SETUP as _, &setup), "UI_DEV_SETUP")?;
+            checked(libc::ioctl(raw, UI_DEV_CREATE as _), "UI_DEV_CREATE")?;
         }
 
         Ok(UinputJoystick {
@@ -519,22 +539,11 @@ impl UinputJoystick {
     /// Write one batch of axis values, terminated by the `SYN_REPORT` that
     /// makes the kernel deliver them as a single state change.
     fn report(&mut self, values: [i32; 8]) -> io::Result<()> {
-        let mut events = [InputEvent {
-            tv_sec: 0,
-            tv_usec: 0,
-            kind: EV_SYN,
-            code: SYN_REPORT,
-            value: 0,
-        }; AXES.len() + 1];
-        for (i, (code, value)) in AXES.iter().zip(values).enumerate() {
-            events[i] = InputEvent {
-                tv_sec: 0,
-                tv_usec: 0,
-                kind: EV_ABS,
-                code: *code,
-                value,
-            };
-        }
+        // One event per axis, then the terminator in the slot past the last.
+        let events: [InputEvent; AXES.len() + 1] = std::array::from_fn(|i| match AXES.get(i) {
+            Some(&code) => InputEvent::new(EV_ABS, code, values[i]),
+            None => InputEvent::new(EV_SYN, SYN_REPORT, 0),
+        });
         // SAFETY: `events` is a live array of `#[repr(C)]` structs with no
         // padding bytes read as anything but bytes, and the length is exact.
         let bytes = unsafe {
@@ -550,10 +559,7 @@ impl UinputJoystick {
 /// `fd` must be a live uinput file descriptor and `request` one of the
 /// `UI_SET_*BIT` requests, all of which take an `int` by value.
 unsafe fn set_bit(fd: i32, request: u32, bit: i32) -> io::Result<()> {
-    if libc::ioctl(fd, request as _, bit) < 0 {
-        return Err(last_error("UI_SET_*BIT"));
-    }
-    Ok(())
+    checked(libc::ioctl(fd, request as _, bit), "UI_SET_*BIT")
 }
 
 impl Drop for UinputJoystick {
@@ -617,16 +623,27 @@ impl Sink for UinputJoystick {
 /// live one, since the hub's is usually enumerated first.
 ///
 /// Scanned from sysfs rather than tracked in a process-wide flag, because the
-/// two producers are different processes.
+/// two producers are different processes. No sysfs to consult reports "absent":
+/// that is not evidence of absence, but reporting "present" would disable the
+/// sink on a system where it might work.
 pub fn already_present() -> bool {
+    !our_input_nodes().is_empty()
+}
+
+/// Every `/sys/class/input/*` entry belonging to a device this program made.
+///
+/// Matched on [`DEVICE_NAME`], which is the one identifying field sysfs exposes
+/// without opening the device, and which both producers set identically.
+fn our_input_nodes() -> Vec<PathBuf> {
     let Ok(dir) = std::fs::read_dir("/sys/class/input") else {
-        // No sysfs to consult is not evidence of absence, but reporting
-        // "present" would disable the sink on a system where it might work.
-        return false;
+        return Vec::new();
     };
-    dir.flatten().any(|e| {
-        std::fs::read_to_string(e.path().join("device/name")).is_ok_and(|n| n.trim() == DEVICE_NAME)
-    })
+    dir.flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            std::fs::read_to_string(p.join("device/name")).is_ok_and(|n| n.trim() == DEVICE_NAME)
+        })
+        .collect()
 }
 
 /// A shared reference to a joystick whose lifetime is owned elsewhere.
@@ -883,21 +900,29 @@ mod tests {
         use crate::TrackingFrame;
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
-        use std::path::PathBuf;
         use std::time::{Duration, Instant};
 
-        /// Every `/sys/class/input/*` entry whose device is ours.
-        fn our_nodes() -> Vec<PathBuf> {
-            let Ok(dir) = std::fs::read_dir("/sys/class/input") else {
-                return Vec::new();
-            };
-            dir.flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    std::fs::read_to_string(p.join("device/name"))
-                        .is_ok_and(|n| n.trim() == DEVICE_NAME)
-                })
-                .collect()
+        /// Poll `attempt` every 50 ms until it succeeds, and panic after three
+        /// seconds naming `what` and the last failure.
+        ///
+        /// Everything about a fresh uinput device races the udev event that
+        /// creating it triggers: the sysfs entries exist the instant the kernel
+        /// makes the device, while the properties udev computes and the
+        /// `uaccess` ACL that makes the node readable both land afterwards.
+        /// Reading or opening immediately loses that race — a test bug rather
+        /// than a permission-model problem, since a game starts long after this.
+        fn wait_for<T, E: std::fmt::Display>(
+            what: &str,
+            mut attempt: impl FnMut() -> Result<T, E>,
+        ) -> T {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match attempt() {
+                    Ok(value) => return value,
+                    Err(e) if Instant::now() >= deadline => panic!("waited 3s for {what}: {e}"),
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                }
+            }
         }
 
         // Stamped before the device exists, so the udev record read below can
@@ -908,12 +933,15 @@ mod tests {
         let created_at = std::time::SystemTime::now();
         let mut js = UinputJoystick::open().expect("create the device");
 
-        // udev has to run its rules before the nodes exist.
+        // udev has to run its rules before the nodes exist. Not `wait_for`:
+        // falling through with whichever nodes did appear lets the two
+        // expectations below name the missing one, which is a better failure
+        // than a timeout here.
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut nodes = our_nodes();
+        let mut nodes = our_input_nodes();
         while Instant::now() < deadline && nodes.len() < 2 {
             std::thread::sleep(Duration::from_millis(50));
-            nodes = our_nodes();
+            nodes = our_input_nodes();
         }
         let named = |prefix: &str| {
             nodes.iter().find(|p| {
@@ -936,13 +964,8 @@ mod tests {
         //
         // `/run/udev/data/c<major>:<minor>` is where udev keeps the properties
         // it computed, world-readable, with no `udevadm` to shell out to.
-        //
-        // Retried, for the same reason the evdev open below is: the sysfs entry
-        // exists the instant the kernel creates the device, and udev writes its
-        // verdict afterwards.
         let dev = std::fs::read_to_string(event_node.join("dev")).expect("the dev node numbers");
         let record = format!("/run/udev/data/c{}", dev.trim());
-        let deadline = Instant::now() + Duration::from_secs(3);
         let fresh = |path: &str| -> bool {
             std::fs::metadata(path)
                 .and_then(|m| m.modified())
@@ -953,21 +976,14 @@ mod tests {
                 .map(|m| m + Duration::from_secs(1) >= created_at)
                 .unwrap_or(false)
         };
-        let props = loop {
-            match std::fs::read_to_string(&record) {
-                Ok(p) if p.contains("E:ID_INPUT") && fresh(&record) => break p,
-                other => {
-                    if Instant::now() >= deadline {
-                        panic!(
-                            "no fresh udev verdict at {record} after 3s \
-                             (a stale record from a previous device with the same \
-                             minor does not count): {other:?}"
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        };
+        // A record that is not fresh is a failure to retry, not a result: one
+        // left by a previous device with the same minor number reads as a pass.
+        let verdict = format!("a fresh udev verdict at {record}");
+        let props = wait_for(&verdict, || match std::fs::read_to_string(&record) {
+            Ok(p) if p.contains("E:ID_INPUT") && fresh(&record) => Ok(p),
+            Ok(stale) => Err(format!("still stale or incomplete: {stale:?}")),
+            Err(e) => Err(e.to_string()),
+        });
         assert!(
             props.lines().any(|l| l == "E:ID_INPUT_JOYSTICK=1"),
             "udev did not classify this as a joystick, so SDL will skip it.\n{props}"
@@ -988,29 +1004,17 @@ mod tests {
         );
 
         // Read back through evdev. Opened before emitting: an evdev node
-        // delivers nothing that happened before it was opened.
-        // Retried, not opened once: the sysfs entry exists the instant the
-        // kernel creates the device, but the `uaccess` ACL that makes it
-        // readable is applied later by udev processing that event. Opening
-        // immediately loses the race and gets EACCES — which is a test bug
-        // rather than a permission-model problem, since a game starts long
-        // after this.
+        // delivers nothing that happened before it was opened. The open itself
+        // races the `uaccess` ACL and gets EACCES until udev applies it, which
+        // is what `wait_for` is here for.
         let dev = PathBuf::from("/dev/input").join(event_node.file_name().expect("a name"));
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut reader = loop {
-            match OpenOptions::new()
+        let acl = format!("the udev ACL on {}", dev.display());
+        let mut reader = wait_for(&acl, || {
+            OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NONBLOCK)
                 .open(&dev)
-            {
-                Ok(f) => break f,
-                Err(e) if Instant::now() < deadline => {
-                    let _ = e;
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => panic!("open {} after waiting for the udev ACL: {e}", dev.display()),
-            }
-        };
+        });
 
         let yaw_deg = 45.0;
         js.emit(&TrackingFrame {

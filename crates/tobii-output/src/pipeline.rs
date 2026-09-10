@@ -228,6 +228,25 @@ mod tests {
         s
     }
 
+    /// A tracked sample with both eyes `z` mm in front of the sensor. 680 mm is
+    /// where people actually sit, which is the distance the recentring exists
+    /// for.
+    fn seated(z: f64) -> GazeSample {
+        let mut s = tracked_sample(Some([0.5, 0.5]));
+        s.eye_origin_l_mm = [-32.0, 0.0, z];
+        s.eye_origin_r_mm = [32.0, 0.0, z];
+        s
+    }
+
+    /// A sample with neither eye tracked — validity 4 is "not found".
+    fn lost() -> GazeSample {
+        GazeSample {
+            validity_l: 4,
+            validity_r: 4,
+            ..Default::default()
+        }
+    }
+
     fn corners() -> DisplayCorners {
         DisplayCorners {
             tl: [-300.0, 200.0, 0.0],
@@ -370,18 +389,13 @@ mod tests {
         assert!(p.last_tracked.is_some());
 
         // Untracked sample, a short time later.
-        let lost = GazeSample {
-            validity_l: 4,
-            validity_r: 4,
-            ..Default::default()
-        };
-        p.offer(&lost, None, &c, None, now + Duration::from_millis(200));
+        p.offer(&lost(), None, &c, None, now + Duration::from_millis(200));
         assert!(
             p.last_tracked.is_some(),
             "a 200 ms loss must not discard the smoothing state"
         );
 
-        p.offer(&lost, None, &c, None, now + TRACKING_LOSS_RESET);
+        p.offer(&lost(), None, &c, None, now + TRACKING_LOSS_RESET);
         assert!(
             p.last_tracked.is_none(),
             "a loss of a full second must reset"
@@ -403,14 +417,6 @@ mod tests {
         let now = Instant::now();
         let c = cfg(false);
         let mut p = FramePipeline::new(&c);
-
-        // Both eyes 680 mm in front of the sensor, which is where people sit.
-        let seated = |z: f64| {
-            let mut s = tracked_sample(Some([0.5, 0.5]));
-            s.eye_origin_l_mm = [-32.0, 0.0, z];
-            s.eye_origin_r_mm = [32.0, 0.0, z];
-            s
-        };
 
         let first = p
             .offer(&seated(680.0), None, &c, None, now)
@@ -443,28 +449,17 @@ mod tests {
         let now = Instant::now();
         let c = cfg(false);
         let mut p = FramePipeline::new(&c);
-        let seated = |z: f64| {
-            let mut s = tracked_sample(Some([0.5, 0.5]));
-            s.eye_origin_l_mm = [-32.0, 0.0, z];
-            s.eye_origin_r_mm = [32.0, 0.0, z];
-            s
-        };
         p.offer(&seated(680.0), None, &c, None, now);
         assert_eq!(p.neutral.map(|n| n[2]), Some(680.0));
 
-        let lost = GazeSample {
-            validity_l: 4,
-            validity_r: 4,
-            ..Default::default()
-        };
-        p.offer(&lost, None, &c, None, now + Duration::from_millis(200));
+        p.offer(&lost(), None, &c, None, now + Duration::from_millis(200));
         assert_eq!(
             p.neutral.map(|n| n[2]),
             Some(680.0),
             "a short loss must not move the centre"
         );
 
-        p.offer(&lost, None, &c, None, now + TRACKING_LOSS_RESET);
+        p.offer(&lost(), None, &c, None, now + TRACKING_LOSS_RESET);
         assert_eq!(p.neutral, None, "a long loss drops it");
 
         let back = p

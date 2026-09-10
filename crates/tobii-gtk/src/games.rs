@@ -111,6 +111,41 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStat
     }
 }
 
+/// A checkbox with its label beside it, as one row.
+///
+/// Separate labels rather than a `CheckButton`'s built-in one: the tops of tall
+/// glyphs clip on this theme, which is why every radio in this hub is built
+/// this way. Same fault and same workaround as [`crate::widget::button`], which
+/// records what has already been ruled out.
+fn check_row(text: &str) -> (CheckButton, gtk::Box) {
+    let cb = CheckButton::new();
+    cb.set_valign(Align::Center);
+    let lbl = Label::new(Some(text));
+    lbl.set_valign(Align::Center);
+    lbl.set_margin_top(2);
+    lbl.set_margin_bottom(2);
+    let row = gtk::Box::new(Orientation::Horizontal, 5);
+    row.append(&cb);
+    row.append(&lbl);
+    (cb, row)
+}
+
+/// Read the settings, change them, write them back.
+///
+/// Every write re-reads the file first. Three controls edit the same config —
+/// and `tobii games` in a terminal edits it too — so holding a copy in each
+/// would make whichever was touched second overwrite the other's change.
+///
+/// `what` names the setting in the warning, so a failed write says which
+/// control the user just touched did not take.
+fn edit_config(what: &str, change: impl FnOnce(&mut OutputConfig)) {
+    let mut cfg = load_output_config();
+    change(&mut cfg);
+    if let Err(e) = save_output_config(&cfg) {
+        tobii_diagnostics::log::warn(&format!("could not save the {what}: {e}"));
+    }
+}
+
 /// The control block for the row.
 pub struct GamesRow {
     pub controls: gtk::Box,
@@ -150,34 +185,24 @@ impl GamesRow {
         status.set_max_width_chars(44);
         status.add_css_class("section-desc");
 
-        // Separate labels rather than a CheckButton's built-in one: the tops of
-        // tall glyphs clip on this theme, which is why every radio in this hub
-        // is built this way.
         let strength_ctl = gtk::Box::new(Orientation::Horizontal, 16);
         let mut buttons: Vec<CheckButton> = Vec::new();
+        let selected = strength_index(&cfg);
         for (i, (name, _, _)) in STRENGTHS.iter().enumerate() {
-            let cb = CheckButton::new();
+            let (cb, row) = check_row(name);
             if let Some(first) = buttons.first() {
                 cb.set_group(Some(first));
             }
-            cb.set_valign(Align::Center);
-            let lbl = Label::new(Some(name));
-            lbl.set_valign(Align::Center);
-            lbl.set_margin_top(2);
-            lbl.set_margin_bottom(2);
-            let row = gtk::Box::new(Orientation::Horizontal, 5);
-            row.append(&cb);
-            row.append(&lbl);
             strength_ctl.append(&row);
-            if strength_index(&cfg) == Some(i) {
+            if selected == Some(i) {
                 cb.set_active(true);
             }
             buttons.push(cb);
         }
 
-        // Every write re-reads the file first. Two controls edit the same
-        // config, and holding a copy in each would make whichever was touched
-        // second overwrite the other's change.
+        // The status line, put back in step after every write. `tracker_on` is
+        // false because a save handler has no way to know: the 33 ms hub tick
+        // calls `GamesRow::refresh` with the truth immediately afterwards.
         let refresh = {
             let status = status.clone();
             let joystick = Arc::clone(&joystick);
@@ -190,13 +215,7 @@ impl GamesRow {
         {
             let refresh = refresh.clone();
             sw.connect_state_set(move |_, on| {
-                let mut cfg = load_output_config();
-                cfg.enabled = on;
-                if let Err(e) = save_output_config(&cfg) {
-                    tobii_diagnostics::log::warn(&format!(
-                        "could not save the game-output setting: {e}"
-                    ));
-                }
+                edit_config("game-output setting", |cfg| cfg.enabled = on);
                 refresh();
                 glib::Propagation::Proceed
             });
@@ -209,14 +228,10 @@ impl GamesRow {
                     return;
                 }
                 let (_, yaw, pitch) = STRENGTHS[i];
-                let mut cfg = load_output_config();
-                cfg.extended_view.yaw.output_max_deg = yaw;
-                cfg.extended_view.pitch.output_max_deg = pitch;
-                if let Err(e) = save_output_config(&cfg) {
-                    tobii_diagnostics::log::warn(&format!(
-                        "could not save the game-output strength: {e}"
-                    ));
-                }
+                edit_config("game-output strength", |cfg| {
+                    cfg.extended_view.yaw.output_max_deg = yaw;
+                    cfg.extended_view.pitch.output_max_deg = pitch;
+                });
                 refresh();
             });
         }
@@ -224,16 +239,8 @@ impl GamesRow {
         // Its own row rather than a fourth item on the top row: the top row is
         // already a switch and three radios, and the hub is laid out to stay
         // narrow.
-        let joy = CheckButton::new();
+        let (joy, joy_row) = check_row("Virtual joystick");
         joy.set_active(cfg.joystick);
-        joy.set_valign(Align::Center);
-        let joy_lbl = Label::new(Some("Virtual joystick"));
-        joy_lbl.set_valign(Align::Center);
-        joy_lbl.set_margin_top(2);
-        joy_lbl.set_margin_bottom(2);
-        let joy_row = gtk::Box::new(Orientation::Horizontal, 5);
-        joy_row.append(&joy);
-        joy_row.append(&joy_lbl);
         joy_row.set_tooltip_text(Some(
             "Present head pose and gaze as a game controller, for games with no \
              head-tracking support. Works in native and Proton games without Wine \
@@ -242,13 +249,8 @@ impl GamesRow {
         {
             let refresh = refresh.clone();
             joy.connect_toggled(move |c| {
-                let mut cfg = load_output_config();
-                cfg.joystick = c.is_active();
-                if let Err(e) = save_output_config(&cfg) {
-                    tobii_diagnostics::log::warn(&format!(
-                        "could not save the virtual-joystick setting: {e}"
-                    ));
-                }
+                let on = c.is_active();
+                edit_config("virtual-joystick setting", |cfg| cfg.joystick = on);
                 refresh();
             });
         }
@@ -309,10 +311,13 @@ impl GamesRow {
 mod tests {
     use super::*;
 
-    /// A config with only the sinks named. `joystick` is off rather than
-    /// inherited from the defaults, so these cases keep testing what they were
-    /// written to test — with it on, "no destination is configured" would be
-    /// unreachable.
+    /// [`status_text`] for a config that does not ask for a joystick, so the
+    /// status it is given is never read. Spelling `JoystickStatus::Off` at
+    /// every one of these call sites buried the case each was asserting.
+    fn text(cfg: &OutputConfig, tracker_on: bool) -> String {
+        status_text(cfg, tracker_on, &JoystickStatus::Off)
+    }
+
     /// Game output on, with the joystick as its only destination.
     fn joystick_only() -> OutputConfig {
         OutputConfig {
@@ -324,6 +329,10 @@ mod tests {
         }
     }
 
+    /// A config with only the sinks named. `joystick` is off rather than
+    /// inherited from the defaults — where it is ON — so these cases keep
+    /// testing what they were written to test: with it on, "no destination is
+    /// configured" would be unreachable.
     fn cfg_with(enabled: bool, opentrack: Option<&str>, bridge: Option<u16>) -> OutputConfig {
         OutputConfig {
             enabled,
@@ -337,34 +346,25 @@ mod tests {
     /// Every half-configured state has to be distinguishable. All of them look
     /// identical in game — the camera does not move — so if this line does not
     /// separate them, nothing does.
+    ///
+    /// The joystick status is `Off` throughout, and never consulted: these
+    /// configs come from `cfg_with`, which does not ask for one.
     #[test]
     fn each_broken_state_says_which_part_is_missing() {
-        let off = status_text(
-            &cfg_with(false, Some("127.0.0.1:4242"), None),
-            false,
-            &JoystickStatus::Off,
-        );
+        let off = text(&cfg_with(false, Some("127.0.0.1:4242"), None), false);
         assert!(off.contains("Off"), "{off}");
 
-        let no_sink = status_text(&cfg_with(true, None, None), true, &JoystickStatus::Off);
+        let no_sink = text(&cfg_with(true, None, None), true);
         assert!(no_sink.contains("no destination"), "{no_sink}");
 
-        let ready = status_text(
-            &cfg_with(true, Some("127.0.0.1:4242"), None),
-            false,
-            &JoystickStatus::Off,
-        );
+        let ready = text(&cfg_with(true, Some("127.0.0.1:4242"), None), false);
         assert!(ready.contains("Ready"), "{ready}");
         assert!(
             ready.contains("tobii game"),
             "a user who sees 'Ready' needs to be told what starts it: {ready}"
         );
 
-        let sending = status_text(
-            &cfg_with(true, Some("127.0.0.1:4242"), None),
-            true,
-            &JoystickStatus::Off,
-        );
+        let sending = text(&cfg_with(true, Some("127.0.0.1:4242"), None), true);
         assert!(sending.starts_with("Sending"), "{sending}");
 
         // And they are genuinely different sentences, not four spellings of one.
@@ -381,11 +381,7 @@ mod tests {
     /// would send people looking for a problem that is the design working.
     #[test]
     fn a_dark_tracker_is_not_reported_as_a_problem() {
-        let s = status_text(
-            &cfg_with(true, Some("127.0.0.1:4242"), None),
-            false,
-            &JoystickStatus::Off,
-        );
+        let s = text(&cfg_with(true, Some("127.0.0.1:4242"), None), false);
         for alarming in ["not running", "error", "failed", "cannot", "problem"] {
             assert!(
                 !s.to_lowercase().contains(alarming),
@@ -398,11 +394,7 @@ mod tests {
     /// knows which one to look at.
     #[test]
     fn both_destinations_are_named() {
-        let s = status_text(
-            &cfg_with(true, Some("127.0.0.1:4242"), Some(4243)),
-            true,
-            &JoystickStatus::Off,
-        );
+        let s = text(&cfg_with(true, Some("127.0.0.1:4242"), Some(4243)), true);
         assert!(s.contains("4242") && s.contains("4243"), "{s}");
     }
 

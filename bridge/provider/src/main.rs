@@ -14,27 +14,25 @@
 use std::net::UdpSocket;
 
 use tobii_bridge_core::{register, shm::Provider, INSTALL_DIR};
-use tobii_output::frame::FRAME_LEN;
 use tobii_output::TrackingFrame;
 
 fn main() {
     let mut port = tobii_bridge_core::feeder::port();
     let mut dir = INSTALL_DIR.to_string();
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
+    // A flag's value is consumed whether or not it parses, so `--port nonsense`
+    // keeps the default rather than trying to read `nonsense` as the next flag.
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--port" => {
-                if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
+                if let Some(v) = args.next().and_then(|v| v.parse().ok()) {
                     port = v;
                 }
-                i += 1;
             }
             "--dir" => {
-                if let Some(v) = args.get(i + 1) {
-                    dir = v.clone();
+                if let Some(v) = args.next() {
+                    dir = v;
                 }
-                i += 1;
             }
             "--help" | "-h" => {
                 println!("usage: tobii-bridge.exe [--port PORT] [--dir 'C:\\tobii-bridge']");
@@ -42,7 +40,6 @@ fn main() {
             }
             _ => {}
         }
-        i += 1;
     }
 
     // Written at startup rather than only by the installer, so the keys always
@@ -103,9 +100,8 @@ fn main() {
                 }
             }
         }
-        if received % 600 == 0 && received > 0 {
+        if received > 0 && received % 600 == 0 {
             println!("{received} frames published, {rejected} rejected");
         }
-        let _ = FRAME_LEN;
     }
 }

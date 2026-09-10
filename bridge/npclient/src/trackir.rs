@@ -7,15 +7,13 @@
 
 use std::sync::atomic::Ordering;
 
+use tobii_bridge_core::feeder;
 pub use tobii_output::trackir::TrackIrData;
 
 // The spike stub logs calls instead of serving data, so everything below that
 // reads the mapping is compiled out along with `fill`.
 #[cfg(not(feature = "spike-log"))]
-use {
-    std::sync::atomic::AtomicU16, std::sync::OnceLock, tobii_bridge_core::feeder,
-    tobii_bridge_core::shm::Consumer, tobii_output::trackir::from_ft_heap,
-};
+use {std::sync::atomic::AtomicU16, tobii_output::trackir::from_ft_heap};
 
 /// Advances on every fill, because a game may ignore a repeated signature.
 #[cfg(not(feature = "spike-log"))]
@@ -41,25 +39,16 @@ pub fn game_id() -> i32 {
 
 /// Fill `out` from the mapping.
 ///
-/// The mapping is opened once and reused: a game polls `NP_GetData` every
-/// frame, so re-opening it per call would be a syscall per frame for nothing.
+/// Leaves `out` alone when there is nothing to report, which covers a mapping
+/// that has never been written as well as one that does not exist: advancing
+/// the signature over an all-zero frame would present a live tracker frozen at
+/// dead centre. Both, and the once-only open behind them, are
+/// `feeder::published_frame`.
 #[cfg(not(feature = "spike-log"))]
 pub fn fill(out: &mut TrackIrData) {
-    static SHM: OnceLock<Option<Consumer>> = OnceLock::new();
-    // Ordered, not incidental: the feeder is what creates the mapping, and
-    // `SHM` caches its answer for the life of the process. Opening first would
-    // cache `None` and report "no data" for ever.
-    feeder::ensure_started();
-    let Some(shm) = SHM.get_or_init(Consumer::open).as_ref() else {
+    let Some(raw) = feeder::published_frame() else {
         return;
     };
-    let raw = shm.read();
-    // As in `ftclient`: a never-written mapping is an all-zero frame, and
-    // advancing the signature over it would present a live tracker frozen at
-    // dead centre. `DataID == 0` is reserved for "nothing published yet".
-    if u32::from_le_bytes(raw[0..4].try_into().expect("4-byte slice")) == 0 {
-        return;
-    }
     let sig = FRAME_SIGNATURE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     from_ft_heap(&raw, sig, out);
 }

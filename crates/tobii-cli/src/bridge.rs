@@ -127,6 +127,10 @@ fn find_installed_npclient() -> Option<PathBuf> {
 /// Closing it means building the two client crates for `i686-pc-windows-gnu` as
 /// well and adding them here; the registry key and install directory are shared,
 /// so nothing else changes.
+/// The one artifact without which there is no installation — also what
+/// [`artifact_dir`] recognises a build directory by.
+const REQUIRED_ARTIFACT: &str = "freetrackclient64.dll";
+
 const ARTIFACTS: [(&str, bool); 3] = [
     ("tobii-bridge.exe", false),
     ("freetrackclient64.dll", true),
@@ -291,12 +295,28 @@ fn push_library(out: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+/// The value of a `"key"    "value"` line in Valve's key-value format.
+///
+/// `libraryfolders.vdf` and an `appmanifest_*.acf` are both that format, and
+/// both are read by pulling out the two or three keys that matter rather than
+/// by understanding VDF, because a real parser would be a dependency and a
+/// maintenance burden for three strings.
+///
+/// The key is matched a piece at a time rather than against a quoted copy of
+/// it, so running this over every line of every manifest allocates nothing.
+fn vdf_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line
+        .trim()
+        .strip_prefix('"')?
+        .strip_prefix(key)?
+        .strip_prefix('"')?;
+    rest.trim().trim_start_matches('"').split('"').next()
+}
+
 /// Every Steam library on this machine.
 ///
-/// The libraries live in `libraryfolders.vdf`, which is Valve's own nested
-/// key-value format. It is parsed here by pulling out `"path"` lines rather
-/// than by understanding VDF, because that is the only key this needs and a
-/// real parser would be a dependency and a maintenance burden for one string.
+/// The libraries live in `libraryfolders.vdf`, out of which [`vdf_value`] pulls
+/// the `"path"` lines.
 pub fn steam_libraries(home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in STEAM_ROOTS {
@@ -309,11 +329,7 @@ pub fn steam_libraries(home: &Path) -> Vec<PathBuf> {
         let vdf = root.join("steamapps/libraryfolders.vdf");
         let text = std::fs::read_to_string(&vdf).unwrap_or_default();
         for line in text.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("\"path\"") else {
-                continue;
-            };
-            if let Some(p) = rest.trim().trim_matches('"').split('"').next() {
+            if let Some(p) = vdf_value(line, "path") {
                 push_library(&mut out, PathBuf::from(p.replace("\\\\", "/")));
             }
         }
@@ -339,14 +355,9 @@ pub fn steam_apps(home: &Path) -> Vec<(String, String)> {
             let Ok(text) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
-            let field = |key: &str| {
-                text.lines()
-                    .find_map(|l| l.trim().strip_prefix(&format!("\"{key}\"")))
-                    .and_then(|r| r.trim().trim_start_matches('"').split('"').next())
-                    .map(str::to_string)
-            };
-            if let (Some(id), Some(n)) = (field("appid"), field("name")) {
-                out.push((id, n));
+            let field = |key: &str| text.lines().find_map(|l| vdf_value(l, key));
+            if let (Some(id), Some(name)) = (field("appid"), field("name")) {
+                out.push((id.to_string(), name.to_string()));
             }
         }
     }
@@ -495,8 +506,12 @@ fn artifact_dir(args: &[String]) -> Result<PathBuf, String> {
         }
     }
     candidates.push(PathBuf::from("/usr/lib/tobii-linux/bridge"));
+    // Recognised by the DLL, not by `tobii-bridge.exe`. The exe used to be
+    // required, so probing for it was the same question; it is optional now, and
+    // a directory holding only the client DLLs — which is a complete
+    // installation — would otherwise not be found at all.
     for c in &candidates {
-        if c.join("tobii-bridge.exe").is_file() {
+        if c.join(REQUIRED_ARTIFACT).is_file() {
             return Ok(c.clone());
         }
     }
@@ -849,7 +864,12 @@ mod tests {
             .filter(|(_, req)| *req)
             .map(|(n, _)| *n)
             .collect();
-        assert_eq!(required, vec!["freetrackclient64.dll"]);
+        assert_eq!(required, vec![REQUIRED_ARTIFACT]);
+        // `artifact_dir` recognises a build directory by this same file, so a
+        // directory holding a complete installation is always found.
+        assert!(ARTIFACTS
+            .iter()
+            .any(|(n, req)| *n == REQUIRED_ARTIFACT && *req));
         for optional in ["tobii-bridge.exe", "NPClient64.dll"] {
             assert!(
                 ARTIFACTS.iter().any(|(n, req)| *n == optional && !req),

@@ -354,6 +354,32 @@ fn usb_present() -> String {
     "NOT FOUND on the bus".into()
 }
 
+/// Where a distribution may have put the rules file.
+const RULES_DIRS: [&str; 3] = [
+    "/etc/udev/rules.d",
+    "/usr/lib/udev/rules.d",
+    "/lib/udev/rules.d",
+];
+
+/// Whether an installed `60-tobii.rules` carries the uinput grant.
+///
+/// `None` when there is no rules file to inspect. `Some(false)` is the
+/// interesting answer: a machine that upgraded from before the virtual joystick
+/// has a rules file that looks installed and is missing the one line the
+/// joystick needs — and `tobii update` replaces binaries only, so it never
+/// delivers the new one.
+fn rules_grant_uinput() -> Option<bool> {
+    for dir in RULES_DIRS {
+        if let Ok(text) = std::fs::read_to_string(format!("{dir}/60-tobii.rules")) {
+            return Some(text.lines().any(|l| {
+                let l = l.trim();
+                !l.starts_with('#') && l.contains("uinput")
+            }));
+        }
+    }
+    None
+}
+
 /// Whether the udev rule is installed — and whether it is the one that works.
 ///
 /// Both names are looked for. The rule shipped before v0.1.0 was called
@@ -365,33 +391,6 @@ fn usb_present() -> String {
 /// "worked" only because it also said `MODE="0666"`, which is a different and
 /// much broader grant. A leftover copy of the old file still wins on mode, so
 /// it is worth naming in the report rather than passing as installed.
-/// Whether an installed `60-tobii.rules` carries the uinput grant.
-///
-/// `None` when there is no rules file to inspect. `Some(false)` is the
-/// interesting answer: a machine that upgraded from before the virtual joystick
-/// has a rules file that looks installed and is missing the one line the
-/// joystick needs — and `tobii update` replaces binaries only, so it never
-/// delivers the new one.
-fn rules_grant_uinput() -> Option<bool> {
-    for dir in RULES_DIRS {
-        let path = format!("{dir}/60-tobii.rules");
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            return Some(text.lines().any(|l| {
-                let l = l.trim();
-                !l.starts_with('#') && l.contains("uinput")
-            }));
-        }
-    }
-    None
-}
-
-/// Where a distribution may have put the rules file.
-const RULES_DIRS: [&str; 3] = [
-    "/etc/udev/rules.d",
-    "/usr/lib/udev/rules.d",
-    "/lib/udev/rules.d",
-];
-
 fn udev_rule() -> String {
     let found = |name: &str| {
         RULES_DIRS
@@ -470,8 +469,7 @@ fn uinput_message(
                     "the installed 60-tobii.rules predates the virtual joystick and has \
                      no uinput line — reinstall the package, or copy the current \
                      assets/60-tobii.rules over it",
-                Some(true) => "install 60-tobii.rules and log out and back in",
-                None => "install 60-tobii.rules and log out and back in",
+                Some(true) | None => "install 60-tobii.rules and log out and back in",
             }
         ),
         Err(e) => format!("{NODE} unusable ({e:?})"),

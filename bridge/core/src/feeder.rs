@@ -34,8 +34,10 @@
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use tobii_output::freetrack::FT_HEAP_LEN;
 use tobii_output::TrackingFrame;
 
 use crate::shm::{Consumer, Provider};
@@ -185,4 +187,31 @@ pub fn ensure_started() {
         // loop for longer than a hitch.
         let _ = rx.recv_timeout(Duration::from_secs(1));
     });
+}
+
+/// The frame the mapping currently holds, or `None` when there is nothing a
+/// game should be shown.
+///
+/// Both client DLLs read through this, and the order inside it is load-bearing
+/// rather than incidental: the feeder is what creates the mapping, and the
+/// consumer handle is cached for the life of the process, so opening first
+/// would cache `None` and report "no data" for ever.
+///
+/// `None` also covers a mapping that exists but has never been written. That
+/// reads as a perfectly valid all-zero frame, which in a game is a live tracker
+/// sitting at dead centre — worse than no tracker, because nothing looks wrong.
+/// Since a DLL creates the mapping itself now, that state is ordinary whenever
+/// nothing is sending yet, so `DataID == 0` is reserved to mean exactly it (see
+/// [`tobii_output::freetrack::next_data_id`]).
+///
+/// The mapping is opened once and reused: a game polls for data every frame, so
+/// re-opening it per call would be a syscall per frame for nothing.
+pub fn published_frame() -> Option<[u8; FT_HEAP_LEN]> {
+    static SHM: OnceLock<Option<Consumer>> = OnceLock::new();
+    ensure_started();
+    let raw = SHM.get_or_init(Consumer::open).as_ref()?.read();
+    if u32::from_le_bytes(raw[0..4].try_into().expect("4-byte slice")) == 0 {
+        return None;
+    }
+    Some(raw)
 }

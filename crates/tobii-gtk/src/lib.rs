@@ -251,12 +251,12 @@ pub fn run() -> glib::ExitCode {
                 w.present();
                 return;
             }
-            // Cloned, not taken. Every handle in a `device::Session` is a clone of a
-            // shared thing — an `Arc`, a `Sender`, a `Demand` — so this shares
-            // the one device thread. Taking it left the slot empty, and the
-            // next hub in a long-lived background process spawned a SECOND
-            // device thread that never exits; two of them then raced for a USB
-            // interface only one can claim.
+            // Cloned, not taken. Every handle in a `device::Session` is a
+            // clone of a shared thing — an `Arc`, a `Sender`, a `Demand` — so
+            // this shares the one device thread. Taking it left the slot empty,
+            // and the next hub in a long-lived background process spawned a
+            // SECOND device thread that never exits; two of them then raced for
+            // a USB interface only one can claim.
             let s = session
                 .borrow_mut()
                 .get_or_insert_with(device::spawn)
@@ -824,7 +824,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     ));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
     // tracker does, not about how this program behaves.
-    let games_row = crate::games::GamesRow::build(std::sync::Arc::clone(&joystick_status));
+    let games_row = crate::games::GamesRow::build(joystick_status);
     right.append(&section(
         "Head tracking for games",
         "Sends head tracking and gaze to a game. Wrap the game with \
