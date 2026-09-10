@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "NPClient64"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tobii-bridge-core",
  "tobii-output",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "freetrackclient64"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tobii-bridge-core",
  "tobii-output",
@@ -26,7 +26,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "tobii-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tobii-bridge-core",
  "tobii-output",
@@ -34,21 +34,21 @@ dependencies = [
 
 [[package]]
 name = "tobii-bridge-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tobii-output",
 ]
 
 [[package]]
 name = "tobii-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tobii-protocol",
 ]
 
 [[package]]
 name = "tobii-headpose"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tobii-config",
  "tobii-protocol",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "tobii-output"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "tobii-config",
@@ -66,4 +66,4 @@ dependencies = [
 
 [[package]]
 name = "tobii-protocol"
-version = "0.1.0"
+version = "0.2.0"

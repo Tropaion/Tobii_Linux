@@ -177,6 +177,40 @@ because the reasoning is worth more than the tidiness.
   falling back; GTK's own threads could not be separated out. Worth one clean
   measurement.
 
+### 11.3a Game output (new in v0.2.0)
+
+- **Nothing has been consumed by a real game, and no real head has driven the
+  axes.** Every figure in the v0.2.0 notes came from synthetic poses fed through
+  the shipped code and read back by SDL, joydev, DirectInput or the FreeTrack
+  client. That proves the plumbing, not the feel — the amplification default,
+  the auto-recentre, and the per-axis **signs** are all unvalidated by use.
+- **Our own udev rule has never been shown to work in isolation.** `/dev/uinput`
+  is writable on the development machine because Steam, KDE Connect and Logitech
+  each ship a rule granting it. Every "the joystick works" result was therefore
+  obtained on a borrowed grant. The packaged rule is believed correct and is
+  unproven.
+- **`tobii update` cannot deliver the udev rule**, since it replaces binaries
+  only. Anyone upgrading into this feature has a rules file that looks installed
+  and lacks the uinput line; `tobii debug` detects and names that state, which is
+  a mitigation and not a fix.
+- **Some games' "look" axis is a rate control**, so a successful bind is not
+  evidence the sink works. There is no way to detect this from our side.
+- **Steam Input can hide or remangle the device** for a Steam-launched game.
+  Documented, not reproduced here.
+- **The bridge is 64-bit only.** A 32-bit game finds no DLL while `install`
+  reports success. Judged acceptable: of the head-tracking titles that run on
+  Linux, Falcon BMS is the only active 32-bit holdout.
+- **Flatpak/Snap Steam is half-supported** — the install finds the prefix, the
+  launch wrapper probably cannot reach the hub from inside the sandbox.
+  Unmeasured in both directions.
+- **`GAME_ID` and the feeder's `Once` are per DLL image, not per process.** A
+  game loading both client DLLs gets two of each, so the TrackIR profile id
+  reaches the mapping only when that DLL also won the port. Harmless today
+  because nothing reads `GameID` back.
+- **The feeder thread's failure to start is never surfaced.** `Started` is
+  discarded by the caller, so a DLL that is waiting on a port held by another
+  wineserver session looks identical to one with nothing sending.
+
 ### 11.4 Environmental
 
 - **Glyph clipping at fractional display scale.** Tops of tall glyphs appear

@@ -11,7 +11,7 @@ exclude = ["bridge"]
 # One version for the whole workspace: it is what a release is tagged with and
 # what the updater compares against, so it cannot be per-crate without the
 # question "which crate's version am I running?" having several answers.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["Fabian Plaimauer"]
