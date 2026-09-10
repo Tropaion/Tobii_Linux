@@ -24,7 +24,7 @@
 //! frame whose `wPFrameSignature` did not change (assumed yes, which is why the
 //! counter advances on every fill). Both need a game that will actually consume
 //! this DLL — see `docs/wiki/Game-Output.md` on the signature check that
-//! currently prevents that.
+//! currently prevents that, and on the TIR5 checksum this does not compute.
 
 #![allow(non_snake_case)]
 

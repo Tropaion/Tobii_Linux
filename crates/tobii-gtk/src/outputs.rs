@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tobii_ipc::{subs, ClientId, LeaseAction, Server, StatusCode};
+use tobii_output::sinks::JoystickHandle;
 
 use crate::device::{ConnStatus, Demand, DemandGuard, DeviceState, Lease};
 
@@ -236,12 +237,12 @@ impl GameOutput {
     /// Off is the default, deliberately: a hub that started steering games the
     /// moment it was installed would be a surprise, and the illuminator rule
     /// says nothing about who is allowed to consume the data.
-    pub fn for_session() -> Option<GameOutput> {
+    pub fn for_session(joystick: Option<JoystickHandle>) -> Option<GameOutput> {
         let cfg = tobii_output::games::load_output_config();
         if !cfg.enabled {
             return None;
         }
-        Self::from_config(cfg)
+        Self::from_config(cfg, joystick)
     }
 
     /// The same, from a config given rather than read.
@@ -250,7 +251,10 @@ impl GameOutput {
     /// worth asserting is that a datagram actually leaves, and that cannot be
     /// checked against whatever `games.toml` happens to say on the machine
     /// running the test.
-    fn from_config(cfg: tobii_output::games::OutputConfig) -> Option<GameOutput> {
+    fn from_config(
+        cfg: tobii_output::games::OutputConfig,
+        joystick: Option<JoystickHandle>,
+    ) -> Option<GameOutput> {
         let mut router = tobii_output::Router::new(cfg.rate_hz);
         if let Some(spec) = &cfg.opentrack {
             match spec
@@ -274,6 +278,11 @@ impl GameOutput {
                     "game output: could not open the bridge sink on port {port} ({e})"
                 )),
             }
+        }
+        // Handed in, never created here: the device outlives any one session.
+        // See `JoystickHandle`.
+        if let Some(js) = joystick {
+            router.add(Box::new(js));
         }
         if router.sink_count() == 0 {
             tobii_diagnostics::log::warn(
@@ -769,7 +778,7 @@ mod tests {
             bridge_port: None,
             ..OutputConfig::default()
         };
-        let mut out = GameOutput::from_config(cfg).expect("a router with one sink");
+        let mut out = GameOutput::from_config(cfg, None).expect("a router with one sink");
 
         // A sample the tracker would produce with both eyes visible.
         let mut sample = tobii_protocol::GazeSample {

@@ -40,7 +40,8 @@ inspired by the original Tobii Experience UI.
   infrared camera at ~12 ms a frame. The model is **not shipped**: its weights
   are non-commercial-only, so the program shows the terms and fetches it only if
   you agree.
-- **Output to games** over opentrack's UDP protocol.
+- **Output to games** as a virtual joystick (nothing else needed), over
+  opentrack's UDP protocol, or to TrackIR/FreeTrack games through a Wine bridge.
 - **Pitch zero calibration** — the model reports pitch in its own frame, offset
   by how your tracker is mounted. `tobii headpose --calibrate-pitch` measures it
   once.
@@ -391,6 +392,34 @@ Steam's `%command%`, Lutris's and Heroic's wrapper fields, and a plain shell
 script all work with no further support, which is why this is a wrapper rather
 than a setting.
 
+### Games with no head-tracking support (virtual joystick)
+
+Most games have never heard of head tracking, but nearly all of them can bind a
+joystick axis. So game output also presents one:
+
+```sh
+tobii games set joystick true    # on by default
+```
+
+It appears as **Tobii Eye Tracker 5 head tracking**, an eight-axis controller:
+
+| Axis | Carries | Full scale |
+|---|---|---|
+| X, Y, Z | head position | ±500 mm |
+| RX, RY, RZ | yaw, pitch, roll | ±180°, ±90°, ±180° |
+| Throttle, Rudder | gaze on screen, left→right and top→bottom | the whole screen |
+
+Nothing else has to be installed — no opentrack, no Wine. Because it is an
+ordinary evdev joystick it is read by SDL, by the legacy `/dev/input/js*`
+interface, and by Wine's `winebus`, so **Proton games see it as a normal game
+controller** too. The last two axes are gaze, which no other head tracker
+offers; bind them to a free-look axis and the camera follows your eyes.
+
+This needs write access to `/dev/uinput`, which the packaged udev rule grants —
+`tobii debug` reports whether it is there. The rule is one line and the file
+says how to remove it if you would rather not grant it; everything else keeps
+working without it.
+
 ### Games that speak TrackIR or FreeTrack (Wine)
 
 opentrack is not the only protocol. Windows games under Wine ask for TrackIR or
@@ -408,9 +437,15 @@ The hub sends frames to the provider over loopback UDP, the provider writes
 
 **TrackIR is pointed at an already-installed client** (opentrack's, if you have
 it) rather than at ours, because games verify NaturalPoint's signature and a
-clean-room DLL cannot answer it. Nothing is copied — our provider still supplies
-the data behind it. `--npclient ours` overrides that for a game that does not
-check.
+clean-room DLL cannot answer it. That is not a guess: the established
+implementations answer `NP_GetSignature` from two 200-byte tables XORed
+together, which is NaturalPoint's own signature data carried in obfuscated
+halves — which is also why scanning those DLLs for the string "NaturalPoint"
+finds nothing. Shipping it would mean redistributing their blob, so we do not.
+Nothing is copied — our provider still supplies the data behind it.
+`--npclient ours` overrides that for a game that does not check, and FreeTrack
+has no signature at all, so a game that speaks FreeTrack works with our own DLL
+today.
 
 Verified end to end on a Wine 11.17 prefix: the bridge's own probe loads the DLL
 the way a game does (`LoadLibrary` + `GetProcAddress`), and a pose sent as

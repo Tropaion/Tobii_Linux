@@ -61,6 +61,14 @@ pub struct OutputConfig {
     pub opentrack: Option<String>,
     /// Loopback port for the Wine bridge, or `None` to not send there.
     pub bridge_port: Option<u16>,
+    /// Whether to present a virtual joystick on `/dev/uinput`.
+    ///
+    /// On by default, unlike every other sink, because it is the only one that
+    /// does something on a machine with nothing else installed: the other two
+    /// are fire-and-forget UDP to opentrack and to a Wine prefix, so with
+    /// neither present, turning game output on would otherwise have no effect
+    /// whatsoever and no way to tell that apart from a fault.
+    pub joystick: bool,
     /// Gaze-driven camera offset.
     pub extended_view: ExtendedView,
 }
@@ -73,6 +81,7 @@ impl Default for OutputConfig {
             filter_alpha: tobii_headpose::filter::DEFAULT_ALPHA,
             opentrack: Some(DEFAULT_OPENTRACK_ADDR.to_string()),
             bridge_port: Some(DEFAULT_BRIDGE_PORT),
+            joystick: true,
             extended_view: ExtendedView::default(),
         }
     }
@@ -122,6 +131,7 @@ impl OutputConfig {
             "bridge_port = {}\n",
             self.bridge_port.unwrap_or(0)
         ));
+        s.push_str(&format!("joystick = {}\n", self.joystick));
         s.push_str(&format!("extended_view = {}\n", self.extended_view.enabled));
         s.push_str(&format!("ev_hold_ms = {}\n", self.extended_view.hold_ms));
         s.push_str(&axis_to_toml("ev_yaw", &self.extended_view.yaw));
@@ -194,6 +204,10 @@ impl OutputConfig {
             "bridge_port" => match value.parse::<u16>() {
                 Ok(0) => self.bridge_port = None,
                 Ok(p) => self.bridge_port = Some(p),
+                Err(_) => return false,
+            },
+            "joystick" => match value.parse::<bool>() {
+                Ok(b) => self.joystick = b,
                 Err(_) => return false,
             },
             "extended_view" => match value.parse::<bool>() {
@@ -310,6 +324,9 @@ mod tests {
             filter_alpha: 0.4,
             opentrack: Some("192.168.1.7:4242".to_string()),
             bridge_port: Some(5000),
+            // Off, because the default is on: the round-trip tests below only
+            // mean anything if every field differs from its default.
+            joystick: false,
             extended_view: ExtendedView {
                 hold_ms: 350,
                 yaw: AxisResponse {

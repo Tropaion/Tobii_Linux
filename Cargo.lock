@@ -1527,6 +1527,7 @@ version = "0.1.0"
 name = "tobii-output"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tobii-config",
  "tobii-headpose",
  "tobii-protocol",

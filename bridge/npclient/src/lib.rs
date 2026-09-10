@@ -68,11 +68,21 @@ pub unsafe extern "system" fn NP_GetData(data: *mut TrackIrData) -> i32 {
     NP_OK
 }
 
-/// NaturalPoint's anti-clone check.
+/// NaturalPoint's anti-clone check, deliberately unanswered.
 ///
-/// We do **not** ship NaturalPoint's signature blob. Whether Star Citizen gates
-/// on it is unknown; the spike build answers that by logging whether the game
-/// calls this and whether it stops asking for data afterwards.
+/// A real client fills two 200-byte buffers — `DllSignature` and
+/// `AppSignature` — and the game compares them against what it expects. The
+/// established open implementations produce them by XORing two byte tables
+/// together, which is NaturalPoint's own signature data carried in obfuscated
+/// halves; that is why scanning such a DLL for the string "NaturalPoint" finds
+/// nothing, and why that absence is not evidence the check is fake.
+///
+/// We do not ship their blob, so this returns success without filling the
+/// buffer and a game that checks will reject us. `tobii bridge install` points
+/// TrackIR at an already-installed client for exactly this reason; FreeTrack
+/// has no signature and works with our own DLL. Whether any particular game
+/// gates on it is still unmeasured — the spike build answers that by logging
+/// whether the game calls this and whether it stops asking for data afterwards.
 ///
 /// # Safety
 /// `sig` must point to writable storage for the signature pair.
@@ -88,7 +98,11 @@ pub unsafe extern "system" fn NP_GetSignature(sig: *mut c_void) -> i32 {
 pub unsafe extern "system" fn NP_QueryVersion(version: *mut u16) -> i32 {
     trace!("NP_QueryVersion(version={version:p})");
     if !version.is_null() {
-        // 4.00, the version TrackIR clients report.
+        // 4.00. The established open client reports 5.00, but TIR5 also
+        // requires a checksum computed over the head-pose data and relayed to
+        // the game, which this does not compute — claiming the newer version
+        // without it may be worse than claiming the older one. Untested either
+        // way, so it is left where it was rather than changed on a hunch.
         *version = 0x0400;
     }
     NP_OK

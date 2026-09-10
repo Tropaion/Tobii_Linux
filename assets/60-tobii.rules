@@ -39,3 +39,23 @@
 SUBSYSTEM=="usb", ATTR{idVendor}=="2104", ATTR{idProduct}=="0102", MODE="0660", TAG+="uaccess"
 # Runtime mode
 SUBSYSTEM=="usb", ATTR{idVendor}=="2104", ATTR{idProduct}=="0313", MODE="0660", TAG+="uaccess"
+
+# ---------------------------------------------------------------------------
+# Virtual joystick (optional — safe to delete the rule at the end of this file)
+#
+# The "Virtual joystick" output presents head pose and gaze as a game
+# controller, which is how a native Linux or Proton game receives head tracking
+# without Wine and without opentrack. Creating one needs write access to
+# /dev/uinput, which is root-only by default on most distributions.
+#
+# What this grants: any program running as the logged-in user may create
+# virtual input devices — that is, synthesise keystrokes and pointer motion
+# into the session. That is a real capability, and it is the same one Steam,
+# KDE Connect and Logitech's own rules already grant on machines that have
+# them; this file is written the same way they are. Delete the last line below
+# if you do not want it. Everything except the virtual joystick still works,
+# and the hub will say so rather than failing silently.
+#
+# static_node= creates the node before the module is loaded, so the first
+# program to open it triggers the autoload rather than finding nothing there.
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"

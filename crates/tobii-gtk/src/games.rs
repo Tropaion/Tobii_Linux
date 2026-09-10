@@ -62,6 +62,11 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool) -> String {
         return "Off. Turn on to send head tracking to games.".to_string();
     }
     let mut sinks: Vec<String> = Vec::new();
+    // Named first because it is the one that needs nothing else installed, so
+    // it is the one a reader of this line most likely actually has.
+    if cfg.joystick {
+        sinks.push("a virtual joystick".to_string());
+    }
     if let Some(addr) = &cfg.opentrack {
         sinks.push(format!("opentrack ({addr})"));
     }
@@ -179,11 +184,44 @@ impl GamesRow {
             });
         }
 
+        // Its own row rather than a fourth item on the top row: the top row is
+        // already a switch and three radios, and the hub is laid out to stay
+        // narrow.
+        let joy = CheckButton::new();
+        joy.set_active(cfg.joystick);
+        joy.set_valign(Align::Center);
+        let joy_lbl = Label::new(Some("Virtual joystick"));
+        joy_lbl.set_valign(Align::Center);
+        joy_lbl.set_margin_top(2);
+        joy_lbl.set_margin_bottom(2);
+        let joy_row = gtk::Box::new(Orientation::Horizontal, 5);
+        joy_row.append(&joy);
+        joy_row.append(&joy_lbl);
+        joy_row.set_tooltip_text(Some(
+            "Present head pose and gaze as a game controller, for games with no \
+             head-tracking support. Works in native and Proton games without Wine \
+             or opentrack.",
+        ));
+        {
+            let refresh = refresh.clone();
+            joy.connect_toggled(move |c| {
+                let mut cfg = load_output_config();
+                cfg.joystick = c.is_active();
+                if let Err(e) = save_output_config(&cfg) {
+                    tobii_diagnostics::log::warn(&format!(
+                        "could not save the virtual-joystick setting: {e}"
+                    ));
+                }
+                refresh();
+            });
+        }
+
         let controls = gtk::Box::new(Orientation::Vertical, 8);
         let top = gtk::Box::new(Orientation::Horizontal, 16);
         top.append(&sw);
         top.append(&strength_ctl);
         controls.append(&top);
+        controls.append(&joy_row);
         controls.append(&status);
 
         let row = GamesRow { controls, status };
@@ -207,11 +245,16 @@ impl GamesRow {
 mod tests {
     use super::*;
 
+    /// A config with only the sinks named. `joystick` is off rather than
+    /// inherited from the defaults, so these cases keep testing what they were
+    /// written to test — with it on, "no destination is configured" would be
+    /// unreachable.
     fn cfg_with(enabled: bool, opentrack: Option<&str>, bridge: Option<u16>) -> OutputConfig {
         OutputConfig {
             enabled,
             opentrack: opentrack.map(str::to_string),
             bridge_port: bridge,
+            joystick: false,
             ..OutputConfig::default()
         }
     }
@@ -266,6 +309,26 @@ mod tests {
     fn both_destinations_are_named() {
         let s = status_text(&cfg_with(true, Some("127.0.0.1:4242"), Some(4243)), true);
         assert!(s.contains("4242") && s.contains("4243"), "{s}");
+    }
+
+    /// The joystick is the sink that works with nothing else installed, so a
+    /// user reading this line with no opentrack and no Wine prefix has to be
+    /// told that something is nevertheless receiving.
+    #[test]
+    fn the_virtual_joystick_is_named_like_any_other_destination() {
+        let only_joystick = OutputConfig {
+            enabled: true,
+            opentrack: None,
+            bridge_port: None,
+            joystick: true,
+            ..OutputConfig::default()
+        };
+        let s = status_text(&only_joystick, true);
+        assert!(s.contains("joystick"), "{s}");
+        assert!(
+            !s.contains("no destination"),
+            "a joystick is a destination: {s}"
+        );
     }
 
     #[test]

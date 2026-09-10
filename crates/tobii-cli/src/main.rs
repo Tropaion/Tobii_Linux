@@ -65,12 +65,14 @@ fn main() -> ExitCode {
         (Some("cal-blob"), _) => cal_blob(),
         (Some("cal-points"), _) => cal_points(),
         (Some("enabled-eye"), arg) => enabled_eye_cmd(arg),
+        (Some("games"), sub) => games_cmd(sub, &args),
         _ => {
             eprintln!(
                 "usage:\n  \
                  tobii update [--install]\n  \
                  tobii stream [--json] [--eyes]\n  \
                  tobii game -- <command> [args...]\n  \
+                 tobii games [set KEY VALUE]\n  \
                  tobii bridge install --prefix PATH\n  \
                  tobii bridge run --prefix PATH\n  \
                  tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE]\n  \
@@ -1871,9 +1873,59 @@ fn apply_games_opt_in(cfg: &mut tobii_output::games::OutputConfig, args: &[Strin
     if !opted_in {
         cfg.extended_view.enabled = false;
         cfg.bridge_port = None;
+        // Same reasoning, and louder: a virtual joystick is visible. Somebody
+        // running the command they have always run would find a new controller
+        // in every game's bind list, which is a stranger thing to happen than
+        // an unused socket.
+        cfg.joystick = false;
     }
     if args.iter().any(|a| a == "--no-extended-view") {
         cfg.extended_view.enabled = false;
+    }
+}
+
+/// `tobii games` — show the game-output settings; `tobii games set K V` — change one.
+///
+/// Writes through [`OutputConfig::apply_key`], the same function the file
+/// parser uses, so the CLI cannot accept a spelling the file would reject or
+/// vice versa. That is the whole reason this command is thin: the validation
+/// lives with the config, not here.
+fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
+    use tobii_output::games::{load_output_config, save_output_config};
+
+    match sub {
+        None => {
+            print!("{}", load_output_config().to_toml());
+            println!("\n# path: {}", tobii_output::games::games_path().display());
+            Ok(())
+        }
+        Some("set") => {
+            let (key, value) = match (args.get(3), args.get(4)) {
+                (Some(k), Some(v)) => (k.as_str(), v.as_str()),
+                _ => return Err("usage: tobii games set KEY VALUE".into()),
+            };
+            let mut cfg = load_output_config();
+            if !cfg.apply_key(key, value) {
+                // The valid spellings are exactly the keys the file writes, so
+                // they are listed from a serialized config rather than from a
+                // second hand-maintained list that could drift from it.
+                let doc = cfg.to_toml();
+                let keys: Vec<&str> = doc
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with('#'))
+                    .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim()))
+                    .collect();
+                return Err(format!(
+                    "{key} = {value:?} was not accepted.\nvalid keys: {}",
+                    keys.join(", ")
+                )
+                .into());
+            }
+            save_output_config(&cfg)?;
+            println!("{key} = {value}");
+            Ok(())
+        }
+        Some(other) => Err(format!("unknown: tobii games {other} (try: tobii games set KEY VALUE)").into()),
     }
 }
 
@@ -1933,6 +1985,12 @@ fn headpose(args: &[String]) -> CmdResult {
     if let Some(port) = cfg.bridge_port {
         router.add(Box::new(tobii_output::sinks::BridgeUdp::new(port)?));
     }
+    if cfg.joystick {
+        // Fatal here, unlike in the hub: this command was asked for one run in
+        // a terminal, and failing loudly with the reason beats streaming to a
+        // sink the user believes exists.
+        router.add(Box::new(tobii_output::sinks::UinputJoystick::open()?));
+    }
 
     let mut model = open_model(&model_choice(args));
 
@@ -1960,6 +2018,12 @@ fn headpose(args: &[String]) -> CmdResult {
     }
     if let Some(port) = cfg.bridge_port {
         eprintln!("also sending to the FreeTrack bridge on port {port}");
+    }
+    if cfg.joystick {
+        eprintln!(
+            "also presenting a virtual joystick — bind its axes in any game that \
+             has no head-tracking support"
+        );
     }
     if model.is_none() {
         eprintln!(
@@ -2454,6 +2518,40 @@ mod tests {
         assert_eq!(exit_code_of(killed), 137, "the shell's 128 + signal");
     }
 
+    /// The keys `tobii games set` accepts must be exactly the keys the file
+    /// writes. They are derived from a serialized config rather than listed by
+    /// hand precisely so they cannot drift apart — but the derivation has to
+    /// skip the file's comment lines, two of which contain `" = "`.
+    #[test]
+    fn the_settable_keys_are_the_keys_the_file_writes() {
+        let doc = tobii_output::games::OutputConfig::default().to_toml();
+        let keys: Vec<&str> = doc
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim()))
+            .collect();
+        assert!(keys.contains(&"joystick"), "{keys:?}");
+        assert!(
+            !keys.iter().any(|k| k.starts_with('#')),
+            "the file's comments are not settings: {keys:?}"
+        );
+        let mut cfg = tobii_output::games::OutputConfig::default();
+        for k in &keys {
+            // Every listed key must actually be settable, or the error message
+            // that lists them is lying about what it accepts.
+            let probe = match *k {
+                "opentrack" => "127.0.0.1:1",
+                "ev_yaw_curve" | "ev_pitch_curve" => "linear",
+                _ if k.ends_with("_deg") || *k == "rate_hz" => "1",
+                "filter_alpha" => "0.5",
+                "ev_hold_ms" => "1",
+                "bridge_port" => "1",
+                _ => "true",
+            };
+            assert!(cfg.apply_key(k, probe), "{k} is listed but not settable");
+        }
+    }
+
     /// `tobii headpose` shipped in v0.1.0 as plain head pose to opentrack. The
     /// config's defaults have Extended View on and a bridge port set, so
     /// reading the file without this narrowing would have added gaze steering
@@ -2472,6 +2570,7 @@ mod tests {
         apply_games_opt_in(&mut c, &plain);
         assert!(!c.extended_view.enabled, "gaze must not steer by default");
         assert_eq!(c.bridge_port, None, "no second socket by default");
+        assert!(!c.joystick, "no new controller appears in anyone's games");
 
         // Opted in for one run.
         let mut c = OutputConfig::default();

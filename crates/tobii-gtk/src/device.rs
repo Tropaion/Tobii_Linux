@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tobii_protocol::camera::decode_camera_frame;
 use tobii_protocol::frame::OP_GAZE_NOTIFY;
 use tobii_protocol::{CameraFrame, DisplayCorners, EnabledEye, GazeSample};
+use tobii_output::sinks::{JoystickHandle, UinputJoystick};
 use tobii_usb::{Connection, Transport, UsbError, UsbTransport};
 
 /// The eye-camera stream mirrored into the hub preview (one of the stereo pair).
@@ -922,7 +923,14 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
         // dropped: "select left eye only" typed into an idle hub has to take
         // effect, so a queued command is itself a reason to open the session.
         let mut pending: Vec<DeviceCommand> = Vec::new();
+        // The virtual joystick, if the setting asks for one. Owned here rather
+        // than by a session because a game enumerates controllers when it
+        // launches and the tracker is dark until something asks for it — see
+        // `JoystickHandle`.
+        let mut joystick: Option<JoystickHandle> = None;
+        let mut joystick_state = JoystickWanted::default();
         loop {
+            joystick_state.sync(&mut joystick);
             // Nothing wants the tracker: do not open it. This is the whole
             // point of `Demand` — an idle hub leaves the illuminators dark and
             // the USB device free for `tobii headpose`.
@@ -947,6 +955,10 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
                     }
                 }
                 std::thread::sleep(Duration::from_millis(120));
+                // Polled while idle too, so ticking the checkbox in an idle hub
+                // makes the controller appear rather than waiting for whatever
+                // next wakes the tracker.
+                joystick_state.sync(&mut joystick);
             }
             device_session(
                 &thread_state,
@@ -954,10 +966,78 @@ pub fn spawn() -> (Arc<Mutex<DeviceState>>, Sender<DeviceCommand>, Demand) {
                 &thread_lease,
                 &rx,
                 &mut pending,
+                joystick.as_ref(),
             );
         }
     });
     (state, tx, demand)
+}
+
+/// Keeps the virtual joystick's existence matched to the setting.
+///
+/// The device is created when game output and the joystick are both on and
+/// destroyed when either goes off, so a game's controller list reflects what
+/// the user actually asked for — see
+/// [`JoystickHandle`](tobii_output::sinks::JoystickHandle) for why its lifetime
+/// cannot simply be the tracking session's.
+///
+/// Two pieces of state that look like caching but are not:
+///
+/// * `checked` rate-limits the config read. [`sync`](Self::sync) is called on
+///   every 120 ms idle tick, and re-reading a file eight times a second forever
+///   is not what an idle hub should be doing.
+/// * `warned` stops a failure from logging once a second for the life of the
+///   session. `/dev/uinput` being unwritable is a standing condition with a
+///   standing fix, not an event.
+#[derive(Default)]
+struct JoystickWanted {
+    checked: Option<Instant>,
+    warned: bool,
+}
+
+/// How often the setting is re-read while idle.
+const JOYSTICK_POLL: Duration = Duration::from_secs(1);
+
+impl JoystickWanted {
+    fn sync(&mut self, slot: &mut Option<JoystickHandle>) {
+        let now = Instant::now();
+        if self
+            .checked
+            .is_some_and(|t| now.saturating_duration_since(t) < JOYSTICK_POLL)
+        {
+            return;
+        }
+        self.checked = Some(now);
+
+        let cfg = tobii_output::games::load_output_config();
+        let wanted = cfg.enabled && cfg.joystick;
+        match (wanted, slot.is_some()) {
+            (true, false) => match UinputJoystick::open() {
+                Ok(js) => {
+                    tobii_diagnostics::log::info(
+                        "game output: virtual joystick created — bind its axes in your game",
+                    );
+                    self.warned = false;
+                    *slot = Some(JoystickHandle::new(js));
+                }
+                Err(e) => {
+                    if !self.warned {
+                        self.warned = true;
+                        tobii_diagnostics::log::warn(&format!(
+                            "game output: could not create the virtual joystick ({e})"
+                        ));
+                    }
+                }
+            },
+            // Dropping the handle removes the device, which is the point: a
+            // controller the user has switched off must leave the bind list.
+            (false, true) => {
+                *slot = None;
+                tobii_diagnostics::log::info("game output: virtual joystick removed");
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Tell whoever is waiting that a queued command will never run.
@@ -1000,6 +1080,7 @@ fn device_session(
     lease: &Arc<Mutex<Lease>>,
     rx: &Receiver<DeviceCommand>,
     pending: &mut Vec<DeviceCommand>,
+    joystick: Option<&JoystickHandle>,
 ) {
     // Runs on every exit from this function, however it left — a lease, a
     // disconnect, or the demand going quiet. Anything asked for while the hub
@@ -1075,7 +1156,7 @@ fn device_session(
                 // watching — which makes toggling the games switch take effect
                 // without restarting the hub, and re-reads the display corners
                 // that Extended View needs after a screen change.
-                let mut games = crate::outputs::GameOutput::for_session();
+                let mut games = crate::outputs::GameOutput::for_session(joystick.cloned());
 
                 let mut quiet_since = Instant::now();
                 // Anything queued while the tracker was off is applied now that

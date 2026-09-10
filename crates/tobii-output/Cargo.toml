@@ -12,3 +12,9 @@ tobii-protocol = { path = "../tobii-protocol" }
 # cross-compile tract-onnx's tree to x86_64-pc-windows-gnu for nothing.
 tobii-headpose = { path = "../tobii-headpose", default-features = false }
 tobii-config = { path = "../tobii-config" }
+
+# Linux only: `sinks::uinput_joystick` talks to /dev/uinput through `ioctl`,
+# which std has no wrapper for. Gated by target because this crate also
+# cross-compiles to x86_64-pc-windows-gnu for the Wine bridge.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

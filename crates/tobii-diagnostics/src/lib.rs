@@ -77,6 +77,7 @@ pub fn report() -> String {
     let _ = writeln!(o, "\ndevice");
     let _ = writeln!(o, "  {:<16} {}", format!("usb {VID}:{PID}"), usb_present());
     let _ = writeln!(o, "  {:<16} {}", "udev rule", udev_rule());
+    let _ = writeln!(o, "  {:<16} {}", "uinput", uinput());
 
     // Under sudo this whole block would be a lie, so it does not get printed.
     //
@@ -385,6 +386,31 @@ fn udev_rule() -> String {
              have any effect; replace it with 60-tobii.rules"
         ),
         (None, None) => "NOT INSTALLED — the tracker needs root without it".into(),
+    }
+}
+
+/// Whether the virtual-joystick output can work.
+///
+/// The three ways it fails are indistinguishable from inside a game — the
+/// controller simply is not in the bind list — and each has a different fix, so
+/// the report separates them rather than saying "not available".
+///
+/// Access is probed by actually opening the node for writing rather than by
+/// reading its mode: the grant is an ACL applied by logind, so the mode bits
+/// say `rw-rw----` root:root on a machine where it works perfectly.
+fn uinput() -> String {
+    const NODE: &str = "/dev/uinput";
+    if !Path::new(NODE).exists() {
+        return format!(
+            "{NODE} MISSING — the uinput module is not loaded and no rule creates              the node; install 60-tobii.rules, or run: sudo modprobe uinput"
+        );
+    }
+    match std::fs::OpenOptions::new().write(true).open(NODE) {
+        Ok(_) => "writable — the virtual joystick can be created".into(),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => format!(
+            "{NODE} NOT WRITABLE — the virtual joystick cannot be created;              install 60-tobii.rules and log out and back in"
+        ),
+        Err(e) => format!("{NODE} unusable ({e})"),
     }
 }
 
