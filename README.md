@@ -290,8 +290,28 @@ leaves the device to root. Give a group access instead — pick one your user is
 already in (`id -nG`), often `plugdev` on Debian-family systems:
 
 ```sh
-sudo sed -i 's/MODE="0660"/MODE="0660", GROUP="plugdev"/' /etc/udev/rules.d/60-tobii.rules
-sudo udevadm control --reload && sudo udevadm trigger
+# Addressed to the tracker lines only — see the warning below.
+sudo sed -i '/idVendor/s/MODE="0660"/MODE="0660", GROUP="plugdev"/' \
+    /etc/udev/rules.d/60-tobii.rules
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb
+```
+
+> **Do not drop the `/idVendor/` address.** The file also carries a
+> `MODE="0660"` line for `/dev/uinput` (the virtual joystick). An unaddressed
+> `sed` would put `GROUP="plugdev"` on that one too, and every member of the
+> group — logged in or not — could then synthesise keystrokes into any local
+> session. That is a much broader grant than the `uaccess` one this section is
+> replacing, which is scoped to whoever is actually sitting at the machine.
+
+Without logind the **virtual joystick** needs its own group grant as well, and a
+second one: udev's `uaccess` is also what makes the device it creates readable,
+so add your group to `/dev/uinput` and to the created node:
+
+```sh
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="plugdev", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="?*", MODE="0660", GROUP="plugdev"' \
+  | sudo tee /etc/udev/rules.d/61-tobii-nologind.rules
+sudo udevadm control --reload
 ```
 
 ## Usage
@@ -455,6 +475,10 @@ publishes it into `FT_SharedMem` where the game reads it. A second executable
 would have to run inside the game's own wineserver session, which for a Steam
 game means reproducing Proton's entire launch environment; the DLL is already
 in there.
+
+**64-bit games only.** A 32-bit game asks for `freetrackclient.dll` without the
+`64` and finds nothing — see
+[`docs/wiki/Game-Output.md`](docs/wiki/Game-Output.md).
 
 `install --steam` finds the prefix from Steam's own library files and writes the
 registry with **the Proton build the prefix records**, not whatever `wine` is on

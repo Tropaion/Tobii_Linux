@@ -118,6 +118,15 @@ fn find_installed_npclient() -> Option<PathBuf> {
 /// was the thing that received frames and created `FT_SharedMem`; the DLLs feed
 /// themselves now, so it is a diagnostic — a console that says what is arriving
 /// — and a prefix without it works.
+///
+/// **[LIMITATION] 64-bit games only.** A 32-bit game calls
+/// `LoadLibrary("freetrackclient.dll")` — no `64` — and finds nothing here, so
+/// it gets no tracking while `install` reports success. That is a real slice of
+/// the head-tracking audience (Falcon BMS, IL-2 1946, the FSX generation), and
+/// opentrack ships all four names side by side for exactly this reason.
+/// Closing it means building the two client crates for `i686-pc-windows-gnu` as
+/// well and adding them here; the registry key and install directory are shared,
+/// so nothing else changes.
 const ARTIFACTS: [(&str, bool); 3] = [
     ("tobii-bridge.exe", false),
     ("freetrackclient64.dll", true),
@@ -536,17 +545,24 @@ fn install(args: &[String]) -> CmdResult {
         println!("  {name}");
     }
     println!("copied {copied} file(s) into {}", dest.display());
+    // Said at install time, not only in the docs: a 32-bit game's failure to
+    // find a DLL is indistinguishable from every other "no tracking" cause.
+    println!("  (64-bit games only — a 32-bit game looks for freetrackclient.dll)");
 
     // FreeTrack always gets our own DLL: that ABI has no signature check, so
     // nothing stands between it and our data.
-    set_key(&wine, &prefix, FT_KEY, INSTALL_WIN_DIR)?;
+    let mut all_written = set_key(&wine, &prefix, FT_KEY, INSTALL_WIN_DIR)?;
+    // Held rather than printed as we go: "registered X" is only true once every
+    // write has landed, and printing it before the check put confident lines
+    // above the failure that contradicted it.
+    let registered;
 
     let mut third_party_np = false;
     let explicit_np = crate::flag_value(args, "--npclient");
     match choose_npclient(explicit_np, find_installed_npclient())? {
         NpSource::Ours => {
-            set_key(&wine, &prefix, NP_KEY, INSTALL_WIN_DIR)?;
-            println!("registered {INSTALL_WIN_DIR} for TrackIR and FreeTrack");
+            all_written &= set_key(&wine, &prefix, NP_KEY, INSTALL_WIN_DIR)?;
+            registered = format!("registered {INSTALL_WIN_DIR} for TrackIR and FreeTrack");
             if explicit_np != Some("ours") {
                 println!(
                     "\nnote: no third-party NPClient64.dll was found. Games that verify\n      \
@@ -559,11 +575,11 @@ fn install(args: &[String]) -> CmdResult {
         }
         NpSource::Installed(dir) => {
             let win = wine_path_for(&dir);
-            set_key(&wine, &prefix, NP_KEY, &win)?;
-            println!("registered {INSTALL_WIN_DIR} for FreeTrack");
-            println!("registered {win} for TrackIR");
-            println!(
-                "\nTrackIR points at the client already installed there, because games\n\
+            all_written &= set_key(&wine, &prefix, NP_KEY, &win)?;
+            registered = format!(
+                "registered {INSTALL_WIN_DIR} for FreeTrack\n\
+                 registered {win} for TrackIR\n\n\
+                 TrackIR points at the client already installed there, because games\n\
                  verify NaturalPoint's signature and a clean-room DLL cannot answer it.\n\
                  Nothing was copied."
             );
@@ -575,6 +591,22 @@ fn install(args: &[String]) -> CmdResult {
         }
     }
 
+    // Nothing below here is true if the keys did not land, so it is not
+    // printed. A game finds its client DLL through the registry and nowhere
+    // else — copied files alone install nothing.
+    if !all_written {
+        return Err(format!(
+            "the registry keys could not be written, so the DLLs are copied but \
+             nothing will load them.\n\
+             The wine used was {}. For a Steam title that must be the Proton \
+             build the prefix records; pass --wine explicitly if this one is \
+             wrong for it.",
+            wine.display()
+        )
+        .into());
+    }
+
+    println!("{registered}");
     println!();
     if third_party_np {
         println!(
@@ -598,18 +630,28 @@ fn install(args: &[String]) -> CmdResult {
 }
 
 /// Point one discovery key at `dir`.
-fn set_key(wine: &Path, prefix: &Path, key: &str, dir: &str) -> CmdResult {
+/// Write one registry key, reporting whether it actually landed.
+///
+/// The return value is load-bearing. This used to warn and return `Ok(())`, so
+/// a wine that ran but could not serve the prefix produced two warning lines
+/// followed by "registered …", the whole "now launch the game" paragraph and
+/// exit 0 — four confident lines burying the two that mattered. The registry
+/// path IS the installation: without it a game never finds the DLL, so a failed
+/// write is a failed install and has to be reported as one.
+fn set_key(wine: &Path, prefix: &Path, key: &str, dir: &str) -> Result<bool, String> {
     let status = wine_run(
         wine,
         prefix,
         &[
             "reg", "add", key, "/v", "Path", "/t", "REG_SZ", "/d", dir, "/f",
         ],
-    )?;
+    )
+    .map_err(|e| format!("{e}"))?;
     if !status.success() {
         eprintln!("warning: could not write {key}");
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// `tobii bridge run` — run the provider in the foreground.

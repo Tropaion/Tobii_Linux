@@ -365,14 +365,37 @@ fn usb_present() -> String {
 /// "worked" only because it also said `MODE="0666"`, which is a different and
 /// much broader grant. A leftover copy of the old file still wins on mode, so
 /// it is worth naming in the report rather than passing as installed.
+/// Whether an installed `60-tobii.rules` carries the uinput grant.
+///
+/// `None` when there is no rules file to inspect. `Some(false)` is the
+/// interesting answer: a machine that upgraded from before the virtual joystick
+/// has a rules file that looks installed and is missing the one line the
+/// joystick needs — and `tobii update` replaces binaries only, so it never
+/// delivers the new one.
+fn rules_grant_uinput() -> Option<bool> {
+    for dir in RULES_DIRS {
+        let path = format!("{dir}/60-tobii.rules");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            return Some(text.lines().any(|l| {
+                let l = l.trim();
+                !l.starts_with('#') && l.contains("uinput")
+            }));
+        }
+    }
+    None
+}
+
+/// Where a distribution may have put the rules file.
+const RULES_DIRS: [&str; 3] = [
+    "/etc/udev/rules.d",
+    "/usr/lib/udev/rules.d",
+    "/lib/udev/rules.d",
+];
+
 fn udev_rule() -> String {
-    const DIRS: [&str; 3] = [
-        "/etc/udev/rules.d",
-        "/usr/lib/udev/rules.d",
-        "/lib/udev/rules.d",
-    ];
     let found = |name: &str| {
-        DIRS.iter()
+        RULES_DIRS
+            .iter()
             .map(|d| format!("{d}/{name}"))
             .find(|p| Path::new(p).exists())
     };
@@ -380,7 +403,13 @@ fn udev_rule() -> String {
         (Some(new), Some(old)) => format!(
             "installed ({new}) — but {old} is still there and overrides its mode; delete it"
         ),
-        (Some(new), None) => format!("installed ({new})"),
+        (Some(new), None) => match rules_grant_uinput() {
+            Some(false) => format!(
+                "installed ({new}) — but it predates the virtual joystick and has no \
+                 uinput line; the tracker works, the joystick will not"
+            ),
+            _ => format!("installed ({new})"),
+        },
         (None, Some(old)) => format!(
             "installed ({old}), the OLD rule — its uaccess tag is set too late to \
              have any effect; replace it with 60-tobii.rules"
@@ -405,7 +434,7 @@ fn uinput() -> String {
         .open(NODE)
         .map(|_| ())
         .map_err(|e| e.kind());
-    uinput_message(Path::new(NODE).exists(), access)
+    uinput_message(Path::new(NODE).exists(), access, rules_grant_uinput())
 }
 
 /// The wording, separated from the probe so every branch can be tested.
@@ -414,7 +443,11 @@ fn uinput() -> String {
 /// branch the test host happens to take, and on a working machine that is the
 /// one branch whose literal has no line continuation and therefore cannot carry
 /// the defect the guard exists for.
-fn uinput_message(exists: bool, access: Result<(), std::io::ErrorKind>) -> String {
+fn uinput_message(
+    exists: bool,
+    access: Result<(), std::io::ErrorKind>,
+    rules_have_uinput: Option<bool>,
+) -> String {
     const NODE: &str = "/dev/uinput";
     if !exists {
         return format!(
@@ -426,7 +459,20 @@ fn uinput_message(exists: bool, access: Result<(), std::io::ErrorKind>) -> Strin
         Ok(()) => "writable — the virtual joystick can be created".into(),
         Err(std::io::ErrorKind::PermissionDenied) => format!(
             "{NODE} NOT WRITABLE — the virtual joystick cannot be created; \
-             install 60-tobii.rules and log out and back in"
+             {}",
+            match rules_have_uinput {
+                // Named separately because the remedy differs: an old rules
+                // file is on the machine and looks installed, so "install the
+                // udev rule" reads as already done. `tobii update` replaces
+                // binaries only, so anyone who upgraded into the joystick
+                // feature is in exactly this state.
+                Some(false) =>
+                    "the installed 60-tobii.rules predates the virtual joystick and has \
+                     no uinput line — reinstall the package, or copy the current \
+                     assets/60-tobii.rules over it",
+                Some(true) => "install 60-tobii.rules and log out and back in",
+                None => "install 60-tobii.rules and log out and back in",
+            }
         ),
         Err(e) => format!("{NODE} unusable ({e:?})"),
     }
@@ -832,10 +878,12 @@ mod tests {
     fn every_uinput_message_reads_as_one_sentence() {
         use std::io::ErrorKind;
         for m in [
-            uinput_message(false, Ok(())),
-            uinput_message(true, Ok(())),
-            uinput_message(true, Err(ErrorKind::PermissionDenied)),
-            uinput_message(true, Err(ErrorKind::NotFound)),
+            uinput_message(false, Ok(()), None),
+            uinput_message(true, Ok(()), Some(true)),
+            uinput_message(true, Err(ErrorKind::PermissionDenied), Some(true)),
+            uinput_message(true, Err(ErrorKind::PermissionDenied), Some(false)),
+            uinput_message(true, Err(ErrorKind::PermissionDenied), None),
+            uinput_message(true, Err(ErrorKind::NotFound), Some(true)),
         ] {
             assert!(!m.contains("   "), "a run of spaces mid-sentence: {m:?}");
             assert!(!m.contains('\n'), "the report is one line per field: {m:?}");
@@ -848,9 +896,10 @@ mod tests {
     #[test]
     fn each_uinput_failure_names_a_different_remedy() {
         use std::io::ErrorKind;
-        let missing = uinput_message(false, Ok(()));
-        let denied = uinput_message(true, Err(ErrorKind::PermissionDenied));
-        let working = uinput_message(true, Ok(()));
+        let missing = uinput_message(false, Ok(()), None);
+        let denied = uinput_message(true, Err(ErrorKind::PermissionDenied), Some(true));
+        let stale = uinput_message(true, Err(ErrorKind::PermissionDenied), Some(false));
+        let working = uinput_message(true, Ok(()), Some(true));
 
         assert!(missing.contains("modprobe"), "{missing}");
         assert!(denied.contains("60-tobii.rules"), "{denied}");
@@ -858,10 +907,16 @@ mod tests {
             denied.contains("log out"),
             "re-plugging cannot apply a logind ACL to a virtual device: {denied}"
         );
-        assert!(
-            !denied.contains("re-plug"),
-            "that advice is right for the tracker and wrong for /dev/uinput: {denied}"
-        );
+        for m in [&missing, &denied, &stale] {
+            assert!(
+                !m.contains("re-plug"),
+                "that advice is right for the tracker and wrong for /dev/uinput: {m}"
+            );
+        }
+        // A rules file that predates the joystick looks installed, so telling
+        // that user to "install 60-tobii.rules" reads as already done.
+        assert_ne!(stale, denied, "a stale rule needs its own remedy");
+        assert!(stale.contains("predates"), "{stale}");
         assert_ne!(missing, denied);
         assert!(!working.contains("NOT"), "{working}");
     }

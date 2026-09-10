@@ -286,6 +286,29 @@ a console that says what is arriving and what is being rejected, which is the
 difference between "the game sees nothing" and "the game sees nothing *because
 the frames never arrive*".
 
+### [LIMITATION] 64-bit games only
+
+We ship `freetrackclient64.dll` and `NPClient64.dll`. A 32-bit game asks for
+`freetrackclient.dll` and `NPClient.dll` — without the `64` — and finds nothing,
+so it gets no tracking while `tobii bridge install` reports success. opentrack
+ships all four names side by side for exactly this reason.
+
+That excludes a real part of the head-tracking audience: Falcon BMS, IL-2 1946,
+and the FSX generation are 32-bit. Closing it means building the two client
+crates for `i686-pc-windows-gnu` as well; the install directory and both
+registry keys are shared, so nothing else about the design changes.
+
+### [UNTESTED] Flatpak and Snap Steam
+
+`--steam` finds a Flatpak Steam prefix (`~/.var/app/com.valvesoftware.Steam`)
+and will install into it. What is *not* verified is the other half: inside the
+sandbox the host's `tobii` is not on `PATH`, and `$XDG_RUNTIME_DIR` is the
+app's rather than the host's, so the `tobii game -- %command%` launch option
+this prints may not resolve or may not reach the hub's socket. If you run
+Flatpak Steam, `flatpak-spawn --host tobii game -- %command%` is the shape to
+try first. Whether the sandboxed game sees the uinput device, and whether the
+DLL's loopback bind lands in the host's namespace, are both unmeasured.
+
 ### Which wine writes the registry matters
 
 `install` uses the Proton build recorded in the prefix's own
