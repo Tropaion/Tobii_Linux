@@ -354,7 +354,7 @@ impl OutputConfig {
 
 /// Path to the game-output config, beside `config.toml`.
 pub fn games_path() -> PathBuf {
-    tobii_config::config_path().with_file_name("games.toml")
+    tobii_config::config_path().with_file_name(tobii_config::paths::GAMES_TOML)
 }
 
 /// Write the game-output config to an explicit path, atomically.

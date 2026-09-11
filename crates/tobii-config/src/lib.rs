@@ -13,8 +13,12 @@
 //! [`chord_from_arc`] / [`arc_from_chord`] remain as general arc/chord helper
 //! math; the plane sent to the device no longer goes through them.
 
+/// The XDG autostart entry, shared by the hub and `tobii uninstall`.
+pub mod autostart;
 mod calibration_state;
 mod edid;
+/// Every name this program writes, and the XDG directories they go in.
+pub mod paths;
 mod setpm;
 mod setup;
 /// A dependency-free SHA-256.

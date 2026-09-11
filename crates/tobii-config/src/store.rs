@@ -3,28 +3,20 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::paths;
 use crate::DisplaySetup;
 
 /// The default config file path: `$XDG_CONFIG_HOME/tobii-linux/config.toml`,
 /// falling back to `$HOME/.config/tobii-linux/config.toml`.
 pub fn config_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| {
-            // An absent or empty HOME must not produce a RELATIVE path.
-            // `PathBuf::default().join(".config")` is `.config`, so every
-            // loader and every writer would resolve against the working
-            // directory — `tobii debug` in a git checkout created a `.config`
-            // tree inside it, and a service started with a scrubbed
-            // environment would scatter one wherever it happened to be.
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| PathBuf::from("/nonexistent"));
-            home.join(".config")
-        });
-    base.join("tobii-linux").join("config.toml")
+    // An absent or empty HOME must not produce a RELATIVE path.
+    // `PathBuf::default().join(".config")` is `.config`, so every loader and
+    // every writer would resolve against the working directory — `tobii debug`
+    // in a git checkout created a `.config` tree inside it, and a service
+    // started with a scrubbed environment would scatter one wherever it
+    // happened to be. `paths::xdg_dir` is where that rule lives now, shared with
+    // everything else that resolves an XDG directory.
+    paths::config_dir().join(paths::CONFIG_TOML)
 }
 
 /// Write `setup` as TOML to `path`, creating parent directories as needed.
@@ -63,12 +55,12 @@ pub fn load() -> io::Result<Option<DisplaySetup>> {
 
 /// Path to the calibration blob, beside `config.toml`.
 pub fn calibration_path() -> PathBuf {
-    config_path().with_file_name("calibration.bin")
+    config_path().with_file_name(paths::CALIBRATION_BIN)
 }
 
 /// Path to the calibration metadata sidecar, beside `calibration.bin`.
 fn calibration_meta_path() -> PathBuf {
-    config_path().with_file_name("calibration.meta.toml")
+    config_path().with_file_name(paths::CALIBRATION_META)
 }
 
 /// Write `bytes` to `path` atomically (temp file in the same directory, then
@@ -85,7 +77,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // Append ".tmp" to the whole file name (not `with_extension`, which would
     // replace rather than append for names that already have a `.` in them).
     let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
+    tmp_name.push(paths::ATOMIC_TMP_SUFFIX);
     let tmp = PathBuf::from(tmp_name);
 
     // Write AND fsync before the rename. Rename alone gives atomicity of
@@ -241,7 +233,7 @@ pub fn load_calibration() -> io::Result<Option<(Vec<u8>, Option<CalMeta>)>> {
 
 /// Path to the persisted "select eyes to detect" choice, beside `config.toml`.
 pub fn enabled_eye_path() -> PathBuf {
-    config_path().with_file_name("enabled_eye")
+    config_path().with_file_name(paths::ENABLED_EYE)
 }
 
 /// Persist which eye(s) the tracker should detect (stored as the wire value).
@@ -265,7 +257,7 @@ pub fn load_enabled_eye() -> io::Result<Option<tobii_protocol::EnabledEye>> {
 
 /// Path to the automatic-update-check preference, beside `config.toml`.
 pub fn update_check_path() -> PathBuf {
-    config_path().with_file_name("update_check")
+    config_path().with_file_name(paths::UPDATE_CHECK)
 }
 
 /// Whether the GUI may ask GitHub for the latest release when it starts.
@@ -305,7 +297,7 @@ pub fn save_update_check_to(path: &Path, enabled: bool) -> io::Result<()> {
 
 /// Path to the persisted text scale, beside `config.toml`.
 pub fn text_scale_path() -> PathBuf {
-    config_path().with_file_name("text_scale")
+    config_path().with_file_name(paths::TEXT_SCALE)
 }
 
 /// The smallest and largest text scale the UI will apply.
@@ -359,7 +351,7 @@ pub fn save_text_scale_to(path: &Path, scale: f64) -> io::Result<()> {
 
 /// Path to the persisted head-pose pitch offset, beside `config.toml`.
 pub fn pitch_offset_path() -> PathBuf {
-    config_path().with_file_name("headpose_pitch_offset")
+    config_path().with_file_name(paths::PITCH_OFFSET)
 }
 
 /// Persist the head-pose pitch zero, in degrees, as plain text.
@@ -401,7 +393,7 @@ pub fn load_pitch_offset_from(path: &Path) -> io::Result<Option<f64>> {
 
 /// Path to the persisted setup-time chosen monitor id, beside `config.toml`.
 fn setup_monitor_id_path() -> PathBuf {
-    config_path().with_file_name("setup_monitor_id")
+    config_path().with_file_name(paths::SETUP_MONITOR_ID)
 }
 
 /// Persist which monitor the tracker is set up on (stored as plain UTF-8 text).
