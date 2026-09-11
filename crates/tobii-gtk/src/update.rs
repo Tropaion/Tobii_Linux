@@ -114,6 +114,27 @@ pub fn restart_headline(version: &str) -> String {
     )
 }
 
+/// The banner for a copy in this user's own directory whose files another
+/// account owns — what `sudo ./install.sh ~/.local/bin` leaves.
+pub fn home_headline(version: &str, dir: &Path) -> String {
+    format!(
+        "Version {version} is available. The program's files in {} belong to another \
+         account — installed with sudo, probably — so they cannot be replaced in place. \
+         Download fetches the release and says the one command that installs it as you, \
+         replacing them with files you own.",
+        dir.display()
+    )
+}
+
+/// How an archive download is installed, for a copy no package manager owns.
+#[derive(Clone)]
+enum ArchiveInstall {
+    /// Into a directory only an administrator can change.
+    System(PathBuf),
+    /// Into this user's own directory, over files another account owns.
+    Home(PathBuf),
+}
+
 /// The banner for a copy only an administrator can replace.
 pub fn system_headline(version: &str, dir: &Path) -> String {
     format!(
@@ -127,6 +148,30 @@ pub fn system_headline(version: &str, dir: &Path) -> String {
 /// Where the archive went, and the command that installs it into `dir` for
 /// every user. The counterpart of [`saved`] for a copy no package manager owns.
 pub fn saved_for_system(dir: &Path, files: &[PathBuf]) -> String {
+    saved_archive(
+        files,
+        "Install it for every user with:",
+        &format!(
+            "sudo ./install.sh --system {}",
+            sh_quote(&dir.to_string_lossy())
+        ),
+    )
+}
+
+/// Where the archive went, and the plain `./install.sh` that replaces files
+/// another account left in this user's own directory. Not with sudo: sudo is
+/// what put them there, and would do it again.
+pub fn saved_for_home(dir: &Path, files: &[PathBuf]) -> String {
+    saved_archive(
+        files,
+        "Install it as yourself — not with sudo, which is what left the old files there:",
+        &format!("./install.sh {}", sh_quote(&dir.to_string_lossy())),
+    )
+}
+
+/// The shared shape of the two archive messages: where it went, and the
+/// unpack-then-install command, with every path quoted.
+fn saved_archive(files: &[PathBuf], lead: &str, install: &str) -> String {
     let Some(first) = files.first() else {
         // Unreachable: a download that succeeded wrote at least one file.
         return "The download finished, but reported no files.".to_string();
@@ -145,11 +190,9 @@ pub fn saved_for_system(dir: &Path, files: &[PathBuf]) -> String {
         .to_string();
     let stem = name.trim_end_matches(".tar.gz");
     format!(
-        "Saved {name} to {folder}.\nInstall it for every user with:\n  cd {folder} && tar -xzf {} \
-         && cd {} && sudo ./install.sh --system {}",
+        "Saved {name} to {folder}.\n{lead}\n  cd {folder} && tar -xzf {} && cd {} && {install}",
         sh_quote(&name),
         sh_quote(stem),
-        sh_quote(&dir.to_string_lossy()),
     )
 }
 
@@ -422,7 +465,24 @@ pub fn banner() -> gtk::Box {
                     Action::DownloadForSystem { dir } => {
                         text.set_text(&system_headline(&release.version.to_string(), &dir));
                         crate::widget::set_button_text(update_btn, "Download");
-                        wire_download(&banner, *release, String::new(), Some(dir));
+                        wire_download(
+                            &banner,
+                            *release,
+                            String::new(),
+                            Some(ArchiveInstall::System(dir)),
+                        );
+                    }
+                    // The folder is this user's and the files in it are not:
+                    // the archive, and the plain ./install.sh that replaces them.
+                    Action::DownloadForHome { dir } => {
+                        text.set_text(&home_headline(&release.version.to_string(), &dir));
+                        crate::widget::set_button_text(update_btn, "Download");
+                        wire_download(
+                            &banner,
+                            *release,
+                            String::new(),
+                            Some(ArchiveInstall::Home(dir)),
+                        );
                     }
                     Action::Update => {
                         text.set_text(&headline(&release));
@@ -542,7 +602,7 @@ fn wire(b: &Banner, release: Release) {
 /// `system_dir` is set instead for a copy nobody owns in a directory only an
 /// administrator can write. `manager` is then empty, so the file is the plain
 /// archive, and the saved message is the `--system` install for that directory.
-fn wire_download(b: &Banner, release: Release, manager: String, system_dir: Option<PathBuf>) {
+fn wire_download(b: &Banner, release: Release, manager: String, archive: Option<ArchiveInstall>) {
     wire_notes(b, &release);
 
     let Some(offer) = release.offer_for(&manager, &tobii_update::Target::triple()) else {
@@ -570,13 +630,13 @@ fn wire_download(b: &Banner, release: Release, manager: String, system_dir: Opti
         if let Some(d) = default_download_dir() {
             dialog.set_initial_folder(Some(&gtk::gio::File::for_path(d)));
         }
-        let (release, files, system_dir) = (release.clone(), files.clone(), system_dir.clone());
+        let (release, files, archive) = (release.clone(), files.clone(), archive.clone());
         dialog.select_folder(
             btn.root().and_downcast::<gtk::Window>().as_ref(),
             gtk::gio::Cancellable::NONE,
             move |chosen| match chosen {
                 Ok(folder) => match folder.path() {
-                    Some(into) => start_download(&b, release, files, channel, into, system_dir),
+                    Some(into) => start_download(&b, release, files, channel, into, archive),
                     // A location gio can name and the filesystem cannot: a
                     // remote share that is not mounted, or a trash URI.
                     None => b.text.set_text(
@@ -607,7 +667,7 @@ fn start_download(
     files: Vec<Asset>,
     channel: Channel,
     into: PathBuf,
-    system_dir: Option<PathBuf>,
+    archive: Option<ArchiveInstall>,
 ) {
     b.action.set_sensitive(false);
     crate::widget::set_button_text(&b.action, "Downloading…");
@@ -644,8 +704,9 @@ fn start_download(
         match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Ok(Ok(written)) => {
-                b.text.set_text(&match &system_dir {
-                    Some(dir) => saved_for_system(dir, &written),
+                b.text.set_text(&match &archive {
+                    Some(ArchiveInstall::System(dir)) => saved_for_system(dir, &written),
+                    Some(ArchiveInstall::Home(dir)) => saved_for_home(dir, &written),
                     None => saved(channel, &written),
                 });
                 // The message is now a command to run: selectable so it can be
@@ -1103,6 +1164,28 @@ mod banner_text_tests {
         );
         let h = system_headline("0.3.1", Path::new("/usr/local/bin"));
         assert!(h.contains("/usr/local/bin") && h.contains("0.3.1"), "{h}");
+    }
+
+    /// Someone else's files in this user's own directory: the plain command, no
+    /// sudo anywhere in it.
+    #[test]
+    fn someone_elses_files_at_home_get_a_plain_install_command() {
+        let t = saved_for_home(
+            Path::new("/home/u/.local/bin"),
+            &[PathBuf::from(
+                "/home/u/Downloads/tobii-linux-0.3.1/tobii-linux-0.3.1-x86_64-unknown-linux-gnu.tar.gz",
+            )],
+        );
+        assert!(t.contains("&& ./install.sh '/home/u/.local/bin'"), "{t}");
+        assert!(
+            !t.contains("sudo ./install.sh") && !t.contains("--system"),
+            "{t}"
+        );
+        let h = home_headline("0.3.1", Path::new("/home/u/.local/bin"));
+        assert!(
+            h.contains("/home/u/.local/bin") && h.contains("another"),
+            "{h}"
+        );
     }
 
     /// A bare file name has an empty parent. It must read as the current
