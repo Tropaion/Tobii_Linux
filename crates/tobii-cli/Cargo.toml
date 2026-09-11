@@ -23,6 +23,9 @@ tobii-output = { path = "../tobii-output" }
 tobii-ipc = { path = "../tobii-ipc" }
 tobii-update = { path = "../tobii-update" }
 tobii-headpose = { path = "../tobii-headpose", default-features = false }
+# For `tobii uninstall`'s O_NOFOLLOW | O_NONBLOCK opens. Already in the tree
+# through tobii-update and tobii-output.
+libc = "0.2"
 
 [features]
 # Mirrors `tobii-headpose`'s. With this off, `tobii headpose` is the 5-DOF

@@ -157,6 +157,9 @@ pub struct Env {
     pub path: Vec<PathBuf>,
     /// `WINEPREFIX`, which `tobii bridge install` uses when given no prefix.
     pub wineprefix: Option<PathBuf>,
+    /// `CARGO_HOME`, absolute only; `~/.cargo` when unset. `cargo uninstall`
+    /// needs `--root` for anywhere else.
+    pub cargo_home: Option<PathBuf>,
     pub euid: u32,
     pub sudo_user: Option<String>,
     pub current_exe: Option<PathBuf>,
@@ -205,6 +208,7 @@ impl Env {
                 })
                 .unwrap_or_default(),
             wineprefix: var("WINEPREFIX"),
+            cargo_home: var("CARGO_HOME").filter(|p| p.is_absolute()),
             euid,
             sudo_user: std::env::var("SUDO_USER").ok().filter(|s| !s.is_empty()),
             current_exe: std::env::current_exe().ok(),
@@ -307,6 +311,10 @@ pub enum Verdict {
     /// Listed in the system manifest, or not writable by this user and holding
     /// a binary that answered as this program when this user ran it.
     SystemInstall,
+    /// This user's own directory, holding a binary that answered as this
+    /// program, but not writable by them. `chmod u+w` is the way, not sudo:
+    /// root will not run what is in a directory that is not root's.
+    NotWritable,
     /// Present, but nothing there could be identified as this program.
     Unidentified,
     /// A build tree or an unpacked archive: somewhere a copy runs from, not an
@@ -331,8 +339,9 @@ pub enum Ident {
     Answered(Option<String>),
     /// Not run: this is root, and someone else could have put it there.
     NotRun,
-    /// Found by inference and failed [`Fs::vet`], so neither run nor planned:
-    /// what it is instead, in a few words.
+    /// Neither run nor planned — found by inference and failed [`Fs::vet`],
+    /// listed in the manifest but another user's, or listed in Cargo's
+    /// record: what it is instead, in a few words.
     Refused(String),
 }
 
@@ -385,6 +394,9 @@ pub struct Plan {
     pub root: PathBuf,
     /// Who the plan is for: the udev commands need `sudo` unless this is 0.
     pub euid: u32,
+    /// `$CARGO_HOME`, resolved: where `cargo uninstall` looks without
+    /// `--root`.
+    pub cargo_home: Option<PathBuf>,
     /// Set when nothing may be done at all.
     pub refusal: Option<String>,
     pub locations: Vec<Location>,
@@ -482,6 +494,42 @@ struct Fs<'a> {
 fn owner_of(_: &Path, m: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
     m.uid()
+}
+
+/// The overflow uid: what a file whose owner has no mapping in this user
+/// namespace shows up as. Inside a toolbox or `unshare -c`, root's `/` and
+/// `/home` are owned by it.
+const OVERFLOW_UID: u32 = 65534;
+
+#[cfg(test)]
+thread_local! {
+    /// Every path [`Fs::program_check`] opened, for the tests that check it is
+    /// the path then run.
+    static PROGRAM_CHECKED: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Open `real` to read it, only if it is a regular file.
+///
+/// Whatever is opened with this sits somewhere another user may have put
+/// something: a `CACHEDIR.TAG`, Cargo's record, a binary. So a symlink at its
+/// last component is not followed (`O_NOFOLLOW`), a FIFO does not wait for a
+/// writer (`O_NONBLOCK`), and what was opened is `fstat`ed and refused unless
+/// it is a regular file — a device, FIFO or socket is never read.
+fn open_regular(real: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(real)
+        .map_err(|e| format!("it cannot be opened ({e})"))?;
+    let m = f
+        .metadata()
+        .map_err(|e| format!("it cannot be looked at ({e})"))?;
+    if !m.is_file() {
+        return Err("it is not a regular file".into());
+    }
+    Ok((f, m))
 }
 
 /// Why a binary found by inference is neither run nor planned.
@@ -622,23 +670,22 @@ impl<'a> Fs<'a> {
         }
         chain
     }
-    /// `Ok` if `p` is a program: a regular file (after symlinks) with an
-    /// execute bit and an ELF header — what every build and release of this
-    /// program is. `Err` says what it is instead.
-    fn program_check(&self, p: &Path) -> Result<(), String> {
+    /// `Ok` if `real` — a resolved path under the root, the one that will be
+    /// run — is a program: a regular file with an execute bit and an ELF
+    /// header, what every build and release of this program is. Opened with
+    /// [`open_regular`], so a symlink put there since it was resolved is not
+    /// followed. `Err` says what it is instead.
+    fn program_check(&self, real: &Path) -> Result<(), String> {
         use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
-        let real = self.at(p);
-        let m = std::fs::metadata(&real).map_err(|e| format!("it cannot be looked at ({e})"))?;
-        if !m.is_file() {
-            return Err("it is not a regular file".into());
-        }
+        #[cfg(test)]
+        PROGRAM_CHECKED.with(|c| c.borrow_mut().push(real.to_path_buf()));
+        let (mut f, m) = open_regular(real)?;
         if m.permissions().mode() & 0o111 == 0 {
             return Err("it is not executable".into());
         }
         let mut magic = [0u8; 4];
-        std::fs::File::open(&real)
-            .and_then(|mut f| f.read_exact(&mut magic))
+        f.read_exact(&mut magic)
             .map_err(|e| format!("it cannot be read ({e})"))?;
         if &magic != b"\x7fELF" {
             if magic.starts_with(b"#!") {
@@ -650,27 +697,45 @@ impl<'a> Fs<'a> {
         }
         Ok(())
     }
+    /// `Err` unless `real` (`lstat` when `link`, so a symlink's own owner) is
+    /// this user's or root's: in a few words, and in full. Another user's
+    /// copy is theirs to remove.
+    fn owned_by_us(&self, real: &Path, link: bool, euid: u32) -> Result<(), (String, String)> {
+        let uid = self
+            .uid(real, link)
+            .map_err(|e| ("not looked at".to_string(), e))?;
+        if uid == euid || uid == 0 {
+            return Ok(());
+        }
+        Err((
+            format!("owned by uid {uid}"),
+            format!(
+                "{} is owned by uid {uid} — they can run tobii uninstall themselves",
+                self.logical(real).display()
+            ),
+        ))
+    }
     /// Whether a binary found by inference may be run to ask what it is, and
     /// then removed. `Ok` is the file it resolves to, under the root: the file
-    /// every check was made on, and so the only path that may be run. Running
-    /// the name instead would follow its symlinks again, and one of them
-    /// could have been changed in between.
+    /// every check was made on — [`Fs::program_check`] included — and so the
+    /// only path that may be run. Running the name instead would follow its
+    /// symlinks again.
     ///
-    /// It must be a program ([`Fs::program_check`]): a script in
-    /// `~/.local/bin` that prints "tobii-gtk 0.3.0" is a wrapper of the
-    /// user's, not an install. As root, see [`Fs::root_may_run`]. Otherwise
-    /// the name (`lstat`, so a symlink's own owner) and the file it resolves
-    /// to must be this user's or root's — another user's copy is theirs to
-    /// remove — and neither that file, nor the directory the name is in, nor
-    /// the directory the file is in, may be owned or writable by anyone else
-    /// (see [`foreign_writer`]). Those two directories are what decide which
-    /// file a name leads to; the symlinks in between do not matter, because
-    /// the run is of the resolved file and the removal is of the name.
+    /// It must be a program: a script in `~/.local/bin` that prints
+    /// "tobii-gtk 0.3.0" is a wrapper of the user's, not an install. As root,
+    /// [`Fs::root_may_run`] is asked first, before anything there is opened.
+    /// Otherwise every name on the way from `file` to the file it runs
+    /// ([`Fs::link_chain`], each `lstat`ed) and that file must be this user's
+    /// or root's, and neither that file, nor any directory one of those names
+    /// is in, nor the file's own directory, may be owned or writable by anyone
+    /// else (see [`foreign_writer`]). Those directories decide which file the
+    /// name leads to: whoever can write one can re-point a link in it between
+    /// the check and the run, and so choose what runs.
     ///
-    /// Directories further up are not looked at. Root's full-chain check
-    /// ([`Fs::root_may_run`]) does that; for the user it would refuse every
-    /// install inside a user namespace (a toolbox, `unshare -c`), where the
-    /// root-owned `/` and `/home` show up as the overflow uid.
+    /// Every directory above those is checked for writers too — whoever can
+    /// write one can rename what is under it — but its owner may also be
+    /// [`OVERFLOW_UID`], or every install inside a toolbox or `unshare -c`
+    /// would be refused. Root's own check is stricter: all of it root's.
     fn vet(
         &self,
         file: &Path,
@@ -681,34 +746,30 @@ impl<'a> Fs<'a> {
             short: short.to_string(),
             why,
         };
-        if let Err(why) = self.program_check(file) {
+        let not_a_program = |why: String| {
             let short = if why.contains("a script") {
                 "a script"
             } else {
                 "not a program"
             };
-            return Err(refused(short, why));
-        }
+            refused(short, why)
+        };
         if euid == 0 {
-            return self.root_may_run(file).map_err(Unvetted::NotAsRoot);
+            let real = self.root_may_run(file).map_err(Unvetted::NotAsRoot)?;
+            self.program_check(&real).map_err(not_a_program)?;
+            return Ok(real);
         }
-        let named = self.at(&self.unlinked_name(file));
         let real = self
             .at(file)
             .canonicalize()
             .map_err(|e| refused("not resolved", format!("it cannot be resolved ({e})")))?;
+        self.program_check(&real).map_err(not_a_program)?;
         let ours = |uid: u32| uid == euid || uid == 0;
-        for (p, link) in [(&named, true), (&real, false)] {
-            let uid = self.uid(p, link).map_err(|e| refused("not looked at", e))?;
-            if !ours(uid) {
-                return Err(refused(
-                    &format!("owned by uid {uid}"),
-                    format!(
-                        "{} is owned by uid {uid} — they can run tobii uninstall themselves",
-                        self.logical(p).display()
-                    ),
-                ));
-            }
+        let chain: Vec<PathBuf> = self.link_chain(file).iter().map(|n| self.at(n)).collect();
+        let names = chain.iter().map(|n| (n, true));
+        for (p, link) in names.chain([(&real, false)]) {
+            self.owned_by_us(p, link, euid)
+                .map_err(|(short, why)| refused(&short, why))?;
         }
         let others = |m: &std::fs::Metadata, p: &Path, what: &str| {
             foreign_writer(m, private_group).map(|who| {
@@ -727,50 +788,81 @@ impl<'a> Fs<'a> {
         if let Some(r) = others(&m, &real, "a file others can change") {
             return Err(r);
         }
-        let mut dirs: Vec<&Path> = named.parent().into_iter().collect();
-        if let Some(d) = real.parent().filter(|d| !dirs.contains(d)) {
-            dirs.push(d);
+        // Each directory a name on the way is in, and the file's own.
+        let mut dirs: Vec<&Path> = Vec::new();
+        for d in chain.iter().filter_map(|n| n.parent()).chain(real.parent()) {
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
         }
-        for d in dirs {
-            let dir = "in a directory others can write";
-            let m = std::fs::metadata(d).map_err(|e| {
+        let dir = "in a directory others can write";
+        let look = |d: &Path| {
+            std::fs::metadata(d).map_err(|e| {
                 refused(
                     "not looked at",
                     format!("{} cannot be looked at ({e})", self.logical(d).display()),
                 )
-            })?;
+            })
+        };
+        let belongs = |d: &Path, uid: u32| {
+            refused(
+                dir,
+                format!(
+                    "{dir}: {} belongs to uid {uid}, so what runs there is not yours alone to \
+                     choose",
+                    self.logical(d).display()
+                ),
+            )
+        };
+        for d in &dirs {
+            let m = look(d)?;
             let uid = (self.owner)(d, &m);
             if !ours(uid) {
-                return Err(refused(
-                    dir,
-                    format!(
-                        "{dir}: {} belongs to uid {uid}, so what runs there is not yours alone \
-                         to choose",
-                        self.logical(d).display()
-                    ),
-                ));
+                return Err(belongs(d, uid));
             }
             if let Some(r) = others(&m, d, dir) {
+                return Err(r);
+            }
+        }
+        // And every directory above them.
+        let mut above: Vec<&Path> = Vec::new();
+        for a in dirs.iter().flat_map(|d| d.ancestors().skip(1)) {
+            if dirs.contains(&a) || above.contains(&a) {
+                continue;
+            }
+            above.push(a);
+            let m = look(a)?;
+            let uid = (self.owner)(a, &m);
+            if !ours(uid) && uid != OVERFLOW_UID {
+                return Err(belongs(a, uid));
+            }
+            if let Some(r) = others(&m, a, dir) {
                 return Err(r);
             }
         }
         Ok(real)
     }
     /// Whether root may run `file` to ask what it is: only if no one other
-    /// than root can change what it is. The directory it is named in and
-    /// every directory above, and the file it resolves to and every directory
-    /// above that, must all be root's and writable by no one else. `Ok` is the
-    /// file it resolves to — what was checked, and so what may be run — and
-    /// `Err` says why not.
+    /// than root can change what it is. Each directory a name on the way to
+    /// the file is in ([`Fs::link_chain`]) and every directory above, and the
+    /// file it resolves to and every directory above that, must all be root's
+    /// and writable by no one else. `Ok` is the file it resolves to — what was
+    /// checked, and so what may be run — and `Err` says why not. Asked of a
+    /// directory, it says whether anything in it may be opened as root.
     fn root_may_run(&self, file: &Path) -> Result<PathBuf, String> {
         use std::os::unix::fs::MetadataExt;
-        let named = self.at(&self.unlinked_name(file));
         let real = self
             .at(file)
             .canonicalize()
             .map_err(|e| format!("{} cannot be resolved ({e})", file.display()))?;
-        let above_name = named.parent().into_iter().flat_map(Path::ancestors);
-        for p in above_name.chain(real.ancestors()) {
+        let name_dirs: Vec<PathBuf> = self
+            .link_chain(file)
+            .iter()
+            .filter_map(|n| n.parent())
+            .map(|d| self.at(d))
+            .collect();
+        let above_names = name_dirs.iter().flat_map(|d| d.ancestors());
+        for p in above_names.chain(real.ancestors()) {
             let shown = self.logical(p);
             let Ok(m) = std::fs::metadata(p) else {
                 return Err(format!("{} cannot be looked at", shown.display()));
@@ -791,12 +883,14 @@ impl<'a> Fs<'a> {
         }
         Ok(real)
     }
-    /// The first `limit` bytes of a file, as text. `None` if it cannot be read.
-    fn read_head(&self, p: &Path, limit: u64) -> Option<String> {
+    /// The first `limit` bytes of a regular file, as text, opened with
+    /// [`open_regular`]. `None` if it cannot be read, or is not one.
+    fn read_regular(&self, p: &Path, limit: u64) -> Option<String> {
         use std::io::Read;
         let mut buf = Vec::new();
-        std::fs::File::open(self.at(p))
+        open_regular(&self.at(p))
             .ok()?
+            .0
             .take(limit)
             .read_to_end(&mut buf)
             .ok()?;
@@ -894,10 +988,16 @@ fn is_manifest_scratch(name: &str) -> bool {
 /// `assets/install-payload.sh` beside the binary, which every archive since
 /// v0.1.0 has. An `install.sh` alone is not enough: a user may keep one of
 /// their own in `~/.local/bin`, and that must not hide an install there.
-fn not_an_install(fs: &Fs, dir: &Path) -> Option<&'static str> {
+///
+/// `may_read` false — root, and a directory [`Fs::root_may_run`] refused —
+/// skips the tags: nothing someone else controls is opened as root. The name
+/// and the archive layout are only looked at, never opened.
+fn not_an_install(fs: &Fs, dir: &Path, may_read: bool) -> Option<&'static str> {
     let tagged = |a: &Path| {
-        fs.read_head(&a.join("CACHEDIR.TAG"), 1024)
-            .is_some_and(|t| t.contains("created by cargo"))
+        may_read
+            && fs
+                .read_regular(&a.join("CACHEDIR.TAG"), 1024)
+                .is_some_and(|t| t.contains("created by cargo"))
     };
     if is_build_tree(dir) || dir.ancestors().skip(1).take(2).any(tagged) {
         Some("a Cargo build directory")
@@ -910,24 +1010,300 @@ fn not_an_install(fs: &Fs, dir: &Path) -> Option<&'static str> {
     }
 }
 
-/// The package `cargo install` installs each binary from.
-const CARGO_PACKAGES: [(&str, &str); 2] = [("tobii", "tobii-cli"), ("tobii-gtk", "tobii-gtk")];
+/// This program's packages, as `cargo install` names them.
+const CARGO_PACKAGES: [&str; 2] = ["tobii-cli", "tobii-gtk"];
 
-/// When `dir` is `$CARGO_HOME/bin`, the packages `cargo uninstall` removes the
-/// binaries in `present` with. Cargo keeps its record of what it installed
-/// beside that directory, in `.crates.toml` and `.crates2.json`, and a copy
-/// removed behind its back leaves that record wrong.
-fn cargo_packages(fs: &Fs, dir: &Path, present: &[&str]) -> Option<String> {
-    let home = dir.parent()?;
-    if !fs.exists(&home.join(".crates.toml")) && !fs.exists(&home.join(".crates2.json")) {
-        return None;
+/// The most of Cargo's record that is read.
+const RECORD_LIMIT: u64 = 4 << 20;
+
+/// The binaries in `present` that Cargo's record beside `dir` lists as
+/// `cargo install`ed there from this program's packages, each with its
+/// package — Cargo's to remove, since a copy removed behind its back leaves
+/// that record wrong.
+///
+/// The record is `.crates.toml` (under `[v1]`, keys `"<package> <version>
+/// (<source>)"`, each set to its binaries) and `.crates2.json` (the same keys
+/// under `installs`, each with its `bins`). That one exists says only that
+/// `cargo install` was once pointed here, at anything: `cargo install --root
+/// ~/.local ripgrep` writes one beside `~/.local/bin`. So only what it lists
+/// is Cargo's; everything else — everything, when neither can be read — is
+/// looked at like anywhere else.
+fn cargo_listed(
+    fs: &Fs,
+    dir: &Path,
+    present: &[&'static str],
+) -> Vec<(&'static str, &'static str)> {
+    let Some(root) = dir.parent() else {
+        return Vec::new();
+    };
+    let read = |name: &str| fs.read_regular(&root.join(name), RECORD_LIMIT);
+    let entries = read(".crates.toml")
+        .map(|t| crates_toml(&t))
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            read(".crates2.json")
+                .map(|t| crates2_json(&t))
+                .unwrap_or_default(),
+        );
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    for (key, bins) in entries {
+        let ours = CARGO_PACKAGES
+            .iter()
+            .find(|p| key.strip_prefix(**p).is_some_and(|r| r.starts_with(' ')));
+        let Some(package) = ours else {
+            continue;
+        };
+        for b in present {
+            if bins.iter().any(|x| x == b) && !out.iter().any(|(x, _)| x == b) {
+                out.push((b, package));
+            }
+        }
     }
-    let packages: Vec<&str> = CARGO_PACKAGES
-        .iter()
-        .filter(|(bin, _)| present.contains(bin))
-        .map(|(_, package)| *package)
-        .collect();
-    Some(packages.join(" "))
+    out.sort_by_key(|(b, _)| present.iter().position(|x| x == b));
+    out
+}
+
+/// A value in Cargo's record: just enough JSON — and TOML's quoted keys and
+/// arrays of strings — to read which binaries it lists.
+enum Value {
+    Str(String),
+    List(Vec<Value>),
+    Map(Vec<(String, Value)>),
+    Other,
+}
+
+struct Reader<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl Reader<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.i).copied()
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        let hit = self.peek() == Some(c);
+        self.i += usize::from(hit);
+        hit
+    }
+    /// Whitespace, line ends, and TOML's `#` comments.
+    fn blank(&mut self) {
+        while let Some(c) = self.peek() {
+            match c {
+                b' ' | b'\t' | b'\r' | b'\n' => self.i += 1,
+                b'#' => self.line(),
+                _ => return,
+            }
+        }
+    }
+    /// To the end of the line.
+    fn line(&mut self) {
+        while self.peek().is_some_and(|c| c != b'\n') {
+            self.i += 1;
+        }
+    }
+    fn string(&mut self) -> Option<String> {
+        if !self.eat(b'"') {
+            return None;
+        }
+        let mut out = String::new();
+        loop {
+            let start = self.i;
+            while self.peek().is_some_and(|c| c != b'"' && c != b'\\') {
+                self.i += 1;
+            }
+            out.push_str(std::str::from_utf8(&self.s[start..self.i]).ok()?);
+            if self.eat(b'"') {
+                return Some(out);
+            }
+            self.i += 1; // the backslash
+            let e = self.peek()?;
+            self.i += 1;
+            match e {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'b' => out.push('\u{8}'),
+                b'f' => out.push('\u{c}'),
+                b'u' => {
+                    let hex = std::str::from_utf8(self.s.get(self.i..self.i + 4)?).ok()?;
+                    self.i += 4;
+                    let c = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+                    out.push(c.unwrap_or('\u{fffd}'));
+                }
+                c => out.push(char::from(c)), // \" \\ \/
+            }
+        }
+    }
+    fn value(&mut self, depth: u8) -> Option<Value> {
+        self.blank();
+        if depth > 32 {
+            return None;
+        }
+        match self.peek()? {
+            b'"' => self.string().map(Value::Str),
+            open @ (b'[' | b'{') => {
+                self.i += 1;
+                let close = if open == b'[' { b']' } else { b'}' };
+                let (mut list, mut map) = (Vec::new(), Vec::new());
+                loop {
+                    self.blank();
+                    if self.eat(close) {
+                        break;
+                    }
+                    if open == b'[' {
+                        list.push(self.value(depth + 1)?);
+                    } else {
+                        let k = self.string()?;
+                        self.blank();
+                        if !self.eat(b':') {
+                            return None;
+                        }
+                        map.push((k, self.value(depth + 1)?));
+                    }
+                    self.blank();
+                    if !self.eat(b',') {
+                        self.blank();
+                        if !self.eat(close) {
+                            return None;
+                        }
+                        break;
+                    }
+                }
+                Some(if open == b'[' {
+                    Value::List(list)
+                } else {
+                    Value::Map(map)
+                })
+            }
+            _ => {
+                let start = self.i;
+                while self
+                    .peek()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c))
+                {
+                    self.i += 1;
+                }
+                (self.i > start).then_some(Value::Other)
+            }
+        }
+    }
+}
+
+fn strings(v: Vec<Value>) -> Vec<String> {
+    v.into_iter()
+        .filter_map(|x| match x {
+            Value::Str(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(key, binaries)` for each entry under `[v1]` in `.crates.toml`.
+fn crates_toml(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut r = Reader {
+        s: text.as_bytes(),
+        i: 0,
+    };
+    let mut out = Vec::new();
+    let mut in_v1 = false;
+    loop {
+        r.blank();
+        match r.peek() {
+            None => break,
+            Some(b'[') => {
+                let start = r.i;
+                r.line();
+                let header = String::from_utf8_lossy(&r.s[start..r.i]);
+                in_v1 = header.split('#').next().map(str::trim) == Some("[v1]");
+            }
+            Some(b'"') if in_v1 => {
+                let Some(key) = r.string() else {
+                    break;
+                };
+                r.blank();
+                if !r.eat(b'=') {
+                    break;
+                }
+                match r.value(0) {
+                    Some(Value::List(bins)) => out.push((key, strings(bins))),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            Some(_) => r.line(),
+        }
+    }
+    out
+}
+
+/// `(key, bins)` for each entry under `installs` in `.crates2.json`.
+fn crates2_json(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut r = Reader {
+        s: text.as_bytes(),
+        i: 0,
+    };
+    let Some(Value::Map(top)) = r.value(0) else {
+        return Vec::new();
+    };
+    let installs = top.into_iter().find_map(|(k, v)| match v {
+        Value::Map(m) if k == "installs" => Some(m),
+        _ => None,
+    });
+    installs
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, v)| {
+            let Value::Map(fields) = v else {
+                return None;
+            };
+            let bins = fields.into_iter().find_map(|(k, v)| match v {
+                Value::List(b) if k == "bins" => Some(b),
+                _ => None,
+            })?;
+            Some((key, strings(bins)))
+        })
+        .collect()
+}
+
+/// The packages in a [`cargo_listed`] list, each once.
+fn cargo_package_list(listed: &[(&str, &str)]) -> String {
+    let mut packages: Vec<&str> = Vec::new();
+    for (_, p) in listed {
+        if !packages.contains(p) {
+            packages.push(p);
+        }
+    }
+    packages.join(" ")
+}
+
+/// `cargo uninstall` for `packages` installed in `dir`: with `--root` unless
+/// `dir` is `$CARGO_HOME/bin`, where it looks when given none.
+fn cargo_uninstall(dir: &Path, cargo_home: Option<&Path>, packages: &str) -> String {
+    match dir.parent() {
+        Some(root) if Some(root) != cargo_home => {
+            format!("cargo uninstall --root {} {packages}", q(root))
+        }
+        _ => format!("cargo uninstall {packages}"),
+    }
+}
+
+fn cargo_hint(dir: &Path, listed: &[(&str, &str)], cargo_home: Option<&Path>) -> String {
+    let bins: Vec<&str> = listed.iter().map(|(b, _)| *b).collect();
+    let (it, it_is) = if bins.len() == 1 {
+        ("it", "it is")
+    } else {
+        ("them", "they are")
+    };
+    format!(
+        "{} in {} came from `cargo install`, and Cargo's record beside it lists {it}, so \
+         {it_is} left to Cargo — removed behind its back, that record would be wrong. Remove \
+         {it} with:\n    {}",
+        bins.join(" and "),
+        dir.display(),
+        cargo_uninstall(dir, cargo_home, &cargo_package_list(listed))
+    )
 }
 
 /// What a desktop entry runs, as far as it can be told from here.
@@ -1076,20 +1452,11 @@ fn package_remove_command(manager: &str, package: &str) -> String {
         "pacman" => format!("sudo pacman -R {package}"),
         "dpkg" => format!("sudo apt remove {package}"),
         "rpm" => format!("sudo dnf remove {package}    (openSUSE: sudo zypper remove {package})"),
-        "cargo" => format!("cargo uninstall {package}"),
         other => format!("remove the package {package} with {other}"),
     }
 }
 
 fn package_hint(dir: &Path, manager: &str, package: &str) -> String {
-    if manager == "cargo" {
-        return format!(
-            "{} is Cargo's ($CARGO_HOME/bin: `cargo install` put this there, and keeps a \
-             record of it beside it), so nothing is removed there. Remove it with:\n    {}",
-            dir.display(),
-            package_remove_command(manager, package)
-        );
-    }
     format!(
         "{} belongs to {manager}, as the package {package}, so nothing is removed there. \
          Remove it with:\n    {}\n  That removes the packaged copy only. Copies in your home \
@@ -1102,9 +1469,10 @@ fn package_hint(dir: &Path, manager: &str, package: &str) -> String {
 fn system_hint(dir: &Path, exe: &str, self_removed: bool) -> String {
     let mut s = format!(
         "{} is a system-wide install (you cannot write to it, no package owns it, and what is \
-         there is this program). Remove it with:\n    sudo {exe} uninstall --system --bindir {}",
+         there is this program). Remove it with:\n    sudo {} uninstall --system --bindir {}",
         dir.display(),
-        dir.display()
+        sh_quote(exe),
+        q(dir)
     );
     if self_removed {
         s.push_str(&format!(
@@ -1112,6 +1480,19 @@ fn system_hint(dir: &Path, exe: &str, self_removed: bool) -> String {
         ));
     }
     s
+}
+
+/// For a directory of this user's own that they cannot write to. Not sudo:
+/// root will not run what is in a directory that is not root's
+/// ([`Fs::root_may_run`]), and would send them straight back here.
+fn chmod_hint(dir: &Path) -> String {
+    format!(
+        "{} holds this program and is yours, but you cannot write to it, so nothing there is \
+         removed. It is not root's, so sudo would not help. Make it writable, then run this \
+         again:\n    chmod u+w {}",
+        dir.display(),
+        q(dir)
+    )
 }
 
 fn root_refusal(env: &Env) -> String {
@@ -1156,11 +1537,7 @@ fn root_hint(fs: &Fs) -> Option<String> {
             Err(_) => {}
         }
     }
-    let list = files
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let list = files.iter().map(|p| q(p)).collect::<Vec<_>>().join(" ");
     if seen {
         Some(format!(
             "A past `sudo ./install.sh` left a copy in root's home, which this run does not \
@@ -1262,6 +1639,11 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
         p.refusal = Some("HOME is not set, so there is no home install to find".into());
         return p;
     }
+    p.cargo_home = env
+        .cargo_home
+        .clone()
+        .or_else(|| home.as_ref().map(|h| h.join(".cargo")))
+        .map(|c| fs.canon_or(&c));
 
     let data = if opts.system {
         PathBuf::from(paths::SYSTEM_DATA_DIR)
@@ -1358,13 +1740,17 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             binaries: Vec::new(),
         };
         let listed = c.via.contains(&Via::Manifest);
+        // As root, nothing in or above a directory is opened — no
+        // CACHEDIR.TAG, no Cargo record — unless no one but root can change
+        // what is there. Only root_may_run's own checks are made first.
+        let may_read = env.euid != 0 || fs.root_may_run(&c.dir).is_ok();
         // A build tree or an unpacked archive is where a copy runs from, not
         // an install, however it was reached: `cargo run -p tobii-gtk` and
         // then switching start-at-login on puts target/debug into the
         // autostart Exec. Only this mode's own manifest says otherwise —
         // install-payload.sh wrote that line, so an install was made there.
         if !listed {
-            if let Some(why) = not_an_install(&fs, &c.dir) {
+            if let Some(why) = not_an_install(&fs, &c.dir, may_read) {
                 loc.verdict = Verdict::NotAnInstall(why);
                 p.locations.push(loc);
                 continue;
@@ -1389,13 +1775,22 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
         // `cargo install`'s: left to `cargo uninstall`, like a package's copy
         // is left to its package manager, and for the same reason — removed
         // behind its back, Cargo's record of what it installed is wrong.
-        // Nothing there is run. A manifest line overrides it, as for a build
-        // tree: install-payload.sh wrote that line, so it installed there.
-        if !listed {
-            if let Some(package) = cargo_packages(&fs, &c.dir, &present) {
-                let manager = "cargo".to_string();
-                p.hints.push(package_hint(&c.dir, &manager, &package));
-                loc.verdict = Verdict::Package { manager, package };
+        // Only what that record lists, and none of it is run; the rest is
+        // looked at below. A manifest line overrides it, as for a build tree:
+        // install-payload.sh wrote that line, so it installed there.
+        let cargo = if listed || !may_read {
+            Vec::new()
+        } else {
+            cargo_listed(&fs, &c.dir, &present)
+        };
+        if !cargo.is_empty() {
+            p.hints
+                .push(cargo_hint(&c.dir, &cargo, p.cargo_home.as_deref()));
+            if cargo.len() == present.len() {
+                loc.verdict = Verdict::Package {
+                    manager: "cargo".into(),
+                    package: cargo_package_list(&cargo),
+                };
                 p.locations.push(loc);
                 continue;
             }
@@ -1431,22 +1826,28 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
         let mut judged: Vec<(Binary, Option<String>)> = Vec::new();
         for b in present {
             let path = c.dir.join(b);
+            if let Some((_, package)) = cargo.iter().find(|(x, _)| *x == b) {
+                let why = format!(
+                    "`cargo install` put it here from {package}, and Cargo's record lists it — \
+                     left to Cargo (the command is below)"
+                );
+                let bin = Binary {
+                    name: b,
+                    ident: Ident::Refused("cargo install's".into()),
+                    planned: false,
+                };
+                judged.push((bin, Some(why)));
+                continue;
+            }
             let is_me = me
                 .as_ref()
                 .is_some_and(|m| fs.canon(&path).as_ref() == Some(m));
             let me_answer = || Ident::Me(format!("tobii {}", env!("CARGO_PKG_VERSION")));
             let (ident, why_kept) = if listed {
-                match fs.program_check(&path) {
+                match listed_check(&fs, &path, env.euid) {
                     Ok(()) if is_me => (me_answer(), None),
                     Ok(()) => (Ident::Listed, None),
-                    Err(why) => (
-                        Ident::ListedNotProgram,
-                        Some(format!(
-                            "its directory is listed in the install manifest, but {why} — the \
-                             manifest says where to look, and this is not a program that was \
-                             installed there"
-                        )),
-                    ),
+                    Err((ident, why)) => (ident, Some(why)),
                 }
             } else {
                 match fs.vet(&path, env.euid, probes.private_group) {
@@ -1459,7 +1860,7 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
                             "not run as root to ask what it is: {why}, so whoever that is \
                              chooses what it would run. If it is an install of this program, \
                              remove it as that user: tobii uninstall --bindir {}",
-                            c.dir.display()
+                            q(&c.dir)
                         );
                         not_run.get_or_insert_with(|| why.clone());
                         (Ident::NotRun, Some(why))
@@ -1512,8 +1913,16 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             loc.binaries.push(bin);
         }
         if !writable && identified {
-            loc.verdict = Verdict::SystemInstall;
-            system_dirs.push(c.dir.clone());
+            // The user's own directory, only not writable: the advice is
+            // chmod. Under sudo, root_may_run would refuse a directory that
+            // is not root's and send them back to this same hint.
+            if fs.uid(&fs.at(&c.dir), false).is_ok_and(|u| u == env.euid) {
+                loc.verdict = Verdict::NotWritable;
+                p.hints.push(chmod_hint(&c.dir));
+            } else {
+                loc.verdict = Verdict::SystemInstall;
+                system_dirs.push(c.dir.clone());
+            }
             p.locations.push(loc);
             continue;
         }
@@ -1715,10 +2124,11 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             p.udev_notes
                 .push("there is no udev rule of this program's in /etc/udev/rules.d".into());
         }
+        // `cargo install` ships no rule; only a real package does.
         let package = p
             .locations
             .iter()
-            .any(|l| matches!(l.verdict, Verdict::Package { .. }));
+            .any(|l| matches!(&l.verdict, Verdict::Package { manager, .. } if manager != "cargo"));
         if package || fs.exists(Path::new(PACKAGE_UDEV_RULE)) {
             p.udev_notes.push(format!(
                 "a package install is still here, and it ships its own rule at \
@@ -1780,6 +2190,33 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
         }
     }
     p
+}
+
+/// Whether a name in a directory this mode's manifest lists may be removed
+/// without being run: the file it resolves to is a program, and that file
+/// and the name (`lstat`) are this user's or root's. `Err` is how it is
+/// shown, and why it stays.
+fn listed_check(fs: &Fs, path: &Path, euid: u32) -> Result<(), (Ident, String)> {
+    let listed_but = |why: String| {
+        format!(
+            "its directory is listed in the install manifest, but {why} — the manifest says \
+             where to look, and this is not a program that was installed there"
+        )
+    };
+    let real = fs.at(path).canonicalize().map_err(|e| {
+        let why = format!("it cannot be resolved ({e})");
+        (Ident::ListedNotProgram, listed_but(why))
+    })?;
+    fs.program_check(&real)
+        .map_err(|why| (Ident::ListedNotProgram, listed_but(why)))?;
+    let named = fs.at(&fs.unlinked_name(path));
+    for (p, link) in [(&named, true), (&real, false)] {
+        fs.owned_by_us(p, link, euid).map_err(|(short, why)| {
+            let why = format!("its directory is listed in the install manifest, but {why}");
+            (Ident::Refused(short), why)
+        })?;
+    }
+    Ok(())
 }
 
 /// Plan the removal of known names from `dir`, report everything else, and
@@ -1874,7 +2311,7 @@ pub fn execute(plan: &Plan) -> Outcome {
                     "{} could not remove itself; run `{} uninstall` again once the reason above \
                      is fixed",
                     me.display(),
-                    me.display()
+                    q(me)
                 ));
             }
         } else {
@@ -2240,6 +2677,22 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// A word of a command printed for a person to paste, as a POSIX shell
+/// reads it back: as it is when it holds only `[A-Za-z0-9_./-]`, otherwise
+/// in single quotes, each `'` in it written `'\''`.
+fn sh_quote(s: &str) -> String {
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b"_./-".contains(&b);
+    if !s.is_empty() && s.bytes().all(plain) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// A path, as [`sh_quote`] prints it.
+fn q(p: &Path) -> String {
+    sh_quote(&p.to_string_lossy())
+}
+
 fn describe_proc(p: &Proc) -> String {
     let args = sanitize(&p.args.join(" "));
     let args = if args.chars().count() > 140 {
@@ -2306,6 +2759,7 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
                     format!("owned by {manager} ({package}) — left to the package manager")
                 }
                 Verdict::SystemInstall => "a system-wide install — see below".into(),
+                Verdict::NotWritable => "yours, but you cannot write to it — see below".into(),
                 Verdict::Unidentified => {
                     "left: nothing there could be identified as this program's".into()
                 }
@@ -2455,7 +2909,7 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
                              remove the bridge before or after it:",
                             running.display()
                         ),
-                        running.display().to_string(),
+                        q(running),
                     ),
                     (None, None) => ("Remove it with:".to_string(), "tobii".to_string()),
                 };
@@ -2464,7 +2918,7 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
                     "  The TrackIR/FreeTrack bridge is installed in these Wine prefixes. {how}"
                 );
                 for w in &plan.wine_prefixes {
-                    let _ = writeln!(o, "    {tobii} bridge uninstall --prefix {}", w.display());
+                    let _ = writeln!(o, "    {tobii} bridge uninstall --prefix {}", q(w));
                 }
             }
             let _ = writeln!(
@@ -2763,7 +3217,7 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
              line stays in the install manifest. Fix what failed, then run `{} uninstall` \
              again.",
             me.display(),
-            me.display()
+            q(me)
         );
     }
     let left = !plan.kept.is_empty() || !out.not_empty.is_empty();
@@ -2791,6 +3245,11 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
         .locations
         .iter()
         .filter_map(|l| match &l.verdict {
+            Verdict::Package { manager, package } if manager == "cargo" => Some(format!(
+                "{} — `cargo install`'s ({package}): {}",
+                l.dir.display(),
+                cargo_uninstall(&l.dir, plan.cargo_home.as_deref(), package)
+            )),
             Verdict::Package { manager, package } => Some(format!(
                 "{} — owned by {manager} ({package}): {}",
                 l.dir.display(),
@@ -2799,7 +3258,12 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
             Verdict::SystemInstall => Some(format!(
                 "{} — a system-wide install: sudo tobii uninstall --system --bindir {}",
                 l.dir.display(),
-                l.dir.display()
+                q(&l.dir)
+            )),
+            Verdict::NotWritable => Some(format!(
+                "{} — yours, but you cannot write to it: chmod u+w {}, then run this again",
+                l.dir.display(),
+                q(&l.dir)
             )),
             _ => None,
         })
@@ -2827,12 +3291,7 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
                      that ran this stays, and removes it:"
                 );
                 for w in &plan.wine_prefixes {
-                    let _ = writeln!(
-                        o,
-                        "    {} bridge uninstall --prefix {}",
-                        running.display(),
-                        w.display()
-                    );
+                    let _ = writeln!(o, "    {} bridge uninstall --prefix {}", q(running), q(w));
                 }
             }
             None => {
@@ -2843,7 +3302,7 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
                      — from the unpacked archive's folder:"
                 );
                 for w in &plan.wine_prefixes {
-                    let _ = writeln!(o, "    ./tobii bridge uninstall --prefix {}", w.display());
+                    let _ = writeln!(o, "    ./tobii bridge uninstall --prefix {}", q(w));
                 }
             }
         }

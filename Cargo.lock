@@ -1468,6 +1468,7 @@ dependencies = [
 name = "tobii-cli"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "tobii-config",
  "tobii-diagnostics",
  "tobii-headpose",
