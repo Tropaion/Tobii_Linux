@@ -28,7 +28,12 @@
 //!   are emptied of known names and then `remove_dir`'d, so a hand-made backup
 //!   survives and is reported.
 //! * Touch a package-managed copy, `/usr/lib/udev/rules.d`, or a Wine prefix.
-//! * Create an icon cache, or delete `icon-theme.cache` / `mimeinfo.cache`.
+//! * Create an icon cache, or name `icon-theme.cache` or `mimeinfo.cache` for
+//!   removal. An `icon-theme.cache` that exists is refreshed, and the refresh
+//!   tool itself deletes the cache when no icons are left under it — which
+//!   leaves the directory as it was before the install. See
+//!   [`refresh_icon_cache`].
+//! * Run a program as root that anyone but root could have put where it is.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -46,7 +51,8 @@ pub const USAGE: &str =
     "usage: tobii uninstall [--dry-run] [--yes] [--purge] [--udev] [--system] [--bindir DIR]
 
   --dry-run    print the plan and change nothing (do this first)
-  --yes        do not ask; required when there is no terminal to ask on
+  --yes        do not ask; required when there is no terminal to ask on.
+               --yes also stops running copies with SIGTERM if they do not quit
   --purge      also delete your settings, calibration, models and log
   --udev       also remove the udev rule from /etc/udev/rules.d (uses sudo)
   --system     remove a `sudo ./install.sh --system` install (run with sudo)
@@ -67,8 +73,10 @@ const UDEV_RULES: [&str; 2] = [
 /// Where a package puts its own rule. Never touched; only looked at.
 const PACKAGE_UDEV_RULE: &str = "/usr/lib/udev/rules.d/60-tobii.rules";
 
-/// Caches that list other programs' files too. Deleting one is never this
-/// program's business, whatever a bug elsewhere in this file might say.
+/// Caches that list other programs' files too. This program never names one
+/// for removal, whatever a bug elsewhere in this file might say. (Refreshing
+/// an existing `icon-theme.cache` can still end with the cache tool deleting
+/// it; see [`refresh_icon_cache`].)
 const NEVER_REMOVE: [&str; 2] = ["icon-theme.cache", "mimeinfo.cache"];
 
 // ------------------------------------------------------------------- inputs
@@ -130,6 +138,11 @@ pub struct Env {
     pub xdg_runtime_dir: Option<PathBuf>,
     /// `TOBII_LOG_FILE`, which moves the log somewhere the user chose.
     pub log_file: Option<PathBuf>,
+    /// `PATH`, split, absolute entries only: an empty or relative entry means
+    /// "the working directory", which says nothing about where an install is.
+    pub path: Vec<PathBuf>,
+    /// `WINEPREFIX`, which `tobii bridge install` uses when given no prefix.
+    pub wineprefix: Option<PathBuf>,
     pub euid: u32,
     pub sudo_user: Option<String>,
     pub current_exe: Option<PathBuf>,
@@ -170,6 +183,14 @@ impl Env {
             xdg_state_home: var("XDG_STATE_HOME"),
             xdg_runtime_dir: var("XDG_RUNTIME_DIR"),
             log_file: var("TOBII_LOG_FILE"),
+            path: std::env::var_os("PATH")
+                .map(|v| {
+                    std::env::split_paths(&v)
+                        .filter(|d| d.is_absolute())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            wineprefix: var("WINEPREFIX"),
             euid,
             sudo_user: std::env::var("SUDO_USER").ok().filter(|s| !s.is_empty()),
             current_exe: std::env::current_exe().ok(),
@@ -205,6 +226,10 @@ pub struct Proc {
     /// process was started from has since been unlinked or replaced.
     pub exe: String,
     pub args: Vec<String>,
+    /// Field 22 of `/proc/<pid>/stat`: when the process started, in clock
+    /// ticks since boot. With `exe`, what tells this process apart from a
+    /// later one the kernel gave the same pid. `None` if it could not be read.
+    pub start_time: Option<u64>,
 }
 
 /// The questions [`plan`] needs answered about the real system.
@@ -232,6 +257,10 @@ pub enum Via {
     MenuEntry,
     Autostart,
     ThisProgram,
+    /// `~/.local/bin`, where `install.sh` puts it when told nothing else.
+    DefaultDir,
+    /// A `PATH` directory holding a `tobii` or a `tobii-gtk`.
+    Path,
     Bindir,
 }
 
@@ -243,6 +272,8 @@ impl Via {
             Via::MenuEntry => "the menu entry's Exec",
             Via::Autostart => "the autostart entry's Exec",
             Via::ThisProgram => "where this program runs from",
+            Via::DefaultDir => "the default install directory",
+            Via::Path => "PATH",
             Via::Bindir => "--bindir",
         }
     }
@@ -260,18 +291,36 @@ pub enum Verdict {
     },
     /// Not writable by this user, or listed in the system manifest.
     SystemInstall,
-    /// Present, but nothing there identified itself as this program.
+    /// Present, but nothing there could be identified as this program.
     Unidentified,
-    /// A build tree or an unpacked archive: where this program runs from, but
-    /// not an install.
+    /// A build tree or an unpacked archive: somewhere a copy runs from, not an
+    /// install.
     NotAnInstall(&'static str),
+    /// Root would have had to run a program there to identify it, and someone
+    /// other than root can change what that program is.
+    NotRunAsRoot(String),
+}
+
+/// How a binary came to be planned, or not.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ident {
+    /// The running program itself: what it would answer is known.
+    Me(String),
+    /// Listed in this mode's own manifest, and an executable ELF file: trusted
+    /// without being run.
+    Listed,
+    /// Listed in the manifest, but not an executable program.
+    ListedNotProgram,
+    /// Asked with `--version`; what it printed, if it answered.
+    Answered(Option<String>),
+    /// Not run: this is root, and someone else could have put it there.
+    NotRun,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binary {
     pub name: &'static str,
-    /// What it printed for `--version`, if it answered.
-    pub answer: Option<String>,
+    pub ident: Ident,
     pub planned: bool,
 }
 
@@ -326,10 +375,15 @@ pub struct Plan {
     /// single-instance, so asking "the" hub to quit over D-Bus could reach one
     /// of these instead of ours.
     pub other_hubs: Vec<Proc>,
+    /// Hubs whose program has been deleted — a package removed while its hub
+    /// ran. Nothing of them is left to remove, but they hold the tracker and
+    /// the hub's D-Bus name until they quit, so this run offers to stop them.
+    pub orphan_hubs: Vec<Proc>,
     pub remove: Vec<Removal>,
-    /// The running `tobii`, when it is being removed. Deleted after
-    /// everything else: unlinking a running executable is fine on Linux, and
-    /// doing it last means a failure earlier leaves a `tobii` to try again with.
+    /// The running `tobii`, when it is being removed. Deleted after everything
+    /// else, and only if nothing else failed: unlinking a running executable
+    /// is fine on Linux, and keeping it until the end means any failure
+    /// leaves a `tobii` to run this again with.
     pub self_exe: Option<PathBuf>,
     pub manifests: Vec<ManifestEdit>,
     /// `remove_dir`, in order, each only if empty by then.
@@ -381,6 +435,26 @@ impl Plan {
             why: why.into(),
         });
     }
+
+    /// Whether this run removes a `tobii` — the program the bridge's own
+    /// uninstall needs.
+    fn removes_tobii(&self) -> bool {
+        self.remove
+            .iter()
+            .map(|r| r.path.as_path())
+            .chain(self.self_exe.as_deref())
+            .any(|p| p.file_name().is_some_and(|n| n == "tobii"))
+    }
+}
+
+/// Whether a path leads anywhere.
+enum Presence {
+    There,
+    /// It, or a directory on the way, does not exist — a dangling symlink
+    /// included.
+    Gone,
+    /// It cannot be told (no permission, a symlink loop): the error.
+    Unknown(String),
 }
 
 /// Filesystem access under a root.
@@ -404,16 +478,35 @@ impl Fs<'_> {
     fn is_real_dir(&self, p: &Path) -> bool {
         self.at(p).symlink_metadata().is_ok_and(|m| m.is_dir())
     }
+    /// A regular file, after symlinks, with an execute bit: what a `PATH`
+    /// lookup would run.
+    fn is_executable_file(&self, p: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(self.at(p))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    fn presence(&self, p: &Path) -> Presence {
+        use std::io::ErrorKind;
+        match self.at(p).canonicalize() {
+            Ok(_) => Presence::There,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                Presence::Gone
+            }
+            Err(e) => Presence::Unknown(e.to_string()),
+        }
+    }
     /// A real path (under the root) as the user sees it.
     fn logical(&self, real: &Path) -> PathBuf {
-        let root = self
+        let canon_root = self
             .root
             .canonicalize()
             .unwrap_or_else(|_| self.root.to_path_buf());
-        match real.strip_prefix(&root) {
-            Ok(rel) => Path::new("/").join(rel),
-            Err(_) => real.to_path_buf(),
+        for root in [canon_root.as_path(), self.root] {
+            if let Ok(rel) = real.strip_prefix(root) {
+                return Path::new("/").join(rel);
+            }
         }
+        real.to_path_buf()
     }
     /// `p` with every symlink resolved, as the user sees it. `None` if it does
     /// not exist.
@@ -423,6 +516,96 @@ impl Fs<'_> {
     }
     fn canon_or(&self, p: &Path) -> PathBuf {
         self.canon(p).unwrap_or_else(|| p.to_path_buf())
+    }
+    /// `p` with its directory resolved and its last component left alone: the
+    /// name a removal of `p` unlinks. For a symlink that is the link, never
+    /// what it points at.
+    fn unlinked_name(&self, p: &Path) -> PathBuf {
+        match (p.parent(), p.file_name()) {
+            (Some(d), Some(n)) => self.canon(d).map_or_else(|| p.to_path_buf(), |d| d.join(n)),
+            _ => p.to_path_buf(),
+        }
+    }
+    /// Every name `p` passes through on the way to the file it runs: `p`, then
+    /// each symlink's target in turn, all as [`Fs::unlinked_name`]s. Removing
+    /// any one of them leaves `p` running nothing.
+    fn link_chain(&self, p: &Path) -> Vec<PathBuf> {
+        let mut chain = vec![self.unlinked_name(p)];
+        // 40 is the kernel's own limit on symlinks followed in one lookup.
+        while chain.len() <= 40 {
+            let real = self.at(chain.last().expect("the chain is never empty"));
+            let Ok(target) = std::fs::read_link(&real) else {
+                break;
+            };
+            // An absolute target replaces the directory in `join`.
+            let next = match real.parent() {
+                Some(d) => d.join(target),
+                None => target,
+            };
+            let next = self.unlinked_name(&self.logical(&next));
+            if chain.contains(&next) {
+                break;
+            }
+            chain.push(next);
+        }
+        chain
+    }
+    /// `Ok` if `p` is a program: a regular file (after symlinks) with an
+    /// execute bit and an ELF header — what every build and release of this
+    /// program is. `Err` says what it is instead.
+    fn program_check(&self, p: &Path) -> Result<(), String> {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let real = self.at(p);
+        let m = std::fs::metadata(&real).map_err(|e| format!("it cannot be looked at ({e})"))?;
+        if !m.is_file() {
+            return Err("it is not a regular file".into());
+        }
+        if m.permissions().mode() & 0o111 == 0 {
+            return Err("it is not executable".into());
+        }
+        let mut magic = [0u8; 4];
+        std::fs::File::open(&real)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .map_err(|e| format!("it cannot be read ({e})"))?;
+        if &magic != b"\x7fELF" {
+            return Err("it is not an ELF program".into());
+        }
+        Ok(())
+    }
+    /// Why root must not run `file` to ask what it is, if it must not:
+    /// someone other than root can change what it is. The directory it is
+    /// named in and every directory above, and the file it resolves to and
+    /// every directory above that, must all be root's and writable by no one
+    /// else.
+    fn why_root_may_not_run(&self, file: &Path) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let named = self.at(&self.unlinked_name(file));
+        let real = match self.at(file).canonicalize() {
+            Ok(r) => r,
+            Err(e) => return Some(format!("{} cannot be resolved ({e})", file.display())),
+        };
+        let above_name = named.parent().into_iter().flat_map(Path::ancestors);
+        for p in above_name.chain(real.ancestors()) {
+            let shown = self.logical(p);
+            let Ok(m) = std::fs::metadata(p) else {
+                return Some(format!("{} cannot be looked at", shown.display()));
+            };
+            if m.uid() != 0 {
+                return Some(format!(
+                    "{} is owned by uid {}, not by root",
+                    shown.display(),
+                    m.uid()
+                ));
+            }
+            if m.mode() & 0o022 != 0 {
+                return Some(format!(
+                    "{} can be written by its group or by anyone",
+                    shown.display()
+                ));
+            }
+        }
+        None
     }
     fn read(&self, p: &Path) -> Option<String> {
         std::fs::read_to_string(self.at(p)).ok()
@@ -466,6 +649,10 @@ fn manifest_line_survives(line: &str, dropped: &dyn Fn(&Path) -> bool) -> bool {
     }
 }
 
+fn is_pid(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// An updater or installer temporary in an install directory.
 ///
 /// `.tobii-update-<pid>` (the updater's work directory),
@@ -473,19 +660,112 @@ fn manifest_line_survives(line: &str, dropped: &dyn Fn(&Path) -> bool) -> bool {
 /// by `install-payload.sh`) and `.<bin>.old-<pid>` (the updater's rollback
 /// backup, left if it was killed mid-swap).
 fn is_install_scratch(name: &str) -> bool {
-    let pid_ok = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     if let Some(rest) = name.strip_prefix(".tobii-update-probe-") {
-        return pid_ok(rest);
+        return is_pid(rest);
     }
     if let Some(rest) = name.strip_prefix(".tobii-update-") {
-        return pid_ok(rest);
+        return is_pid(rest);
     }
     BINARIES.iter().any(|b| {
         [".new-", ".old-"].iter().any(|kind| {
             name.strip_prefix(&format!(".{b}{kind}"))
-                .is_some_and(pid_ok)
+                .is_some_and(is_pid)
         })
     })
+}
+
+/// The temporary `install-payload.sh` writes the manifest to before renaming
+/// it into place: `installs.new-<pid>`.
+fn is_manifest_scratch(name: &str) -> bool {
+    name.strip_prefix(paths::MANIFEST_FILE)
+        .and_then(|r| r.strip_prefix(".new-"))
+        .is_some_and(is_pid)
+}
+
+/// A build tree or an unpacked release archive: somewhere a copy of this
+/// program runs from, which no install made.
+///
+/// `is_build_tree` knows `target/release` and `target/debug`. Cargo also
+/// writes `target/<profile>` for a custom profile and
+/// `target/<triple>/<profile>` for `--target` — which is how
+/// scripts/release.sh builds — and those are told by the `CACHEDIR.TAG` Cargo
+/// puts in `target/`. Only one or two levels up, because Cargo puts binaries
+/// no deeper: looking further would call anything that merely sits under a
+/// target directory a build tree — a test HOME, for one.
+fn not_an_install(fs: &Fs, dir: &Path) -> Option<&'static str> {
+    let cargo_target = |a: &Path| {
+        a.file_name().is_some_and(|n| n == "target") && fs.exists(&a.join("CACHEDIR.TAG"))
+    };
+    let cargo = is_build_tree(dir) || dir.ancestors().skip(1).take(2).any(cargo_target);
+    if cargo {
+        Some("a Cargo build directory")
+    } else if fs.exists(&dir.join("install.sh")) {
+        Some("an unpacked release archive (install.sh is beside it)")
+    } else {
+        None
+    }
+}
+
+/// What a desktop entry runs, as far as it can be told from here.
+enum ExecTarget {
+    /// An absolute path.
+    Path(PathBuf),
+    /// A bare name, and every place `PATH` finds it, in `PATH` order.
+    Bare { name: String, hits: Vec<PathBuf> },
+    /// It cannot be told, and why.
+    Unknown(String),
+}
+
+/// What a desktop entry's `Exec` runs, read past `env NAME=value …`, with a
+/// bare name looked up on `path`.
+///
+/// `path` is this process's PATH, which is not necessarily the one the
+/// session starts entries with; a name it does not find is reported as
+/// unknown rather than as gone.
+fn exec_target(fs: &Fs, text: &str, path: &[PathBuf]) -> ExecTarget {
+    let Some(args) = autostart::exec_arguments(text) else {
+        return ExecTarget::Unknown("it has no Exec line that names a program".into());
+    };
+    let mut words = args.iter().map(String::as_str);
+    let mut prog = words.next().unwrap_or_default();
+    if Path::new(prog).file_name().is_some_and(|n| n == "env") {
+        // `env NAME=value … program …`. An option to env (`-u NAME`, `-i`,
+        // `-S`, `--`) changes how the rest is read, so that is not guessed at.
+        match words.find(|w| w.starts_with('-') || !w.contains('=')) {
+            Some(w) if w.starts_with('-') => {
+                return ExecTarget::Unknown(format!(
+                    "it runs `env {} …`, and env's options are not read here",
+                    sanitize(w)
+                ))
+            }
+            Some(w) => prog = w,
+            None => return ExecTarget::Unknown("it runs `env` with no program after it".into()),
+        }
+    }
+    let p = Path::new(prog);
+    if p.is_absolute() {
+        return ExecTarget::Path(p.to_path_buf());
+    }
+    if prog.contains('/') {
+        return ExecTarget::Unknown(format!(
+            "it runs `{}`, a relative path, which depends on where it is started from",
+            sanitize(prog)
+        ));
+    }
+    let mut hits: Vec<PathBuf> = Vec::new();
+    for d in path.iter().filter(|d| d.is_absolute()) {
+        let c = d.join(prog);
+        if fs.is_executable_file(&c) {
+            let c = fs.unlinked_name(&c);
+            if !hits.contains(&c) {
+                hits.push(c);
+            }
+        }
+    }
+    ExecTarget::Bare {
+        name: prog.to_string(),
+        hits,
+    }
 }
 
 enum Decision {
@@ -497,43 +777,73 @@ enum Decision {
 /// Whether a desktop entry of ours goes, judged by the program it runs.
 ///
 /// It goes when that program is being removed or no longer exists. It stays
-/// when it runs a copy that is staying — a package's, a system install's —
-/// because deleting it would silently switch that install's menu entry or
-/// start-at-login off, with nothing to say it had happened.
-fn entry_decision(fs: &Fs, entry: &Path, removing: &dyn Fn(&Path) -> bool, what: &str) -> Decision {
+/// when it runs a copy that is staying — a package's, a system install's, a
+/// build tree's — because deleting it would silently switch that copy's menu
+/// entry or start-at-login off, with nothing to say it had happened. And it
+/// stays when what it runs cannot be told, for the same reason: a guess of
+/// "gone" is the one that switches something off.
+fn entry_decision(
+    fs: &Fs,
+    entry: &Path,
+    removing: &dyn Fn(&Path) -> bool,
+    path: &[PathBuf],
+    what: &str,
+) -> Decision {
     if !fs.exists(entry) {
         return Decision::Absent;
     }
+    let unknown = |why: &str| {
+        Decision::Keep(format!(
+            "{why}, so whether it runs a copy that stays cannot be told — left as it is"
+        ))
+    };
     let Some(text) = fs.read(entry) else {
-        return Decision::Remove("it could not be read, and it has this program's name".into());
+        return unknown("it could not be read");
     };
-    let Some(prog) = autostart::exec_program(&text) else {
-        return Decision::Remove("it has no Exec line".into());
+    let stays = |prog: &Path| {
+        Decision::Keep(format!(
+            "it runs {}, which is not being removed — deleting it would silently switch {what} \
+             off for that copy",
+            prog.display()
+        ))
     };
-    let prog = PathBuf::from(prog);
-    if !prog.is_absolute() {
-        return Decision::Remove(format!(
-            "it runs a bare `{}`, not a path to an install",
-            prog.display()
-        ));
+    match exec_target(fs, &text, path) {
+        ExecTarget::Unknown(why) => unknown(&why),
+        ExecTarget::Path(prog) => match fs.presence(&prog) {
+            Presence::Gone => Decision::Remove(format!(
+                "it runs {}, which no longer exists",
+                prog.display()
+            )),
+            Presence::Unknown(e) => unknown(&format!(
+                "it runs {}, which cannot be looked at ({e})",
+                prog.display()
+            )),
+            Presence::There if removing(&prog) => Decision::Remove(format!(
+                "it runs {}, which is being removed",
+                prog.display()
+            )),
+            Presence::There => stays(&prog),
+        },
+        ExecTarget::Bare { name, hits } => {
+            let name = sanitize(&name);
+            if let Some(stay) = hits.iter().find(|h| !removing(h)) {
+                // The first copy PATH finds after this run is what it will
+                // run, and that one stays.
+                stays(stay)
+            } else if hits.is_empty() {
+                unknown(&format!(
+                    "it runs a bare `{name}`, which is not on this PATH (the session that starts \
+                     it may have another)"
+                ))
+            } else {
+                let list: Vec<String> = hits.iter().map(|h| h.display().to_string()).collect();
+                Decision::Remove(format!(
+                    "it runs `{name}`, which PATH finds only at {} — being removed",
+                    list.join(" and ")
+                ))
+            }
+        }
     }
-    if !fs.exists(&prog) {
-        return Decision::Remove(format!(
-            "it runs {}, which no longer exists",
-            prog.display()
-        ));
-    }
-    if removing(&prog) {
-        return Decision::Remove(format!(
-            "it runs {}, which is being removed",
-            prog.display()
-        ));
-    }
-    Decision::Keep(format!(
-        "it runs {}, which is not being removed — deleting it would silently switch {what} \
-         off for that copy",
-        prog.display()
-    ))
 }
 
 /// The removal command for a package, in the tool a person removes with.
@@ -637,8 +947,11 @@ fn root_hint(fs: &Fs) -> Option<String> {
 ///
 /// Every Steam library's `compatdata/*/pfx`, scanned directly rather than only
 /// for installed games — Steam keeps a prefix after the game is uninstalled —
-/// plus `~/.wine`, which is the prefix `tobii bridge` uses when given none.
-fn wine_prefixes(fs: &Fs, home: &Path) -> Vec<PathBuf> {
+/// plus the prefixes `tobii bridge install` falls back to when given none
+/// (`resolve_prefix` in bridge.rs): `$WINEPREFIX`, then `~/.wine`. Both of
+/// those are checked, not only the first: the WINEPREFIX of this shell is not
+/// necessarily the one the bridge was installed with.
+fn wine_prefixes(fs: &Fs, home: &Path, wineprefix: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for lib in bridge::steam_libraries(&fs.at(home)) {
         let Ok(entries) = std::fs::read_dir(lib.join("steamapps/compatdata")) else {
@@ -651,9 +964,15 @@ fn wine_prefixes(fs: &Fs, home: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    let wine = home.join(".wine");
-    if fs.is_real_dir(&wine.join(BRIDGE_SUBDIR)) {
-        out.push(wine);
+    let defaults = wineprefix
+        .filter(|w| w.is_absolute())
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain([home.join(".wine")]);
+    for w in defaults {
+        if fs.is_real_dir(&w.join(BRIDGE_SUBDIR)) {
+            out.push(fs.canon_or(&w));
+        }
     }
     out.sort();
     out.dedup();
@@ -733,6 +1052,7 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
             }),
         }
     };
+    let holds_ours = |d: &Path| BINARIES.iter().any(|b| fs.is_file_or_link(&d.join(b)));
     for d in fs.manifest_bindirs(&manifest) {
         add(&d, Via::Manifest);
     }
@@ -746,7 +1066,6 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
     };
     let config_home = env.config_home();
     let autostart_entry = autostart::dir_in(&config_home).join(autostart::ENTRY_NAME);
-    let mut not_installs: Vec<(PathBuf, &'static str)> = Vec::new();
     if !opts.system {
         for d in &system_listed {
             add(d, Via::SystemManifest);
@@ -755,36 +1074,45 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
             (paths::desktop_entry_in(&data), Via::MenuEntry),
             (autostart_entry.clone(), Via::Autostart),
         ] {
-            let prog = fs.read(&entry).and_then(|t| autostart::exec_program(&t));
-            if let Some(dir) = prog.as_deref().map(Path::new).and_then(Path::parent) {
-                if dir.is_absolute() {
-                    add(dir, via);
+            let Some(text) = fs.read(&entry) else {
+                continue;
+            };
+            match exec_target(&fs, &text, &env.path) {
+                ExecTarget::Path(prog) => {
+                    if let Some(dir) = prog.parent() {
+                        add(dir, via);
+                    }
                 }
+                ExecTarget::Bare { hits, .. } => {
+                    for dir in hits.iter().filter_map(|h| h.parent()) {
+                        add(dir, via);
+                    }
+                }
+                ExecTarget::Unknown(_) => {}
             }
         }
         if let Some(dir) = env.current_exe.as_deref().and_then(Path::parent) {
-            if is_build_tree(dir) {
-                not_installs.push((dir.to_path_buf(), "a Cargo build directory"));
-            } else if fs.exists(&dir.join("install.sh")) {
-                not_installs.push((
-                    dir.to_path_buf(),
-                    "an unpacked release archive (install.sh is beside it)",
-                ));
-            } else {
-                add(dir, Via::ThisProgram);
+            add(dir, Via::ThisProgram);
+        }
+        // An install with no manifest and no menu entry — every `--lean`
+        // install from v0.1.0 to v0.3.0, or one whose menu entry is gone — is
+        // otherwise found only if this program happens to run from it. These
+        // are inferred like everything above: identified by --version, never
+        // trusted.
+        if let Some(home) = &home {
+            let default = home.join(".local/bin");
+            if holds_ours(&default) {
+                add(&default, Via::DefaultDir);
+            }
+        }
+        for d in &env.path {
+            if holds_ours(d) {
+                add(d, Via::Path);
             }
         }
     }
     for d in &opts.bindirs {
         add(d, Via::Bindir);
-    }
-    for (dir, why) in not_installs {
-        p.locations.push(Location {
-            dir,
-            via: vec![Via::ThisProgram],
-            verdict: Verdict::NotAnInstall(why),
-            binaries: Vec::new(),
-        });
     }
 
     // -------------------------------------------------------- classification
@@ -794,17 +1122,30 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
     let mut cleared: Vec<PathBuf> = Vec::new();
     let mut system_dirs: Vec<PathBuf> = Vec::new();
     for c in found {
-        let present: Vec<&'static str> = BINARIES
-            .iter()
-            .copied()
-            .filter(|b| fs.is_file_or_link(&c.dir.join(b)))
-            .collect();
         let mut loc = Location {
             dir: c.dir.clone(),
             via: c.via.clone(),
             verdict: Verdict::NothingThere,
             binaries: Vec::new(),
         };
+        let listed = c.via.contains(&Via::Manifest);
+        // A build tree or an unpacked archive is where a copy runs from, not
+        // an install, however it was reached: `cargo run -p tobii-gtk` and
+        // then switching start-at-login on puts target/debug into the
+        // autostart Exec. Only this mode's own manifest says otherwise —
+        // install-payload.sh wrote that line, so an install was made there.
+        if !listed {
+            if let Some(why) = not_an_install(&fs, &c.dir) {
+                loc.verdict = Verdict::NotAnInstall(why);
+                p.locations.push(loc);
+                continue;
+            }
+        }
+        let present: Vec<&'static str> = BINARIES
+            .iter()
+            .copied()
+            .filter(|b| fs.is_file_or_link(&c.dir.join(b)))
+            .collect();
         if present.is_empty() {
             cleared.push(c.dir.clone());
             p.locations.push(loc);
@@ -845,28 +1186,50 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
             p.locations.push(loc);
             continue;
         }
-        // Trusted without asking only when this mode's own manifest lists it.
-        // Anything inferred must say what it is before it is deleted.
-        let trusted = c.via.contains(&Via::Manifest);
+        // Trusted without asking only when this mode's own manifest lists the
+        // directory AND the name there is a program. Anything inferred must
+        // say what it is before it is deleted.
+        let mut not_run: Option<String> = None;
         for b in present {
             let path = c.dir.join(b);
             let is_me = me
                 .as_ref()
                 .is_some_and(|m| fs.canon(&path).as_ref() == Some(m));
-            let answer = if is_me {
-                Some(format!("tobii {}", env!("CARGO_PKG_VERSION")))
+            let (ident, why_kept) = if is_me {
+                (
+                    Ident::Me(format!("tobii {}", env!("CARGO_PKG_VERSION"))),
+                    None,
+                )
+            } else if listed {
+                match fs.program_check(&path) {
+                    Ok(()) => (Ident::Listed, None),
+                    Err(why) => (
+                        Ident::ListedNotProgram,
+                        Some(format!(
+                            "its directory is listed in the install manifest, but {why} — the \
+                             manifest says where to look, and this is not a program that was \
+                             installed there"
+                        )),
+                    ),
+                }
+            } else if let Some(why) = (env.euid == 0)
+                .then(|| fs.why_root_may_not_run(&path))
+                .flatten()
+            {
+                let why = format!(
+                    "not run as root to ask what it is: {why}, so whoever that is chooses what \
+                     it would run. If it is an install of this program, remove it as that \
+                     user: tobii uninstall --bindir {}",
+                    c.dir.display()
+                );
+                not_run.get_or_insert_with(|| why.clone());
+                (Ident::NotRun, Some(why))
             } else {
-                (probes.identify)(&fs.at(&path))
-            };
-            let answers = answer
-                .as_deref()
-                .is_some_and(|a| a.starts_with(&format!("{b} ")));
-            let planned = answers || trusted;
-            if planned {
-                removing.push(path.clone());
-            } else {
-                p.keep(
-                    path.clone(),
+                let answer = (probes.identify)(&fs.at(&path));
+                let answers = answer
+                    .as_deref()
+                    .is_some_and(|a| a.starts_with(&format!("{b} ")));
+                let why = (!answers).then(|| {
                     format!(
                         "found by inference, and it did not answer --version with \"{b} …\" \
                          ({}) — it may not be this program's",
@@ -874,17 +1237,26 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
                             Some(a) => format!("it said {:?}", sanitize(a)),
                             None => "it gave no answer".into(),
                         }
-                    ),
-                );
+                    )
+                });
+                (Ident::Answered(answer), why)
+            };
+            let planned = why_kept.is_none();
+            match why_kept {
+                None => removing.push(path.clone()),
+                Some(why) => p.keep(path.clone(), why),
             }
             loc.binaries.push(Binary {
                 name: b,
-                answer,
+                ident,
                 planned,
             });
         }
         if !loc.binaries.iter().any(|b| b.planned) {
-            loc.verdict = Verdict::Unidentified;
+            loc.verdict = match not_run {
+                Some(why) => Verdict::NotRunAsRoot(why),
+                None => Verdict::Unidentified,
+            };
             p.locations.push(loc);
             continue;
         }
@@ -902,10 +1274,13 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
         p.locations.push(loc);
     }
 
-    // The running binary goes last; every other binary first.
+    // The running binary goes last; every other binary first. Compared
+    // without resolving the planned name's last component: a symlink to the
+    // running program is only a link, removing it leaves the program where it
+    // is, and so it goes with the others.
     let mut binaries = Vec::new();
     for b in &removing {
-        if me.is_some() && fs.canon(b) == me {
+        if me.as_ref() == Some(b) {
             p.self_exe = Some(b.clone());
         } else {
             binaries.push(b.clone());
@@ -926,16 +1301,15 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
             .push(system_hint(d, &exe_display, p.self_exe.is_some()));
     }
 
-    let is_removed = |x: &Path| {
-        let cx = fs.canon(x);
-        removing
-            .iter()
-            .any(|r| r == x || (cx.is_some() && fs.canon(r) == cx))
-    };
+    // A planned name is `canonical directory + file name`, and a removal
+    // unlinks exactly that name. So a path is removed when a name on its way
+    // to the file it runs is planned — never merely because it resolves to
+    // the same file as a planned symlink, whose target stays.
+    let is_removed = |x: &Path| fs.link_chain(x).iter().any(|n| removing.contains(n));
 
     // ------------------------------------------------------------ data files
     let entry = paths::desktop_entry_in(&data);
-    let entry_kept = match entry_decision(&fs, &entry, &is_removed, "the menu entry") {
+    let entry_kept = match entry_decision(&fs, &entry, &is_removed, &env.path, "the menu entry") {
         Decision::Absent => false,
         Decision::Remove(why) => {
             p.push_remove(entry, format!("the menu entry — {why}"), false);
@@ -962,7 +1336,13 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
         }
     }
     if !opts.system {
-        match entry_decision(&fs, &autostart_entry, &is_removed, "start-at-login") {
+        match entry_decision(
+            &fs,
+            &autostart_entry,
+            &is_removed,
+            &env.path,
+            "start-at-login",
+        ) {
             Decision::Absent => {}
             Decision::Remove(why) => {
                 p.push_remove(
@@ -998,6 +1378,18 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
         let then_empty = !text.lines().any(|l| manifest_line_survives(l, &dropped));
         if then_empty {
             if let Some(dir) = manifest.parent() {
+                // The installer writes the manifest to installs.new-<pid> and
+                // renames it into place; one stopped in between leaves that
+                // behind, and it would keep this directory from going.
+                for name in fs.list(dir).unwrap_or_default() {
+                    if is_manifest_scratch(&name) {
+                        p.push_remove(
+                            dir.join(name),
+                            "a temporary left by the installer's manifest write",
+                            false,
+                        );
+                    }
+                }
                 p.rmdirs.push(dir.to_path_buf());
             }
         }
@@ -1083,7 +1475,7 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
     }
     if !opts.system {
         if let Some(home) = &home {
-            p.wine_prefixes = wine_prefixes(&fs, home);
+            p.wine_prefixes = wine_prefixes(&fs, home, env.wineprefix.as_deref());
         }
     }
 
@@ -1091,14 +1483,10 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
     //
     // Last, because it needs the final list of binaries. Matched by the path
     // the kernel reports, including `<path> (deleted)` — which is what a copy
-    // started before the updater replaced its binary looks like.
-    let mut targets: Vec<String> = Vec::new();
-    for b in removing.iter() {
-        targets.push(b.display().to_string());
-        if let Some(c) = fs.canon(b) {
-            targets.push(c.display().to_string());
-        }
-    }
+    // started before the updater replaced its binary looks like. The kernel's
+    // path has every symlink resolved, so a process running the target of a
+    // planned symlink does not match the link's name: that target stays.
+    let targets: Vec<String> = removing.iter().map(|b| b.display().to_string()).collect();
     for pr in procs {
         if pr.pid == env.pid || pr.pid == env.ppid {
             continue;
@@ -1106,11 +1494,24 @@ pub fn plan(env: &Env, opts: &Options, root: &Path, probes: &Probes, procs: &[Pr
         if !opts.system && pr.uid != env.euid {
             continue;
         }
-        let exe = pr.exe.strip_suffix(" (deleted)").unwrap_or(&pr.exe);
+        let (exe, deleted) = match pr.exe.strip_suffix(" (deleted)") {
+            Some(e) => (e, true),
+            None => (pr.exe.as_str(), false),
+        };
         if targets.iter().any(|t| t == exe) {
             p.stop.push(pr.clone());
-        } else if Path::new(exe).file_name().and_then(|n| n.to_str()) == Some("tobii-gtk") {
-            p.other_hubs.push(pr.clone());
+        } else if Path::new(exe).file_name().is_some_and(|n| n == "tobii-gtk") {
+            // Its program deleted and nothing at that path any more: a
+            // package removed while its hub ran. Under --system that would be
+            // another user's hub, which is not this run's to stop.
+            let gone = matches!(fs.presence(Path::new(exe)), Presence::Gone);
+            if deleted && gone {
+                if !opts.system {
+                    p.orphan_hubs.push(pr.clone());
+                }
+            } else {
+                p.other_hubs.push(pr.clone());
+            }
         }
     }
     p
@@ -1145,6 +1546,8 @@ pub struct Outcome {
     pub failed: Vec<(PathBuf, String)>,
     /// Directories `remove_dir` found not empty, with what is still in them.
     pub not_empty: Vec<(PathBuf, Vec<String>)>,
+    /// The running `tobii`, kept because something else could not be removed.
+    pub self_kept: Option<PathBuf>,
     pub notes: Vec<String>,
 }
 
@@ -1170,16 +1573,13 @@ pub fn execute(plan: &Plan) -> Outcome {
     for r in &plan.remove {
         remove(r, &mut out);
     }
-    if let Some(me) = &plan.self_exe {
-        let r = Removal {
-            path: me.clone(),
-            what: "this program".into(),
-            tree: false,
-        };
-        remove(&r, &mut out);
-    }
+    // The running tobii goes last, and only if nothing has failed — so a
+    // failure leaves a tobii to run this again with, and its manifest line
+    // with it. Whether it is going is decided here, before the manifest is
+    // edited, so that its line can go if it is.
+    let self_going = plan.self_exe.as_deref().filter(|_| out.failed.is_empty());
     for m in &plan.manifests {
-        apply_manifest(&fs, m, &mut out);
+        apply_manifest(&fs, m, self_going, &mut out);
     }
     for d in &plan.rmdirs {
         match std::fs::remove_dir(fs.at(d)) {
@@ -1194,6 +1594,28 @@ pub fn execute(plan: &Plan) -> Outcome {
     for h in &plan.icon_caches {
         refresh_icon_cache(&fs.at(h), &mut out);
     }
+    if let Some(me) = &plan.self_exe {
+        if out.failed.is_empty() {
+            let r = Removal {
+                path: me.clone(),
+                what: "this program".into(),
+                tree: false,
+            };
+            remove(&r, &mut out);
+            if out.failed.iter().any(|(p, _)| p == me) {
+                // Its manifest line went already, on the understanding that
+                // it would. It is still found: it is the program you run.
+                out.notes.push(format!(
+                    "{} could not remove itself; run `{} uninstall` again once the reason above \
+                     is fixed",
+                    me.display(),
+                    me.display()
+                ));
+            }
+        } else {
+            out.self_kept = Some(me.clone());
+        }
+    }
     out
 }
 
@@ -1201,13 +1623,19 @@ pub fn execute(plan: &Plan) -> Outcome {
 ///
 /// Decided again here, against what is really left: a line only goes when
 /// neither binary remains in that directory, so a removal that failed keeps the
-/// directory discoverable for the next attempt.
-fn apply_manifest(fs: &Fs, m: &ManifestEdit, out: &mut Outcome) {
+/// directory discoverable for the next attempt. `self_going` is the running
+/// program when it is about to be removed; it does not count as remaining.
+fn apply_manifest(fs: &Fs, m: &ManifestEdit, self_going: Option<&Path>, out: &mut Outcome) {
     let Some(text) = fs.read(&m.file) else {
         return;
     };
-    let emptied =
-        |d: &Path| m.drop.iter().any(|x| x == d) && !BINARIES.iter().any(|b| fs.exists(&d.join(b)));
+    let remains = |d: &Path| {
+        BINARIES.iter().any(|b| {
+            let f = d.join(b);
+            fs.exists(&f) && self_going != Some(fs.unlinked_name(&f).as_path())
+        })
+    };
+    let emptied = |d: &Path| m.drop.iter().any(|x| x == d) && !remains(d);
     let kept: Vec<&str> = text
         .lines()
         .filter(|l| match l.trim().strip_prefix("bindir=") {
@@ -1234,7 +1662,8 @@ fn apply_manifest(fs: &Fs, m: &ManifestEdit, out: &mut Outcome) {
     }
 }
 
-/// Refresh an icon cache that exists. Never creates one.
+/// Refresh an icon cache that exists. Never creates one — but the tool this
+/// runs deletes the cache when no icons are left under it; see below.
 fn refresh_icon_cache(hicolor: &Path, out: &mut Outcome) {
     if !hicolor.join("icon-theme.cache").is_file() {
         return;
@@ -1370,19 +1799,41 @@ pub fn scan_processes() -> Vec<Proc> {
             uid,
             exe: exe.to_string_lossy().into_owned(),
             args,
+            start_time: start_time(pid),
         });
     }
     out
 }
 
+/// When a process started, from `/proc/<pid>/stat`.
+fn start_time(pid: u32) -> Option<u64> {
+    parse_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Field 22 of a `/proc/<pid>/stat` line. Field 2 is the command name in
+/// parentheses, which may itself hold spaces and parentheses, so the fields
+/// are counted from the LAST `)`.
+fn parse_start_time(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    // `rest` begins at field 3, the state, so field 22 is its 20th word.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// Whether a process from the plan is still the process it was.
 ///
-/// Compared by executable as well as pid, so a pid the kernel has since given
-/// to something else does not read as "still running".
+/// Compared by executable and start time as well as pid, so a pid the kernel
+/// has since given to something else does not read as "still running".
 fn still_running(p: &Proc) -> bool {
     let strip = |s: &str| s.strip_suffix(" (deleted)").unwrap_or(s).to_string();
     std::fs::read_link(format!("/proc/{}/exe", p.pid))
         .is_ok_and(|e| strip(&e.to_string_lossy()) == strip(&p.exe))
+        && (p.start_time.is_none() || start_time(p.pid) == p.start_time)
+}
+
+/// Whether a signal may go to `p`'s pid: it is provably still that process.
+/// Without a start time from the scan it cannot be proved, so no.
+fn safe_to_signal(p: &Proc) -> bool {
+    p.start_time.is_some() && still_running(p)
 }
 
 /// The first line a binary prints for `--version`.
@@ -1477,7 +1928,14 @@ fn describe_proc(p: &Proc) -> String {
     s
 }
 
+fn is_hub(p: &Proc) -> bool {
+    p.exe.contains("/tobii-gtk")
+}
+
 /// The plan, as the person about to approve it reads it.
+///
+/// A refused plan shows what was looked at and stops; the refusal itself is
+/// the caller's to print, once.
 pub fn render(plan: &Plan, opts: &Options) -> String {
     use std::fmt::Write as _;
     let mut o = String::new();
@@ -1498,11 +1956,17 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
             let via: Vec<&str> = l.via.iter().map(|v| v.label()).collect();
             let _ = writeln!(o, "  {}   (found via {})", l.dir.display(), via.join(", "));
             for b in &l.binaries {
-                let answer = match &b.answer {
-                    Some(a) => format!("answers {:?}", sanitize(a)),
-                    None => "no answer to --version".into(),
+                let what = match &b.ident {
+                    Ident::Me(a) => format!("answers {:?} (this program)", sanitize(a)),
+                    Ident::Listed => "listed in the install manifest; not identified".into(),
+                    Ident::ListedNotProgram => {
+                        "listed in the install manifest, but not an executable program".into()
+                    }
+                    Ident::Answered(Some(a)) => format!("answers {:?}", sanitize(a)),
+                    Ident::Answered(None) => "no answer to --version".into(),
+                    Ident::NotRun => "not run as root to ask what it is".into(),
                 };
-                let _ = writeln!(o, "      {:<10} {answer}", b.name);
+                let _ = writeln!(o, "      {:<10} {what}", b.name);
             }
             let verdict = match &l.verdict {
                 Verdict::Remove => {
@@ -1516,24 +1980,29 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
                 }
                 Verdict::SystemInstall => "a system-wide install — see below".into(),
                 Verdict::Unidentified => {
-                    "left: nothing there identified itself as this program".into()
+                    "left: nothing there could be identified as this program's".into()
                 }
                 Verdict::NotAnInstall(why) => format!("not an install: {why}"),
+                Verdict::NotRunAsRoot(why) => format!("left: {why}"),
             };
             let _ = writeln!(o, "      → {verdict}");
         }
         let _ = writeln!(o);
     }
 
-    if let Some(r) = &plan.refusal {
-        let _ = writeln!(o, "Refused: {r}");
+    if plan.refusal.is_some() {
         return o;
     }
 
+    let sigterm = if opts.yes {
+        "SIGTERM if they have not quit 5 seconds later — --yes agrees to that"
+    } else {
+        "SIGTERM only if you agree"
+    };
     if !plan.stop.is_empty() {
         let _ = writeln!(
             o,
-            "Running copies — stopped first (asked to quit, then SIGTERM only if you agree)"
+            "Running copies — stopped first (asked to quit, then {sigterm})"
         );
         for p in &plan.stop {
             let _ = writeln!(o, "  {}", describe_proc(p));
@@ -1548,13 +2017,41 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
         let _ = writeln!(o);
     }
 
+    if !plan.orphan_hubs.is_empty() {
+        let _ = writeln!(o, "A hub whose program has been deleted is still running");
+        for p in &plan.orphan_hubs {
+            let _ = writeln!(o, "  {}", describe_proc(p));
+        }
+        let how = if plan.other_hubs.is_empty() {
+            format!(
+                "it is asked to quit over D-Bus first — which reaches whichever hub owns the \
+                 name, this one or a copy being removed — then {sigterm}"
+            )
+        } else {
+            format!(
+                "with {sigterm} — not over D-Bus, which could reach the hub from a copy that \
+                 stays instead"
+            )
+        };
+        let _ = writeln!(
+            o,
+            "  Its program is gone — most likely a package was removed while it ran — so \
+             there is nothing of it to remove. But it still holds the tracker, and every start \
+             of the hub is handed to it until it quits. This run offers to stop it: {how}.\n"
+        );
+    }
+
     if !plan.is_empty() {
         let _ = writeln!(o, "Will remove");
         for r in &plan.remove {
             let _ = writeln!(o, "  {}   ({})", r.path.display(), r.what);
         }
         if let Some(me) = &plan.self_exe {
-            let _ = writeln!(o, "  {}   (this program — removed last)", me.display());
+            let _ = writeln!(
+                o,
+                "  {}   (this program — removed last, and only if nothing else failed)",
+                me.display()
+            );
         }
         for m in &plan.manifests {
             for d in &m.drop {
@@ -1575,7 +2072,8 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
         for h in &plan.icon_caches {
             let _ = writeln!(
                 o,
-                "  (then refresh the existing icon cache in {})",
+                "  (then refresh the existing icon cache in {}; the cache tool deletes it if no \
+                 icons are left there)",
                 h.display()
             );
         }
@@ -1610,13 +2108,18 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
             if plan.wine_prefixes.is_empty() {
                 let _ = writeln!(
                     o,
-                    "  No Wine prefix with the bridge was found in Steam or ~/.wine."
+                    "  No Wine prefix with the bridge was found in Steam, $WINEPREFIX or ~/.wine."
                 );
             } else {
                 let _ = writeln!(
                     o,
-                    "  The TrackIR/FreeTrack bridge is installed in these Wine prefixes. Remove \
-                     it first, while `tobii` is still installed:"
+                    "  The TrackIR/FreeTrack bridge is installed in these Wine prefixes. {}",
+                    if plan.removes_tobii() {
+                        "Removing it takes `tobii`, and this run removes `tobii` — so run \
+                         these first:"
+                    } else {
+                        "Remove it with:"
+                    }
                 );
                 for w in &plan.wine_prefixes {
                     let _ = writeln!(o, "    tobii bridge uninstall --prefix {}", w.display());
@@ -1624,7 +2127,7 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
             }
             let _ = writeln!(
                 o,
-                "  Prefixes outside Steam (Lutris, Heroic, Bottles, a WINEPREFIX of your own) \
+                "  Prefixes outside Steam (Lutris, Heroic, Bottles, a WINEPREFIX not set here) \
                  cannot be found from here; for any you installed the bridge into, run \
                  `tobii bridge uninstall --prefix PATH`."
             );
@@ -1733,32 +2236,51 @@ fn wait_gone(procs: &[Proc], limit: Duration) -> Vec<Proc> {
     }
 }
 
-/// Stop the running copies before anything is removed.
+/// Stop the running copies before anything is removed, and offer to stop a
+/// hub whose program was deleted.
 ///
 /// There is no other way to stop a primary hub from receiving every launch:
 /// `GApplication` is single-instance, so while one runs, starting any copy
-/// hands off to it. `Err` means something is still running and nothing has
-/// been removed.
+/// hands off to it. `Err` means one of our copies is still running and
+/// nothing has been removed. A hub whose program was deleted is not ours to
+/// insist on: declining to stop it leaves it running and goes on.
 fn stop_running(plan: &Plan, opts: &Options, interactive: bool) -> Result<(), String> {
-    if plan.stop.is_empty() {
+    let ours = &plan.stop;
+    let orphans = &plan.orphan_hubs;
+    if ours.is_empty() && orphans.is_empty() {
         return Ok(());
     }
     let stop_msg = "Nothing was removed. Quit them first — the hub's Quit is in its cogwheel \
                     menu — and run this again.";
-    if !opts.yes && !(interactive && ask("Ask the running copies to quit now?", true)) {
+    let orphan_left = "  left running: the hub whose program was deleted. Its Quit is in its \
+                       cogwheel menu.";
+    let question = match (ours.is_empty(), orphans.is_empty()) {
+        (false, true) => "Ask the running copies to quit now?",
+        (true, _) => "Ask the hub whose program was deleted to quit now?",
+        (false, false) => {
+            "Ask the running copies, and the hub whose program was deleted, to quit now?"
+        }
+    };
+    if !opts.yes && !(interactive && ask(question, true)) {
+        if ours.is_empty() {
+            println!("{orphan_left}");
+            return Ok(());
+        }
         return Err(stop_msg.into());
     }
-    let hub = plan.stop.iter().any(|p| p.exe.contains("/tobii-gtk"));
-    if hub && plan.other_hubs.is_empty() {
+    let all: Vec<Proc> = ours.iter().chain(orphans).cloned().collect();
+    if all.iter().any(is_hub) && plan.other_hubs.is_empty() {
         match ask_hub_to_quit() {
-            Ok(()) => println!("  asked the hub to quit"),
+            Ok(()) => println!(
+                "  asked the hub to quit (over D-Bus, which reaches whichever hub owns the name)"
+            ),
             Err(e) => println!(
                 "  the hub could not be asked to quit ({e}) — hubs before v0.4 have no way \
                  to be asked"
             ),
         }
     }
-    let left = wait_gone(&plan.stop, Duration::from_secs(5));
+    let left = wait_gone(&all, Duration::from_secs(5));
     if left.is_empty() {
         return Ok(());
     }
@@ -1766,33 +2288,61 @@ fn stop_running(plan: &Plan, opts: &Options, interactive: bool) -> Result<(), St
     for p in &left {
         println!("  {}", describe_proc(p));
     }
+    let ours_left = |set: &[Proc]| set.iter().any(|p| ours.contains(p));
     if !opts.yes && !(interactive && ask("Send them SIGTERM?", false)) {
-        return Err(stop_msg.into());
+        if ours_left(&left) {
+            return Err(stop_msg.into());
+        }
+        println!("{orphan_left}");
+        return Ok(());
     }
+    let mut signalled = Vec::new();
     for p in &left {
+        // Checked again right before the signal: the question above waited
+        // for a person, for as long as they took, and a pid freed meanwhile
+        // can belong to anything by now.
+        if !safe_to_signal(p) {
+            println!(
+                "  pid {} is no longer the process listed above — not signalled",
+                p.pid
+            );
+            continue;
+        }
         let mut c = Command::new("kill");
         c.args(["-TERM", &p.pid.to_string()]);
-        if let Err(e) = run_bounded(c, Duration::from_secs(5)) {
-            println!("  could not signal {}: {e}", p.pid);
+        match run_bounded(c, Duration::from_secs(5)) {
+            Ok(_) => signalled.push(p.clone()),
+            Err(e) => println!("  could not signal {}: {e}", p.pid),
         }
     }
     let still = wait_gone(&left, Duration::from_secs(3));
-    if left.iter().any(|p| p.exe.contains("/tobii-gtk")) {
+    if signalled.iter().any(is_hub) {
         println!(
             "A hub was stopped with SIGTERM. If the tracker's lights stay on, unplug it and \
              plug it back in. (Whether a hub stopped this way leaves the ET5 lit has not been \
              measured.)"
         );
     }
-    if still.is_empty() {
-        Ok(())
-    } else {
-        let pids: Vec<String> = still.iter().map(|p| p.pid.to_string()).collect();
-        Err(format!(
+    let pids = |set: &[Proc]| {
+        set.iter()
+            .map(|p| p.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if ours_left(&still) {
+        return Err(format!(
             "still running after SIGTERM: {}. Nothing was removed.",
-            pids.join(", ")
-        ))
+            pids(&still)
+        ));
     }
+    if !still.is_empty() {
+        println!(
+            "  still running after SIGTERM, and left: {} (its program is already gone, so \
+             nothing here depends on it)",
+            pids(&still)
+        );
+    }
+    Ok(())
 }
 
 fn run_udev(plan: &Plan, euid: u32, interactive: bool, yes: bool) {
@@ -1850,6 +2400,16 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
             let _ = writeln!(o, "    {} — {e}", p.display());
         }
     }
+    if let Some(me) = &out.self_kept {
+        let _ = writeln!(
+            o,
+            "  Kept {} — this program — because something above could not be removed. Its \
+             line stays in the install manifest. Fix what failed, then run `{} uninstall` \
+             again.",
+            me.display(),
+            me.display()
+        );
+    }
     let left = !plan.kept.is_empty() || !out.not_empty.is_empty();
     if left {
         let _ = writeln!(o, "  Left in place:");
@@ -1887,10 +2447,39 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
             );
         }
     }
+    let tobii_gone = out
+        .removed
+        .iter()
+        .any(|p| p.file_name().is_some_and(|n| n == "tobii"));
+    if tobii_gone && !plan.wine_prefixes.is_empty() {
+        let _ = writeln!(
+            o,
+            "  The TrackIR/FreeTrack bridge is still in these Wine prefixes. `tobii` is removed \
+             now, but the `tobii` in a release archive runs these just as well — from the \
+             unpacked archive's folder:"
+        );
+        for w in &plan.wine_prefixes {
+            let _ = writeln!(o, "    ./tobii bridge uninstall --prefix {}", w.display());
+        }
+    }
     for n in &out.notes {
         let _ = writeln!(o, "  {n}");
     }
     o
+}
+
+/// The question asked before anything is removed when the bridge is still in
+/// a Wine prefix and this run removes the `tobii` that removes it.
+fn bridge_question(plan: &Plan) -> Option<String> {
+    if plan.wine_prefixes.is_empty() || !plan.removes_tobii() {
+        return None;
+    }
+    let n = plan.wine_prefixes.len();
+    Some(format!(
+        "The bridge is still in {n} Wine prefix{}, and removing it needs this program. Stop here \
+         so you can remove it first?",
+        if n == 1 { "" } else { "es" }
+    ))
 }
 
 /// `tobii uninstall ...`
@@ -1911,6 +2500,7 @@ pub fn run(args: &[String]) -> CmdResult {
     let plan = plan(&env, &opts, Path::new("/"), &probes, &procs);
     print!("{}", render(&plan, &opts));
     if let Some(r) = &plan.refusal {
+        // Printed once, as the caller's `error:` line.
         return Err(r.clone().into());
     }
     if opts.dry_run {
@@ -1920,6 +2510,7 @@ pub fn run(args: &[String]) -> CmdResult {
     let interactive = std::io::stdin().is_terminal();
     if plan.is_empty() {
         println!("Nothing to remove.");
+        stop_running(&plan, &opts, interactive)?;
         if opts.udev {
             run_udev(&plan, euid, interactive, opts.yes);
         }
@@ -1932,6 +2523,15 @@ pub fn run(args: &[String]) -> CmdResult {
                         plan above, then re-run with --yes to go ahead."
                     .into(),
             );
+        }
+        if let Some(q) = bridge_question(&plan) {
+            if ask(&q, true) {
+                println!(
+                    "Nothing was changed. Run the `tobii bridge uninstall` commands listed \
+                     above, then run this again."
+                );
+                return Ok(());
+            }
         }
         if !ask("Remove everything listed under “Will remove”?", false) {
             println!("Nothing was changed.");
