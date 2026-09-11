@@ -586,27 +586,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let theme = write_icon_theme(&base).expect("writable temp dir");
         assert_eq!(theme, base.join("icons"));
-        for f in [
-            theme.join(format!("hicolor/scalable/apps/{ICON_NAME}.svg")),
-            theme.join(format!("{ICON_NAME}.svg")),
-        ] {
-            assert_eq!(
-                std::fs::read(&f).expect("icon written"),
-                ICON_SVG,
-                "{}",
-                f.display()
-            );
-        }
-        let index = std::fs::read_to_string(theme.join("hicolor/index.theme")).expect("index");
-        assert!(index.contains("Directories=scalable/apps"), "{index}");
-        // A second start must leave the files as they are: a rename makes a new
-        // inode, and a host may be reading the old one at that moment.
-        use std::os::unix::fs::MetadataExt;
         let files = [
             theme.join(format!("hicolor/scalable/apps/{ICON_NAME}.svg")),
             theme.join(format!("{ICON_NAME}.svg")),
             theme.join("hicolor/index.theme"),
         ];
+        for f in &files[..2] {
+            assert_eq!(
+                std::fs::read(f).expect("icon written"),
+                ICON_SVG,
+                "{}",
+                f.display()
+            );
+        }
+        let index = std::fs::read_to_string(&files[2]).expect("index");
+        assert!(index.contains("Directories=scalable/apps"), "{index}");
+        // A second start must leave the files as they are: a rename makes a new
+        // inode, and a host may be reading the old one at that moment.
+        use std::os::unix::fs::MetadataExt;
         let inodes = || -> Vec<u64> {
             files
                 .iter()

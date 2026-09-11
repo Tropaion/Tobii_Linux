@@ -36,7 +36,11 @@ use gtk::{
 
 use tobii_protocol::EnabledEye;
 
-const APP_ID: &str = "com.tobiilinux.Configuration";
+// The one spelling, shared with `tobii uninstall`: it asks a running hub to quit
+// by this name on the session bus, and a hub registered under a copy that had
+// drifted would simply not be found — which is also what a hub older than the
+// action looks like, so nothing would say anything was wrong.
+use tobii_config::paths::APP_ID;
 
 /// The stylesheet.
 ///
@@ -712,6 +716,19 @@ pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
     win.add_controller(keys);
 }
 
+/// Make `btn` close the window it is in.
+///
+/// Found from the button at click time, never captured: the button lives inside
+/// that window, so a captured reference is a cycle, and a flow window that is
+/// never freed keeps everything it holds — see `hold_while_open`.
+pub(crate) fn close_on_click(btn: &gtk::Button) {
+    btn.connect_clicked(|b| {
+        if let Some(w) = b.root().and_downcast::<gtk::Window>() {
+            w.close();
+        }
+    });
+}
+
 /// Build the hub over an existing device thread.
 ///
 /// Returns the hub window, or `None` when `--accuracy` took over and there is
@@ -737,9 +754,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     }
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
-    // Set by the Quit item, and only by it. See the close handler: pressing X
-    // hides or minimises rather than exiting, so something has to tell the two
-    // apart.
+    // Set by the `quit` action (see `QUIT_HUB`: the cogwheel's Quit item,
+    // `tobii uninstall` and the update banner all go through it), and only by
+    // it. See the close handler: pressing X hides or minimises rather than
+    // exiting, so something has to tell the two apart.
     let really_quitting = Rc::new(Cell::new(false));
     // "Select eyes to detect": guard against echoing our own seeding as a user
     // change, and seed the radios from the device once per connection.
@@ -1342,7 +1360,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     title.set_hexpand(true);
     header.append(&title);
     header.append(&status_bar);
-    header.append(&settings_button(&really_quitting));
+    header.append(&settings_button());
 
     // One margin all round, so the frame of background around the content is
     // even. Anything else reads as a mistake at the corners.
@@ -1845,7 +1863,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 return glib::Propagation::Stop;
             }
 
-            // From here down: an actual quit, from the Quit item.
+            // From here down: an actual quit, from the `quit` action.
             //
             // 1. The tracker claim. A hub closed while focused would otherwise
             //    leave one behind for the life of the process — which in
@@ -1861,6 +1879,26 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             //    window remained.
             if let Some(w) = overlay_win.borrow_mut().take() {
                 w.close();
+            }
+
+            // 2b. Every other window of the application: an open calibration
+            //     or display-setup flow. Their teardown is their own close
+            //     handler — calibration's sends the abort that stops an open
+            //     session and puts the saved calibration back — and
+            //     `app.quit()` below ends the loop without closing anything, so
+            //     a quit arriving from outside while a flow was up (`tobii
+            //     uninstall`, which can come at any moment) skipped all of it
+            //     and left the flow's tracker claim standing to the end.
+            //     Closed, not destroyed: only `close()` runs those handlers.
+            let others: Vec<gtk::Window> = w
+                .application()
+                .map(|app| app.windows())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|o| o != w.upcast_ref::<gtk::Window>())
+                .collect();
+            for o in others {
+                o.close();
             }
 
             // 3. The 33 ms tick. It captures the application and can open a
@@ -1888,9 +1926,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         });
     }
 
-    // The `quit` action's way in — see `QUIT_HUB`. The same two steps as the
-    // cogwheel's Quit row: the flag that makes the close handler tear down
-    // instead of hiding, then the close.
+    // The `quit` action's way in — see `QUIT_HUB`. The flag that makes the
+    // close handler tear down instead of hiding, then the close.
     {
         let quitting = really_quitting.clone();
         let window = window.downgrade();
@@ -2004,9 +2041,9 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 /// A `Popover`, not a second window: it is anchored to the button that opened
 /// it, it closes on click-away, and it needs no title bar, no size negotiation
 /// and no place in the window list for what is three rows of content.
-fn settings_button(quitting: &Rc<Cell<bool>>) -> gtk::MenuButton {
+fn settings_button() -> gtk::MenuButton {
     let popover = gtk::Popover::new();
-    popover.set_child(Some(&settings_list(quitting)));
+    popover.set_child(Some(&settings_list()));
     popover.set_position(gtk::PositionType::Bottom);
     popover.set_has_arrow(false);
     // Right edge flush with the cogwheel's, not centred under it. A popover is
@@ -2143,7 +2180,7 @@ fn text_size_row() -> gtk::Box {
     )
 }
 
-fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
+fn settings_list() -> gtk::Box {
     let list = gtk::Box::new(Orientation::Vertical, 4);
     // An explicit width rather than one negotiated from the longest sentence.
     // `set_max_width_chars` is a hint about where a label may wrap, not a cap
@@ -2185,7 +2222,7 @@ fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
 
     list.append(&diagnostics_row());
     list.append(&hairline());
-    list.append(&quit_row(quitting));
+    list.append(&quit_row());
 
     list
 }
@@ -2196,26 +2233,18 @@ fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
 /// its exit went, and this is where somebody looks for it. The description is
 /// not decoration: without it, the only way to discover that X does not quit is to
 /// press X.
-fn quit_row(quitting: &Rc<Cell<bool>>) -> gtk::Box {
+fn quit_row() -> gtk::Box {
     let btn = crate::widget::button("Quit");
     btn.add_css_class("quiet");
     btn.set_tooltip_text(Some(
         "Exit completely. Games stop receiving head tracking until this is \
          started again.",
     ));
-    let quitting = quitting.clone();
-    btn.connect_clicked(move |b| {
-        // The flag is what tells the hub's close handler that this is a real
-        // exit rather than the X button, so it tears down instead of
-        // minimising. Closing the window rather than calling `app.quit()`
-        // directly keeps ONE teardown path — the claim, the overlay and the
-        // tick are all released there, and a second exit route would be a
-        // second place to forget one of them.
-        quitting.set(true);
-        if let Some(w) = b.root().and_downcast::<gtk::Window>() {
-            w.close();
-        }
-    });
+    // The application's `quit` action, the same door `tobii uninstall` and the
+    // update banner use, so there is ONE teardown path (see `QUIT_HUB`): the
+    // claim, the overlay, any open flow and the tick are all released there,
+    // and a second exit route would be a second place to forget one of them.
+    btn.set_action_name(Some("app.quit"));
     settings_row(
         "Quit",
         "Closing the window leaves it running, so games keep getting head \

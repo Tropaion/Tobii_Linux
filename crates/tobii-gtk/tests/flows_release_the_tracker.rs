@@ -8,6 +8,8 @@
 //! reasons, which is state, not hardware. Nothing the user has saved is touched —
 //! the calibration flow is closed at its eye-preview step, before any session
 //! begins, and the display-setup flow is cancelled before anything is written.
+//! Both are closed with their own Cancel button, clicked the way a user would,
+//! so the path from that button to the window's close is exercised too.
 //!
 //! This is the regression the v0.3.0 bug report found: closing either flow left
 //! its claim in place for the life of the process, so after one calibration the
@@ -29,8 +31,8 @@ fn walk(w: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
     }
 }
 
-/// The button whose label reads `text` — the hub's real button, clicked the way
-/// a user would, so the whole path from the click to the claim is exercised.
+/// The button whose label reads `text` — the real button, clicked the way a
+/// user would, so the whole path from the click to the claim is exercised.
 fn button_labelled(root: &gtk::Widget, text: &str) -> gtk::Button {
     let mut all = Vec::new();
     walk(root, &mut all);
@@ -40,7 +42,7 @@ fn button_labelled(root: &gtk::Widget, text: &str) -> gtk::Button {
             w.downcast_ref::<gtk::Label>()
                 .is_some_and(|l| l.text() == text)
         })
-        .unwrap_or_else(|| panic!("no label {text:?} in the hub"));
+        .unwrap_or_else(|| panic!("no label {text:?} in the window"));
     loop {
         if let Some(b) = w.downcast_ref::<gtk::Button>() {
             return b.clone();
@@ -84,8 +86,9 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
             let hub = tobii_gtk::build_hub(app, session).expect("hub");
             hub.present();
 
-            // (open at, close at, check at, button label, the claim it takes,
-            // whether to keep the window alive across the close)
+            // (open at, button label, the claim it takes, whether to keep the
+            // window alive across the close). Each flow is sampled 500 ms after
+            // it opens, closed 1 s after, and checked 800 ms after the close.
             //
             // The third run holds the window on purpose. The first two prove
             // the flows no longer reference themselves; that one proves the
@@ -94,18 +97,12 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
             // the next self-reference anyone adds would bring the bug back with
             // every other assertion here still passing.
             let flows = [
-                (
-                    600u64,
-                    1600u64,
-                    2400u64,
-                    "Improve calibration",
-                    "calibration",
-                    false,
-                ),
-                (3000, 4000, 4800, "Set up display", "display setup", false),
-                (5400, 6400, 7200, "Improve calibration", "calibration", true),
+                (600u64, "Improve calibration", "calibration", false),
+                (3000, "Set up display", "display setup", false),
+                (5400, "Improve calibration", "calibration", true),
             ];
-            for (open, close, check, label, flow, held) in flows {
+            for (open, label, flow, held) in flows {
+                let (close, check) = (open + 1000, open + 1800);
                 let weak: Rc<RefCell<Option<gtk::glib::WeakRef<gtk::Window>>>> = Rc::default();
                 let during: Rc<RefCell<Vec<&'static str>>> = Rc::default();
                 let (d, du) = (demand.clone(), during.clone());
@@ -113,14 +110,14 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
                     std::time::Duration::from_millis(open + 500),
                     move || *du.borrow_mut() = d.reasons(),
                 );
-                let (h, w) = (hub.clone(), weak.clone());
+                let h = hub.clone();
                 gtk::glib::timeout_add_local_once(
                     std::time::Duration::from_millis(open),
                     move || {
                         button_labelled(h.upcast_ref(), label).emit_clicked();
                     },
                 );
-                let (h, a, w2, k) = (hub.clone(), app.clone(), weak.clone(), keep.clone());
+                let (h, a, w, k) = (hub.clone(), app.clone(), weak.clone(), keep.clone());
                 gtk::glib::timeout_add_local_once(
                     std::time::Duration::from_millis(close),
                     move || {
@@ -129,11 +126,11 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
                             .into_iter()
                             .find(|x| x != h.upcast_ref::<gtk::Window>())
                             .unwrap_or_else(|| panic!("{flow} opened no window"));
-                        *w2.borrow_mut() = Some(flow_win.downgrade());
+                        *w.borrow_mut() = Some(flow_win.downgrade());
                         if held {
                             k.borrow_mut().push(flow_win.clone());
                         }
-                        flow_win.close();
+                        button_labelled(flow_win.upcast_ref(), "Cancel").emit_clicked();
                     },
                 );
                 let (d, s) = (demand.clone(), seen.clone());
@@ -145,7 +142,7 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
                             held,
                             claims_while_open: during.borrow().clone(),
                             claims_after_close: d.reasons(),
-                            window_alive_after_close: w
+                            window_alive_after_close: weak
                                 .borrow()
                                 .as_ref()
                                 .and_then(|w| w.upgrade())

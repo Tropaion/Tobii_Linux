@@ -38,7 +38,7 @@ use gtk::{
 
 use crate::align;
 use crate::device::DeviceCommand;
-use crate::{add_escape_to_close, screen_height};
+use crate::{add_escape_to_close, close_on_click, screen_height};
 use tobii_config::{pick_monitor, DisplaySetup};
 
 fn aspect(area: &DrawingArea) -> f64 {
@@ -1050,11 +1050,8 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     {
         let setup = setup.clone();
         let chosen = chosen.clone();
-        // Weak: this button lives inside the window, so a strong reference is
-        // a cycle that keeps the window alive after it closes.
-        let win = win.downgrade();
         let posture_warn = posture_warn.clone();
-        posture_done.connect_clicked(move |_| {
+        posture_done.connect_clicked(move |b| {
             let s = *setup.borrow();
             let saved = tobii_config::save(&s);
             let _ = cmd_tx.send(DeviceCommand::SetDisplayArea(s.to_corners()));
@@ -1076,21 +1073,16 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
                 posture_warn.set_visible(true);
                 return;
             }
-            if let Some(w) = win.upgrade() {
+            // From the button, not captured: see `close_on_click`.
+            if let Some(w) = b.root().and_downcast::<gtk::Window>() {
                 w.close();
             }
         });
     }
 
-    // Cancel, on every page, all closing the whole wizard the same way. Weak
-    // for the same reason as Done above.
+    // Cancel, on every page, all closing the whole wizard the same way.
     for cancel_btn in [&align_cancel, &pick_cancel, &posture_cancel] {
-        let win = win.downgrade();
-        cancel_btn.connect_clicked(move |_| {
-            if let Some(w) = win.upgrade() {
-                w.close();
-            }
-        });
+        close_on_click(cancel_btn);
     }
 
     // Seed the form + readout from the initial setup.

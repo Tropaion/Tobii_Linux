@@ -19,8 +19,8 @@ use gtk::{cairo, Align, Application, Button, DrawingArea, Label, Orientation, Ov
 
 use crate::device::{next_cal_token, CalPhase, DeviceCommand, DeviceState};
 use crate::{
-    add_escape_to_close, calibration_area, eye_preview, focus, particles, screen_aspect,
-    screen_height, widget,
+    add_escape_to_close, calibration_area, close_on_click, eye_preview, focus, particles,
+    screen_aspect, screen_height, widget,
 };
 use tobii_protocol::gaze::present;
 
@@ -728,26 +728,8 @@ pub fn launch(
     }
     // Every exit routes through `win.close()` so the single close handler below
     // is the one place that aborts the session and stops the tick.
-    //
-    // Weak references, because both buttons live inside the window: a strong
-    // one is a cycle, and the window outlived its own closing — for the life of
-    // the process, with everything it holds.
-    {
-        let win = win.downgrade();
-        done_btn.connect_clicked(move |_| {
-            if let Some(w) = win.upgrade() {
-                w.close();
-            }
-        });
-    }
-    {
-        let win = win.downgrade();
-        cancel.connect_clicked(move |_| {
-            if let Some(w) = win.upgrade() {
-                w.close();
-            }
-        });
-    }
+    close_on_click(&done_btn);
+    close_on_click(&cancel);
 
     // Esc cancels.
     add_escape_to_close(&win);
