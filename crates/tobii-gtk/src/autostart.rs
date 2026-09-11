@@ -225,7 +225,9 @@ mod tests {
         // `tobii uninstall` and `install.sh` read it.
         let text = entry_text(&exec.display().to_string());
         assert_eq!(
-            tobii_config::autostart::exec_program(&text).as_deref(),
+            tobii_config::autostart::exec_arguments(&text)
+                .and_then(|args| args.into_iter().next())
+                .as_deref(),
             Some(bin.to_str().unwrap())
         );
 
