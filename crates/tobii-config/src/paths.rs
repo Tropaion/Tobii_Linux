@@ -101,16 +101,22 @@ pub const MANIFEST_FILE: &str = "installs";
 /// The data directory a `sudo ./install.sh --system` install writes into.
 pub const SYSTEM_DATA_DIR: &str = "/usr/local/share";
 
-/// An XDG base directory: `$VAR` when it is set and non-empty, otherwise
-/// `$HOME/<fallback>`.
+/// An XDG base directory: `$VAR` when it is set to an absolute path,
+/// otherwise `$HOME/<fallback>`.
+///
+/// A relative `$VAR` is ignored, as the XDG Base Directory spec says it must
+/// be ("If an implementation encounters a relative path in any of these
+/// variables it should consider the path invalid and ignore it"). Taking it
+/// would resolve against the working directory — for the uninstaller, a
+/// different directory on every run.
 ///
 /// An absent or relative HOME gives `/nonexistent/<fallback>`, not a relative
 /// path: `PathBuf::default().join(".config")` is `.config`, which would put
 /// every file this program writes wherever the working directory happens to
 /// be. See [`crate::config_path`], which learned that the hard way.
 pub fn xdg_dir(var: Option<&OsStr>, home: Option<&OsStr>, fallback: &str) -> PathBuf {
-    if let Some(v) = var.filter(|v| !v.is_empty()) {
-        return PathBuf::from(v);
+    if let Some(v) = var.map(Path::new).filter(|v| v.is_absolute()) {
+        return v.to_path_buf();
     }
     home.map(PathBuf::from)
         .filter(|h| h.is_absolute())
@@ -200,6 +206,20 @@ mod tests {
             xdg_dir(None, Some(&home), ".local/state"),
             PathBuf::from("/home/u/.local/state")
         );
+    }
+
+    /// The XDG spec: a relative value in an XDG variable is invalid and is
+    /// ignored, so the fallback under HOME is used instead.
+    #[test]
+    fn a_relative_xdg_variable_is_ignored() {
+        let home = OsString::from("/home/u");
+        for rel in ["cfg", "./cfg", "../x/cfg", "~/.config"] {
+            assert_eq!(
+                xdg_dir(Some(OsStr::new(rel)), Some(&home), ".config"),
+                PathBuf::from("/home/u/.config"),
+                "{rel}"
+            );
+        }
     }
 
     /// A relative or missing HOME must never produce a relative path: every

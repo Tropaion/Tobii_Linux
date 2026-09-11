@@ -113,7 +113,21 @@ fn quote_exec(exec: &str) -> String {
 /// entry above a quoted one, and both undo the same two layers: the
 /// desktop-entry value escapes (`\\`, `\s`, …) and then the `Exec` quoting.
 /// Only the `[Desktop Entry]` group is read, as the spec says.
+///
+/// This is the first word, whatever it is. An entry edited by hand to
+/// `Exec=env GDK_BACKEND=x11 /usr/bin/tobii-gtk` runs `env`; to see past that,
+/// read [`exec_arguments`].
 pub fn exec_program(entry: &str) -> Option<String> {
+    exec_arguments(entry)?.into_iter().next()
+}
+
+/// Every argument of a desktop entry's `Exec` line, unescaped and unquoted.
+///
+/// `None` when the `[Desktop Entry]` group has no `Exec` line, or when its
+/// quoting is broken (an unterminated quote): a launcher refuses such a line,
+/// and guessing where the arguments end would be guessing what it runs.
+/// Field codes (`%U`, `%f`, …) are returned as they are.
+pub fn exec_arguments(entry: &str) -> Option<Vec<String>> {
     let mut in_main = false;
     for line in entry.lines() {
         let line = line.trim();
@@ -130,7 +144,7 @@ pub fn exec_program(entry: &str) -> Option<String> {
         if key.trim() != "Exec" {
             continue;
         }
-        return first_argument(&unescape_value(value.trim()));
+        return split_arguments(&unescape_value(value.trim()));
     }
     None
 }
@@ -160,25 +174,38 @@ fn unescape_value(v: &str) -> String {
     out
 }
 
-/// The first argument of an unescaped `Exec` value, with its quoting removed.
-fn first_argument(v: &str) -> Option<String> {
-    let v = v.trim_start();
-    let arg = if let Some(rest) = v.strip_prefix('"') {
-        let mut out = String::new();
-        let mut chars = rest.chars();
-        loop {
-            match chars.next()? {
+/// The arguments of an unescaped `Exec` value, with their quoting removed.
+///
+/// Arguments are separated by unquoted whitespace. A double-quoted stretch is
+/// part of the argument it sits in, and inside it a backslash escapes the next
+/// character. `%%` is a literal `%`. An empty value, or one with an
+/// unterminated quote, gives `None`.
+fn split_arguments(v: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    let mut chars = v.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut arg = String::new();
+        let mut quoted = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => quoted = !quoted,
                 // Inside quotes a backslash escapes the next character.
-                '\\' => out.push(chars.next()?),
-                '"' => break out,
-                c => out.push(c),
+                '\\' if quoted => arg.push(chars.next()?),
+                c if c.is_whitespace() && !quoted => break,
+                c => arg.push(c),
             }
         }
-    } else {
-        v.split_whitespace().next()?.to_string()
-    };
-    let arg = arg.replace("%%", "%");
-    (!arg.is_empty()).then_some(arg)
+        if quoted {
+            return None;
+        }
+        args.push(arg.replace("%%", "%"));
+    }
+    // An empty first argument names no program.
+    args.first().is_some_and(|a| !a.is_empty()).then_some(args)
 }
 
 #[cfg(test)]
@@ -278,6 +305,34 @@ mod tests {
             exec_program("[Desktop Action x]\nExec=/other\n[Desktop Entry]\nName=y\n"),
             None
         );
+    }
+
+    /// Every argument, so a reader can see past `env VAR=value` to the
+    /// program: the form a hand-edited entry most often takes.
+    #[test]
+    fn every_argument_is_read_with_its_quoting_removed() {
+        let args = |e: &str| exec_arguments(&format!("[Desktop Entry]\nExec={e}\n"));
+        assert_eq!(
+            args("env GDK_BACKEND=x11 /usr/bin/tobii-gtk --background").unwrap(),
+            [
+                "env",
+                "GDK_BACKEND=x11",
+                "/usr/bin/tobii-gtk",
+                "--background"
+            ]
+        );
+        assert_eq!(
+            args("\"/home/u/My Projects/tobii-gtk\"   %U").unwrap(),
+            ["/home/u/My Projects/tobii-gtk", "%U"]
+        );
+        assert_eq!(
+            exec_arguments(&entry_text("/home/u/100%/b\\s/tobii-gtk")).unwrap(),
+            ["/home/u/100%/b\\s/tobii-gtk", "--background"]
+        );
+        // An unterminated quote is a line no launcher runs.
+        assert_eq!(args("\"/usr/bin/tobii-gtk --background"), None);
+        assert_eq!(args(""), None);
+        assert_eq!(args("\"\" x"), None);
     }
 
     #[test]
