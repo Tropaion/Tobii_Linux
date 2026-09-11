@@ -267,7 +267,57 @@ checks that the `.deb` and `.rpm` actually *declare* it, verifies the checksums
 and publishes a **draft** — the release notes are the changelog every user's
 updater shows them, so a human sees them first.
 
-That package check is in CI rather than in `package.sh` because most developer
+**Pre-release tags** must look like `v1.0.0-rc1`: the suffix starts with a
+letter, and `release.yml` rejects anything else. Each format has its own
+spelling of it: the PKGBUILDs strip the `-` (`1.0.0rc1`, which `vercmp` sorts
+below `1.0.0`), and the `.deb` and `.rpm` use `~` (`1.0.0~rc1`, their own "sorts
+before" marker; an rpm Version may not contain `-` at all). A numeric suffix
+such as `-1` would become `1.0.01`, which `vercmp` sorts *above* `1.0.0`. File
+names keep the tag's `-`, because GitHub rewrites `~` in an asset's name to `.`
+and `SHA256SUMS` would then list a file the release does not have.
+
+**The Arch package.** After `build`, the `arch` job repackages the same tarball
+in an `archlinux:base-devel` container. `package.sh` has already written
+`aur/tobii-linux-bin/PKGBUILD` (`scripts/aur-bin.sh`, which derives `depends`
+from the binaries' NEEDED entries and refuses a soname it has no Arch package
+for). `makepkg` builds it as an unprivileged user from the tarball in its start
+directory, checking it against the pin, since the draft's URL would 404.
+`pacman -U` installs it on the clean container. Both binaries must then answer
+`--version` from `/usr/bin` with every library resolved, and the package must
+declare `glibc>=`. The `.pkg.tar.zst` joins `dist/`, `SHA256SUMS` is rewritten
+over every file, and every file must be listed and named the way a hub's
+matcher looks for it. `publish` uploads that set. The tested PKGBUILD and its
+`.SRCINFO` are kept as the `aur-bin` artifact.
+
+**The AUR.** `.github/workflows/aur.yml` runs when the draft is **published**
+(pre-releases are skipped), or by hand: *Actions → AUR → Run workflow*, with a
+tag. It downloads the published tarball and `SHA256SUMS`, checks one against the
+other, regenerates the PKGBUILD, compares its pin with the release's
+`SHA256SUMS` entry, lets `makepkg --verifysource` download from the published
+URL and check the pin, writes `.SRCINFO`, and pushes to
+`ssh://aur@aur.archlinux.org/tobii-linux-bin.git`. The pin is an integrity check
+taken from the same release, not a signature. It proves an AUR user got what was
+published, and nothing about who published it.
+
+One-time setup, before the first push:
+
+1. An AUR account: <https://aur.archlinux.org/register>.
+2. A key used for nothing else:
+   `ssh-keygen -t ed25519 -N '' -C tobii-linux-bin -f aur_key`. Paste
+   `aur_key.pub` into *My Account → SSH Public Key* on the AUR.
+3. The private key, `aur_key`, as the repository secret `AUR_SSH_KEY`
+   (*Settings → Secrets and variables → Actions*). Then delete the local copy,
+   or keep it somewhere you would keep a password.
+4. Run the workflow by hand for the latest release. **The first push creates the
+   package** under your account; there is nothing to register beforehand.
+
+Until the secret exists, the job does everything except the push, prints what it
+would have pushed, and ends green with a notice. The AUR's SSH host keys are
+pinned in `aur.yml`. If the AUR ever rotates them, the push fails closed:
+compare the new fingerprints with the ones listed on <https://aur.archlinux.org>
+before replacing the lines.
+
+The `.deb`/`.rpm` check is in CI rather than in `package.sh` because most developer
 machines have no `rpmbuild`, so the spec's dependencies cannot be read where
 they are written. That is exactly how `AutoReqProv: no` sat in the spec silently
 declaring no glibc requirement at all.

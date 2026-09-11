@@ -85,13 +85,13 @@ updater, or do you want your system to own this?**
 
 | | Get it | Updated by |
 |---|---|---|
-| **A release** — `.tar.gz`, `.deb`, `.rpm` or a `PKGBUILD` | [Releases](https://github.com/Tropaion/Tobii_Linux/releases) | the built-in updater (`.tar.gz` only) or your package manager |
+| **A release** — `.tar.gz`, `.deb`, `.rpm`, an Arch package, or a `PKGBUILD` | [Releases](https://github.com/Tropaion/Tobii_Linux/releases) | the built-in updater (`.tar.gz` only) or your package manager |
 | **From source** | the steps below | `git pull` and rebuild |
 
 The prebuilt binaries are built in a Debian 13 container, so they need **glibc
-2.41 or newer**; on an older distribution, build from source. The `.deb`/`.rpm`
-declare that floor, so your package manager refuses rather than installing
-something that cannot start.
+2.41 or newer**; on an older distribution, build from source. The `.deb`, the
+`.rpm` and the Arch package declare that floor, so your package manager refuses
+rather than installing something that cannot start.
 
 <details>
 <summary><b>Installing a release</b></summary>
@@ -104,9 +104,34 @@ cd tobii-linux-*/ && ./install.sh          # ~/.local/bin, menu entry, udev rule
 sudo apt install ./tobii-linux_*.deb       # Debian, Ubuntu, Mint, Pop!_OS
 sudo dnf install ./tobii-linux-*.rpm       # Fedora, RHEL (gtk4-layer-shell is in EPEL)
 sudo zypper install ./tobii-linux-*.rpm    # openSUSE
-# Arch: download PKGBUILD *and* tobii-linux.install into the same directory
-makepkg -si
+sudo pacman -U ./tobii-linux-bin-*-x86_64.pkg.tar.zst   # Arch — see below
 ```
+
+**On Arch, CachyOS, Manjaro or EndeavourOS**, use the prebuilt package. It needs
+no Rust toolchain and has nothing to compile:
+
+```sh
+curl -LO https://github.com/Tropaion/Tobii_Linux/releases/download/vX.Y.Z/tobii-linux-bin-X.Y.Z-1-x86_64.pkg.tar.zst
+sudo pacman -U ./tobii-linux-bin-X.Y.Z-1-x86_64.pkg.tar.zst
+```
+
+Once `tobii-linux-bin` is on the AUR, `paru -S tobii-linux-bin` (or `yay -S`)
+does the same and updates it along with the rest of your system.
+
+Download the file first and install it from disk. `pacman -U` with the URL
+refuses this package: pacman checks a remote file at `RemoteFileSigLevel`, which
+defaults to `SigLevel`, and Arch's stock `pacman.conf` sets that to `Required`.
+The package is not signed. A file on disk is checked at `LocalFileSigLevel`,
+which the same `pacman.conf` sets to `Optional`. The release's `SHA256SUMS`
+lists the package, so a download can be checked for damage. That proves the file
+arrived intact and says nothing about who built it; see
+[What installing an update trusts](#what-installing-an-update-trusts).
+
+**To build it yourself** instead, download `PKGBUILD` *and*
+`tobii-linux.install` from the release into one directory and run `makepkg -si`.
+That compiles the program against your own GTK (it needs `rust`) and installs a
+package called `tobii-linux`. It and `tobii-linux-bin` conflict, so installing
+either one offers to remove the other.
 
 `install.sh` copies the two binaries, adds the application-menu entry, and asks
 before using `sudo` for the udev rule. The packages do all of that as part of
