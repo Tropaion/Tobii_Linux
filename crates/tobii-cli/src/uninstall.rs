@@ -305,6 +305,11 @@ pub enum Verdict {
     /// program, but not writable by them. `chmod u+w` is the way, not sudo:
     /// root will not run what is in a directory that is not root's.
     NotWritable,
+    /// A directory inside this user's home that another account owns, holding a
+    /// binary that answered as this program. `sudo tobii uninstall --system`
+    /// refuses a directory under a home, so the way out is the same one-folder
+    /// `chown` the update banner offers. Carries the uid to give it back to.
+    NotOurs(u32),
     /// Something may be there — present, or in a directory that cannot be
     /// looked at — but nothing there could be identified as this program.
     Unidentified,
@@ -1480,6 +1485,19 @@ fn chmod_hint(dir: &Path) -> String {
     )
 }
 
+/// For a directory inside this user's home that another account owns. The same
+/// one-folder `chown` the update banner gives for it, so the two agree.
+fn chown_hint(dir: &Path, euid: u32) -> String {
+    format!(
+        "{} holds this program and belongs to another account — an older \
+         `sudo ./install.sh` made it, probably. It is inside your home, so \
+         `sudo tobii uninstall --system` refuses it too, and nothing there is removed. Give \
+         that one folder back to yourself, then run this again:\n    sudo chown {euid} {}",
+        dir.display(),
+        q(dir)
+    )
+}
+
 fn root_refusal(env: &Env) -> String {
     let who = env
         .sudo_user
@@ -1943,6 +1961,15 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             if fs.uid(&fs.at(&c.dir), false).is_ok_and(|u| u == env.euid) {
                 loc.verdict = Verdict::NotWritable;
                 p.hints.push(chmod_hint(&c.dir));
+            } else if env.home.as_deref().is_some_and(|h| c.dir.starts_with(h)) {
+                // Another account's, inside this user's home: what an older
+                // `sudo ./install.sh ~/.local/bin` left. `sudo tobii uninstall
+                // --system` refuses a directory under a home — the folders above
+                // it are the user's — so sending them there is a circle. The one
+                // chown that makes it theirs is what the update banner offers
+                // for the same folder (`FolderFix::TakeBack`).
+                loc.verdict = Verdict::NotOurs(env.euid);
+                p.hints.push(chown_hint(&c.dir, env.euid));
             } else {
                 loc.verdict = Verdict::SystemInstall;
                 system_dirs.push(c.dir.clone());
@@ -2663,6 +2690,7 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
                 }
                 Verdict::SystemInstall => "a system-wide install — see below".into(),
                 Verdict::NotWritable => "yours, but you cannot write to it — see below".into(),
+                Verdict::NotOurs(_) => "another account's — see below".into(),
                 Verdict::Unidentified => {
                     "left: nothing there could be identified as this program's".into()
                 }
@@ -3180,6 +3208,11 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
             )),
             Verdict::NotWritable => Some(format!(
                 "{} — yours, but you cannot write to it: chmod u+w {}, then run this again",
+                l.dir.display(),
+                q(&l.dir)
+            )),
+            Verdict::NotOurs(euid) => Some(format!(
+                "{} — another account's: sudo chown {euid} {}, then run this again",
                 l.dir.display(),
                 q(&l.dir)
             )),

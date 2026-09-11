@@ -109,14 +109,31 @@ if [[ $system -eq 1 && $bins_wanted -eq 1 ]]; then
         if [[ $owner -ne 0 && $owner -ne $self_uid ]] \
            || (( foreign && (first || !(8#$mode & 8#1000)) )); then
             q="$(printf '%q' "$bindir")"
+            # The invoking user's home, not root's: under sudo HOME is /root.
+            # Only a folder in their own home is theirs to take back, and then
+            # one folder, not -R, as the hub's own advice says.
+            home=""
+            if [[ -n "${SUDO_USER:-}" ]]; then
+                home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+            elif [[ -z "${SUDO_UID:-}" ]]; then
+                home="${HOME:-}"
+            fi
             {
                 echo "${bold}--system installs for every user${reset}, so $bindir must be somewhere"
                 echo "only root can change, and $d is not."
-                if [[ "$bindir" != /usr/local/bin ]]; then
-                    echo "  For every user:  sudo ./install.sh --system        (into /usr/local/bin)"
+                if [[ -n "$home" && "$bindir" == "$home"/* ]]; then
+                    echo "  That folder is in your home. Give it back to yourself, then install as"
+                    echo "  yourself — no sudo:"
+                    echo "    sudo chown ${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)} $q"
+                    echo "    ./install.sh $q"
+                else
+                    echo "  Only for you:    ./install.sh        (into ~/.local/bin, no sudo)"
+                    if [[ "$d" == /usr/local* ]]; then
+                        echo "  For every user:  sudo ./install.sh --system /opt/tobii-linux"
+                    else
+                        echo "  For every user:  sudo ./install.sh --system        (into /usr/local/bin)"
+                    fi
                 fi
-                echo "  Only for you:    ./install.sh $q        (without sudo)"
-                echo "  If an earlier sudo install left it root's, first:  sudo chown -R \"\$USER\" $q"
             } >&2
             exit 1
         fi

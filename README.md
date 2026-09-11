@@ -943,13 +943,16 @@ never installs anything itself. This is the hub only; `tobii update` on the
 command line still just refuses and tells you why.
 
 Four more cases get something other than *Update*, all decided before the
-banner appears, so the button you see is one that can work:
+banner appears, so the button you see fits the copy you have:
 
 - **A copy in a folder only an administrator can change** — one installed with
-  `sudo ./install.sh --system`, copied into a system folder by hand, or another
-  account's files in a shared folder that is not yours either — also gets
-  *Download*: the release archive, and the one command that installs it for every
-  user, `sudo ./install.sh --system <that folder>`.
+  `sudo ./install.sh --system`, or copied into a system folder by hand — also
+  gets *Download*: the release archive, and the one command that installs it for
+  every user, `sudo ./install.sh --system <that folder>`. The same is offered
+  for another account's files in a folder that is not yours either, such as one
+  a group can write; there `install.sh --system` refuses the folder, because it
+  installs for every user and the folder is not root's alone. The way out is a
+  copy of your own: `./install.sh` into `~/.local/bin`, without sudo.
 - **A copy in your own folder whose files are someone else's** — what an older
   `sudo ./install.sh ~/.local/bin` left behind — gets *Download* as well, with a
   plain `./install.sh <that folder>`, no `sudo`. That replaces root's files
@@ -962,9 +965,10 @@ banner appears, so the button you see is one that can work:
   when the folder did not exist yet — gets no button. The banner shows the one
   command, `chmod u+w <that folder>` or
   `sudo chown <your uid>:<your gid> <that folder>` (that folder alone, not what
-  is in it), selectable so you can copy it, and says to reopen the app
-  afterwards. `tobii update --install` prints the same command and says to run
-  it again.
+  is in it), selectable so you can copy it. Its button quits the hub, because
+  the banner is worked out once when the app starts and closing the window only
+  hides it. Run the command, start the app again, and it decides afresh.
+  `tobii update --install` prints the same command and says to run it again.
 - **A copy that was replaced or removed while it was running** — its package
   uninstalled, or a newer version installed over it — gets *Quit*. There is
   nothing at its path to update, and starting the app again would only hand off

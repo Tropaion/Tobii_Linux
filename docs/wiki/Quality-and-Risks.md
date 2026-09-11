@@ -294,19 +294,25 @@ because the reasoning is worth more than the tidiness.
   new* usable again, and *Quit* once the install finds this copy replaced while
   it ran — is covered by a display test that is ignored by default:
   `cargo test -p tobii-gtk --lib -- --ignored a_finished_install`.
-- **A group member without sudo is sent to an administrator.** Another
-  account's files in a group-writable folder the user does not own get the
-  `--system` *Download*, where a plain `./install.sh` by a member of that group
-  would have worked. Accepted: the folder is not theirs, and what is in it may
-  be what every user runs.
+- **A group member without sudo is sent to an administrator, and the command
+  they are given is refused.** Another account's files in a group-writable
+  folder the user does not own get the `--system` *Download*, where a plain
+  `./install.sh` by a member of that group would have worked. Worse, the
+  `sudo ./install.sh --system <dir>` it prints is refused by the installer,
+  whose rule is that `--system` writes only where root alone can change things —
+  so that banner leads nowhere but to the installer's own advice, a plain
+  install into `~/.local/bin`. Accepted for v0.3.1: the folder is not theirs,
+  what is in it may be what every user runs, and both the banner and the
+  installer refuse to touch it. The README and Runtime-View say so.
 - **The download folder is refused if another user could change it**
   (`UnsafeFolder`), because the command printed for it is run later, perhaps with
   `sudo`, on files that must still be the ones checked. The chosen folder and
   every folder above it, both as written and as resolved, must belong to the
   user, root or uid 65534 (how root's `/` and `/home` look inside a toolbox),
   and be writable by no one else. A sticky folder is exempt from the write rule,
-  but as the chosen folder only when the user or root owns it, so `/tmp` is
-  accepted and another account's sticky folder is not. The refusal names who
+  but only when the user, root or uid 65534 owns it, so `/tmp` is accepted —
+  inside a toolbox too, where it belongs to the overflow uid — and another
+  account's sticky folder is not. The refusal names who
   can write the folder. Checked with folders a test makes, never with a second
   real user.
 - **A group write bit is harmless only when `/etc/passwd` and `/etc/group` show
@@ -316,6 +322,12 @@ because the reasoning is worth more than the tidiness.
   the user has to pick another. The version folder the download makes inside
   the chosen one is created 0755 whatever the umask, and removed again if the
   check refuses it.
+- **A POSIX ACL can hide a writer from this rule.** Where a directory has an
+  extended ACL, its group bits hold the ACL mask, so a `setfacl -m u:someone:rwx`
+  on the download folder, or on a folder above it, reads as a group write bit
+  and passes whenever the group is the user's own private group. The account
+  that ACL names can then swap the checked files. Nothing here reads ACLs;
+  `getfacl` would be needed. The same gap is in `tobii uninstall`'s rule.
 - **The folder chooser skips a Downloads folder the download would refuse** and
   opens in the home folder instead. Seen on the development machine, whose
   Downloads folder a download service's group can write (0775). Chosen by hand

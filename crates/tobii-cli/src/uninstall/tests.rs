@@ -356,12 +356,73 @@ fn checked() -> Vec<PathBuf> {
 
 /// Who owns a file, as a test tree pretends: everything under `/opt` is
 /// root's, as a system install is.
+/// Everything outside the user's home belongs to root, as on a real system.
+/// Two reasons: the plan asks whether root could act on a directory, which
+/// walks every directory above it, and the tree sits in a temp directory this
+/// test's user owns; and CI runs the tests as root, where every file in the
+/// tree is uid 0 while `me()` plans as 1000, so a directory that is meant to be
+/// the user's own would otherwise look like root's.
 fn opt_is_roots(p: &Path, m: &std::fs::Metadata) -> u32 {
-    if p.components().any(|c| c.as_os_str() == "opt") {
-        0
-    } else {
-        owner_of(p, m)
+    // By the tree's own `home/u`, not by a `home` component: these are real
+    // paths, and the tree itself sits under this machine's /home/<someone>.
+    let c: Vec<_> = p.components().map(|c| c.as_os_str().to_owned()).collect();
+    if !c.windows(2).any(|w| w[0] == "home" && w[1] == "u") {
+        return 0;
     }
+    match owner_of(p, m) {
+        o if o == real_uid() => me(),
+        o => o,
+    }
+}
+
+/// A bin directory in the user's home that another account owns — what an older
+/// `sudo ./install.sh ~/.local/bin` left when the folder did not exist yet.
+/// `sudo tobii uninstall --system` would refuse it (the folders above it are the
+/// user's), so pointing them there is a circle; they get the one chown that
+/// makes it theirs, the same one the update banner gives.
+#[test]
+fn a_root_owned_bin_directory_in_the_home_is_given_back_not_sent_to_sudo() {
+    fn bin_is_roots(p: &Path, m: &std::fs::Metadata) -> u32 {
+        if p.ends_with(".local/bin") {
+            return 0;
+        }
+        match owner_of(p, m) {
+            o if o == real_uid() => me(),
+            o => o,
+        }
+    }
+    let t = Tree::new("roots-home-bin");
+    t.bin("/home/u/.local/bin/tobii", "tobii 0.3.0");
+    t.bin("/home/u/.local/bin/tobii-gtk", "tobii-gtk 0.3.0");
+    let runs = Runs::new();
+    let identify = runs.identify();
+    let probes = Probes {
+        writable: &|_| false,
+        ..home_probes(&identify)
+    };
+    let p = plan_with_fs(
+        &user(),
+        &Options::default(),
+        t.fs(bin_is_roots),
+        &probes,
+        &[],
+    );
+    assert_eq!(
+        location(&p, "/home/u/.local/bin").verdict,
+        Verdict::NotOurs(me())
+    );
+    assert!(removals(&p).is_empty(), "{:#?}", removals(&p));
+    let hint = p
+        .hints
+        .iter()
+        .find(|h| h.contains("/home/u/.local/bin"))
+        .expect("a hint");
+    assert!(hint.contains(&format!("sudo chown {} ", me())), "{hint}");
+    // It may say why --system is no way out; it must not hand over that command.
+    assert!(!hint.contains("--system --bindir"), "{hint}");
+    let s = summary(&p, &Outcome::default());
+    assert!(s.contains(&format!("sudo chown {} ", me())), "{s}");
+    assert!(!s.contains("--bindir /home/u/.local/bin"), "{s}");
 }
 
 #[test]

@@ -222,7 +222,7 @@ fn split_arguments(v: &str) -> Option<Vec<String>> {
                 // `~`, and GLib takes a word that starts with `#` as a comment,
                 // so the first word is not what either of them runs.
                 c if !quoted && RESERVED.contains(&c) => return None,
-                c if c.is_whitespace() && !quoted => break,
+                c if !quoted && matches!(c, ' ' | '\t' | '\n' | '\r') => break,
                 c => arg.push(c),
             }
         }

@@ -194,8 +194,9 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
    - **Unowned, the directory writable and the binaries this user's** →
      *Update*, the path below.
    - **Unowned, not writable, and the directory this user's** (its write bit
-     off) → no download and no button (`FixFolder`): the banner shows
-     `chmod u+w <dir>`, selectable, and says to reopen the app. Not sudo:
+     off) → no download (`FixFolder`): the banner shows `chmod u+w <dir>`,
+     selectable, and its button quits, since the banner is decided once per
+     launch and closing the window only hides the hub. Not sudo:
      `--system` there would put root's files, and a menu entry for every user,
      into one user's folder.
    - **Unowned, not writable, inside the home and another account's** (what
@@ -215,7 +216,11 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
      folder someone else owns, rename(2) refuses anyone but the file's owner or
      the folder's, so a plain install would stop at its first `mv`; and a
      group-writable system folder holds files every user runs, which a per-user
-     install should not take over.
+     install should not take over. The printed `sudo ./install.sh --system
+     <dir>` is then refused by the installer itself, whose own rule is that
+     `--system` writes only where root alone can change things; it names the
+     folder and offers a plain install into `~/.local/bin` instead. Known, and
+     recorded in Quality-and-Risks 11.3c.
    - **Owner unknown** (a package manager could not be asked) → *Update*, which
      `install_release` then refuses, saying which query failed. Overwriting a
      packaged file on the strength of a query that failed is the one outcome

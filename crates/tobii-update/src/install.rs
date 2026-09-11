@@ -1106,8 +1106,8 @@ pub fn download_folder_ok(into: &Path) -> bool {
 /// and put their own in its place — see [`download_release_files`].
 ///
 /// A directory's owner can always do that, sticky bit or not (rename(2)), so
-/// each one must be this user's or root's — or, above the chosen folder, the
-/// overflow uid, which is how root's `/` and `/home` look inside a toolbox.
+/// each one must be this user's or root's — or the overflow uid, which is how
+/// root's `/`, `/home` and `/tmp` look inside a toolbox or `unshare -c`.
 /// Anyone else can only through a write bit, and not in a sticky directory,
 /// where only an entry's owner or the directory's can move it. So the chosen
 /// folder may be /tmp, but not a sticky folder another account owns.
@@ -1130,7 +1130,7 @@ fn chosen_folder(
         why,
     };
     let chosen = std::fs::metadata(into)?;
-    if chosen.mode() & 0o1000 != 0 && chosen.uid() != me && chosen.uid() != 0 {
+    if chosen.mode() & 0o1000 != 0 && !may_own(chosen.uid(), me) {
         return Err(unsafe_folder(
             into,
             format!(
@@ -3325,19 +3325,35 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         mode(&into, 0o755);
         let dir = into.join("tobii-linux-9.9.9");
         let private = |_| true;
-        let stranger = me().wrapping_add(4242);
+        // Mine: taken first, because as root the folder is given away below and
+        // does not come back.
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &private)),
+            None
+        );
+        // Someone else's. As root every folder this test made is root's, and
+        // root may own any of them, so it is given to a spare uid and asked as
+        // a third account. CI runs the tests as root; this must hold there too.
+        let stranger = if me() == 0 {
+            // Root: give the folder away, since root may own any folder and
+            // would not be refused. In a user namespace without a mapping for
+            // 4242 the kernel refuses that, and then no folder here can belong
+            // to another account, so there is nothing left to check.
+            if std::os::unix::fs::chown(&into, Some(4242), None).is_err() {
+                return;
+            }
+            4243
+        } else {
+            me().wrapping_add(4242)
+        };
         // Its owner can rename anything in it, so the chosen folder — the
         // first on the way up — is the one refused.
         assert_eq!(
             refused_at(private_folder(&into, &dir, stranger, &private)),
             Some(into.clone())
         );
-        assert_eq!(
-            refused_at(private_folder(&into, &dir, me(), &private)),
-            None
-        );
-        // A sticky shared folder is fine only when its owner is this user or
-        // root: the owner can move entries in it, sticky bit or not.
+        // A sticky shared folder is fine only when its owner is this user, root
+        // or the overflow uid: the owner can move entries in it, sticky or not.
         mode(&into, 0o1777);
         let why = match chosen_folder(&into, stranger, &private) {
             Err(InstallError::UnsafeFolder { path, why }) => {
@@ -3347,6 +3363,14 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
             other => panic!("{other:?}"),
         };
         assert!(why.contains("its owner"), "{why}");
+        // The overflow uid owns /tmp and everything above it inside a toolbox
+        // or `unshare -c`, so a sticky folder of its is not refused. Only root
+        // can make one, so only a root run checks it.
+        if me() == 0 {
+            std::os::unix::fs::chown(&into, Some(OVERFLOW_UID), None).unwrap();
+            assert!(chosen_folder(&into, stranger, &private).is_ok());
+            std::os::unix::fs::chown(&into, Some(0), None).unwrap();
+        }
         mode(&into, 0o755);
     }
 

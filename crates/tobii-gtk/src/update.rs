@@ -145,19 +145,21 @@ pub fn system_headline(version: &str, dir: &Path) -> String {
 }
 
 /// The banner for a folder the user cannot write but can fix with one
-/// command, which it ends with. Nothing is downloaded, so it ends by saying to
-/// reopen the app: the banner is decided once per launch, and the next one
-/// decides again — Update, or for root's files left in the folder a TakeBack
-/// gave back, the home download.
+/// command, which it ends with. Nothing is downloaded, so the button quits
+/// instead: this banner is decided once per launch, and closing the window only
+/// hides the hub, so the next launch hands straight back to this same process
+/// and shows this same banner. Started again, it decides afresh — Update, or
+/// for root's files left in a folder a TakeBack gave back, the home download.
 pub fn fix_folder_headline(version: &str, dir: &Path, fix: FolderFix) -> String {
     let (state, remedy) = match fix {
         FolderFix::MakeWritable => (
             "which is yours but not writable,",
-            "Make it writable, then reopen the app",
+            "Make it writable, then quit with the button below and start the app again",
         ),
         FolderFix::TakeBack => (
             "a folder in your home that another account owns — sudo made it, probably —",
-            "Give that one folder back to yourself, then reopen the app",
+            "Give that one folder back to yourself, then quit with the button below and \
+             start the app again",
         ),
     };
     format!(
@@ -490,7 +492,8 @@ pub fn banner() -> gtk::Box {
                     Action::FixFolder { dir, fix } => {
                         text.set_text(&fix_folder_headline(&version, dir, *fix));
                         text.set_selectable(true);
-                        update_btn.set_visible(false);
+                        crate::widget::set_button_text(update_btn, "Quit");
+                        update_btn.connect_clicked(|_| quit_app());
                         wire_notes(&banner, &release);
                     }
                     Action::Update => {
@@ -1272,7 +1275,7 @@ mod tests {
     /// A folder the user can fix: the command, the folder, and to reopen the
     /// app — no download, and no sudo for a folder of their own.
     #[test]
-    fn a_folder_the_user_can_fix_is_handed_the_command_and_told_to_reopen() {
+    fn a_folder_the_user_can_fix_is_handed_the_command_and_told_to_start_again() {
         let dir = Path::new("/home/u/My Apps");
         let own = fix_folder_headline("0.3.1", dir, FolderFix::MakeWritable);
         assert!(
@@ -1280,7 +1283,7 @@ mod tests {
             "{own}"
         );
         assert!(
-            own.ends_with("reopen the app:\n  chmod u+w '/home/u/My Apps'"),
+            own.ends_with("start the app again:\n  chmod u+w '/home/u/My Apps'"),
             "{own}"
         );
         assert!(!own.contains("sudo") && !own.contains("Download"), "{own}");
@@ -1289,7 +1292,7 @@ mod tests {
         let chown = FolderFix::TakeBack.command(dir);
         assert!(chown.starts_with("sudo chown "), "{chown}");
         assert!(
-            root_s.ends_with(&format!("reopen the app:\n  {chown}")),
+            root_s.ends_with(&format!("start the app again:\n  {chown}")),
             "{root_s}"
         );
         assert!(root_s.contains("another account owns"), "{root_s}");
