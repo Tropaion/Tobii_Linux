@@ -360,15 +360,19 @@ fn current_ownership() -> Ownership {
     }
 }
 
+/// The "What's new" button, which both banner variants have and which does the
+/// same thing in each.
+fn wire_notes(b: &Banner, release: &Release) {
+    let release = release.clone();
+    b.notes.connect_clicked(move |btn| {
+        let parent = btn.root().and_downcast::<gtk::Window>();
+        changelog_dialog(parent.as_ref(), &release);
+    });
+}
+
 /// Attach the two actions once a release is actually in hand.
 fn wire(b: &Banner, release: Release) {
-    {
-        let release = release.clone();
-        b.notes.connect_clicked(move |btn| {
-            let parent = btn.root().and_downcast::<gtk::Window>();
-            changelog_dialog(parent.as_ref(), &release);
-        });
-    }
+    wire_notes(b, &release);
     let (text, dismiss, notes_btn) = (b.text.clone(), b.dismiss.clone(), b.notes.clone());
     b.action.connect_clicked(move |btn| {
         btn.set_sensitive(false);
@@ -439,13 +443,7 @@ fn wire(b: &Banner, release: Release) {
 /// installing. `manager` is the tool that answered the ownership query — it
 /// picks the file, because a `.deb` is no use to somebody running `pacman`.
 fn wire_download(b: &Banner, release: Release, manager: String) {
-    {
-        let release = release.clone();
-        b.notes.connect_clicked(move |btn| {
-            let parent = btn.root().and_downcast::<gtk::Window>();
-            changelog_dialog(parent.as_ref(), &release);
-        });
-    }
+    wire_notes(b, &release);
 
     let Some(offer) = release.offer_for(&manager, &tobii_update::Target::triple()) else {
         // `Check::Newer` is only reached when the release has an archive for

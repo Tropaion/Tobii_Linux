@@ -29,7 +29,7 @@
 //! event model. That is a large amount of surface to carry for one "Quit"
 //! entry, and the hub already has Quit in its cogwheel popover. Right-click and
 //! middle-click therefore raise the window just as left-click does — see
-//! [`Gesture`] — because a click that does nothing reads as a broken icon.
+//! [`raises_the_window`] — a click that does nothing reads as a broken icon.
 //!
 //! # Threading
 //!
@@ -37,7 +37,7 @@
 //! [`install`] is called, so [`install`] must be called from the GTK main
 //! thread: that is what makes it safe for `on_activate` to touch widgets.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gtk::gio;
@@ -129,28 +129,15 @@ const ITEM_XML: &str = r#"
 </node>
 "#;
 
-/// What a host's click should do.
+/// Whether a method call from a host means "bring the hub back".
 ///
 /// Right-click (`ContextMenu`) and middle-click (`SecondaryActivate`) raise the
 /// window like a left-click, because this item publishes no menu for a
-/// right-click to open — see the module documentation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gesture {
-    /// Bring the hub back.
-    Raise,
-    /// Answer the call and do nothing else.
-    Ignore,
-}
-
-/// The gesture a method call from a host means.
-fn gesture(method: &str) -> Gesture {
-    match method {
-        "Activate" | "SecondaryActivate" | "ContextMenu" => Gesture::Raise,
-        // In practice only `Scroll`: GDBus rejects any method not in
-        // [`ITEM_XML`] before this runs. The arm is what keeps a method added
-        // to that list from falling through with no reply.
-        _ => Gesture::Ignore,
-    }
+/// right-click to open — see the module documentation. Everything else is
+/// answered and otherwise ignored; in practice that is only `Scroll`, since
+/// GDBus rejects any method not in [`ITEM_XML`] before this runs.
+fn raises_the_window(method: &str) -> bool {
+    matches!(method, "Activate" | "SecondaryActivate" | "ContextMenu")
 }
 
 /// The value of one `org.kde.StatusNotifierItem` property.
@@ -211,7 +198,7 @@ fn bus_name() -> String {
 struct State {
     bus_name: String,
     /// The hover text, read back by the `ToolTip` getter.
-    tooltip: RefCell<String>,
+    tooltip: String,
     /// Whether the bus name is ours, and whether a watcher is up.
     ///
     /// The item can only be announced once both hold, and either can become
@@ -262,19 +249,16 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// Update the hover text, e.g. "Tobii Eye Tracker 5 — tracker off".
+    /// Whether a watcher is up right now, and therefore whether the icon is
+    /// somewhere the user can see it.
     ///
-    /// The signal is what makes it visible: a host reads `ToolTip` once and
-    /// then waits to be told, so a silent write would only be seen by a host
-    /// that happened to restart.
-    pub fn set_tooltip(&self, text: &str) {
-        if *self.state.tooltip.borrow() == text {
-            return;
-        }
-        self.state.tooltip.replace(text.to_owned());
-        let _ = self
-            .conn
-            .emit_signal(None, ITEM_PATH, ITEM_INTERFACE, "NewToolTip", None);
+    /// Asked rather than remembered, because the answer changes during a
+    /// session in both directions: a panel started after this program puts a
+    /// watcher up, and a panel that crashes takes one away. A caller that
+    /// hides its window into the status area has to know which is true at the
+    /// moment it hides, not at the moment this was installed.
+    pub fn is_published(&self) -> bool {
+        self.state.watcher_up.get()
     }
 }
 
@@ -294,48 +278,46 @@ impl Drop for Tray {
 
 /// Publish a StatusNotifierItem for this application.
 ///
-/// `on_activate` is invoked on the GTK main thread when the user clicks the
-/// icon. Returns `None` when this desktop publishes no StatusNotifierWatcher,
-/// which is the ordinary case on stock GNOME.
+/// `tooltip` is the hover text. `on_activate` is invoked on the GTK main thread
+/// when the user clicks the icon.
 ///
 /// Call this from the GTK main thread, and hold the returned [`Tray`] for as
 /// long as the icon should exist.
 ///
 /// # What `None` means, exactly
 ///
-/// It is decided by one question to the bus daemon: does anything own
-/// `org.kde.StatusNotifierWatcher` *right now*. That is the only way to know
-/// before returning, and the answer is what a caller needs in order to decide
-/// whether hiding its window is safe. The cost is a boot race on desktops where
-/// the panel starts alongside the autostarted application rather than before it
-/// — Plasma starts kded, which owns the name, well before XDG autostart runs,
-/// but a tiling compositor launching a bar from its own config need not. A
-/// caller that autostarts and gets `None` at login may reasonably try again a
-/// few seconds later.
+/// Only that there is no session bus to publish on, or that GDBus refused the
+/// object — both of which mean no icon is possible at all. It does NOT mean no
+/// host is watching: that question is [`Tray::is_published`], and it is asked
+/// rather than answered once because the answer changes during a session.
 ///
-/// Once it has said yes, a watcher that restarts is handled: the item
-/// re-announces itself without the caller doing anything.
-pub fn install(on_activate: impl Fn() + 'static) -> Option<Tray> {
+/// So on stock GNOME, which publishes no watcher, this still returns `Some`
+/// and holds a bus name nobody reads. That is two round trips and a few
+/// hundred bytes, and it buys the case that matters: a panel started after
+/// this program — a tiling compositor launching a bar from its own config, an
+/// AppIndicator extension switched on mid-session — gets the icon anyway. The
+/// subscription that handles a panel *restart* is the same one that handles a
+/// panel *arrival*; returning `None` early was the only thing that made the
+/// second case special.
+pub fn install(tooltip: &str, on_activate: impl Fn() + 'static) -> Option<Tray> {
     // Blocking, but only as far as the session bus GTK itself is already
     // connected to: GLib caches one connection per bus type, so with the
     // application registered this hands back the connection it is already
     // using. With no session bus at all it fails here and the hub starts
     // without a tray.
     let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
-    if !watcher_is_up(&conn) {
-        return None;
-    }
 
     let node = gio::DBusNodeInfo::for_xml(ITEM_XML).ok()?;
     let interface = node.lookup_interface(ITEM_INTERFACE)?;
 
     let state = Rc::new(State {
         bus_name: bus_name(),
-        tooltip: RefCell::new(TITLE.to_owned()),
+        tooltip: tooltip.to_owned(),
         have_name: Cell::new(false),
-        // True because `watcher_is_up` just said so; the subscription below is
-        // what keeps it honest from here on.
-        watcher_up: Cell::new(true),
+        // Seeded from the bus daemon, then kept honest by the subscription
+        // below. Either order is fine: `announce` fires on whichever of the
+        // two becomes true last.
+        watcher_up: Cell::new(watcher_is_up(&conn)),
     });
 
     let registration = conn
@@ -346,12 +328,12 @@ pub fn install(on_activate: impl Fn() + 'static) -> Option<Tray> {
                 // The fallback is unreachable — GDBus rejects any name absent
                 // from ITEM_XML before calling this — and exists because the
                 // signature has no room to say so.
-                property(name, &state.tooltip.borrow()).unwrap_or_else(|| "".to_variant())
+                property(name, &state.tooltip).unwrap_or_else(|| "".to_variant())
             }
         })
         .method_call(
             move |_conn, _sender, _path, _interface, method, _args, invocation| {
-                if gesture(method) == Gesture::Raise {
+                if raises_the_window(method) {
                     on_activate();
                 }
                 // Every declared method must be answered, including the ones
@@ -530,9 +512,9 @@ mod tests {
     #[test]
     fn every_click_a_host_reports_raises_the_window() {
         for m in ["Activate", "SecondaryActivate", "ContextMenu"] {
-            assert_eq!(gesture(m), Gesture::Raise, "{m} must raise the hub");
+            assert!(raises_the_window(m), "{m} must raise the hub");
         }
-        assert_eq!(gesture("Scroll"), Gesture::Ignore);
+        assert!(!raises_the_window("Scroll"));
     }
 
     /// The shape is convention; the assertion that the bus would accept the

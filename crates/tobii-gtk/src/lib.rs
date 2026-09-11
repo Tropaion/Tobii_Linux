@@ -196,43 +196,26 @@ pub fn run() -> glib::ExitCode {
         builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
     }
     let app = builder.build();
-    app.connect_startup(|_| load_css());
-
-    // The tray icon, published once the app starts.
+    // The stylesheet and the tray icon, both once the app starts.
     //
-    // Kept in a thread-local rather than passed down, because the two places
-    // that need it are far apart and neither can reach the other: it is created
-    // at startup (before any window exists, which is the whole point in
+    // The tray is kept in a thread-local rather than passed down, because the
+    // two places that need it are far apart and neither can reach the other: it
+    // is created here, before any window exists (which is the whole point in
     // background mode), and it is CONSULTED by the hub's close handler, which
     // has to know whether hiding the window would leave the user no way back.
     // GTK is single-threaded and there is exactly one application, so the
     // sharing is real rather than incidental.
-    {
-        let app_for_click = app.clone();
-        app.connect_startup(move |_| {
-            let app = app_for_click.clone();
-            publish_tray(&app);
-
-            // Retried once, and only when there is no window.
-            //
-            // `install` has to answer synchronously — the close handler needs
-            // to know whether hiding is safe — so it asks whether a watcher
-            // owns its name right now. At login that is a race: the desktop's
-            // status-area host and this program are both starting. Losing it
-            // costs nothing when there is a window, because the window is the
-            // way back. In `--background` there is no window, so losing it
-            // would leave a running program with no icon and no way to reach
-            // it short of launching it again from a menu.
-            if autostart::background_mode() {
-                let app = app.clone();
-                glib::timeout_add_seconds_local_once(5, move || {
-                    if !tray_is_published() {
-                        publish_tray(&app);
-                    }
-                });
-            }
-        });
-    }
+    //
+    // There is no retry. There used to be one, five seconds later and only in
+    // background mode, because `install` answered "is a status-area host up?"
+    // once and collapsed "not yet" into "no icon" — which at login is a race
+    // with the panel. It now answers that question whenever it is asked, so a
+    // host arriving at any point is handled by the same subscription that
+    // already handled a host restarting.
+    app.connect_startup(|app| {
+        load_css();
+        publish_tray(app);
+    });
 
     // The device thread, started once. In background mode it exists before any
     // window does; otherwise the first activation creates it.
@@ -439,13 +422,15 @@ fn scaled_css(css: &str, scale: f64) -> String {
 /// Thread-local because a `CssProvider` is a GObject and therefore neither
 /// `Send` nor `Sync` — which is not a limitation to work around: everything
 /// that touches it runs on the GTK main thread by definition.
-fn with_css_provider<T>(f: impl FnOnce(&gtk::CssProvider) -> T) -> T {
+fn css_provider() -> gtk::CssProvider {
     thread_local! {
         static PROVIDER: std::cell::OnceCell<gtk::CssProvider> = const {
             std::cell::OnceCell::new()
         };
     }
-    PROVIDER.with(|p| f(p.get_or_init(gtk::CssProvider::new)))
+    // Cloning a GObject is a refcount bump onto the same provider, so callers
+    // get the one the display already has installed, not a second one.
+    PROVIDER.with(|p| p.get_or_init(gtk::CssProvider::new).clone())
 }
 
 thread_local! {
@@ -455,34 +440,43 @@ thread_local! {
 
 /// Publish the tray icon.
 ///
-/// Called at startup, and once more five seconds later if that first attempt
-/// found no status-area host — never over an icon that is already up, which is
-/// why it does not have to take one down first.
+/// Called once, from `startup`.
 ///
 /// Clicking it goes through `activate`, which already knows how to either
 /// present the hub that exists or build one — doing it here instead would be a
 /// second, divergent copy of that decision.
 fn publish_tray(app: &Application) {
     let app = app.clone();
-    let tray = tray::install(move || app.activate());
-    if let Some(t) = &tray {
-        t.set_tooltip("Tobii Eye Tracker 5");
-    }
+    let tray = tray::install("Tobii Eye Tracker 5", move || app.activate());
     TRAY.with(|c| *c.borrow_mut() = tray);
 }
 
-/// Whether a tray icon is published, and therefore whether hiding the window
-/// leaves the user a way back to it.
+/// Whether a tray icon is somewhere the user can see it, and therefore whether
+/// hiding the window leaves them a way back to it.
+///
+/// Asked at the moment of hiding rather than remembered from startup: a panel
+/// can appear or die at any point in a session, and a `Tray` that exists is
+/// not the same thing as an icon anybody is showing.
 fn tray_is_published() -> bool {
-    TRAY.with(|c| c.borrow().is_some())
+    TRAY.with(|c| c.borrow().as_ref().is_some_and(tray::Tray::is_published))
 }
 
-/// A "fit the window to its content" callback, filled once the window exists.
-///
-/// Late-bound because the cogwheel — which is what changes the text size — is
-/// built as part of the header, and the header is built before the window it
-/// would have to resize.
-type Refit = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+thread_local! {
+    /// How to fit the window to its content, registered once the window exists.
+    ///
+    /// Beside [`TRAY`] and for the same reason: the two ends are far apart and
+    /// neither can reach the other. The cogwheel — which is what changes the
+    /// text size — is built as part of the header, and the header is built
+    /// before the window it would have to resize.
+    ///
+    /// Consulted by [`apply_text_scale`] rather than by the button, so that
+    /// "the text got bigger" and "the window has to grow with it" are one fact
+    /// in one place. They were two, threaded through three signatures to reach
+    /// the click handler, and `load_css` — the other caller — did not know the
+    /// second one. It happens not to need it, there being no window yet at
+    /// startup, which is exactly the shape where the next caller gets it wrong.
+    static REFIT: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
 
 /// The gap between any two cards, whichever direction they are stacked.
 ///
@@ -502,6 +496,32 @@ const CARD_GAP: i32 = 16;
 /// instead of doing arithmetic on this number.
 const COLUMN_WIDTH: i32 = 360;
 
+/// The width to lay the hub out for.
+///
+/// Not `width()`, which is 0 until the first allocation and stale while the
+/// window is hidden in the tray, and not `default_width()`, which is what the
+/// window was last *asked* to be. The larger of the two is the only expression
+/// that is right in all three states, and it used to be written out at each of
+/// the four places that needed it.
+fn effective_width(w: &ApplicationWindow) -> i32 {
+    w.width().max(w.default_width())
+}
+
+/// One column of the control rack.
+///
+/// A function rather than three copies, because [`COLUMN_WIDTH`]'s promise —
+/// that the columns read as one rack rather than as panels that disagree — is
+/// only true while all three are built the same way.
+fn control_column() -> gtk::Box {
+    let c = gtk::Box::new(Orientation::Vertical, CARD_GAP);
+    c.set_size_request(COLUMN_WIDTH, -1);
+    // Packed from the top: a column is as tall as its cards, and the row is as
+    // tall as the tallest column. Anything else stretches the gaps.
+    c.set_valign(Align::Start);
+    c.set_hexpand(true);
+    c
+}
+
 /// Install this app's stylesheet on the default display.
 ///
 /// Public so a dialog can be rendered outside the hub for a visual check —
@@ -510,13 +530,11 @@ const COLUMN_WIDTH: i32 = 360;
 pub fn load_css() {
     hint_font_metrics();
     if let Some(display) = gtk::gdk::Display::default() {
-        with_css_provider(|provider| {
-            gtk::style_context_add_provider_for_display(
-                &display,
-                provider,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-        });
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &css_provider(),
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
     apply_text_scale(tobii_config::text_scale());
 }
@@ -529,7 +547,14 @@ pub fn load_css() {
 /// them makes the UI grow unevenly, which looks like a bug rather than a
 /// setting.
 pub fn apply_text_scale(scale: f64) {
-    with_css_provider(|p| p.load_from_string(&scaled_css(CSS, scale)));
+    css_provider().load_from_string(&scaled_css(CSS, scale));
+    // The window has to grow with the text, or the last card is simply cut off
+    // — which reads as the setting being broken rather than as a window that
+    // needs dragging. Taken out of the cell so the fit itself cannot re-enter.
+    let refit = REFIT.with(|c| c.borrow().clone());
+    if let Some(fit) = refit {
+        fit();
+    }
     if let Some(settings) = gtk::Settings::default() {
         // Relative to whatever this desktop already asked for, not an absolute
         // DPI: a user on a HiDPI session has a large value here already, and
@@ -783,7 +808,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // eye camera for the moment before the first one arrives, and corrected
         // by the first frame — a device that sends something else is then
         // matched rather than assumed about.
-        let last_shape = std::rc::Rc::new(Cell::new((280i32, 280i32)));
+        let last_shape = Cell::new((280i32, 280i32));
         cam_area.set_draw_func(move |_, cr, w, h| {
             if let Some(f) = cam_frame.borrow().as_ref() {
                 last_shape.set((f.width as i32, f.height as i32));
@@ -802,6 +827,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let readout = gtk::Grid::new();
     readout.add_css_class("readout");
     readout.set_halign(Align::Center);
+    readout.set_valign(Align::Center);
     readout.set_row_spacing(2);
     // Two groups side by side — where the head is, and which way it faces — so
     // the readout is three rows tall rather than five. Column 2 is a spacer
@@ -850,23 +876,18 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // added their own full height to a band that is now the top of the window,
     // and they are a narrow block of text next to a wide one — which is the
     // shape that fits in the space the trackbox cannot use anyway.
-    let readout_side = gtk::Box::new(Orientation::Vertical, 12);
-    readout_side.set_valign(Align::Center);
-    readout_side.append(&readout);
-
     let cam_side = gtk::Box::new(Orientation::Vertical, 12);
     cam_side.set_hexpand(true);
     cam_side.append(&cam_title);
     cam_side.append(&cam_area);
 
-    let instrument = gtk::Box::new(Orientation::Horizontal, 20);
-    instrument.add_css_class("surface");
-    instrument.add_css_class("panel-pad");
-    instrument.set_hexpand(true);
-    instrument.append(&gaze_side);
-    instrument.append(&readout_side);
-    instrument.append(&cam_side);
-    let live = instrument;
+    let live = gtk::Box::new(Orientation::Horizontal, 20);
+    live.add_css_class("surface");
+    live.add_css_class("panel-pad");
+    live.set_hexpand(true);
+    live.append(&gaze_side);
+    live.append(&readout);
+    live.append(&cam_side);
 
     // --- Right column: settings sections (original wording) ---
     let b_setup = crate::widget::button("Set up display");
@@ -1030,10 +1051,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // above, plus the `CARD_GAP` between them) the levelling buys at most 13px,
     // and it costs a gap inside a column that visibly differs from the gap
     // between the rows.
-    let col_calib = gtk::Box::new(Orientation::Vertical, CARD_GAP);
-    col_calib.set_size_request(COLUMN_WIDTH, -1);
-    col_calib.set_valign(Align::Start);
-    col_calib.set_hexpand(true);
+    let col_calib = control_column();
     col_calib.append(&section(
         "Improve my calibration",
         "If the light conditions change or if you experience less tracker precision, you might \
@@ -1098,10 +1116,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     }
 
     // What the tracker measures: which eyes to look for, and head pose.
-    let col_display = gtk::Box::new(Orientation::Vertical, CARD_GAP);
-    col_display.set_size_request(COLUMN_WIDTH, -1);
-    col_display.set_valign(Align::Start);
-    col_display.set_hexpand(true);
+    let col_display = control_column();
     col_display.append(&section(
         "Select eyes to detect",
         "If you typically squint or have poor sight in one eye, you can make the eye tracker \
@@ -1115,10 +1130,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     ));
 
     // Where the result goes: onto the screen, and out to a game.
-    let col_games = gtk::Box::new(Orientation::Vertical, CARD_GAP);
-    col_games.set_size_request(COLUMN_WIDTH, -1);
-    col_games.set_valign(Align::Start);
-    col_games.set_hexpand(true);
+    let col_games = control_column();
     col_games.append(&section(
         "Preview my gaze",
         "Shows you a visual trail of your gaze.",
@@ -1153,7 +1165,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // columns end level and any spare window height is plain background.
     split.set_vexpand(false);
     split.set_valign(Align::Start);
-    split.set_column_spacing(16);
+    split.set_column_spacing(CARD_GAP as u32);
     split.set_row_spacing(CARD_GAP as u32);
     // The three layouts. One function, so the arrangement a width selects and
     // the arrangement it was measured against cannot drift apart.
@@ -1164,6 +1176,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         let col_display = col_display.clone();
         let col_games = col_games.clone();
         Rc::new(move |columns: i32| {
+            let columns = columns.clamp(1, 3);
             // Only what is actually in the grid: the first call is the one that
             // fills it, and removing an unattached child is a GTK-CRITICAL.
             for card in [
@@ -1178,11 +1191,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             }
             // The live data always spans the full width, whatever that is: it
             // is one card and splitting it across rows would put the two views
-            // in different places depending on the window size.
+            // in different places depending on the window size. Spanning
+            // `columns` rather than a literal per arm is what keeps that true —
+            // the two disagreeing is a card that stops short of the window edge.
+            split.attach(&live, 0, 0, columns, 1);
+            // And the first control column is always directly under it.
+            split.attach(&col_calib, 0, 1, 1, 1);
             match columns {
                 3 => {
-                    split.attach(&live, 0, 0, 3, 1);
-                    split.attach(&col_calib, 0, 1, 1, 1);
                     split.attach(&col_display, 1, 1, 1, 1);
                     split.attach(&col_games, 2, 1, 1, 1);
                 }
@@ -1190,14 +1206,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 // them: it is the widest card of the three, and a half-width
                 // hole beside it would read as something missing.
                 2 => {
-                    split.attach(&live, 0, 0, 2, 1);
-                    split.attach(&col_calib, 0, 1, 1, 1);
                     split.attach(&col_display, 1, 1, 1, 1);
                     split.attach(&col_games, 0, 2, 2, 1);
                 }
                 _ => {
-                    split.attach(&live, 0, 0, 1, 1);
-                    split.attach(&col_calib, 0, 1, 1, 1);
                     split.attach(&col_display, 0, 2, 1, 1);
                     split.attach(&col_games, 0, 3, 1, 1);
                 }
@@ -1231,17 +1243,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     arrange(3);
     let three_col_min = split.measure(Orientation::Horizontal, -1).0;
 
-    // Re-fit the window to its content. Late-bound on purpose: the cogwheel is
-    // built as part of the header, which is built before the window exists, so
-    // the control that changes the text size cannot capture a window that is
-    // not there yet. The cell is filled the moment it is.
-    let refit: Refit = Rc::new(RefCell::new(None));
-
     let header = gtk::Box::new(Orientation::Horizontal, 12);
     title.set_hexpand(true);
     header.append(&title);
     header.append(&status_bar);
-    header.append(&settings_button(&really_quitting, refit.clone()));
+    header.append(&settings_button(&really_quitting));
 
     // One margin all round, so the frame of background around the content is
     // even. Anything else reads as a mistake at the corners.
@@ -1294,9 +1300,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // Both used to leave the window at whatever height it was born with, so
     // larger text was clipped and a banner pushed the last card out of view.
     {
-        let win = window.clone();
         let root = root.clone();
-        let window = win.clone();
+        let fit_window = window.clone();
         // The last size this closure itself set. Anything else is the user.
         //
         // The comment here used to claim it never touched "a window the user
@@ -1306,30 +1311,29 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // `default_height` tracks the current size, so a window made smaller
         // was silently grown back to its content the next time anything
         // re-fitted.
-        let ours = std::rc::Rc::new(Cell::new((0i32, 0i32)));
         let fit: Rc<dyn Fn()> = {
-            let ours = ours.clone();
+            let ours = Cell::new((0i32, 0i32));
             Rc::new(move || {
                 // Maximised or fullscreen, the height is not ours to choose.
-                if window.is_maximized() || window.is_fullscreen() {
+                if fit_window.is_maximized() || fit_window.is_fullscreen() {
                     return;
                 }
-                let (w, h) = (window.default_width(), window.default_height());
+                let (w, h) = (fit_window.default_width(), fit_window.default_height());
                 // Sized by hand since we last set it: leave it alone. The first
                 // call sees (0, 0) and proceeds, which is what opens the window
                 // at its content height.
                 if ours.get() != (0, 0) && ours.get() != (w, h) {
                     return;
                 }
-                let width = window.width().max(w);
+                let width = effective_width(&fit_window);
                 let (_, wanted, _, _) = root.measure(Orientation::Vertical, width);
                 if wanted != h {
-                    window.set_default_size(width, wanted);
+                    fit_window.set_default_size(width, wanted);
                     ours.set((width, wanted));
                 }
             })
         };
-        *refit.borrow_mut() = Some(fit.clone());
+        REFIT.with(|c| *c.borrow_mut() = Some(fit.clone()));
 
         // Once, and latched — because `map` is not a first-appearance signal.
         // It fires on every show, so closing to the tray and coming back used to
@@ -1342,7 +1346,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         {
             let fit = fit.clone();
             let first = Cell::new(true);
-            win.connect_map(move |_| {
+            window.connect_map(move |_| {
                 if !first.replace(false) {
                     return;
                 }
@@ -1375,12 +1379,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // below, which exist precisely so the window CAN be made narrow.
     window.set_size_request(-1, 340);
 
-    // The breakpoints. Three layouts, chosen by width alone.
-    //
-    // Arithmetic on the real floors rather than three tuned numbers: the
-    // instrument's 340px, plus a control column per tier, plus the 16px gutters
-    // and the 20px page margins either side. Tuned constants drift the moment
-    // any of those changes; these do not.
+    // The breakpoints. Three layouts, chosen by width alone, each switching at
+    // the width its own layout measured — see `arrange` above.
     let breakpoint: Rc<dyn Fn(i32)> = {
         // Measured above, plus the page margins either side.
         let three_below = three_col_min + PAGE_MARGIN * 2;
@@ -1412,9 +1412,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // it also re-checks there — one integer compare, and `apply` returns
         // immediately when nothing changed.
         let apply: Rc<dyn Fn(i32)> = Rc::new(apply);
-        apply(window.default_width());
+        apply(effective_width(&window));
         let on_notify = apply.clone();
-        window.connect_default_width_notify(move |w| on_notify(w.width().max(w.default_width())));
+        window.connect_default_width_notify(move |w| on_notify(effective_width(w)));
         apply
     };
 
@@ -1446,9 +1446,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
 
     // Kept so the close handler can retire it: the tick captures the
     // application and can open a forced flow, so it must not outlive the hub.
+    // Also so it can be stopped while the window is hidden — see `restart_tick`.
     let tick_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-    *tick_id.borrow_mut() = Some(glib::timeout_add_local(
-        Duration::from_millis(33),
+    let tick_body: Rc<dyn Fn() -> glib::ControlFlow> = Rc::new({
         move || {
             // Ask for the tracker exactly while this window has focus. Polled
             // rather than driven by `notify::is-active`: see the note below.
@@ -1462,25 +1462,24 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 }
             }
             // Nothing below this line is worth doing for a window nobody can
-            // see, and now that closing MINIMISES rather than exits, that is a
-            // state the hub sits in for hours while a game plays. Everything
-            // above it still runs: the claim has to be released when the window
-            // stops being active, which is the whole reason the tracker goes
-            // dark when you minimise.
+            // see. Everything above it still runs: the claim has to be released
+            // when the window stops being active, which is the whole reason the
+            // tracker goes dark when you minimise.
             //
             // `is_suspended` rather than `is_minimized`: GTK sets it for any
             // reason the surface is not visible to the user — minimised, fully
             // occluded, on another workspace — which is exactly the set of
-            // states where redrawing a readout is wasted work.
+            // states where redrawing a readout is wasted work. That is the case
+            // this guard is for, since a minimised window stays mapped and so
+            // keeps ticking.
             //
             // `is_mapped` as well, and it is not redundant: a HIDDEN window —
             // which is what closing to the tray produces — reports
             // `is_suspended() == false`. Measured, on this window: hidden gives
             // `mapped=false suspended=false`, minimised gives `suspended=true`.
-            // So the guard that exists to stop this body running while nobody
-            // is looking was inert in precisely the state the tray made the
-            // default, and the full 30 Hz tick ran for as long as the hub sat
-            // in the tray.
+            // The tick is stopped outright while hidden, so this is the window
+            // between construction and the first `map`, plus whatever gap a
+            // compositor leaves between the two signals.
             if tick_window.is_suspended() || !tick_window.is_mapped() {
                 return glib::ControlFlow::Continue;
             }
@@ -1497,7 +1496,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             // window for it. Measured: natural height 803 -> 1736, window left
             // 420px too tall for the rest of the run. `fit` already guards the
             // same way.
-            breakpoint(tick_window.width().max(tick_window.default_width()));
+            breakpoint(effective_width(&tick_window));
             // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
             // under one lock. `new_cam` is None on the ticks between device frames.
             let (snap, new_cam) = {
@@ -1632,8 +1631,60 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 area.queue_draw();
             }
             glib::ControlFlow::Continue
-        },
-    ));
+        }
+    });
+
+    // Started now, stopped whenever the window is unmapped, started again when
+    // it comes back.
+    //
+    // The guard inside the body already skips the work for a window nobody can
+    // see, but the timer still fired 30 times a second to reach that guard —
+    // and closing to the tray is a state the hub sits in for hours while a game
+    // plays. Measured on this machine: 30 wakeups/s at 12.5 us each, 0.038% of
+    // a core, ~324k no-op wakeups over a three-hour session, and 30 scheduler
+    // wakeups a second is enough to keep a laptop out of its deeper idle
+    // states.
+    //
+    // `map`/`unmap` and not `is_suspended`, because those are the transitions
+    // that bracket exactly the hidden case: measured on this window,
+    // `minimize()` leaves it MAPPED (so a minimised hub keeps ticking and the
+    // body's `is_suspended` guard handles it, unchanged), while
+    // `set_visible(false)` unmaps and `present()` maps again.
+    let restart_tick: Rc<dyn Fn()> = {
+        let tick_id = tick_id.clone();
+        let tick_body = tick_body.clone();
+        Rc::new(move || {
+            let mut slot = tick_id.borrow_mut();
+            if slot.is_some() {
+                return;
+            }
+            let body = tick_body.clone();
+            *slot = Some(glib::timeout_add_local(
+                Duration::from_millis(33),
+                move || body(),
+            ));
+        })
+    };
+    restart_tick();
+    {
+        let restart_tick = restart_tick.clone();
+        window.connect_map(move |_| restart_tick());
+    }
+    {
+        let tick_id = tick_id.clone();
+        let unmap_focus = focus_hold.clone();
+        window.connect_unmap(move |_| {
+            if let Some(id) = tick_id.borrow_mut().take() {
+                id.remove();
+            }
+            // The one thing above the body's guard that still has to happen.
+            // It was the tick that released the tracker claim when the window
+            // stopped being active; with the tick stopped, hiding the window
+            // has to release it here — which it does at the moment of hiding
+            // rather than a frame or two later.
+            *unmap_focus.borrow_mut() = None;
+        });
+    }
 
     // The tracker runs while you are looking at the hub, and not otherwise.
     //
@@ -1680,11 +1731,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             //
             // Nothing else is needed to keep the process alive: the window is
             // never destroyed, so `GApplication` still has one and does not
-            // exit. And the tracker still goes dark, because the claim below is
-            // polled from `is_active()` on the 33 ms tick and neither a hidden
-            // nor a minimised window is active — the illuminators are out
-            // within a frame or two of the click, without this handler doing
-            // anything about it.
+            // exit. And the tracker still goes dark without this handler doing
+            // anything about it — hiding unmaps, and the unmap handler releases
+            // the claim; minimising leaves it mapped, and the 33 ms tick
+            // releases it from `is_active()` a frame or two later.
             //
             // The gaze overlay is deliberately NOT closed here. It has its own
             // switch and its own claim; if the user left it on, something
@@ -1841,9 +1891,9 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 /// A `Popover`, not a second window: it is anchored to the button that opened
 /// it, it closes on click-away, and it needs no title bar, no size negotiation
 /// and no place in the window list for what is three rows of content.
-fn settings_button(quitting: &Rc<Cell<bool>>, refit: Refit) -> gtk::MenuButton {
+fn settings_button(quitting: &Rc<Cell<bool>>) -> gtk::MenuButton {
     let popover = gtk::Popover::new();
-    popover.set_child(Some(&settings_list(quitting, refit)));
+    popover.set_child(Some(&settings_list(quitting)));
     popover.set_position(gtk::PositionType::Bottom);
     popover.set_has_arrow(false);
     // Right edge flush with the cogwheel's, not centred under it. A popover is
@@ -1904,7 +1954,7 @@ fn stepped(current: f64, by: f64) -> f64 {
 /// steps are meaningful, so a slider would offer a hundred positions to choose
 /// between five — and a slider is the harder thing to hit for exactly the user
 /// who is here because the text is too small to read.
-fn text_size_row(refit: Refit) -> gtk::Box {
+fn text_size_row() -> gtk::Box {
     /// One press. Large enough to be worth pressing, small enough that the
     /// range is not crossed in two.
     const STEP: f64 = 0.1;
@@ -1937,7 +1987,8 @@ fn text_size_row(refit: Refit) -> gtk::Box {
             plus.set_sensitive(scale < tobii_config::TEXT_SCALE_MAX - f64::EPSILON);
         }
     };
-    refresh(tobii_config::text_scale());
+    let saved = tobii_config::text_scale();
+    refresh(saved);
 
     // The live value, held here rather than re-read from disk on every press.
     //
@@ -1946,7 +1997,7 @@ fn text_size_row(refit: Refit) -> gtk::Box {
     // press re-reads the old value, and the control appears stuck at one step
     // from where it started — while the text on screen had actually changed.
     // The save is best-effort; the setting is not.
-    let current = std::rc::Rc::new(Cell::new(tobii_config::text_scale()));
+    let current = std::rc::Rc::new(Cell::new(saved));
     let bump = {
         let refresh = refresh.clone();
         let current = current.clone();
@@ -1956,13 +2007,8 @@ fn text_size_row(refit: Refit) -> gtk::Box {
             // Applied before it is saved: the change is visible instantly, and
             // a read-only config directory costs the user the persistence
             // rather than the feature.
+            // Which also re-fits the window around it.
             apply_text_scale(next);
-            // The window has to grow with the text, or the last card is simply
-            // cut off — which reads as the setting being broken rather than as
-            // a window that needs dragging.
-            if let Some(fit) = refit.borrow().as_ref() {
-                fit();
-            }
             if let Err(e) = tobii_config::save_text_scale(next) {
                 tobii_diagnostics::log::warn(&format!("could not save the text size: {e}"));
             }
@@ -1983,7 +2029,7 @@ fn text_size_row(refit: Refit) -> gtk::Box {
     )
 }
 
-fn settings_list(quitting: &Rc<Cell<bool>>, refit: Refit) -> gtk::Box {
+fn settings_list(quitting: &Rc<Cell<bool>>) -> gtk::Box {
     let list = gtk::Box::new(Orientation::Vertical, 4);
     // An explicit width rather than one negotiated from the longest sentence.
     // `set_max_width_chars` is a hint about where a label may wrap, not a cap
@@ -2020,7 +2066,7 @@ fn settings_list(quitting: &Rc<Cell<bool>>, refit: Refit) -> gtk::Box {
         &update_check_switch(),
     ));
     list.append(&hairline());
-    list.append(&text_size_row(refit));
+    list.append(&text_size_row());
     list.append(&hairline());
 
     list.append(&diagnostics_row());

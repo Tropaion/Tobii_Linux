@@ -230,6 +230,21 @@ pub fn camera_rect(w: i32, h: i32, iw: i32, ih: i32) -> (f64, f64, f64, f64) {
     ((f64::from(w) - dw) / 2.0, (f64::from(h) - dh) / 2.0, dw, dh)
 }
 
+/// Clip to the letterboxed rect and fill it with the colour a frame is drawn on.
+///
+/// Leaves the clip in place, which is what lets [`draw_camera_view`] paint the
+/// image into it — and is why this is a shared helper rather than one of these
+/// two calling the other. The colour and the corner radius have to agree
+/// between the placeholder and a live frame, or the panel changes shade the
+/// instant the tracker connects: the same defect in the same pixels as the
+/// size jump `camera_rect` exists to prevent.
+fn clip_to_camera_rect(cr: &cairo::Context, ox: f64, oy: f64, dw: f64, dh: f64) {
+    rounded_rect(cr, ox, oy, dw, dh, CAMERA_CORNER_RADIUS);
+    cr.clip();
+    cr.set_source_rgb(0.05, 0.05, 0.06);
+    let _ = cr.paint();
+}
+
 /// Fill the rectangle a frame WOULD occupy, in the colour it is drawn on.
 ///
 /// `iw`/`ih` are the last frame's dimensions, so the placeholder is the shape
@@ -240,10 +255,7 @@ pub fn draw_camera_placeholder(cr: &cairo::Context, w: i32, h: i32, iw: i32, ih:
         return;
     }
     cr.save().ok();
-    rounded_rect(cr, ox, oy, dw, dh, CAMERA_CORNER_RADIUS);
-    cr.clip();
-    cr.set_source_rgb(0.05, 0.05, 0.06);
-    let _ = cr.paint();
+    clip_to_camera_rect(cr, ox, oy, dw, dh);
     cr.restore().ok();
 }
 
@@ -288,10 +300,7 @@ pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_proto
     // to the LETTERBOXED rect rather than the widget keeps the radius on the
     // picture: rounding the widget would round empty space when the allocation
     // is not square.
-    rounded_rect(cr, ox, oy, dw, dh, CAMERA_CORNER_RADIUS);
-    cr.clip();
-    cr.set_source_rgb(0.05, 0.05, 0.06);
-    let _ = cr.paint();
+    clip_to_camera_rect(cr, ox, oy, dw, dh);
     // Centre, then mirror horizontally (flip x about the image centre).
     cr.translate(ox, oy);
     cr.translate(dw, 0.0);
