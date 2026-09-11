@@ -196,6 +196,26 @@ pub fn run() -> glib::ExitCode {
         builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
     }
     let app = builder.build();
+
+    // `quit`, as an application action and not only a button.
+    //
+    // GApplication exports its actions on the session bus, so this is also a
+    // door in from outside the window: `tobii uninstall` asks a running hub to
+    // leave through it (org.freedesktop.Application.ActivateAction), and so does
+    // the update banner when this copy was replaced while it ran. Without it the
+    // only way to stop a primary instance — which receives every launch of the
+    // app for as long as it lives — was a signal, and a signal skips every step
+    // of the teardown the close handler does.
+    {
+        let quit = gtk::gio::SimpleAction::new("quit", None);
+        let app_weak = app.downgrade();
+        quit.connect_activate(move |_, _| {
+            if let Some(app) = app_weak.upgrade() {
+                quit_everything(&app);
+            }
+        });
+        app.add_action(&quit);
+    }
     // The stylesheet and the tray icon, both once the app starts.
     //
     // The tray is kept in a thread-local rather than passed down, because the
@@ -498,6 +518,31 @@ fn publish_tray(app: &Application) {
 /// not the same thing as an icon anybody is showing.
 fn tray_is_published() -> bool {
     TRAY.with(|c| c.borrow().as_ref().is_some_and(tray::Tray::is_published))
+}
+
+thread_local! {
+    /// How to quit the hub that exists, registered by `build_hub`.
+    ///
+    /// Beside [`TRAY`] and [`REFIT`] for the same reason: the `quit` action is
+    /// installed on the application at startup — in background mode possibly
+    /// hours before any hub is built — and when a hub exists it has to leave
+    /// through the hub's own close handler, the ONE place the tracker claim,
+    /// the overlay and the tick are released.
+    static QUIT_HUB: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// End the program, through the hub's own teardown when there is a hub.
+fn quit_everything(app: &Application) {
+    let hub = QUIT_HUB.with(|c| c.borrow().clone());
+    match hub {
+        Some(close_for_real) => close_for_real(),
+        // Background mode before anything asked for a window: nothing holds the
+        // tracker and nothing needs tearing down but the icon.
+        None => {
+            TRAY.with(|c| *c.borrow_mut() = None);
+            app.quit();
+        }
+    }
 }
 
 thread_local! {
@@ -1835,6 +1880,22 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 app.quit();
             }
             glib::Propagation::Proceed
+        });
+    }
+
+    // The `quit` action's way in — see `QUIT_HUB`. The same two steps as the
+    // cogwheel's Quit row: the flag that makes the close handler tear down
+    // instead of hiding, then the close.
+    {
+        let quitting = really_quitting.clone();
+        let window = window.downgrade();
+        QUIT_HUB.with(|c| {
+            *c.borrow_mut() = Some(Rc::new(move || {
+                quitting.set(true);
+                if let Some(w) = window.upgrade() {
+                    w.close();
+                }
+            }))
         });
     }
 

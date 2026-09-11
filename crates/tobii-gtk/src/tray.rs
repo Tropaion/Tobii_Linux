@@ -38,6 +38,7 @@
 //! thread: that is what makes it safe for `on_activate` to touch widgets.
 
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk::gio;
@@ -68,9 +69,12 @@ const TITLE: &str = "Tobii Eye Tracker";
 /// The same string as [`APP_ID`] because that is what `Icon=` in
 /// `assets/com.tobiilinux.Configuration.desktop` names, and
 /// `scripts/install-payload.sh` installs `com.tobiilinux.Configuration.svg`
-/// into `…/icons/hicolor/scalable/apps`. A host that cannot find it in the
-/// icon theme shows its own placeholder; the icon is not sent over the bus as
-/// pixels, so there is nothing to fall back to here.
+/// into `…/icons/hicolor/scalable/apps`. A host looks for it in `IconThemePath`
+/// first — see [`private_icon_theme`], which exists because Plasma could not
+/// find the installed copy for a whole session after a first install. It is
+/// still not sent over the bus as pixels: rendering the SVG takes an image
+/// loader this machine does not have (checked: no SVG loader for gdk-pixbuf,
+/// and GdkTexture refuses the file).
 const ICON_NAME: &str = APP_ID;
 
 /// How long to wait for either of the two calls this module makes.
@@ -117,6 +121,7 @@ const ITEM_XML: &str = r#"
     <property name="Title" type="s" access="read"/>
     <property name="Status" type="s" access="read"/>
     <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <signal name="NewTitle"/>
@@ -144,7 +149,7 @@ fn raises_the_window(method: &str) -> bool {
 ///
 /// `None` for a name this interface does not declare, which GDBus never asks
 /// for: it rejects properties absent from [`ITEM_XML`] before the getter runs.
-fn property(name: &str, tooltip: &str) -> Option<glib::Variant> {
+fn property(name: &str, tooltip: &str, icon_theme_path: &str) -> Option<glib::Variant> {
     Some(match name {
         // The category describes what the item IS, not what it watches. This
         // is an application the user opens; "Hardware", the tempting one for a
@@ -161,10 +166,68 @@ fn property(name: &str, tooltip: &str) -> Option<glib::Variant> {
         // exists to provide.
         "Status" => "Active".to_variant(),
         "IconName" => ICON_NAME.to_variant(),
+        // Where the host should look for that name before its own theme — see
+        // `private_icon_theme`. Empty when it could not be written, which a host
+        // reads as "no path" and falls back to its own lookup.
+        "IconThemePath" => icon_theme_path.to_variant(),
         "ItemIsMenu" => false.to_variant(),
         "ToolTip" => tooltip_variant(tooltip),
         _ => return None,
     })
+}
+
+/// The icon, compiled in, so the tray never depends on where — or whether — it
+/// was installed.
+const ICON_SVG: &[u8] = include_bytes!("../../../assets/com.tobiilinux.Configuration.svg");
+
+/// Put the icon where `IconThemePath` can point at it, and return that path.
+///
+/// Measured on 2026-09-11: Plasma's icon lookup scans the icon folders that
+/// existed when it started, and no others. A first tarball install creates
+/// `~/.local/share/icons/hicolor/scalable/` after Plasma has started, so the
+/// tray showed a placeholder until the next login — restarting plasmashell fixed
+/// it. `IconThemePath` makes the host look in a folder named by the item, and
+/// this writes the icon into it at every start, so the icon no longer depends
+/// on the install location, and a build run straight from the tree gets the
+/// real icon too.
+///
+/// Under the runtime directory the tracking socket already uses: per user, mode
+/// 0700, on tmpfs, gone at logout.
+fn private_icon_theme() -> Option<PathBuf> {
+    let base = tobii_ipc::path::ensure_socket_dir().ok()?;
+    write_icon_theme(&base).ok()
+}
+
+/// [`private_icon_theme`] against any directory, so a test can use its own.
+///
+/// Both layouts a host might search: the theme-shaped
+/// `hicolor/scalable/apps/<name>.svg`, with the `index.theme` a Qt lookup needs
+/// before it will look inside a theme folder at all, and the flat
+/// `<path>/<name>.svg` some hosts look for directly.
+fn write_icon_theme(base: &Path) -> std::io::Result<PathBuf> {
+    let theme = base.join("icons");
+    let hicolor = theme.join("hicolor");
+    let apps = hicolor.join("scalable/apps");
+    std::fs::create_dir_all(&apps)?;
+    let files: [(PathBuf, &[u8]); 3] = [
+        (apps.join(format!("{ICON_NAME}.svg")), ICON_SVG),
+        (theme.join(format!("{ICON_NAME}.svg")), ICON_SVG),
+        (
+            hicolor.join("index.theme"),
+            b"[Icon Theme]\nName=Hicolor\nComment=tobii-linux tray icon\nDirectories=scalable/apps\n\n\
+              [scalable/apps]\nSize=128\nMinSize=8\nMaxSize=512\nType=Scalable\nContext=Applications\n",
+        ),
+    ];
+    for (file, bytes) in files {
+        // Rewritten only when it differs, so a second hub starting does not
+        // replace a file a host may be reading at that moment.
+        if std::fs::read(&file).ok().as_deref() != Some(bytes) {
+            let tmp = file.with_extension(format!("new-{}", std::process::id()));
+            std::fs::write(&tmp, bytes)?;
+            std::fs::rename(&tmp, &file)?;
+        }
+    }
+    Ok(theme)
 }
 
 /// A `ToolTip` value: icon name, icon pixmaps, title, description.
@@ -199,6 +262,8 @@ struct State {
     bus_name: String,
     /// The hover text, read back by the `ToolTip` getter.
     tooltip: String,
+    /// The `IconThemePath` value, fixed at install.
+    icon_theme_path: String,
     /// Whether the bus name is ours, and whether a watcher is up.
     ///
     /// The item can only be announced once both hold, and either can become
@@ -313,6 +378,9 @@ pub fn install(tooltip: &str, on_activate: impl Fn() + 'static) -> Option<Tray> 
     let state = Rc::new(State {
         bus_name: bus_name(),
         tooltip: tooltip.to_owned(),
+        icon_theme_path: private_icon_theme()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
         have_name: Cell::new(false),
         // Seeded from the bus daemon, then kept honest by the subscription
         // below. Either order is fine: `announce` fires on whichever of the
@@ -328,7 +396,8 @@ pub fn install(tooltip: &str, on_activate: impl Fn() + 'static) -> Option<Tray> 
                 // The fallback is unreachable — GDBus rejects any name absent
                 // from ITEM_XML before calling this — and exists because the
                 // signature has no room to say so.
-                property(name, &state.tooltip).unwrap_or_else(|| "".to_variant())
+                property(name, &state.tooltip, &state.icon_theme_path)
+                    .unwrap_or_else(|| "".to_variant())
             }
         })
         .method_call(
@@ -459,7 +528,7 @@ mod tests {
             ["ContextMenu", "Activate", "SecondaryActivate", "Scroll"],
             "the four methods a host may call"
         );
-        assert_eq!(declared("property", "name").len(), 7);
+        assert_eq!(declared("property", "name").len(), 8);
         for m in &methods {
             assert!(
                 iface.lookup_method(m).is_some(),
@@ -479,7 +548,7 @@ mod tests {
         let types = declared("property", "type");
         assert_eq!(names.len(), types.len());
         for (name, ty) in names.iter().zip(&types) {
-            let value = property(name, "hover text")
+            let value = property(name, "hover text", "/run/user/1000/tobii-linux/icons")
                 .unwrap_or_else(|| panic!("{name} is declared but never answered"));
             assert_eq!(
                 value.type_().as_str(),
@@ -505,6 +574,31 @@ mod tests {
             0,
             "no pixmaps: the icon is named, not sent"
         );
+    }
+
+    /// The files `IconThemePath` points a host at, in both layouts, byte for byte
+    /// the shipped icon — and a second start leaves them as they are.
+    #[test]
+    fn the_private_icon_theme_holds_the_shipped_icon() {
+        let base = std::env::temp_dir().join(format!("tobii-tray-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let theme = write_icon_theme(&base).expect("writable temp dir");
+        assert_eq!(theme, base.join("icons"));
+        for f in [
+            theme.join(format!("hicolor/scalable/apps/{ICON_NAME}.svg")),
+            theme.join(format!("{ICON_NAME}.svg")),
+        ] {
+            assert_eq!(
+                std::fs::read(&f).expect("icon written"),
+                ICON_SVG,
+                "{}",
+                f.display()
+            );
+        }
+        let index = std::fs::read_to_string(theme.join("hicolor/index.theme")).expect("index");
+        assert!(index.contains("Directories=scalable/apps"), "{index}");
+        assert_eq!(write_icon_theme(&base).expect("second start"), theme);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// No published menu means a right-click has nothing to open, so it must
