@@ -86,7 +86,7 @@ pub fn set_enabled(on: bool) -> io::Result<()> {
     // autostarts that build and enabling it from an installed copy autostarts
     // that one. `current_exe` resolves symlinks, which is what we want here:
     // the entry should survive the symlink being repointed.
-    let exec = std::env::current_exe()?.display().to_string();
+    let exec = entry_exec(&std::env::current_exe()?)?.display().to_string();
     std::fs::create_dir_all(dir())?;
     // Written whole and renamed: a login that reads a half-written entry would
     // silently not start, and the failure would look like the setting never
@@ -94,6 +94,43 @@ pub fn set_enabled(on: bool) -> io::Result<()> {
     let tmp = dir().join(scratch_name(std::process::id()));
     std::fs::write(&tmp, entry_text(&exec))?;
     std::fs::rename(&tmp, &path)
+}
+
+/// The path the entry should run, from `exe` as [`std::env::current_exe`]
+/// reported it.
+///
+/// That is `/proc/self/exe`, and the kernel appends ` (deleted)` to it once the
+/// file is unlinked — which `install.sh`, the updater and a package upgrade all
+/// do, by renaming a new copy over the running one. Written as it reads, the
+/// entry named a file that cannot exist: the switch said on, and the next login
+/// started nothing. So a running copy that was REPLACED writes the path it was
+/// replaced at, where the new copy now is and where the next login should find
+/// it; one that was REMOVED is refused, since any entry written then would be
+/// the same dead one.
+///
+/// The path is taken at its word when it exists, so a directory or file that
+/// really is called `(deleted)` is not second-guessed.
+fn entry_exec(exe: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if exe.is_file() {
+        return Ok(exe.to_path_buf());
+    }
+    let bytes = exe.as_os_str().as_bytes();
+    let Some(stem) = bytes.strip_suffix(b" (deleted)") else {
+        return Ok(exe.to_path_buf());
+    };
+    let replaced = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(stem));
+    if replaced.is_file() {
+        return Ok(replaced);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "this program was removed from {} while it ran; start the copy that is \
+             installed now and turn this on from there",
+            replaced.display()
+        ),
+    ))
 }
 
 /// Whether this process was started for the background session.
@@ -168,6 +205,61 @@ mod tests {
         )
         .unwrap();
         assert!(is_enabled_at(&on));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reported failure: start-at-login switched on from a hub that had
+    /// been updated in place wrote `Exec=".../tobii-gtk (deleted)"`, an entry
+    /// that reads as on and never starts anything.
+    #[test]
+    fn a_copy_replaced_while_it_ran_writes_the_path_it_was_replaced_at() {
+        let dir = scratch("replaced");
+        let bin = dir.join("tobii-gtk");
+        std::fs::write(&bin, b"the new copy").unwrap();
+        let reported = dir.join("tobii-gtk (deleted)");
+
+        let exec = entry_exec(&reported).expect("the new copy is there");
+        assert_eq!(exec, bin);
+        // And the entry built from it runs that file, read back the way
+        // `tobii uninstall` and `install.sh` read it.
+        let text = entry_text(&exec.display().to_string());
+        assert_eq!(
+            tobii_config::autostart::exec_program(&text).as_deref(),
+            Some(bin.to_str().unwrap())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_removed_while_it_ran_writes_no_entry() {
+        let dir = scratch("removed");
+        let err = entry_exec(&dir.join("tobii-gtk (deleted)")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string()
+                .contains(&dir.join("tobii-gtk").display().to_string()),
+            "the message names where it was: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the kernel's suffix is special: a path that exists is used as it
+    /// is, whatever it is called.
+    #[test]
+    fn a_path_that_exists_is_used_as_it_is() {
+        let dir = scratch("as-is");
+        let odd = dir.join("(deleted)");
+        std::fs::create_dir_all(&odd).unwrap();
+        let bin = odd.join("tobii-gtk");
+        std::fs::write(&bin, b"x").unwrap();
+        assert_eq!(entry_exec(&bin).unwrap(), bin);
+
+        let literal = dir.join("tobii-gtk (deleted)");
+        std::fs::write(&literal, b"x").unwrap();
+        std::fs::write(dir.join("tobii-gtk"), b"another copy").unwrap();
+        assert_eq!(entry_exec(&literal).unwrap(), literal);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
