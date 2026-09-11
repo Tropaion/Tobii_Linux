@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::paths;
+use crate::paths::{self, APP_ID};
 
 /// The autostart entry's file name — the application id, like the menu entry.
 pub const ENTRY_NAME: &str = paths::DESKTOP_ENTRY;
@@ -59,7 +59,7 @@ pub fn entry_text(exec: &str) -> String {
          Name=Tobii Eye Tracker\n\
          Comment=Keep the Tobii hub ready in the background\n\
          Exec={exec} --background\n\
-         Icon=com.tobiilinux.Configuration\n\
+         Icon={APP_ID}\n\
          Terminal=false\n\
          NoDisplay=true\n\
          X-GNOME-Autostart-enabled=true\n"
@@ -105,30 +105,29 @@ fn quote_exec(exec: &str) -> String {
     out
 }
 
-/// The program a desktop entry runs: the first argument of its `Exec` line,
-/// unescaped.
-///
-/// Reads any desktop entry, not only the autostart one — the menu entry that
-/// `install-payload.sh` writes has an unquoted absolute path, the autostart
-/// entry above a quoted one, and both undo the same two layers: the
-/// desktop-entry value escapes (`\\`, `\s`, …) and then the `Exec` quoting.
-/// Only the `[Desktop Entry]` group is read, as the spec says.
-///
-/// This is the first word, whatever it is. An entry edited by hand to
-/// `Exec=env GDK_BACKEND=x11 /usr/bin/tobii-gtk` runs `env`; to see past that,
-/// read [`exec_arguments`].
-pub fn exec_program(entry: &str) -> Option<String> {
-    exec_arguments(entry)?.into_iter().next()
-}
-
 /// Every argument of a desktop entry's `Exec` line, unescaped and unquoted.
 ///
-/// `None` when the `[Desktop Entry]` group has no `Exec` line, or when its
-/// quoting is broken (an unterminated quote): a launcher refuses such a line,
-/// and guessing where the arguments end would be guessing what it runs.
+/// Reads any desktop entry, not only the autostart one: the menu entry that
+/// `install-payload.sh` writes (quoted, `%` doubled, and never containing `"`,
+/// `` ` ``, `$` or `\`, so the same bytes `quote_exec` writes; an older install
+/// wrote it unquoted), the autostart entry above, and the packages' bare
+/// `tobii-gtk`. All undo the same two layers: the desktop-entry value escapes
+/// (`\\`, `\s`, …) and then the `Exec` quoting. Only the `[Desktop Entry]`
+/// group is read, as the spec says. All arguments, not just the first: a
+/// hand-edited `Exec=env GDK_BACKEND=x11 /usr/bin/tobii-gtk` runs `env`.
+///
+/// `None` when the `[Desktop Entry]` group has no `Exec` line, when it has
+/// two, or when the line is escaped or quoted in a way the spec does not
+/// define — an unterminated quote, a backslash or a reserved character outside
+/// double quotes, a backslash before anything but the four characters it may
+/// escape. Launchers refuse such a line or disagree about it, and guessing
+/// where the arguments end would be guessing what it runs. Unknown is the safe
+/// answer for `tobii uninstall`, which keeps an entry it cannot read rather
+/// than switch start-at-login off for a copy that stays.
 /// Field codes (`%U`, `%f`, …) are returned as they are.
 pub fn exec_arguments(entry: &str) -> Option<Vec<String>> {
     let mut in_main = false;
+    let mut exec: Option<&str> = None;
     for line in entry.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -144,13 +143,22 @@ pub fn exec_arguments(entry: &str) -> Option<Vec<String>> {
         if key.trim() != "Exec" {
             continue;
         }
-        return split_arguments(&unescape_value(value.trim()));
+        // Two `Exec` keys are read differently by different launchers: GKeyFile
+        // and KConfig keep the last, systemd's xdg-autostart generator (which
+        // starts autostart entries on a systemd session) keeps the first. A
+        // reader that picked either could judge a program nobody runs.
+        if exec.replace(value.trim()).is_some() {
+            return None;
+        }
     }
-    None
+    split_arguments(&unescape_value(exec?)?)
 }
 
 /// Undo the desktop-entry *string* escapes: `\s \n \t \r \\`.
-fn unescape_value(v: &str) -> String {
+///
+/// `None` for any other escape, or for a backslash that ends the value:
+/// GKeyFile refuses to read such a value at all, so GLib has no `Exec` to run.
+fn unescape_value(v: &str) -> Option<String> {
     let mut out = String::with_capacity(v.len());
     let mut chars = v.chars();
     while let Some(c) = chars.next() {
@@ -158,28 +166,32 @@ fn unescape_value(v: &str) -> String {
             out.push(c);
             continue;
         }
-        match chars.next() {
-            Some('s') => out.push(' '),
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
+        out.push(match chars.next()? {
+            's' => ' ',
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '\\' => '\\',
+            _ => return None,
+        });
     }
-    out
+    Some(out)
 }
+
+/// The characters the spec reserves: outside double quotes, an argument
+/// containing one must be quoted. Whitespace separates arguments and `"`
+/// starts a quote, so they are handled before this is looked at.
+const RESERVED: &[char] = &[
+    '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '`',
+];
 
 /// The arguments of an unescaped `Exec` value, with their quoting removed.
 ///
 /// Arguments are separated by unquoted whitespace. A double-quoted stretch is
-/// part of the argument it sits in, and inside it a backslash escapes the next
-/// character. `%%` is a literal `%`. An empty value, or one with an
-/// unterminated quote, gives `None`.
+/// part of the argument it sits in, and inside it a backslash escapes `"`,
+/// `` ` ``, `$` and `\`, the four characters the spec reserves there. `%%` is a
+/// literal `%`. An empty value, an unterminated quote, or quoting the spec does
+/// not define gives `None`.
 fn split_arguments(v: &str) -> Option<Vec<String>> {
     let mut args = Vec::new();
     let mut chars = v.chars().peekable();
@@ -193,8 +205,25 @@ fn split_arguments(v: &str) -> Option<Vec<String>> {
         while let Some(c) = chars.next() {
             match c {
                 '"' => quoted = !quoted,
-                // Inside quotes a backslash escapes the next character.
-                '\\' if quoted => arg.push(chars.next()?),
+                // Inside quotes the spec defines a backslash only before `"`,
+                // `` ` ``, `$` and `\`. Before anything else it is undefined:
+                // GLib keeps the backslash, a reader that drops it names a
+                // different path, so what runs is not told here.
+                '\\' if quoted => match chars.next()? {
+                    e @ ('"' | '`' | '$' | '\\') => arg.push(e),
+                    _ => return None,
+                },
+                // Unescaped inside quotes these are undefined too: GLib takes
+                // them literally, KDE hands the line to a shell, which expands
+                // them.
+                '`' | '$' if quoted => return None,
+                // Outside quotes the spec wants every reserved character
+                // quoted. GLib and KDE read a backslash or a single quote as
+                // shell quoting (`My\ Projects`, `'/a b'/x`), KDE runs a line
+                // with `$`, `*`, `;` and the like through a shell and expands
+                // `~`, and GLib takes a word that starts with `#` as a comment,
+                // so the first word is not what either of them runs.
+                c if !quoted && RESERVED.contains(&c) => return None,
                 c if c.is_whitespace() && !quoted => break,
                 c => arg.push(c),
             }
@@ -211,6 +240,11 @@ fn split_arguments(v: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a launcher runs: the first argument.
+    fn program(entry: &str) -> Option<String> {
+        exec_arguments(entry)?.into_iter().next()
+    }
 
     #[test]
     fn the_entry_is_a_valid_desktop_file_that_runs_the_background_session() {
@@ -277,32 +311,31 @@ mod tests {
             "/home/u/$HOME/`x`/\"q\"/tobii-gtk",
             "/home/u/back\\slash/tobii-gtk",
         ] {
-            assert_eq!(
-                exec_program(&entry_text(exec)).as_deref(),
-                Some(exec),
-                "{exec}"
-            );
+            assert_eq!(program(&entry_text(exec)).as_deref(), Some(exec), "{exec}");
         }
     }
 
-    /// The menu entry `install-payload.sh` writes: an unquoted absolute path,
-    /// and comments above it that mention `Exec` in prose.
+    /// The menu entry an older `install-payload.sh` wrote, which is still on
+    /// disk after an update: an unquoted absolute path, with comments above it
+    /// that mention `Exec` in prose. The quoted form it writes now is byte for
+    /// byte what `quote_exec` writes for every path it accepts, so the round
+    /// trip above covers that one.
     #[test]
-    fn the_menu_entrys_unquoted_exec_is_read() {
+    fn an_unquoted_menu_entry_exec_is_read() {
         let entry = "[Desktop Entry]\nType=Application\n# rewrites this line\n\
                      Exec=/home/u/.local/bin/tobii-gtk\nIcon=x\n";
         assert_eq!(
-            exec_program(entry).as_deref(),
+            program(entry).as_deref(),
             Some("/home/u/.local/bin/tobii-gtk")
         );
         // The shipped, unrewritten entry says a bare name.
         assert_eq!(
-            exec_program("[Desktop Entry]\nExec=tobii-gtk\n").as_deref(),
+            program("[Desktop Entry]\nExec=tobii-gtk\n").as_deref(),
             Some("tobii-gtk")
         );
         // An action group's Exec is not the application's.
         assert_eq!(
-            exec_program("[Desktop Action x]\nExec=/other\n[Desktop Entry]\nName=y\n"),
+            program("[Desktop Action x]\nExec=/other\n[Desktop Entry]\nName=y\n"),
             None
         );
     }
@@ -333,6 +366,67 @@ mod tests {
         assert_eq!(args("\"/usr/bin/tobii-gtk --background"), None);
         assert_eq!(args(""), None);
         assert_eq!(args("\"\" x"), None);
+    }
+
+    /// Escaping or quoting the spec does not define is read differently by
+    /// different launchers — as shell quoting, through a shell, or not at all
+    /// — so it is unknown, never a guessed path that "no longer exists".
+    #[test]
+    fn quoting_the_spec_does_not_define_is_unknown() {
+        let args = |e: &str| exec_arguments(&format!("[Desktop Entry]\nExec={e}\n"));
+        for e in [
+            // GLib reads `\ ` as an escaped space and runs
+            // `/home/u/My Projects/tobii-gtk`, not `/home/u/My\`.
+            r"/home/u/My\\ Projects/tobii-gtk --background",
+            // GLib keeps a backslash before anything but the four.
+            r#""/home/u/x\\y/tobii-gtk""#,
+            "'/home/u/My Projects/tobii-gtk'",
+            "/home/u/'My Projects'/tobii-gtk",
+            // Unquoted, KDE runs these through a shell.
+            "/home/u/$DIR/tobii-gtk",
+            "/home/u/a&b/tobii-gtk",
+            "~/bin/tobii-gtk",
+            // Unescaped inside quotes, likewise.
+            "\"/home/u/$DIR/tobii-gtk\"",
+            "\"/home/u/`x`/tobii-gtk\"",
+            // Not a key-file escape at all: GKeyFile refuses the value.
+            r#""/home/u/a\"b/tobii-gtk""#,
+            r"/home/u/tobii-gtk\",
+        ] {
+            assert_eq!(args(e), None, "{e}");
+        }
+        // What the spec does define is read, reserved characters and all.
+        assert_eq!(
+            args("\"/home/u/Bob's a&b|c/tobii-gtk\"").unwrap(),
+            ["/home/u/Bob's a&b|c/tobii-gtk"]
+        );
+        assert_eq!(
+            args(r#""/home/u/\\$x/\\`y\\`/tobii-gtk""#).unwrap(),
+            ["/home/u/$x/`y`/tobii-gtk"]
+        );
+    }
+
+    /// Launchers disagree about which of two `Exec` keys runs, so neither is
+    /// guessed at, not even across a repeated `[Desktop Entry]` group.
+    #[test]
+    fn two_exec_keys_are_not_guessed_at() {
+        assert_eq!(
+            exec_arguments("[Desktop Entry]\nExec=/a/tobii-gtk\nExec=/b/tobii-gtk\n"),
+            None
+        );
+        assert_eq!(
+            exec_arguments("[Desktop Entry]\nExec=/a\n[X]\nA=1\n[Desktop Entry]\nExec=/b\n"),
+            None
+        );
+        // An action's Exec, or a localised one, is a different key.
+        assert_eq!(
+            program("[Desktop Entry]\nExec=/a\n[Desktop Action x]\nExec=/other\n").as_deref(),
+            Some("/a")
+        );
+        assert_eq!(
+            program("[Desktop Entry]\nExec=/a\nExec[de]=/b\n").as_deref(),
+            Some("/a")
+        );
     }
 
     #[test]
