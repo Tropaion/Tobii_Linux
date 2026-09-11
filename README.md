@@ -296,12 +296,14 @@ listed with the reason, if:
 - it is not a program. A script called `tobii-gtk` in `~/.local/bin` is a
   wrapper of yours, not a build of this program.
 - it belongs to another user. It is theirs to remove, with their own
-  `tobii uninstall`.
-- others can write where it is: the file, the directory it is in, or (for a
-  symlink) the directory of the file it leads to can be written by another
-  user, or by a group other than your own private group (the group of your own
-  that Fedora and others give each user is fine). Whoever can write there
-  chooses what would run.
+  `tobii uninstall`. That holds for a copy the manifest lists too.
+- others can write where it is: the file, or a directory that decides which
+  file its name leads to — the one it is in, the one of each symlink on the
+  way, and every directory above those — belongs to another user, or can be
+  written by another user or by a group other than your own private group
+  (the group of your own that Fedora and others give each user is fine; so is
+  a sticky directory such as `/tmp`). Whoever can write there chooses what
+  would run.
 
 A copy that passes must still name itself when asked `--version`. It also
 leaves alone:
@@ -310,11 +312,17 @@ leaves alone:
   whatever the directory is called, and an unpacked release archive
   (`install.sh` with `assets/install-payload.sh` beside it). Copies run from
   there, but no install made them.
-- a copy `cargo install` put in `~/.cargo/bin`. It prints
-  `cargo uninstall tobii-cli` or `cargo uninstall tobii-gtk` instead, so
-  Cargo's record of what it installed stays right.
-- a directory you cannot write to. If what is there answers as this program,
-  it is a system-wide install, and the command for that is printed (see below).
+- a copy `cargo install` put there. Cargo keeps a record beside the directory
+  (`.crates.toml`, `.crates2.json`). What that record lists as installed from
+  `tobii-cli` or `tobii-gtk` is left, and it prints `cargo uninstall` for
+  exactly those packages, with `--root` unless the directory is
+  `~/.cargo/bin` (`$CARGO_HOME/bin`), so Cargo's record stays right. A record
+  that lists only other programs — `cargo install --root ~/.local ripgrep`
+  writes one beside `~/.local/bin` — hides nothing.
+- a directory you cannot write to. If what is there answers as this program
+  and the directory is yours, it prints `chmod u+w` for it, to run this again
+  after. Otherwise it is a system-wide install, and the command for that is
+  printed (see below).
 - a menu or start-at-login entry that runs a copy which stays — a package's, a
   build directory's — and one whose program it cannot tell.
 
@@ -355,7 +363,8 @@ sudo dnf remove tobii-linux    # Fedora, RHEL   (openSUSE: sudo zypper remove to
 A system-wide install (`sudo ./install.sh --system`) comes out with
 `sudo tobii uninstall --system`. Without `--system`, `tobii uninstall` refuses to
 run as root. Under `sudo`, HOME is `/root`, so it would search root's home
-instead of yours.
+instead of yours. As root it neither runs nor opens anything in a directory
+that someone other than root could have changed.
 
 <details>
 <summary><b>By hand — for v0.1.0 to v0.3.0, whose <code>tobii</code> has no <code>uninstall</code></b></summary>
