@@ -44,6 +44,8 @@ fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+# shellcheck source=scripts/elf-deps.sh
+. "$root/scripts/elf-deps.sh"
 
 # The version in Cargo.toml is what the running binary reports and what the
 # updater compares against the tag. If they disagree, an update installs itself
@@ -103,19 +105,13 @@ if command -v objdump >/dev/null 2>&1; then
     # needs GLIBC_2.39 and tobii-gtk needs 2.44. Reporting only the CLI
     # understated the archive by five minor versions, which is worse than not
     # reporting at all — it is a number a maintainer would trust.
-    need=""
     for bin in tobii tobii-gtk; do
-        [[ -f "$dist/$name/$bin" ]] || continue
-        this="$(objdump -T "$dist/$name/$bin" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' \
-            | sort -V | tail -1 || true)"
-        [[ -n "$this" ]] || continue
-        echo "  $bin needs $this"
-        # `sort -V` puts the newer version last, so the max of the two is the
-        # tail. Version sort, not string sort: 2.10 is newer than 2.9.
-        need="$(printf '%s\n%s\n' "$need" "$this" | sort -V | tail -1)"
+        this="$(elf_glibc_floor "$dist/$name/$bin")"
+        if [[ -n "$this" ]]; then echo "  $bin needs GLIBC_$this"; fi
     done
+    need="$(elf_glibc_floor "$dist/$name/tobii" "$dist/$name/tobii-gtk")"
     if [[ -n "$need" ]]; then
-        echo "  → this archive needs $need or newer; nobody on an older glibc can run it"
+        echo "  → this archive needs GLIBC_$need or newer; nobody on an older glibc can run it"
     fi
 fi
 
