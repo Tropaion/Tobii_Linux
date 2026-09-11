@@ -17,10 +17,13 @@
 #   something to push at people who did not ask for one.
 # - By hand (Actions → AUR → Run workflow) with a tag, to publish an existing
 #   release, including the first push, which is what creates the AUR package.
-#   A manual run uses the scripts from the branch it is started on, so a fixed
-#   aur-bin.sh can re-publish a release without a new tag. Give such a run a
-#   higher pkgrel: AUR helpers upgrade only when pkgver-pkgrel changes, so a fix
-#   pushed under the same pkgrel reaches new installs only.
+#   A manual run uses the scripts from the ref it is started on, and the `aur`
+#   environment admits only main and v* tags (Development.md), so a fixed
+#   aur-bin.sh must reach main first: a run started on main then re-publishes
+#   a release without a new tag, while one started on a tag uses that tag's
+#   own scripts. Give such a run a higher pkgrel: AUR helpers upgrade only when
+#   pkgver-pkgrel changes, so a fix pushed under the same pkgrel reaches new
+#   installs only.
 #
 # # What the pin is — and is not
 #
@@ -61,6 +64,12 @@ permissions:
 
 # One at a time, and never cancelled halfway: two releases published close
 # together must reach the AUR in order.
+#
+# GitHub keeps only ONE pending run per group: a run queued while one runs and
+# another waits cancels the waiting one, which then never runs — whether it was
+# the newer version or not. So when two runs pile up behind a running one,
+# check which version the AUR ended up with, and start the cancelled one by
+# hand if it was the newer.
 concurrency:
   group: aur
   cancel-in-progress: false
@@ -72,8 +81,12 @@ jobs:
     # AUR_SSH_KEY lives in this Environment, not in the repository's secrets: a
     # repository secret is readable by a workflow on any branch, and this key
     # pushes a PKGBUILD every AUR helper sources on its users' machines. The
-    # Environment's deployment rules (main and v* tags, see Development.md) are
-    # what keep a branch from dispatching this job and printing it.
+    # Environment's deployment rules (main and v* tags) keep a branch from
+    # dispatching this job and printing it. They stop someone who can push a v*
+    # tag or to main only together with the tag and branch rulesets, or the
+    # required reviewer, that Development.md (Releasing, step 3) sets up: a
+    # dispatch can target a tag, and it runs that tag's copy of this file. No
+    # condition in here can help, because that copy is the one that runs.
     environment: aur
     runs-on: ubuntu-latest
     container: archlinux:base-devel

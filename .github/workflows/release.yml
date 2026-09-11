@@ -72,10 +72,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          case "$TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "tag '$TAG' is not vMAJOR.MINOR.PATCH" >&2; exit 1 ;;
-          esac
           printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z][A-Za-z0-9.]*)?$' || {
             echo "tag '$TAG' is not vMAJOR.MINOR.PATCH with an optional suffix like -rc1 (starting with a letter)" >&2
             exit 1
@@ -148,22 +144,19 @@ jobs:
       # release.sh reports the floor; this makes it a gate. Without it, a
       # container image bump could silently narrow every future release and
       # nobody would notice until users could not start the binaries.
+      #
+      # bash, not the default sh: scripts/elf-deps.sh uses `local` and `[[ ]]`.
       - name: Check the glibc floor
+        shell: bash
         run: |
-          set -eu
-          worst=""
+          set -euo pipefail
+          # The function the .deb, the .rpm and the Arch package take their
+          # declared floor from, so the gate measures what they declare.
+          # release.sh has already printed what each binary needs.
+          . scripts/elf-deps.sh
           tmp="$(mktemp -d)"
           tar -xzf dist/tobii-linux-"$VERSION"-*.tar.gz -C "$tmp"
-          for bin in "$tmp"/*/tobii "$tmp"/*/tobii-gtk; do
-            [ -f "$bin" ] || continue
-            need="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
-            need="${need#GLIBC_}"
-            echo "$(basename "$bin") needs glibc $need"
-            # `sort -V` puts the newer last, and an empty first operand sorts
-            # before every version — so the max needs no special case for the
-            # first iteration. Both shell scripts already do it this way.
-            worst="$(printf '%s\n%s\n' "$worst" "$need" | sort -V | tail -1)"
-          done
+          worst="$(elf_glibc_floor "$tmp"/*/tobii "$tmp"/*/tobii-gtk)"
           # Measuring nothing is a failure, not a pass. If objdump is absent,
           # the binaries are missing, or the grep finds no versioned symbols,
           # `worst` stays empty and the comparison below would let ANY build
@@ -178,11 +171,6 @@ jobs:
             exit 1
           fi
 
-      # The archive floor above is measured from the binaries; this checks the
-      # PACKAGES actually say so. It is here rather than in package.sh because
-      # most developer machines have no rpmbuild, so the .rpm's dependencies
-      # cannot be read where it is written — an unverifiable claim in a script
-      # is how `AutoReqProv: no` sat there silently declaring nothing.
       # The archive floor above is measured from the binaries; this checks the
       # PACKAGES actually say so, and that they parse at all. It is here rather
       # than in package.sh because most developer machines have neither
@@ -337,36 +325,23 @@ jobs:
       - name: Check the package, install it, and run it
         run: |
           set -euo pipefail
-          retry() {
-            local i
-            for i in 1 2 3 4 5; do
-              "$@" && return 0
-              echo "attempt $i of 5 failed: $*" >&2
-              sleep $((i * 15))
-            done
-            return 1
-          }
           pkgver="${VERSION//-/}"
           want="tobii-linux-bin-${pkgver}-1-x86_64.pkg.tar.zst"
 
           # Exactly one package, named as the hub's matcher expects, and no
-          # split -debug- package (options=('!debug') must be in effect).
+          # split -debug- package (options=('!debug') must be in effect). A
+          # debug package is a second file, so the count catches it.
           mapfile -t built < <(find /home/builder/pkg -maxdepth 1 -name '*.pkg.tar*' -printf '%f\n' | sort)
           echo "makepkg produced: ${built[*]:-nothing}"
-          for f in "${built[@]}"; do
-            case "$f" in
-              *-debug-*)
-                echo "::error::makepkg split off a debug package, $f — options=('!debug') is not in effect" >&2
-                exit 1 ;;
-            esac
-          done
           if [ "${#built[@]}" -ne 1 ] || [ "${built[0]}" != "$want" ]; then
-            echo "::error::expected exactly $want" >&2
+            echo "::error::expected exactly $want (a -debug- package means options=('!debug') is not in effect)" >&2
             exit 1
           fi
 
-          # On a container that has never had it.
-          retry pacman -U --noconfirm "/home/builder/pkg/$want"
+          # On a container that has never had it. Not retried: a local file
+          # whose depends the step before installed downloads nothing, so a
+          # failure here is the package's, and waiting would not change it.
+          pacman -U --noconfirm "/home/builder/pkg/$want"
 
           # Both answer --version before any GTK or device code runs, so this
           # needs no display and no tracker.
@@ -429,21 +404,16 @@ jobs:
             | sort -z | xargs -0 -r sha256sum)"
           printf '%s\n' "$sums" > SHA256SUMS
           cat SHA256SUMS
-          sha256sum -c SHA256SUMS
 
-          # COMPLETENESS. sha256sum -c checks what is listed and says nothing
-          # about what is not, and the updater refuses an unlisted file
-          # (NotListed). And each name must survive upload: GitHub rewrites
-          # characters such as '~' in an asset's name to '.', after which the
-          # published name is one SHA256SUMS does not list.
-          listed="$(sed -E 's/^[0-9a-f]{64}  //' SHA256SUMS)"
+          # Complete by construction: the list above is every plain file here.
+          # What is left to check is that each name survives upload: GitHub
+          # rewrites characters such as '~' in an asset's name to '.', after
+          # which the published name is one SHA256SUMS does not list, and the
+          # updater refuses it (NotListed). The same check rejects every name
+          # sha256sum would have escaped in the list (a backslash, a newline).
           bad=0
           for f in *; do
             if [ "$f" = SHA256SUMS ]; then continue; fi
-            if ! grep -Fxq -- "$f" <<<"$listed"; then
-              echo "::error::$f is in dist/ but not listed in SHA256SUMS" >&2
-              bad=1
-            fi
             case "$f" in
               *[!A-Za-z0-9._-]*)
                 echo "::error::$f has a character GitHub rewrites in asset names" >&2
@@ -547,6 +517,14 @@ jobs:
             echo "::warning::no $notes — falling back to generated notes"
             set -- --generate-notes
           fi
+          # A suffixed tag (v1.0.0-rc1) is a pre-release, and nothing but this
+          # line marks it as one. The hub's release list (tobii-update's
+          # parse_releases) and aur.yml skip only releases carrying the flag;
+          # without it, publishing an rc draft fires `released`, and aur.yml
+          # pushes it to every AUR user. The tag was validated in `build`, so
+          # the only '-' it can contain is the suffix's. ci.yml runs this step
+          # with a stand-in gh to check it.
+          case "$TAG" in *-*) set -- "$@" --prerelease ;; esac
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \

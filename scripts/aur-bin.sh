@@ -112,32 +112,28 @@ sonames="$(elf_needed "$top/tobii" "$top/tobii-gtk")"
 # meta-package that also drags in libgfortran, libasan and nine more.
 deps=()
 unmapped=()
-add() {
-    local d
-    for d in "${deps[@]}"; do [[ "$d" == "$1" ]] && return 0; done
-    deps+=("$1")
-}
 while read -r so; do
     case "$so" in
-        libgtk-4.so.1)            add gtk4 ;;
-        libgtk4-layer-shell.so.0) add gtk4-layer-shell ;;
-        libusb-1.0.so.0)          add libusb ;;
-        libcairo.so.2)            add cairo ;;
+        libgtk-4.so.1)            deps+=(gtk4) ;;
+        libgtk4-layer-shell.so.0) deps+=(gtk4-layer-shell) ;;
+        libusb-1.0.so.0)          deps+=(libusb) ;;
+        libcairo.so.2)            deps+=(cairo) ;;
         libglib-2.0.so.0|libgobject-2.0.so.0|libgio-2.0.so.0)
-                                  add glib2 ;;
-        libgcc_s.so.1)            add libgcc ;;
+                                  deps+=(glib2) ;;
+        libgcc_s.so.1)            deps+=(libgcc) ;;
         # glibc carries the floor: an unversioned glibc would install on a
         # system too old to start the binaries.
         libc.so.6|libm.so.6|ld-linux-x86-64.so.2)
-                                  add "glibc>=$glibc" ;;
+                                  deps+=("glibc>=$glibc") ;;
         *)                        unmapped+=("$so") ;;
     esac
 done <<<"$sonames"
 if (( ${#unmapped[@]} )); then
     die "no Arch package known for: ${unmapped[*]} — add it to the table in scripts/aur-bin.sh (pacman -Qoq /usr/lib/<soname> names it)"
 fi
-# Sorted, so the same binaries always produce the same PKGBUILD.
-mapfile -t deps < <(printf '%s\n' "${deps[@]}" | LC_ALL=C sort)
+# Sorted and each once, so the same binaries always produce the same PKGBUILD.
+# Several sonames map to one package (glib2 and glibc three times each).
+mapfile -t deps < <(printf '%s\n' "${deps[@]}" | LC_ALL=C sort -u)
 depends_line="$(printf "'%s' " "${deps[@]}")"
 depends_line="${depends_line% }"
 

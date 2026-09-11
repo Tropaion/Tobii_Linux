@@ -52,7 +52,8 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl git pkg-config \
-            libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev
+            libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev \
+            python3-yaml
 
       - uses: actions/checkout@v5
 
@@ -110,3 +111,46 @@ jobs:
       # and every path points into a temp directory.
       - name: install scripts
         run: bash scripts/test-install-payload.sh
+
+      # release.yml's draft step is the one place a release is marked as a
+      # pre-release, and aur.yml and every hub skip only releases that carry
+      # the mark: an rc draft published without it goes to every AUR user.
+      # That step runs only on a tag, so its script is taken out of release.yml
+      # and run here, with a stand-in `gh` that writes down its arguments.
+      - name: release.yml flags an rc tag's draft as a pre-release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          python3 -c '
+          import yaml
+          steps = yaml.safe_load(open(".github/workflows/release.yml"))["jobs"]["publish"]["steps"]
+          print(next(s["run"] for s in steps if s.get("name") == "Create a draft release"))
+          ' > "$tmp/draft.sh"
+          mkdir -p "$tmp/bin"
+          cat > "$tmp/bin/gh" <<'EOF'
+          #!/bin/sh
+          printf '%s\n' "$@" > "$GH_ARGS"
+          EOF
+          chmod 755 "$tmp/bin/gh"
+
+          bad=0
+          # tag, whether it has hand-written notes, whether it is a pre-release
+          for spec in "v1.0.0 no no" "v1.0.0-rc1 no yes" "v1.0.0-rc1 yes yes" "v1.2.3-beta.2 no yes"; do
+            read -r tag notes pre <<<"$spec"
+            work="$tmp/$tag-$notes"
+            mkdir -p "$work/dist" "$work/docs/releases"
+            touch "$work/dist/asset"
+            if [ "$notes" = yes ]; then echo notes > "$work/docs/releases/$tag.md"; fi
+            (cd "$work" && TAG="$tag" GITHUB_REPOSITORY=o/r GH_ARGS="$work/args" \
+               PATH="$tmp/bin:$PATH" bash -e "$tmp/draft.sh" >/dev/null)
+            flagged=no
+            if grep -Fxq -- --prerelease "$work/args"; then flagged=yes; fi
+            if [ "$flagged" != "$pre" ] || ! grep -Fxq -- --draft "$work/args"; then
+              echo "::error::$tag (notes: $notes): pre-release flag $flagged, expected $pre; gh got: $(tr '\n' ' ' < "$work/args")" >&2
+              bad=1
+            else
+              echo "ok  $tag (notes: $notes): pre-release $flagged"
+            fi
+          done
+          exit "$bad"

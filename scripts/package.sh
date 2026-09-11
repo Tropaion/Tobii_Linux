@@ -159,6 +159,12 @@ install -m 644 assets/60-tobii.rules "$payload/usr/lib/udev/rules.d/60-tobii.rul
 
 installed_kb="$(du -sk "$payload" | cut -f1)"
 
+# rpm tags a symbol-version requirement with the ELF's bitness, and gets that
+# from the file itself rather than from a list of architecture names. So does
+# this: a hard-coded "(64bit)" is a second definition of the same fact, and the
+# one that is wrong the first time somebody builds for a 32-bit target.
+rpm_bits=""
+bins=("$payload/usr/bin/tobii" "$payload/usr/bin/tobii-gtk")
 # The glibc floor, from the binaries themselves, so the packages can DECLARE it.
 #
 # Without this the package manager has nothing to refuse on: an unversioned
@@ -166,20 +172,14 @@ installed_kb="$(du -sk "$payload" | cut -f1)"
 # the user's first experience is apt saying yes and the program saying
 # "version `GLIBC_2.41' not found". release.yml enforces the floor at build
 # time; this is what carries it to the person installing.
-glibc_req=""
-# rpm tags a symbol-version requirement with the ELF's bitness, and gets that
-# from the file itself rather than from a list of architecture names. So does
-# this: a hard-coded "(64bit)" is a second definition of the same fact, and the
-# one that is wrong the first time somebody builds for a 32-bit target.
-rpm_bits=""
+#
 # Both read by scripts/elf-deps.sh, which scripts/aur-bin.sh also uses, so the
-# .deb, the .rpm and the Arch package declare the same floor.
-bins=("$payload/usr/bin/tobii" "$payload/usr/bin/tobii-gtk")
-if command -v objdump >/dev/null 2>&1; then
-    glibc_req="$(elf_glibc_floor "${bins[@]}")"
-    if elf_is_64 "${bins[0]}" || elf_is_64 "${bins[1]}"; then
-        rpm_bits="(64bit)"
-    fi
+# .deb, the .rpm and the Arch package declare the same floor. Without objdump
+# its functions print nothing and elf_is_64 is false, so this needs no guard of
+# its own: the two WARNINGs below say what went missing.
+glibc_req="$(elf_glibc_floor "${bins[@]}")"
+if elf_is_64 "${bins[0]}" || elf_is_64 "${bins[1]}"; then
+    rpm_bits="(64bit)"
 fi
 # The SONAMEs the binaries link, as rpm dependency syntax.
 #
@@ -190,16 +190,14 @@ fi
 # rpm-based distribution Provides whatever it calls the package, and deriving
 # it from the ELF means it cannot drift from what the binaries need.
 rpm_sonames=""
-if command -v objdump >/dev/null 2>&1; then
-    # elf_needed lists each soname once across both binaries, so the ones they
-    # share are not required twice.
-    while read -r so; do
-        # libc is covered by the versioned symbol requirement below, and
-        # nobody declares a dependency on the dynamic loader.
-        case "$so" in libc.so.*|ld-linux*|"") continue ;; esac
-        rpm_sonames="${rpm_sonames:+$rpm_sonames, }$so()${rpm_bits}"
-    done < <(elf_needed "${bins[@]}")
-fi
+# elf_needed lists each soname once across both binaries, so the ones they
+# share are not required twice.
+while read -r so; do
+    # libc is covered by the versioned symbol requirement below, and
+    # nobody declares a dependency on the dynamic loader.
+    case "$so" in libc.so.*|ld-linux*|"") continue ;; esac
+    rpm_sonames="${rpm_sonames:+$rpm_sonames, }$so()${rpm_bits}"
+done < <(elf_needed "${bins[@]}")
 if [[ -n "$rpm_sonames" ]]; then
     echo "  rpm sonames: $rpm_sonames"
 else
@@ -264,7 +262,7 @@ if [ "$1" = configure ]; then
     # before v0.1.0 and now installs a package keeps an infrared camera readable by
     # every local process, while the release notes announce the rule as hardened to
     # 0660. The tarball installer removes it; every other channel has to as well, or
-    # three of the four documented install paths silently do not deliver the fix.
+    # the packages silently do not deliver the fix.
     if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
         rm -f /etc/udev/rules.d/99-tobii.rules
         echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
@@ -448,14 +446,7 @@ cp -a %{_sourcedir}/payload/. %{buildroot}/
 %doc /usr/share/doc/tobii-linux/*
 
 %post
-# The pre-v0.1.0 rule, if it is still there.
-#
-# It was called 99-tobii.rules and said MODE="0666". Because 99- sorts AFTER
-# 60-, its mode assignment wins — so a machine that installed this project
-# before v0.1.0 and now installs a package keeps an infrared camera readable by
-# every local process, while the release notes announce the rule as hardened to
-# 0660. The tarball installer removes it; every other channel has to as well, or
-# three of the four documented install paths silently do not deliver the fix.
+# The pre-v0.1.0 99-tobii.rules, whose MODE="0666" wins — see the deb hook.
 if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
     rm -f /etc/udev/rules.d/99-tobii.rules
     echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."

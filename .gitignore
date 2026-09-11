@@ -17,7 +17,5 @@ target/
 .claude/settings.local.json
 # Release artifacts built by scripts/release.sh
 dist/
-/dist/
 # The AUR PKGBUILD scripts/package.sh writes beside dist/ (scripts/aur-bin.sh)
 /aur/
-bridge/target/
