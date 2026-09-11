@@ -27,8 +27,9 @@
 //! arrive *after* the user pressed Update and waited for the download. So the
 //! ownership question is asked as part of the check, and for those copies the
 //! button says **Download**: it fetches the file their own package manager can
-//! install — the `.deb`, the `.rpm`, or the PKGBUILD and its hook — into a
-//! folder they pick, and says what to run.
+//! install — the `.deb`, the `.rpm`, the prebuilt Arch `.pkg.tar.zst`, or, for a
+//! release without one, the PKGBUILD and its hook — into a folder they pick, and
+//! says what to run, with every path quoted so the command survives a paste.
 //!
 //! # What pressing Update or Download trusts
 //!
@@ -96,19 +97,36 @@ pub fn packaged_headline(version: &str, manager: &str, package: &str) -> String 
     )
 }
 
+/// One word of a POSIX shell command: `s` in single quotes, with each embedded
+/// `'` written as `'\''` (close the quote, an escaped quote, reopen it).
+///
+/// The folder is whichever one the user picked, and a command printed for
+/// copying is only a command if it survives the paste: `My Downloads` unquoted
+/// is two arguments, both wrong.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// Where a download went, and the one command that installs it.
 ///
 /// Only reached for a copy a package manager owns, which is why every branch
 /// hands back a package-manager command rather than telling somebody to unpack
 /// something over their packaged install.
+///
+/// Every path in it, in every branch, goes through [`sh_quote`]: the banner
+/// makes this text selectable for exactly one reason, which is to paste it.
 pub fn saved(channel: Channel, files: &[PathBuf]) -> String {
     let Some(first) = files.first() else {
         // Unreachable: a download that succeeded wrote at least one file.
         // Still better than a banner that goes blank if it ever happens.
         return "The download finished, but reported no files.".to_string();
     };
-    let dir = first.parent().unwrap_or(Path::new(".")).display();
-    let path = first.display();
+    let dir = first
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let dir = sh_quote(&dir.to_string_lossy());
+    let path = sh_quote(&first.to_string_lossy());
     let name = |p: &PathBuf| {
         p.file_name()
             .unwrap_or_default()
@@ -123,6 +141,13 @@ pub fn saved(channel: Channel, files: &[PathBuf]) -> String {
         Channel::Rpm => format!(
             "Saved {first_name} to {dir}.\nInstall it with:  sudo dnf install {path}\n\
              (on openSUSE:  sudo zypper install {path})"
+        ),
+        // tobii-linux-bin conflicts with tobii-linux, the package the PKGBUILD
+        // builds, so pacman asks before replacing a copy built that way. The
+        // question reads like a warning; the answer is given in advance.
+        Channel::Pacman => format!(
+            "Saved {first_name} to {dir}.\nInstall it with:  sudo pacman -U {path}\n\
+             (if pacman offers to remove tobii-linux, the copy built from source, answer y)"
         ),
         // Named individually rather than as "the PKGBUILD": makepkg reads the
         // hook from the working directory by name, so the second file being
@@ -139,8 +164,9 @@ pub fn saved(channel: Channel, files: &[PathBuf]) -> String {
             "Saved {first_name} to {dir}.\nThis release publishes no package for your \
              system, so this is the plain archive: it installs into ~/.local/bin, beside \
              the copy your package manager owns rather than over it.\n  cd {dir} && tar \
-             -xzf {first_name} && cd {} && ./install.sh",
-            first_name.trim_end_matches(".tar.gz")
+             -xzf {} && cd {} && ./install.sh",
+            sh_quote(&first_name),
+            sh_quote(first_name.trim_end_matches(".tar.gz"))
         ),
     }
 }
@@ -826,9 +852,111 @@ mod tests {
         assert!(a.contains("beside"), "{a}");
         // The unpacked directory, not the archive, is what install.sh is in.
         assert!(
-            a.contains("cd tobii-linux-0.3.0-x86_64-unknown-linux-gnu && ./install.sh"),
+            a.contains("cd 'tobii-linux-0.3.0-x86_64-unknown-linux-gnu' && ./install.sh"),
             "{a}"
         );
+    }
+
+    /// The prebuilt Arch package is one command, and it says in advance what
+    /// to answer when pacman offers to replace a copy built from the PKGBUILD.
+    #[test]
+    fn the_arch_package_is_saved_with_pacman_u() {
+        let p = saved(
+            Channel::Pacman,
+            &at(
+                "/home/u/Downloads/tobii-linux-0.3.0",
+                &["tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst"],
+            ),
+        );
+        assert!(
+            p.contains(
+                "sudo pacman -U \
+                 '/home/u/Downloads/tobii-linux-0.3.0/tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst'"
+            ),
+            "{p}"
+        );
+        assert!(p.contains("remove tobii-linux"), "{p}");
+        assert!(p.contains("answer y"), "{p}");
+        assert!(!p.contains("makepkg"), "there is nothing to build: {p}");
+    }
+
+    /// A folder with a space or an apostrophe in it is still one argument, in
+    /// every branch: the whole point of the text is to be pasted.
+    #[test]
+    fn every_printed_path_is_quoted_for_the_shell() {
+        let dir = "/home/u/My Downloads/Bob's/tobii-linux-0.3.0";
+        let q = |s: &str| sh_quote(s);
+        let cases: [(Channel, &[&str], String); 5] = [
+            (
+                Channel::Deb,
+                &["tobii-linux_0.3.0_amd64.deb"],
+                format!(
+                    "sudo apt install {}",
+                    q(&format!("{dir}/tobii-linux_0.3.0_amd64.deb"))
+                ),
+            ),
+            (
+                Channel::Rpm,
+                &["tobii-linux-0.3.0-1.x86_64.rpm"],
+                format!(
+                    "sudo zypper install {}",
+                    q(&format!("{dir}/tobii-linux-0.3.0-1.x86_64.rpm"))
+                ),
+            ),
+            (
+                Channel::Pacman,
+                &["tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst"],
+                format!(
+                    "sudo pacman -U {}",
+                    q(&format!("{dir}/tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst"))
+                ),
+            ),
+            (
+                Channel::Pkgbuild,
+                &["PKGBUILD", "tobii-linux.install"],
+                format!("cd {} && makepkg -si", q(dir)),
+            ),
+            (
+                Channel::Archive,
+                &["tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz"],
+                format!(
+                    "cd {} && tar -xzf 'tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz' \
+                     && cd 'tobii-linux-0.3.0-x86_64-unknown-linux-gnu' && ./install.sh",
+                    q(dir)
+                ),
+            ),
+        ];
+        for (channel, names, command) in cases {
+            let s = saved(channel, &at(dir, names));
+            assert!(s.contains(&command), "{channel:?} lacks {command:?}: {s}");
+            assert!(s.contains(&format!("to {}.", q(dir))), "{channel:?}: {s}");
+            // Nowhere bare: an unquoted copy after a space is a broken command.
+            assert!(!s.contains(&format!(" {dir}")), "{channel:?}: {s}");
+            assert!(s.contains(r"Bob'\''s"), "the apostrophe survives: {s}");
+        }
+    }
+
+    /// The quoting is right only if a real shell reads it back as the string
+    /// that went in — including the characters a shell would otherwise act on.
+    #[test]
+    fn sh_quote_round_trips_through_a_real_shell() {
+        for s in [
+            "plain",
+            "My Downloads",
+            "Bob's",
+            "''",
+            "$HOME `id` $(id) \"x\" \\ ; & | * ~",
+            "new\nline",
+            "",
+        ] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", sh_quote(s)))
+                .output()
+                .expect("sh runs");
+            assert!(out.status.success(), "{s:?}: {out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), s, "{s:?}");
+        }
     }
 
     /// Reporting a failed download without saying the file is gone invites
