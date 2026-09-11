@@ -2182,14 +2182,17 @@ fn a_cargo_install_found_through_an_entry_is_left_to_cargo() {
     );
     let hint = p.hints.iter().find(|h| h.contains(bin)).expect("a hint");
     assert!(
-        hint.contains("cargo uninstall tobii-cli tobii-gtk"),
+        // With --root even here, in $CARGO_HOME/bin: CARGO_INSTALL_ROOT or
+        // install.root would send a bare `cargo uninstall` to another copy.
+        hint.contains("cargo uninstall --root /home/u/.cargo tobii-cli tobii-gtk"),
         "{hint}"
     );
     assert!(removals(&p).is_empty(), "{:#?}", removals(&p));
     assert!(kept(&p).contains(&ENTRY.to_string()));
 
-    // The older record, and only the hub there. $CARGO_HOME is where cargo
-    // uninstall looks without --root, wherever that is.
+    // The older record, and only the hub there. Even for $CARGO_HOME/bin the
+    // command names --root: CARGO_INSTALL_ROOT or install.root could send a bare
+    // `cargo uninstall` to a different copy.
     let bin = "/home/u/cargo-x/bin";
     let t = Tree::new("cargo-home-toml");
     t.bin(&format!("{bin}/tobii-gtk"), "tobii-gtk 0.3.0");
@@ -2202,10 +2205,7 @@ fn a_cargo_install_found_through_an_entry_is_left_to_cargo() {
         AUTOSTART,
         &autostart::entry_text(&format!("{bin}/tobii-gtk")),
     );
-    let env = Env {
-        cargo_home: Some("/home/u/cargo-x".into()),
-        ..user()
-    };
+    let env = user();
     let p = plan_full(
         &t,
         &env,
@@ -2218,7 +2218,7 @@ fn a_cargo_install_found_through_an_entry_is_left_to_cargo() {
     assert!(
         p.hints
             .iter()
-            .any(|h| h.ends_with("\n    cargo uninstall tobii-gtk")),
+            .any(|h| h.ends_with("\n    cargo uninstall --root /home/u/cargo-x tobii-gtk")),
         "{:?}",
         p.hints
     );
@@ -2917,4 +2917,69 @@ fn paths_in_printed_commands_are_quoted_for_the_shell() {
         "{s}"
     );
     assert!(s.contains(cargo), "{s}");
+}
+
+/// A device, a FIFO or a symlink is refused by looking at it, before anything is
+/// opened. Opening is itself an action for some devices, and as root this runs on
+/// paths inside directories another user controls. The old order — open, then
+/// fstat — returned the same error for /dev/null, so what is asserted is that
+/// nothing was opened on the way to it.
+#[test]
+fn open_regular_looks_before_it_opens() {
+    let t = Tree::new("open-regular-looks-first");
+    let link = t.root.join("link-to-null");
+    std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+    let fifo = t.root.join("a-fifo");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .is_ok_and(|s| s.success()));
+    super::OPENED.with(|o| o.borrow_mut().clear());
+    for p in [
+        std::path::Path::new("/dev/null"),
+        link.as_path(),
+        fifo.as_path(),
+    ] {
+        assert!(super::open_regular(p).is_err(), "{}", p.display());
+    }
+    assert!(
+        super::OPENED.with(|o| o.borrow().is_empty()),
+        "opened: {:?}",
+        super::OPENED.with(|o| o.borrow().clone())
+    );
+    // A regular file is still opened, once.
+    let plain = t.root.join("plain");
+    std::fs::write(&plain, b"x").unwrap();
+    assert!(super::open_regular(&plain).is_ok());
+    assert_eq!(super::OPENED.with(|o| o.borrow().clone()), vec![plain]);
+}
+
+/// Only a directory named `bin` can be Cargo's: it is the only one `cargo install`
+/// writes to. A record beside any other directory belongs to the `bin` next to it,
+/// and must not hide a copy Cargo never installed.
+#[test]
+fn only_a_bin_directory_can_be_cargos() {
+    let t = Tree::new("cargo-record-not-bin");
+    let apps = "/home/u/apps";
+    t.bin(&format!("{apps}/tobii"), "tobii 0.3.0");
+    t.put(
+        "/home/u/.crates.toml",
+        "[v1]\n\"tobii-cli 0.3.0 (path+file:///home/u/src/TobiiLinux/crates/tobii-cli)\" = \
+         [\"tobii\"]\n",
+    );
+    let opts = Options {
+        bindirs: vec![apps.into()],
+        ..Options::default()
+    };
+    let p = plan_in(&t, &user(), &opts, &unowned);
+    assert!(
+        removals(&p).contains(&format!("{apps}/tobii")),
+        "{:#?}",
+        removals(&p)
+    );
+    assert!(
+        !p.hints.iter().any(|h| h.contains("cargo")),
+        "{:?}",
+        p.hints
+    );
 }

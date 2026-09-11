@@ -157,9 +157,6 @@ pub struct Env {
     pub path: Vec<PathBuf>,
     /// `WINEPREFIX`, which `tobii bridge install` uses when given no prefix.
     pub wineprefix: Option<PathBuf>,
-    /// `CARGO_HOME`, absolute only; `~/.cargo` when unset. `cargo uninstall`
-    /// needs `--root` for anywhere else.
-    pub cargo_home: Option<PathBuf>,
     pub euid: u32,
     pub sudo_user: Option<String>,
     pub current_exe: Option<PathBuf>,
@@ -208,7 +205,6 @@ impl Env {
                 })
                 .unwrap_or_default(),
             wineprefix: var("WINEPREFIX"),
-            cargo_home: var("CARGO_HOME").filter(|p| p.is_absolute()),
             euid,
             sudo_user: std::env::var("SUDO_USER").ok().filter(|s| !s.is_empty()),
             current_exe: std::env::current_exe().ok(),
@@ -394,9 +390,6 @@ pub struct Plan {
     pub root: PathBuf,
     /// Who the plan is for: the udev commands need `sudo` unless this is 0.
     pub euid: u32,
-    /// `$CARGO_HOME`, resolved: where `cargo uninstall` looks without
-    /// `--root`.
-    pub cargo_home: Option<PathBuf>,
     /// Set when nothing may be done at all.
     pub refusal: Option<String>,
     pub locations: Vec<Location>,
@@ -507,6 +500,10 @@ thread_local! {
     /// the path then run.
     static PROGRAM_CHECKED: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Every path [`open_regular`] actually called open() on, for the test that
+    /// checks a device or FIFO is refused by looking, before any open.
+    static OPENED: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Open `real` to read it, only if it is a regular file.
@@ -518,6 +515,21 @@ thread_local! {
 /// it is a regular file — a device, FIFO or socket is never read.
 fn open_regular(real: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
     use std::os::unix::fs::OpenOptionsExt;
+    // Looked at before it is opened, not only after. For a device, opening is
+    // itself an action — some arm a watchdog, some rewind a tape, some block —
+    // and as root this is asked of paths inside directories another user
+    // controls. lstat refuses a device, FIFO, socket or symlink without touching
+    // it. The fstat below still checks what was actually opened, because the path
+    // can change in between: a regular file swapped for a symlink is stopped by
+    // O_NOFOLLOW, a FIFO by O_NONBLOCK, and a user cannot make a device node to
+    // swap in.
+    let before =
+        std::fs::symlink_metadata(real).map_err(|e| format!("it cannot be looked at ({e})"))?;
+    if !before.file_type().is_file() {
+        return Err("it is not a regular file".into());
+    }
+    #[cfg(test)]
+    OPENED.with(|o| o.borrow_mut().push(real.to_path_buf()));
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1033,6 +1045,13 @@ fn cargo_listed(
     dir: &Path,
     present: &[&'static str],
 ) -> Vec<(&'static str, &'static str)> {
+    // `cargo install` writes only to <root>/bin. A record beside a directory with
+    // any other name was written for the `bin` next to it, and reading it as this
+    // directory's would keep a copy Cargo never installed — and print a
+    // `cargo uninstall --root` that removes a different one.
+    if dir.file_name() != Some(std::ffi::OsStr::new("bin")) {
+        return Vec::new();
+    }
     let Some(root) = dir.parent() else {
         return Vec::new();
     };
@@ -1280,16 +1299,19 @@ fn cargo_package_list(listed: &[(&str, &str)]) -> String {
 
 /// `cargo uninstall` for `packages` installed in `dir`: with `--root` unless
 /// `dir` is `$CARGO_HOME/bin`, where it looks when given none.
-fn cargo_uninstall(dir: &Path, cargo_home: Option<&Path>, packages: &str) -> String {
+/// Always with `--root`. Cargo resolves its root from `--root`, then
+/// `CARGO_INSTALL_ROOT`, then `install.root` in its config, and only then
+/// `$CARGO_HOME` — so a command that leaves `--root` out for a copy in
+/// `$CARGO_HOME/bin` removes a different copy whenever either of the first two
+/// is set. With it, the command is right in every case.
+fn cargo_uninstall(dir: &Path, packages: &str) -> String {
     match dir.parent() {
-        Some(root) if Some(root) != cargo_home => {
-            format!("cargo uninstall --root {} {packages}", q(root))
-        }
-        _ => format!("cargo uninstall {packages}"),
+        Some(root) => format!("cargo uninstall --root {} {packages}", q(root)),
+        None => format!("cargo uninstall {packages}"),
     }
 }
 
-fn cargo_hint(dir: &Path, listed: &[(&str, &str)], cargo_home: Option<&Path>) -> String {
+fn cargo_hint(dir: &Path, listed: &[(&str, &str)]) -> String {
     let bins: Vec<&str> = listed.iter().map(|(b, _)| *b).collect();
     let (it, it_is) = if bins.len() == 1 {
         ("it", "it is")
@@ -1302,7 +1324,7 @@ fn cargo_hint(dir: &Path, listed: &[(&str, &str)], cargo_home: Option<&Path>) ->
          {it} with:\n    {}",
         bins.join(" and "),
         dir.display(),
-        cargo_uninstall(dir, cargo_home, &cargo_package_list(listed))
+        cargo_uninstall(dir, &cargo_package_list(listed))
     )
 }
 
@@ -1639,11 +1661,6 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
         p.refusal = Some("HOME is not set, so there is no home install to find".into());
         return p;
     }
-    p.cargo_home = env
-        .cargo_home
-        .clone()
-        .or_else(|| home.as_ref().map(|h| h.join(".cargo")))
-        .map(|c| fs.canon_or(&c));
 
     let data = if opts.system {
         PathBuf::from(paths::SYSTEM_DATA_DIR)
@@ -1784,8 +1801,7 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             cargo_listed(&fs, &c.dir, &present)
         };
         if !cargo.is_empty() {
-            p.hints
-                .push(cargo_hint(&c.dir, &cargo, p.cargo_home.as_deref()));
+            p.hints.push(cargo_hint(&c.dir, &cargo));
             if cargo.len() == present.len() {
                 loc.verdict = Verdict::Package {
                     manager: "cargo".into(),
@@ -3248,7 +3264,7 @@ fn summary(plan: &Plan, out: &Outcome) -> String {
             Verdict::Package { manager, package } if manager == "cargo" => Some(format!(
                 "{} — `cargo install`'s ({package}): {}",
                 l.dir.display(),
-                cargo_uninstall(&l.dir, plan.cargo_home.as_deref(), package)
+                cargo_uninstall(&l.dir, package)
             )),
             Verdict::Package { manager, package } => Some(format!(
                 "{} — owned by {manager} ({package}): {}",

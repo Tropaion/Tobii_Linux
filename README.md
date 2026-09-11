@@ -315,8 +315,10 @@ leaves alone:
 - a copy `cargo install` put there. Cargo keeps a record beside the directory
   (`.crates.toml`, `.crates2.json`). What that record lists as installed from
   `tobii-cli` or `tobii-gtk` is left, and it prints `cargo uninstall` for
-  exactly those packages, with `--root` unless the directory is
-  `~/.cargo/bin` (`$CARGO_HOME/bin`), so Cargo's record stays right. A record
+  exactly those packages, always with `--root` naming where they are — Cargo's
+  own default can be moved by `CARGO_INSTALL_ROOT` or `install.root`, so a
+  command without it could remove a different copy. Only a directory named
+  `bin` is Cargo's, because that is the only one `cargo install` writes. A record
   that lists only other programs — `cargo install --root ~/.local ripgrep`
   writes one beside `~/.local/bin` — hides nothing.
 - a directory you cannot write to. If what is there answers as this program
