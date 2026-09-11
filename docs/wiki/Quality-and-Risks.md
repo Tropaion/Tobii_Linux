@@ -320,8 +320,10 @@ because the reasoning is worth more than the tidiness.
   opens in the home folder instead. Seen on the development machine, whose
   Downloads folder a download service's group can write (0775). Chosen by hand
   it is still refused, with the reason.
-- **`faccessat` answers for the directory, not the swap.** It counts read-only
-  mounts and ACLs; the ownership check covers `protected_hardlinks`. Anything
+- **`faccessat` answers for the directory, not the swap.** It asks for write and
+  search permission (`W_OK | X_OK`), so read-only mounts, ACLs and supplementary
+  groups count; `tobii uninstall` asks a user's question the same way. The
+  ownership check covers `protected_hardlinks`. Anything
   else that fails the rename still reaches `install_release`'s real attempt and
   its rollback — the button can still fail, only no longer for the reasons
   known in advance.
@@ -422,11 +424,14 @@ because the reasoning is worth more than the tidiness.
 - **Hardware claims cannot be re-verified by CI.** The accuracy figure, the sign
   conventions and the tracker-on behaviour were measured by hand. If they
   regress, nothing will say so.
-- **Neither the release workflow nor the release path has ever run.** The
-  repository has no tags, so the first tag will be the first execution of
-  `release.yml` itself *and* of the updater's download-and-install path against
-  a real release. `ci.yml` has run (and failed once, usefully, on a clippy lint
-  the maintainer's toolchain was too old to see).
+- **Half of the release workflow has never run.** `release.yml` built and
+  published v0.1.0 to v0.3.0 (four runs; the first, for v0.1.0, failed and was
+  fixed). Its `arch` job, the tag's own install-script checks and the
+  pre-release flag came after v0.3.0, and `aur.yml` has never run, so the v0.3.1
+  tag is their first execution. Nothing records whether the updater's
+  download-and-install path has run against a real release. `ci.yml` has run
+  (and failed once, usefully, on a clippy lint the maintainer's toolchain was
+  too old to see).
 - **A review agent has twice modified the tree it was told to read.** One
   deleted a security guard and ran `rm -rf` on a tests directory; another left a
   stray git repository in the scratch directory that a later `git add -A` picked

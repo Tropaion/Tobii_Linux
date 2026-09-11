@@ -364,7 +364,8 @@ fi
 # Only an ABSOLUTE path that no longer exists is repaired. A bare name is looked
 # up on PATH by the launcher and may well work; an `env …` wrapper is something
 # the user wrote; a symlinked entry belongs to a dotfile manager, and rewriting
-# it would replace the link with a plain file. Those are named, never touched.
+# it would replace the link with a plain file. None of those is touched; each is
+# named, except a bare name PATH finds, which needs nothing said.
 if [[ $system -eq 0 && $bins_wanted -eq 1 && $lean -eq 0 ]]; then
     auto="$cfg/autostart/com.tobiilinux.Configuration.desktop"
     want="$bindir/tobii-gtk"
