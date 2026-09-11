@@ -13,8 +13,13 @@ scripts/build.sh            # checks dependencies first, then builds release
 scripts/build.sh --check    # only check dependencies
 scripts/build.sh --lean     # CLI only, no neural backend (1.2 MB vs 35 MB)
 scripts/build.sh --install  # + install to ~/.local/bin and the app menu
+scripts/build.sh --install --system   # the same for every user, /usr/local/bin
 scripts/build.sh --udev     # + install the device rule
 ```
+
+Run it as yourself. It refuses under sudo — cargo as root leaves a root-owned
+`target/`, and an install under sudo lands in `/root` — and asks for sudo itself
+for exactly the steps that need it (`--system`'s install, the udev rule).
 
 `--install` and `--udev` both hand off to `scripts/install-payload.sh`, which is
 also what the `install.sh` inside a release tarball runs. One definition of what
@@ -273,7 +278,8 @@ spelling of it: the PKGBUILDs strip the `-` (`1.0.0rc1`, which `vercmp` sorts
 below `1.0.0`), and the `.deb` and `.rpm` use `~` (`1.0.0~rc1`, their own "sorts
 before" marker; an rpm Version may not contain `-` at all). A numeric suffix
 such as `-1` would become `1.0.01`, which `vercmp` sorts *above* `1.0.0`. File
-names keep the tag's `-`, because GitHub rewrites `~` in an asset's name to `.`
+names keep the tag's `-` — except the Arch package, which makepkg names from
+pkgver (`tobii-linux-bin-1.0.0rc1-1-x86_64.pkg.tar.zst`) — because GitHub rewrites `~` in an asset's name to `.`
 and `SHA256SUMS` would then list a file the release does not have.
 
 **The Arch package.** After `build`, the `arch` job repackages the same tarball
@@ -295,7 +301,9 @@ tag. It downloads the published tarball and `SHA256SUMS`, checks one against the
 other, regenerates the PKGBUILD, compares its pin with the release's
 `SHA256SUMS` entry, lets `makepkg --verifysource` download from the published
 URL and check the pin, writes `.SRCINFO`, and pushes to
-`ssh://aur@aur.archlinux.org/tobii-linux-bin.git`. The pin is an integrity check
+`ssh://aur@aur.archlinux.org/tobii-linux-bin.git` — refusing a `pkgver-pkgrel`
+older than the AUR's, and a changed PKGBUILD under the same one, which no helper
+would upgrade anyone to. The pin is an integrity check
 taken from the same release, not a signature. It proves an AUR user got what was
 published, and nothing about who published it.
 
@@ -305,9 +313,14 @@ One-time setup, before the first push:
 2. A key used for nothing else:
    `ssh-keygen -t ed25519 -N '' -C tobii-linux-bin -f aur_key`. Paste
    `aur_key.pub` into *My Account → SSH Public Key* on the AUR.
-3. The private key, `aur_key`, as the repository secret `AUR_SSH_KEY`
-   (*Settings → Secrets and variables → Actions*). Then delete the local copy,
-   or keep it somewhere you would keep a password.
+3. A GitHub **Environment** named `aur` (*Settings → Environments → New
+   environment*), with *Deployment branches and tags* limited to `main` and
+   tags matching `v*` — and a required reviewer if you want one. Store the
+   private key, `aur_key`, there as the secret `AUR_SSH_KEY`, NOT as a
+   repository secret: a repository secret is readable by a workflow on any
+   branch, and this key pushes a PKGBUILD that every AUR helper runs on its
+   users' machines. Then delete the local copy, or keep it somewhere you would
+   keep a password.
 4. Run the workflow by hand for the first release that ships `tobii-linux-bin`
    — v0.3.1 or later, not v0.3.0, whose hub does not know the prebuilt package
    and whose `tobii` has no `uninstall`. **The first push creates the package**

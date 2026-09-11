@@ -103,6 +103,7 @@ from source.
 tar -xzf tobii-linux-*.tar.gz
 cd tobii-linux-*/ && ./install.sh          # ~/.local/bin, menu entry, udev rule
 sudo ./install.sh --system                 # the same for every user, /usr/local/bin
+./uninstall.sh --dry-run                   # removing it again — see Uninstalling
 
 sudo apt install ./tobii-linux_*.deb       # Debian, Ubuntu, Mint, Pop!_OS
 sudo dnf install ./tobii-linux-*.rpm       # Fedora, RHEL (gtk4-layer-shell is in EPEL)
@@ -120,6 +121,10 @@ curl -fLO https://github.com/Tropaion/Tobii_Linux/releases/download/vX.Y.Z/SHA25
 sha256sum -c --ignore-missing SHA256SUMS
 sudo pacman -U ./tobii-linux-bin-X.Y.Z-1-x86_64.pkg.tar.zst
 ```
+
+For a pre-release, drop the dash from the version in the package's name only:
+`v1.0.0-rc1` ships `tobii-linux-bin-1.0.0rc1-1-x86_64.pkg.tar.zst`, because a
+pacman version cannot contain one. The tag in the URL keeps it.
 
 Once `tobii-linux-bin` is on the AUR, `paru -S tobii-linux-bin` (or `yay -S`)
 does the same and updates it along with the rest of your system.
@@ -255,9 +260,11 @@ command-line tool with neither GTK package.
 </details>
 
 `--install` puts `tobii` and `tobii-gtk` in `~/.local/bin`; pass a directory to
-choose another (`scripts/build.sh --install /usr/local/bin`). `--udev` installs
-the device rule described below, which needs `sudo`. Leave both off to just
-build into `target/release/`.
+choose another, or add `--system` for `/usr/local/bin` and every user's menu
+(`scripts/build.sh --install --system`). `--udev` installs the device rule
+described below. Run it as yourself, not with `sudo` — it refuses, and asks for
+`sudo` itself for the steps that need it. Leave both off to just build into
+`target/release/`.
 
 `--install` also adds **Tobii Eye Tracker** to your application menu.
 
@@ -357,6 +364,7 @@ It leaves:
 - **a copy your package manager installed.** It prints the command instead:
 
 ```sh
+sudo pacman -R tobii-linux-bin # Arch (the prebuilt package, or from the AUR)
 sudo pacman -R tobii-linux     # Arch (the PKGBUILD)
 sudo apt remove tobii-linux    # Debian, Ubuntu, Mint, Pop!_OS
 sudo dnf remove tobii-linux    # Fedora, RHEL   (openSUSE: sudo zypper remove tobii-linux)
@@ -458,6 +466,7 @@ scripts/build.sh                    # check dependencies, build everything
 scripts/build.sh --check            # only check dependencies, build nothing
 scripts/build.sh --lean             # CLI only, without the neural backend
 scripts/build.sh --install [DIR]    # build, then install (default ~/.local/bin)
+scripts/build.sh --install --system # the same for every user, /usr/local/bin
 scripts/build.sh --udev             # also install the udev rule
 ```
 
@@ -735,11 +744,13 @@ exactly as it was before, and Alt-Tab or the overview is the way back. Either
 way, launching the app again raises the hub you already have.
 
 The tray icon has no menu on purpose: left-, right- and middle-click all just
-raise the hub, and *Quit* lives in the cogwheel inside it. The icon carries its
-own copy of the picture, so it shows even when Plasma started before the icon
-was installed — Plasma looks only in icon folders that existed when it started,
-so after a first install the *application menu* can still show a generic icon
-until your next login.
+raise the hub, and *Quit* lives in the cogwheel inside it. Plasma looks for
+icons only in folders that existed when it started, so right after a first
+install the tray and the *application menu* can show a generic icon. The hub
+hands the tray its own copy of the picture (`IconThemePath`) for exactly that
+case; Plasma reads it, but that it then draws from it has not been confirmed. If
+the placeholder stays, `systemctl --user restart plasma-plasmashell.service`, or
+your next login, fixes both.
 
 The tracker still goes dark. Hiding releases the claim as it hides; minimising
 drops it within a frame, because the claim is polled from whether the window is
@@ -893,13 +904,19 @@ version-named folder there, and prints the one command that installs it. It
 never installs anything itself. This is the hub only; `tobii update` on the
 command line still just refuses and tells you why.
 
-Two more cases get something other than *Update*, and both are decided before the
+Three more cases get something other than *Update*, all decided before the
 banner appears, so the button you see is one that can work:
 
 - **A copy in a folder only an administrator can change** — one installed with
   `sudo ./install.sh --system`, or copied into a system folder by hand — also gets
   *Download*: the release archive, and the one command that installs it for every
   user, `sudo ./install.sh --system <that folder>`.
+- **A copy in your own folder whose files are someone else's** — what
+  `sudo ./install.sh` into your home directory leaves behind — gets *Download*
+  as well, with a plain `./install.sh <that folder>`, no `sudo`. That replaces
+  root's files with your own, which an update in place cannot: its backup step
+  hard-links the old file, and the kernel refuses that for a file you do not
+  own. `tobii update --install` refuses the same copy and says so.
 - **A copy that was replaced or removed while it was running** — its package
   uninstalled, or a newer version installed over it — gets *Quit*. There is
   nothing at its path to update, and starting the app again would only hand off

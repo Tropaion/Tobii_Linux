@@ -268,11 +268,18 @@ because the reasoning is worth more than the tidiness.
 
 ### 11.3c Update decisions, the installer and quitting from outside (after v0.3.0)
 
-- **The two new banners have never been shown by a real update.** *Download* for
-  a system copy and *Quit* for a replaced one need a release newer than the
-  running copy, so they are unit-tested, with each decision's branch broken once
-  to prove its test bites, and not clicked. The *Quit* case is the reported one:
-  a v0.1.0 hub whose package was removed while it ran.
+- **The three new banners have never been shown by a real update.** *Download*
+  for a system copy, *Download* for a home-directory copy whose files are root's,
+  and *Quit* for a replaced one need a release newer than the running copy, so
+  they are unit-tested, with each decision's branch broken once to prove its test
+  bites, and not clicked. The *Quit* case is the reported one: a v0.1.0 hub whose
+  package was removed while it ran. The root-owned home copy is the other
+  reported one — `sudo ./install.sh` put it there.
+- **The download folder is refused if another user could change it**
+  (`UnsafeFolder`), because the command printed for it is run later, perhaps with
+  `sudo`, on files that must still be the ones checked. A sticky shared folder
+  such as `/tmp` is accepted. Checked with folders a test makes, never with a
+  second real user.
 - **`faccessat` answers for the directory, not the swap.** It counts read-only
   mounts and ACLs; the ownership check covers `protected_hardlinks`. Anything
   else that fails the rename still reaches `install_release`'s real attempt and
@@ -281,7 +288,9 @@ because the reasoning is worth more than the tidiness.
 - **The tray's `IconThemePath` is read by Plasma** — its `GetAll` reply was seen
   carrying it — **but drawing from it in the first-install case is unmeasured.**
   This session's Plasma had already been restarted after `~/.local/share/icons`
-  existed, so the case needs a fresh login to recreate.
+  existed, so the case needs a fresh login to recreate. What is confirmed is
+  the fallback the README gives: after `systemctl --user restart
+  plasma-plasmashell.service` the reported placeholder became the real icon.
 - **Any process of the same user can quit the hub**, through the `quit` action
   GApplication exports on the session bus. By design: that is what the
   uninstaller and scripts use, and a same-user process can already signal it.
@@ -291,7 +300,14 @@ because the reasoning is worth more than the tidiness.
   seams (`TOBII_TEST_EUID`, `TOBII_SYSTEM_DATA_DIR`), with each check broken once
   to prove it bites. An end-to-end `sudo ./install.sh --system` has not run.
 - **The installer edits a file the user owns**: the login entry, and only its
-  `Exec` line, only when that points at a binary that no longer exists.
+  `Exec` line, only when that names an absolute path that no longer exists, and
+  never through a symlink. A bare name, an `env` wrapper or a symlinked entry
+  is named and left alone.
+- **A menu entry needs a path the Desktop Entry spec can quote.** `install.sh`
+  writes `Exec` in double quotes with `%` doubled; for a directory containing
+  `"`, `` ` ``, `$` or `\` it writes no menu entry and says so, because those
+  need escaping that launchers do not apply alike. Checked by the install-script
+  tests with a directory containing a space, `&`, `|` and `%`, and one with `"`.
 
 ### 11.4 Environmental
 

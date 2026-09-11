@@ -173,8 +173,9 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
    `is_writable` is not used here:
    - `ownership_of()`, which asks `dpkg`, `rpm` and `pacman` in turn about each
      installed binary — up to three subprocess calls, each with a deadline;
-   - whether this user can replace the binaries in place: `faccessat(W_OK)` on
-     the directory **and** every binary owned by this user (with
+   - whether this user can replace the binaries in place — two answers, because
+     their failures need opposite advice: `faccessat(W_OK)` on the directory,
+     and whether every installed binary is owned by this user (with
      `fs.protected_hardlinks` on, the swap's hard-linked backup of a file you do
      not own fails even in a writable directory);
    - whether `/proc/self/exe` ends in ` (deleted)` — replaced or removed while
@@ -184,28 +185,37 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
    - **Replaced or removed while running** → *Quit*, through the hub's `quit`
      action. Nothing is at the path to update, and relaunching would hand off
      to this same process.
-   - **Unowned, and replaceable** → *Update*, the path below.
-   - **Unowned, but only an administrator can replace it** → *Download* of the
-     archive, and the `sudo ./install.sh --system <dir>` that installs it.
+   - **Unowned, the directory writable and the binaries this user's** →
+     *Update*, the path below.
+   - **Unowned, but only an administrator can change the directory** →
+     *Download* of the archive, and the `sudo ./install.sh --system <dir>` that
+     installs it.
+   - **Unowned, the directory this user's but the binaries someone else's** (a
+     `sudo ./install.sh` into a home directory) → *Download* of the archive,
+     and a plain `./install.sh <dir>`: the installer renames its files into
+     place, and a rename in a directory you can write ignores the old file's
+     owner.
    - **Owner unknown** (a package manager could not be asked) → *Update*, which
-     `install_release` then refuses with the reason.
-   - **A package manager owns it** → as follows.
-
-   The previous version of this step, for the package-owned case:
-   - **Nobody owns it** → *Update*, the path below.
-   - **A package manager owns it** → *Download*. A folder picker, then
-     `download_release_files` fetches the artifact matching that manager (the
-     `.deb`, the `.rpm`, or the prebuilt Arch package — for a release without one,
-     the `PKGBUILD` **and** its install hook) into a
-     version-named subdirectory, digest-checked against `SHA256SUMS` exactly as
-     the archive would be — and stops. It installs nothing, so it deliberately
-     takes **no** `app.hold()`: there is no window of two-half-written binaries
-     to protect.
-   - **Could not tell** → refuse, and say which query failed. Overwriting a
+     `install_release` then refuses, saying which query failed. Overwriting a
      packaged file on the strength of a query that failed is the one outcome
      worth refusing outright.
+   - **A package manager owns it** → *Download*. A folder picker, then
+     `download_release_files` fetches the artifact matching that manager (the
+     `.deb`, the `.rpm`, or the prebuilt Arch package — for a release without
+     one, the `PKGBUILD` **and** its install hook) into a version-named
+     subdirectory, digest-checked against `SHA256SUMS` exactly as the archive
+     would be — and stops.
+
+   Every *Download*, the two archive ones included, installs nothing, so it
+   deliberately takes **no** `app.hold()`: there is no window of half-written
+   binaries to protect. Before fetching anything it refuses a download folder,
+   or an existing version folder, that another user could change
+   (`UnsafeFolder`): the command it prints is run later, perhaps with `sudo`, on
+   files that must still be the ones it checked.
 4. On **Update**: `app.hold()` (so closing the window cannot kill the process
-   between two renames), then an install thread.
+   between two renames), then an install thread. `install_release` asks step 3's
+   questions again itself — `tobii update --install` has no banner in front of
+   it — and refuses with the matching reason.
 5. `net::download` → digest against `SHA256SUMS` → `tar -xzf` → find the
    binaries **skipping symlinks** → **run each one with `--version`** → swap.
 6. The swap: hard-link the old binary aside as a backup, then a single atomic
@@ -236,11 +246,20 @@ sequence from §6.1, which is why an unplug/replug is invisible to the user.
    User machine                            ├── verifies SHA256SUMS
    ────────────                            └── publishes a DRAFT release
    ~/.local/bin/{tobii,tobii-gtk}    ◄────────────┐  tobii update --install
-   ~/.config/tobii-linux/…                        │  or the hub's banner
-   ~/.local/state/tobii-linux/tobii.log           │  (BINARIES ONLY — the
-   ~/.config/autostart/…  (optional)              │   updater never touches
-   /etc/udev/rules.d/60-tobii.rules  ─────────────┘   config or the rule)
+     (/usr/local/bin with --system)               │  or the hub's banner
+   ~/.config/tobii-linux/…                        │  (BINARIES ONLY — the
+   ~/.local/share/tobii-linux/installs            │   updater never touches
+   ~/.local/state/tobii-linux/tobii.log           │   config or the rule)
+   $XDG_RUNTIME_DIR/tobii-linux/icons             │
+   ~/.config/autostart/…  (optional)              │
+   /etc/udev/rules.d/60-tobii.rules  ─────────────┘
 ```
+
+`installs` is the installer's manifest — the directories `install.sh` put
+binaries in, `/usr/local/share/tobii-linux/installs` for `--system`. It is a
+hint for `tobii uninstall`, which checks every binary it names before
+touching it. `icons` is the tray's private copy of its icon, rewritten only
+when it differs, and gone with the session.
 
 **Why the container matters.** The machine a binary is compiled on *is* its
 compatibility floor. Built on a current rolling distribution both binaries
