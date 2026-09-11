@@ -113,7 +113,8 @@ pub const SYSTEM_DATA_DIR: &str = "/usr/local/share";
 /// An absent or relative HOME gives `/nonexistent/<fallback>`, not a relative
 /// path: `PathBuf::default().join(".config")` is `.config`, which would put
 /// every file this program writes wherever the working directory happens to
-/// be. See [`crate::config_path`], which learned that the hard way.
+/// be. `tobii debug` run from a git checkout once grew a `.config` tree inside
+/// it, and a service started with a scrubbed environment has no HOME at all.
 pub fn xdg_dir(var: Option<&OsStr>, home: Option<&OsStr>, fallback: &str) -> PathBuf {
     if let Some(v) = var.map(Path::new).filter(|v| v.is_absolute()) {
         return v.to_path_buf();
@@ -135,11 +136,6 @@ fn from_env(var: &str, fallback: &str) -> PathBuf {
 /// `$XDG_CONFIG_HOME`, or `~/.config`.
 pub fn config_home() -> PathBuf {
     from_env("XDG_CONFIG_HOME", ".config")
-}
-
-/// `$XDG_DATA_HOME`, or `~/.local/share`.
-pub fn data_home() -> PathBuf {
-    from_env("XDG_DATA_HOME", ".local/share")
 }
 
 /// `$XDG_STATE_HOME`, or `~/.local/state`.

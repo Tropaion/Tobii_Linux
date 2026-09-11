@@ -125,10 +125,7 @@ Decline and head tracking still works. You lose only the up-and-down angle.";
 
 /// Where fetched models are kept: beside the rest of this app's configuration.
 pub fn model_dir() -> PathBuf {
-    tobii_config::config_path()
-        .parent()
-        .map(|d| d.join(tobii_config::paths::MODELS_DIR))
-        .unwrap_or_else(|| PathBuf::from(tobii_config::paths::MODELS_DIR))
+    tobii_config::paths::config_dir().join(tobii_config::paths::MODELS_DIR)
 }
 
 pub fn path_of(src: &ModelSource) -> PathBuf {
@@ -477,7 +474,7 @@ mod tests {
         // A branch URL would silently hand us a different model the next time
         // opentrack updates theirs — which they do; the current file arrived in
         // a commit titled "Update models".
-        for src in [&HEAD_POSE, &HEAD_LOCALIZER] {
+        for src in SOURCES {
             assert!(
                 src.url.contains(src.commit),
                 "{} must be fetched from its pinned commit: {}",
@@ -551,18 +548,11 @@ mod tests {
         );
         assert!(TERMS.contains("CC BY-NC"), "the restriction");
         assert!(TERMS.contains("GPL-3.0-only"), "why we cannot ship it");
+        // A user who declines must be told what still works, not just refused.
         assert!(
             TERMS.contains("Decline and head tracking still works"),
             "the way out"
         );
-    }
-
-    #[test]
-    fn terms_name_the_restriction_and_the_way_out() {
-        assert!(TERMS.contains("CC BY-NC"));
-        assert!(TERMS.contains("GPL-3.0-only"));
-        // A user who declines must be told what still works, not just refused.
-        assert!(TERMS.contains("still works"));
     }
 
     #[test]

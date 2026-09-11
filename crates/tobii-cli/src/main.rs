@@ -395,7 +395,7 @@ fn check_model_update() -> CmdResult {
 fn model_status() -> CmdResult {
     use tobii_headpose::model_store::{self, Status};
     println!("model directory: {}", model_store::model_dir().display());
-    for src in [&model_store::HEAD_POSE, &model_store::HEAD_LOCALIZER] {
+    for src in model_store::SOURCES {
         let state = match model_store::status(src) {
             Status::Ready => "installed and verified".to_string(),
             Status::Missing => "not installed".to_string(),

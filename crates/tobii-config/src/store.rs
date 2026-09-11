@@ -9,13 +9,7 @@ use crate::DisplaySetup;
 /// The default config file path: `$XDG_CONFIG_HOME/tobii-linux/config.toml`,
 /// falling back to `$HOME/.config/tobii-linux/config.toml`.
 pub fn config_path() -> PathBuf {
-    // An absent or empty HOME must not produce a RELATIVE path.
-    // `PathBuf::default().join(".config")` is `.config`, so every loader and
-    // every writer would resolve against the working directory — `tobii debug`
-    // in a git checkout created a `.config` tree inside it, and a service
-    // started with a scrubbed environment would scatter one wherever it
-    // happened to be. `paths::xdg_dir` is where that rule lives now, shared with
-    // everything else that resolves an XDG directory.
+    // Never relative, even with HOME unset: see `paths::xdg_dir`.
     paths::config_dir().join(paths::CONFIG_TOML)
 }
 
@@ -27,9 +21,6 @@ pub fn config_path() -> PathBuf {
 /// ET5 reports no eyes at all, so a truncated `config.toml` presents as a
 /// tracker that has simply stopped working.
 pub fn save_to(path: &Path, setup: &DisplaySetup) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     write_atomic(path, setup.to_toml().as_bytes())
 }
 
@@ -238,21 +229,15 @@ pub fn enabled_eye_path() -> PathBuf {
 
 /// Persist which eye(s) the tracker should detect (stored as the wire value).
 pub fn save_enabled_eye(eye: tobii_protocol::EnabledEye) -> io::Result<()> {
-    let path = enabled_eye_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    write_atomic(&path, &[eye.to_wire() as u8])
+    write_atomic(&enabled_eye_path(), &[eye.to_wire() as u8])
 }
 
 /// Load the persisted eye choice. `Ok(None)` if unset or unparseable.
 pub fn load_enabled_eye() -> io::Result<Option<tobii_protocol::EnabledEye>> {
-    match std::fs::read(enabled_eye_path()) {
-        Ok(b) if !b.is_empty() => Ok(tobii_protocol::EnabledEye::from_wire(b[0] as u32)),
-        Ok(_) => Ok(None),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
+    Ok(read_opt(&enabled_eye_path())?.and_then(|b| {
+        b.first()
+            .and_then(|&w| tobii_protocol::EnabledEye::from_wire(w.into()))
+    }))
 }
 
 /// Path to the automatic-update-check preference, beside `config.toml`.
@@ -400,30 +385,20 @@ fn setup_monitor_id_path() -> PathBuf {
 /// `Some(id)` writes it atomically; `None` removes the file.
 pub fn save_setup_monitor_id_to(path: &Path, id: Option<&str>) -> io::Result<()> {
     match id {
-        Some(id_str) => write_atomic(path, id_str.as_bytes()),
-        None => {
-            // Remove the file if it exists; treat NotFound as success.
-            match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            }
-        }
+        Some(id) => write_atomic(path, id.as_bytes()),
+        // Already gone is success.
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
     }
 }
 
-/// Load the persisted monitor id. `Ok(None)` if unset, missing, or empty.
+/// Load the persisted monitor id. `Ok(None)` if unset, missing, empty or not UTF-8.
 pub fn load_setup_monitor_id_from(path: &Path) -> io::Result<Option<String>> {
-    match read_opt(path)? {
-        Some(bytes) => {
-            match String::from_utf8(bytes) {
-                Ok(s) if !s.is_empty() => Ok(Some(s)),
-                Ok(_) => Ok(None),  // empty string treated as unset
-                Err(_) => Ok(None), // invalid UTF-8 treated as unset
-            }
-        }
-        None => Ok(None),
-    }
+    Ok(read_opt(path)?
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.is_empty()))
 }
 
 /// Save to the default [`setup_monitor_id_path`].
@@ -438,14 +413,25 @@ pub fn load_setup_monitor_id() -> io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A fresh, empty directory of this test's own. The pid keeps two
+    /// overlapping `cargo test` runs from clearing each other's files
+    /// mid-test; the tag keeps the tests of one run apart, so every test
+    /// needs a tag of its own.
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tobii-config-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        d
+    }
 
     /// A corrupt or out-of-range text scale must fall back to 1.0 rather than
     /// render the program unreadable — the control that would fix it is inside
     /// the UI it would have broken.
     #[test]
     fn an_unusable_text_scale_falls_back_to_normal() {
-        let dir = std::env::temp_dir().join(format!("tobii-scale-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = scratch("scale");
         let p = dir.join("text_scale");
 
         for bad in ["", "  ", "abc", "0", "-1", "99", "NaN", "inf"] {
@@ -464,8 +450,7 @@ mod tests {
     /// not sticking.
     #[test]
     fn saving_clamps_into_the_range_the_reader_accepts() {
-        let dir = std::env::temp_dir().join(format!("tobii-scale-save-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = scratch("scale-save");
         let p = dir.join("text_scale");
 
         save_text_scale_to(&p, 99.0).expect("save");
@@ -482,8 +467,7 @@ mod tests {
     /// be read as "off" and silently switch the check off forever.
     #[test]
     fn the_update_check_defaults_to_on_and_only_off_turns_it_off() {
-        let dir = std::env::temp_dir().join(format!("tobii-upd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("upd");
         let path = dir.join("update_check");
 
         assert!(update_check_enabled_at(&path), "unset means on");
@@ -506,7 +490,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-    use super::*;
 
     fn sample() -> DisplaySetup {
         DisplaySetup {
@@ -522,29 +505,26 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrips() {
-        let dir = std::env::temp_dir().join("tobii-config-test-save-load");
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("config.toml");
+        let root = scratch("save-load");
+        // A directory that does not exist yet: the writer creates it.
+        let path = root.join("new").join("config.toml");
         let s = sample();
         save_to(&path, &s).expect("save");
         let loaded = load_from(&path).expect("load io").expect("some");
         assert_eq!(loaded, s);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn load_missing_returns_none() {
-        let path = std::env::temp_dir()
-            .join("tobii-config-test-missing")
-            .join("nope.toml");
-        let _ = std::fs::remove_file(&path);
-        assert!(load_from(&path).expect("io ok").is_none());
+        let dir = scratch("missing");
+        assert!(load_from(&dir.join("nope.toml")).expect("io ok").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_pitch_offset_round_trips_and_bad_input_reads_as_uncalibrated() {
-        let dir = std::env::temp_dir().join(format!("tobii-pitch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = scratch("pitch");
         let path = dir.join("headpose_pitch_offset");
 
         for deg in [-24.08, 0.0, 13.5] {
@@ -602,8 +582,8 @@ mod tests {
         // file left by an interrupted write would be indistinguishable from a
         // good one. Overwriting must also not strand a .tmp beside it (blob or
         // meta).
-        let dir = std::env::temp_dir().join("tobii-config-test-cal-atomic");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = scratch("cal-atomic");
+        let dir = root.join("new");
         let bin = dir.join("calibration.bin");
         let meta_path = dir.join("calibration.meta.toml");
         let meta = sample_meta();
@@ -627,13 +607,13 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn calibration_blob_roundtrips() {
-        let dir = std::env::temp_dir().join("tobii-config-test-cal");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = scratch("cal");
+        let dir = root.join("new");
         let bin = dir.join("calibration.bin");
         let meta_path = dir.join("calibration.meta.toml");
         let blob = vec![0x01, 0x02, 0x03, 0xFE, 0xFF];
@@ -642,19 +622,18 @@ mod tests {
             .expect("load io")
             .expect("some");
         assert_eq!(got_blob, blob);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn load_calibration_missing_is_none() {
-        let dir = std::env::temp_dir().join("tobii-config-test-cal-missing");
+        let dir = scratch("cal-missing");
         let bin = dir.join("calibration.bin");
         let meta_path = dir.join("calibration.meta.toml");
-        let _ = std::fs::remove_file(&bin);
-        let _ = std::fs::remove_file(&meta_path);
         assert!(load_calibration_from(&bin, &meta_path)
             .expect("io ok")
             .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -662,15 +641,10 @@ mod tests {
         assert!(calibration_path().ends_with("tobii-linux/calibration.bin"));
     }
 
-    // NOTE: no `tempfile`/`tempdir()` crate is a dependency anywhere in this
-    // workspace yet, so — unlike the plan's literal snippet — these mirror the
-    // hand-rolled `std::env::temp_dir()` + manual cleanup convention the other
-    // calibration tests in this file already use, rather than introducing a
-    // new external dev-dependency for two tests.
     #[test]
     fn calibration_meta_round_trips_and_blob_is_verbatim() {
-        let dir = std::env::temp_dir().join("tobii-config-test-cal-meta-roundtrip");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = scratch("cal-meta");
+        let dir = root.join("new");
         let bin = dir.join("calibration.bin");
         let meta_path = dir.join("calibration.meta.toml");
         let blob = vec![1u8, 2, 3, 4, 5];
@@ -686,14 +660,12 @@ mod tests {
         let got_meta = got_meta.expect("meta present");
         assert_eq!(got_meta.monitor_id.as_deref(), Some("SAM7454-HNTY900001"));
         assert_eq!(got_meta.display_fingerprint, 0xDEAD_BEEF);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn legacy_blob_without_meta_loads_with_none_meta() {
-        let dir = std::env::temp_dir().join("tobii-config-test-cal-meta-legacy");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("cal-legacy");
         let bin = dir.join("calibration.bin");
         let meta_path = dir.join("calibration.meta.toml");
         std::fs::write(&bin, [9u8, 9, 9]).unwrap(); // no meta file
@@ -705,21 +677,19 @@ mod tests {
 
     #[test]
     fn setup_monitor_id_round_trips() {
-        let dir = std::env::temp_dir().join("tobii-config-test-monitor-id-roundtrip");
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("setup_monitor_id");
+        let root = scratch("monitor-id");
+        let path = root.join("new").join("setup_monitor_id");
         save_setup_monitor_id_to(&path, Some("SAM7454-HNTY900001")).expect("save");
         let loaded = load_setup_monitor_id_from(&path)
             .expect("load io")
             .expect("some");
         assert_eq!(loaded, "SAM7454-HNTY900001");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn setup_monitor_id_missing_file_is_none() {
-        let dir = std::env::temp_dir().join("tobii-config-test-monitor-id-missing");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("monitor-id-missing");
         let path = dir.join("setup_monitor_id");
         let loaded = load_setup_monitor_id_from(&path).expect("load io");
         assert!(loaded.is_none());
@@ -728,13 +698,36 @@ mod tests {
 
     #[test]
     fn saving_none_clears_the_file() {
-        let dir = std::env::temp_dir().join("tobii-config-test-monitor-id-clear");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch("monitor-id-clear");
         let path = dir.join("setup_monitor_id");
         save_setup_monitor_id_to(&path, Some("X")).expect("save");
         save_setup_monitor_id_to(&path, None).expect("clear");
         let loaded = load_setup_monitor_id_from(&path).expect("load io");
         assert!(loaded.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unset reads as unset whatever form it takes — an empty file, bytes that
+    /// are not text — and clearing an id that is already gone is not an error.
+    /// Anything else the filesystem says is: a directory where the file should
+    /// be must not read as "no monitor chosen".
+    #[test]
+    fn an_unusable_monitor_id_reads_as_unset_and_only_real_errors_are_errors() {
+        let dir = scratch("monitor-id-unusable");
+        let path = dir.join("setup_monitor_id");
+        let unusable: [&[u8]; 2] = [b"", &[0xff, 0xfe]];
+        for bytes in unusable {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                load_setup_monitor_id_from(&path).unwrap(),
+                None,
+                "{bytes:?}"
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        save_setup_monitor_id_to(&path, None).expect("clearing what is already gone");
+        assert!(load_setup_monitor_id_from(&dir).is_err());
+        assert!(save_setup_monitor_id_to(&dir, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
