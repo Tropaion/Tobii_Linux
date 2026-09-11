@@ -127,8 +127,8 @@ Decline and head tracking still works. You lose only the up-and-down angle.";
 pub fn model_dir() -> PathBuf {
     tobii_config::config_path()
         .parent()
-        .map(|d| d.join("models"))
-        .unwrap_or_else(|| PathBuf::from("models"))
+        .map(|d| d.join(tobii_config::paths::MODELS_DIR))
+        .unwrap_or_else(|| PathBuf::from(tobii_config::paths::MODELS_DIR))
 }
 
 pub fn path_of(src: &ModelSource) -> PathBuf {
