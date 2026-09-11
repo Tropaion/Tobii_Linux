@@ -35,6 +35,17 @@
 //!   reverse-engineered from a USB capture; until then, opentrack will see a
 //!   permanently level head.
 //!
+//! # One eye is not no eyes
+//!
+//! [`pose_from_sample`] needs both eye origins and gives nothing without them.
+//! That is a strict gate on a device that loses the two eyes *independently*:
+//! this project measured about five per-eye dropouts a second, with one eye
+//! gone far more often than both. [`PairOffset`] is the stateful path beside
+//! it — it keeps the last measured offset between the eyes, reconstructs the
+//! missing one from the surviving one, and ages the offset out so a guess can
+//! never be handed out as a measurement. With both eyes present it returns
+//! exactly what [`pose_from_sample`] returns.
+//!
 //! # Rotation sign conventions — UNVERIFIED ASSUMPTIONS
 //!
 //! * **yaw > 0** — the user turns their head to *their* right (nose swings
@@ -65,6 +76,8 @@ pub use tobii_config::sha256;
 pub use filter::PoseFilter;
 pub use model::{ModelConfig, ModelKind, PoseModel};
 pub use opentrack::to_opentrack_datagram;
+
+use std::time::{Duration, Instant};
 
 use tobii_protocol::gaze::{present, GazeSample};
 
@@ -174,6 +187,211 @@ pub fn pose_from_sample(s: &GazeSample) -> Option<HeadPose> {
         return None;
     }
     Some(pose_from_eyes(s.eye_origin_l_mm, s.eye_origin_r_mm))
+}
+
+/// Where a geometric pose came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoseSource {
+    /// Both eye origins were measured on this frame.
+    BothEyes,
+    /// One eye was measured and the other placed with the last measured
+    /// offset. Translation follows the eye that is really there; yaw and roll
+    /// are the ones the last two-eye frame measured — see [`PairOffset`].
+    Reconstructed,
+}
+
+/// A pose together with the answer to "was this measured, or partly guessed".
+///
+/// The two travel together because a consumer that reports the pose has to be
+/// able to report that as well: the whole risk of the one-eye path is a
+/// reconstruction that looks exactly like a measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourcedPose {
+    pub pose: HeadPose,
+    pub source: PoseSource,
+}
+
+/// Consecutive one-eye samples required before the fallback engages.
+///
+/// The tracker loses the two eyes independently and briefly, so the eye count
+/// does not step from 2 to 1 and back — it flickers. Acting on the first
+/// one-eye sample would switch between measured and reconstructed geometry
+/// frame by frame, and the two do not agree exactly (one re-measures the
+/// interocular vector, the other holds it), so the switching itself becomes a
+/// small oscillation in the pose the filter then has to swallow.
+///
+/// Two means one isolated invalid frame never changes the path. **What it
+/// costs is one frame — about 30 ms — at the start of every real outage**,
+/// during which there is no pose. That frame is exactly what ships today, so
+/// the debounce gives nothing away; it only declines to win the first 30 ms
+/// back.
+pub const ONE_EYE_DEBOUNCE: u32 = 2;
+
+/// How long a measured interocular offset may go on standing in for a lost eye.
+///
+/// Ageing is the whole discipline of this path. A reconstructed pose is a
+/// guess, and the guess is specifically a **rigid-body** one: the vector from
+/// one eye to the other is constant only while the head does not rotate. Since
+/// [`pose_from_eyes`] reads yaw and roll off precisely that vector, a
+/// reconstructed frame reports the rotation that the last two-eye frame
+/// measured, and only translation keeps following the eye that is really
+/// there. So the bound answers one question — how long may a held rotation be
+/// handed out as a measured one.
+///
+/// 300 ms, which is about 10 frames at the **30.208 ms** cadence measured
+/// between consecutive gaze frames in
+/// `crates/tobii-usb/tests/captures/session.tobiicap`. Two things fix it:
+///
+/// * It stays well inside the 1 s `TRACKING_LOSS_RESET` in `tobii-output`'s
+///   pipeline, that crate's statement of when old state has become a lie. A
+///   reconstruction must not outlive the state it is composed into.
+/// * The 400-frame session of 2026-08-09 — the one
+///   `docs/wiki/Planned-Work.md` quotes as roughly five per-eye dropouts a
+///   second — makes the ordinary outage short: its left eye read invalid in
+///   34% of 400 frames across 43 separate outages (~3.2 frames, ~95 ms each)
+///   and its right in 18% across 18 outages (~4 frames, ~120 ms). 300 ms is
+///   about two and a half times that, so an ordinary dropout is covered end to
+///   end, while that session's two extremes (480 ms on the left, 1260 ms on
+///   the right) deliberately run out: a second of frozen rotation is the
+///   confident guess this bound exists to refuse.
+///
+/// What was **not** measured is the distribution between those numbers — the
+/// session recorded the rate and the two maxima, not a histogram — so 300 ms
+/// is a conservative choice inside them, not a fitted one.
+pub const RECONSTRUCTION_MAX_AGE: Duration = Duration::from_millis(300);
+
+/// The last measured offset between the two eyes, used to keep producing a
+/// pose while the tracker can only see one of them.
+///
+/// [`pose_from_sample`] needs both eyes and returns nothing otherwise, which on
+/// this hardware is not a corner case: the 2026-08-09 session measured about
+/// five per-eye dropouts a second, with one eye lost far more often than both
+/// (the head sits off the tracker's optical axis, so the two eyes drop out
+/// independently). Every one of those frames is a pose the driver could have
+/// sent and did not.
+///
+/// The algorithm is the one `tobii-gtk`'s `eyeview::PairOffset` already uses to
+/// keep drawing both dots — re-measure the delta whenever both eyes are real,
+/// reconstruct the missing one from it when exactly one is, age it out so it
+/// can never draw a ghost. This is a second implementation rather than a shared
+/// one because the two work in different spaces: that one carries normalized
+/// trackbox positions for a drawing, this one carries tracker-space
+/// millimetres for a pose, and ages in wall-clock time because its consumer
+/// already has a clock and a stalled stream must not be able to make an old
+/// offset look fresh by simply not arriving.
+///
+/// **Reconstructing beats dropping the frame, but it is not free.** Feeding the
+/// surviving eye's origin straight into [`pose_from_eyes`] as if it were the
+/// head centre would move the reported head half an interocular distance
+/// sideways the moment an eye blinked out — a yank, where today's behaviour is
+/// only a stutter. The stored offset is what keeps the centre still.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PairOffset {
+    /// Right eye minus left eye, in tracker-space mm, from the most recent
+    /// frame that carried both.
+    delta_mm: Option<[f64; 3]>,
+    /// When that measurement was taken. Only a two-eye frame moves it, so the
+    /// age keeps growing for as long as an outage lasts.
+    measured_at: Option<Instant>,
+    /// Consecutive samples so far with exactly one usable eye.
+    one_eye_run: u32,
+}
+
+impl PairOffset {
+    /// A fresh offset that has measured nothing yet.
+    pub fn new() -> Self {
+        PairOffset::default()
+    }
+
+    /// Forget the measurement, so nothing is reconstructed until both eyes
+    /// have been seen together again.
+    pub fn reset(&mut self) {
+        *self = PairOffset::default();
+    }
+
+    /// The stateful counterpart of [`pose_from_sample`]: a pose from two eyes
+    /// where there are two, and from one eye plus the last offset where the
+    /// tracker has momentarily lost the other.
+    ///
+    /// With both eyes tracked this returns bit-for-bit what
+    /// [`pose_from_sample`] returns, from the same strict gate — present bits
+    /// *and* `validity == 0`, because the device sends zeroed origin columns
+    /// rather than omitting them. `None` means no pose at all: no eye, no
+    /// offset measured yet, the debounce not yet satisfied, or an offset past
+    /// [`RECONSTRUCTION_MAX_AGE`].
+    pub fn pose_from_sample(&mut self, s: &GazeSample, now: Instant) -> Option<SourcedPose> {
+        // Without both validity columns there is nothing to gate on, and
+        // validity defaults to 0 — which must not be read as "tracked". The
+        // same refusal as the stateless path, and it must come first: a frame
+        // that cannot say which eyes it has must not advance the debounce.
+        if !s.has(present::VALIDITY_L) || !s.has(present::VALIDITY_R) {
+            self.one_eye_run = 0;
+            return None;
+        }
+        let left = s.validity_l == VALIDITY_TRACKED && s.has(present::EYE_ORIGIN_L);
+        let right = s.validity_r == VALIDITY_TRACKED && s.has(present::EYE_ORIGIN_R);
+
+        match (left, right) {
+            (true, true) => {
+                let (l, r) = (s.eye_origin_l_mm, s.eye_origin_r_mm);
+                self.delta_mm = Some([r[0] - l[0], r[1] - l[1], r[2] - l[2]]);
+                self.measured_at = Some(now);
+                self.one_eye_run = 0;
+                Some(SourcedPose {
+                    pose: pose_from_eyes(l, r),
+                    source: PoseSource::BothEyes,
+                })
+            }
+            (true, false) => self.reconstruct(s.eye_origin_l_mm, Seen::Left, now),
+            (false, true) => self.reconstruct(s.eye_origin_r_mm, Seen::Right, now),
+            (false, false) => {
+                // Nobody there. Not a one-eye outage, so the debounce starts
+                // again rather than counting this towards one.
+                self.one_eye_run = 0;
+                None
+            }
+        }
+    }
+
+    /// Place the eye the tracker cannot see at the one it can, plus the stored
+    /// offset, and take the pose from the completed pair.
+    fn reconstruct(&mut self, seen_mm: [f64; 3], seen: Seen, now: Instant) -> Option<SourcedPose> {
+        self.one_eye_run = self.one_eye_run.saturating_add(1);
+        if self.one_eye_run < ONE_EYE_DEBOUNCE {
+            return None;
+        }
+        // `?` on both: nothing is reconstructed before both eyes have ever
+        // been seen together, and a stale offset yields no pose rather than a
+        // confident one.
+        let measured_at = self.measured_at?;
+        if now.saturating_duration_since(measured_at) > RECONSTRUCTION_MAX_AGE {
+            return None;
+        }
+        let d = self.delta_mm?;
+        let shifted = |sign: f64| {
+            [
+                seen_mm[0] + sign * d[0],
+                seen_mm[1] + sign * d[1],
+                seen_mm[2] + sign * d[2],
+            ]
+        };
+        let (left_mm, right_mm) = match seen {
+            Seen::Left => (seen_mm, shifted(1.0)),
+            Seen::Right => (shifted(-1.0), seen_mm),
+        };
+        Some(SourcedPose {
+            pose: pose_from_eyes(left_mm, right_mm),
+            source: PoseSource::Reconstructed,
+        })
+    }
+}
+
+/// Which eye the tracker still has, so the offset is applied in the right
+/// direction: the delta points from the left eye to the right one.
+#[derive(Debug, Clone, Copy)]
+enum Seen {
+    Left,
+    Right,
 }
 
 #[cfg(test)]
@@ -472,5 +690,324 @@ mod tests {
             ..tracked_sample()
         };
         assert!(pose_from_sample(&s).is_none());
+    }
+
+    /// Where a head actually sat in this project's own dropout session: 795 mm
+    /// from the tracker and 17.4° off its optical axis, 8.7° horizontally and
+    /// 15.3° vertically (the session `docs/wiki/Planned-Work.md` quotes for
+    /// both the five-dropouts-a-second rate and the off-axis placement that
+    /// causes it). The distances are that session's; the *signs* are a choice,
+    /// and nothing below turns on them — the point of an off-centre,
+    /// three-way-asymmetric head is that a path which swapped two components
+    /// or dropped one cannot match the other path by accident.
+    const OFF_AXIS_CENTRE: [f64; 3] = [121.6, 217.4, 795.0];
+
+    /// A both-eyes sample: a real head, at a real angle, in the frame shape the
+    /// device sends.
+    fn pair_sample(centre: [f64; 3], yaw_deg: f64, roll_deg: f64) -> GazeSample {
+        let (l, r) = eyes_at(centre, yaw_deg, roll_deg);
+        GazeSample {
+            eye_origin_l_mm: l,
+            eye_origin_r_mm: r,
+            ..tracked_sample()
+        }
+    }
+
+    /// The same frame after the tracker loses one eye, in the shape it really
+    /// arrives in: validity 4 with the origin column still **present** and
+    /// zeroed. Every gaze frame in the committed capture
+    /// (`crates/tobii-usb/tests/captures/session.tobiicap`, recorded with
+    /// nobody in front of the tracker) looks like this, which is why a
+    /// present-bit check alone would report an eye sitting on the sensor.
+    fn without_eye(s: &GazeSample, drop_right: bool) -> GazeSample {
+        let mut out = s.clone();
+        if drop_right {
+            out.validity_r = 4;
+            out.eye_origin_r_mm = [0.0; 3];
+        } else {
+            out.validity_l = 4;
+            out.eye_origin_l_mm = [0.0; 3];
+        }
+        out
+    }
+
+    /// Feed a sample until the debounce is satisfied, returning the pose the
+    /// fallback settles on.
+    fn after_debounce(pair: &mut PairOffset, s: &GazeSample, now: Instant) -> SourcedPose {
+        for _ in 1..ONE_EYE_DEBOUNCE {
+            assert!(
+                pair.pose_from_sample(s, now).is_none(),
+                "the fallback engaged before the debounce was satisfied"
+            );
+        }
+        pair.pose_from_sample(s, now).expect("a reconstructed pose")
+    }
+
+    /// The regression that matters most: where the new path is not taken, the
+    /// old one must be untouched. Not "close" — the same bits, so the pose a
+    /// game receives on an ordinary two-eye frame cannot have moved at all.
+    #[test]
+    fn with_both_eyes_the_pose_is_bit_for_bit_the_stateless_one() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        for &(yaw, roll) in &[
+            (0.0, 0.0),
+            (12.5, -7.25),
+            (-31.0, 18.0),
+            (45.0, 40.0),
+            (-3.75, 0.5),
+        ] {
+            let s = pair_sample(OFF_AXIS_CENTRE, yaw, roll);
+            let stateful = pair
+                .pose_from_sample(&s, now)
+                .expect("both eyes are tracked");
+            assert_eq!(stateful.source, PoseSource::BothEyes);
+            assert_eq!(
+                stateful.pose,
+                pose_from_sample(&s).expect("the stateless path agrees there is a pose"),
+                "the two-eye pose moved at yaw {yaw} roll {roll}"
+            );
+        }
+    }
+
+    /// Every gate the stateless path refuses on, the stateful one refuses on
+    /// too. A fallback that quietly loosened the validity rule would report a
+    /// head sitting on the tracker's own sensor.
+    #[test]
+    fn the_stateful_path_refuses_everything_the_stateless_one_refuses() {
+        let now = Instant::now();
+        let refused = [
+            // No eyes at all: the real no-eyes frame, both origins zeroed.
+            without_eye(&without_eye(&tracked_sample(), true), false),
+            // Origin columns absent.
+            GazeSample {
+                present_mask: present::VALIDITY_L | present::VALIDITY_R,
+                ..tracked_sample()
+            },
+            // Validity columns absent — validity defaults to 0, which is not
+            // the same thing as "tracked".
+            GazeSample {
+                present_mask: present::EYE_ORIGIN_L | present::EYE_ORIGIN_R,
+                ..tracked_sample()
+            },
+        ];
+        for s in refused {
+            assert_eq!(pose_from_sample(&s), None, "premise");
+            // A fresh offset each time: with nothing measured there is nothing
+            // to reconstruct from either.
+            assert!(PairOffset::new().pose_from_sample(&s, now).is_none());
+        }
+    }
+
+    /// The reason the offset exists at all. Dropping to "wherever the eye I can
+    /// still see is" would move the reported head half an interocular distance
+    /// sideways the instant an eye blinked out — a yank, where today's
+    /// behaviour is merely a missing frame.
+    #[test]
+    fn a_lost_eye_does_not_move_the_head_centre() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
+        let before = pair.pose_from_sample(&both, now).expect("both eyes").pose;
+
+        let one_eye = without_eye(&both, true);
+        let after = after_debounce(&mut pair, &one_eye, now);
+        assert_eq!(after.source, PoseSource::Reconstructed);
+        assert_close(after.pose.x_mm, before.x_mm, "x");
+        assert_close(after.pose.y_mm, before.y_mm, "y");
+        assert_close(after.pose.z_mm, before.z_mm, "z");
+
+        // And the naive answer really would have been a long way off: the
+        // surviving left eye sits half an interocular distance from centre.
+        assert!(
+            (one_eye.eye_origin_l_mm[0] - before.x_mm).abs() > HALF_IPD - 1.0,
+            "the test is not measuring anything: the surviving eye is already \
+             at the centre"
+        );
+    }
+
+    /// A head that moves while one eye is out still moves: the reconstruction
+    /// follows the eye the tracker can see, one for one.
+    #[test]
+    fn a_reconstructed_pose_follows_the_eye_that_is_still_there() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
+        let start = pair.pose_from_sample(&both, now).expect("both eyes").pose;
+
+        // The right eye drops out and the head slides 10 mm left and 5 mm up.
+        let mut moved = without_eye(&both, true);
+        moved.eye_origin_l_mm[0] -= 10.0;
+        moved.eye_origin_l_mm[1] += 5.0;
+        let after = after_debounce(&mut pair, &moved, now);
+        assert_close(after.pose.x_mm, start.x_mm - 10.0, "x follows the eye");
+        assert_close(after.pose.y_mm, start.y_mm + 5.0, "y follows the eye");
+    }
+
+    /// What a reconstructed frame is really claiming. Yaw and roll come from
+    /// the interocular vector, and during an outage that vector *is* the stored
+    /// offset — so rotation is **held at its last measured value**, not
+    /// extrapolated. That is the honest half of the guess, and the reason
+    /// [`RECONSTRUCTION_MAX_AGE`] is short.
+    #[test]
+    fn rotation_is_held_at_its_last_measurement_while_an_eye_is_missing() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        let both = pair_sample(OFF_AXIS_CENTRE, 17.0, -9.0);
+        let measured = pair.pose_from_sample(&both, now).expect("both eyes").pose;
+        assert_close(measured.yaw_deg, 17.0, "premise: yaw");
+
+        let mut drifting = without_eye(&both, false);
+        drifting.eye_origin_r_mm[2] += 25.0; // the visible eye swings backwards
+        let after = after_debounce(&mut pair, &drifting, now);
+        assert_eq!(
+            after.pose.yaw_deg, measured.yaw_deg,
+            "yaw must be the held measurement, not a new guess"
+        );
+        assert_eq!(after.pose.roll_deg, measured.roll_deg, "roll likewise");
+    }
+
+    /// The bound, from both sides. A pose at the limit, none past it: past
+    /// `RECONSTRUCTION_MAX_AGE` a stale offset is refused rather than reported
+    /// as though it were still a measurement.
+    #[test]
+    fn an_offset_past_its_age_yields_no_pose_rather_than_a_confident_guess() {
+        let now = Instant::now();
+        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
+        let one_eye = without_eye(&both, true);
+
+        let mut fresh = PairOffset::new();
+        fresh.pose_from_sample(&both, now);
+        assert!(
+            after_debounce(&mut fresh, &one_eye, now + RECONSTRUCTION_MAX_AGE)
+                .source
+                .eq(&PoseSource::Reconstructed),
+            "the bound is inclusive at its limit"
+        );
+
+        let mut stale = PairOffset::new();
+        stale.pose_from_sample(&both, now);
+        let past = now + RECONSTRUCTION_MAX_AGE + Duration::from_millis(1);
+        for _ in 0..ONE_EYE_DEBOUNCE {
+            assert!(
+                stale.pose_from_sample(&one_eye, past).is_none(),
+                "a stale offset must not produce a pose"
+            );
+        }
+    }
+
+    /// The offset ages from the last *two-eye* frame, not from the last call:
+    /// a long outage runs out even though a one-eye sample arrives every 30 ms.
+    #[test]
+    fn a_long_outage_runs_out_even_though_samples_keep_arriving() {
+        let mut pair = PairOffset::new();
+        let start = Instant::now();
+        pair.pose_from_sample(&pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0), start);
+        let one_eye = without_eye(&pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0), true);
+
+        // The cadence measured between consecutive gaze frames in the
+        // committed capture, so this is the real frame rate ageing it out.
+        let cadence = Duration::from_micros(30_208);
+        let mut produced = 0;
+        let mut at = start;
+        for _ in 0..100 {
+            at += cadence;
+            if pair.pose_from_sample(&one_eye, at).is_some() {
+                produced += 1;
+            }
+        }
+        assert!(produced > 0, "the fallback never engaged at all");
+        assert!(
+            pair.pose_from_sample(&one_eye, at).is_none(),
+            "a three-second outage was still producing a pose"
+        );
+    }
+
+    #[test]
+    fn nothing_is_reconstructed_before_both_eyes_have_ever_been_seen() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        let one_eye = without_eye(&pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0), true);
+        for _ in 0..ONE_EYE_DEBOUNCE * 4 {
+            assert!(
+                pair.pose_from_sample(&one_eye, now).is_none(),
+                "no offset has been measured yet"
+            );
+        }
+    }
+
+    /// The debounce is one-directional on purpose. A 2→1 flicker has to persist
+    /// to change the path, but the *return* to two eyes is immediate — anything
+    /// else would mean answering a frame that carries two measured eyes with a
+    /// reconstruction, and that is the one thing this must never do.
+    #[test]
+    fn the_debounce_delays_the_fallback_but_never_the_return_to_two_eyes() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        let both = pair_sample(OFF_AXIS_CENTRE, 6.0, 0.0);
+        let one_eye = without_eye(&both, true);
+        pair.pose_from_sample(&both, now);
+
+        // A single flickering frame never switches the path.
+        for _ in 1..ONE_EYE_DEBOUNCE {
+            assert!(pair.pose_from_sample(&one_eye, now).is_none());
+            assert_eq!(
+                pair.pose_from_sample(&both, now)
+                    .expect("two eyes again")
+                    .source,
+                PoseSource::BothEyes,
+                "a two-eye frame must be answered with the two-eye pose at once"
+            );
+        }
+        // A persistent outage does switch it.
+        assert_eq!(
+            after_debounce(&mut pair, &one_eye, now).source,
+            PoseSource::Reconstructed
+        );
+    }
+
+    /// Losing both eyes is not a one-eye outage: the run starts again, so the
+    /// frame after a blank gap cannot arrive already past the debounce.
+    #[test]
+    fn a_frame_with_no_eyes_restarts_the_debounce() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
+        let one_eye = without_eye(&both, true);
+        let no_eyes = without_eye(&one_eye, false);
+        pair.pose_from_sample(&both, now);
+
+        for _ in 1..ONE_EYE_DEBOUNCE {
+            pair.pose_from_sample(&one_eye, now);
+        }
+        assert!(pair.pose_from_sample(&no_eyes, now).is_none(), "premise");
+        for _ in 1..ONE_EYE_DEBOUNCE {
+            assert!(
+                pair.pose_from_sample(&one_eye, now).is_none(),
+                "the debounce carried over a gap with no eyes in it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_forgets_the_measurement() {
+        let mut pair = PairOffset::new();
+        let now = Instant::now();
+        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
+        let one_eye = without_eye(&both, true);
+        pair.pose_from_sample(&both, now);
+        assert_eq!(
+            after_debounce(&mut pair, &one_eye, now).source,
+            PoseSource::Reconstructed,
+            "premise"
+        );
+
+        pair.reset();
+        for _ in 0..ONE_EYE_DEBOUNCE * 2 {
+            assert!(
+                pair.pose_from_sample(&one_eye, now).is_none(),
+                "a reset offset must not still be reconstructing"
+            );
+        }
     }
 }

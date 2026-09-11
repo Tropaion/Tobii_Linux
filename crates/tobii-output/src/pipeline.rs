@@ -33,7 +33,7 @@
 
 use std::time::{Duration, Instant};
 
-use tobii_headpose::{pose_from_sample, HeadPose, PoseFilter};
+use tobii_headpose::{HeadPose, PairOffset, PoseFilter, PoseSource};
 use tobii_protocol::gaze::present;
 use tobii_protocol::{DisplayCorners, GazeSample};
 
@@ -87,6 +87,46 @@ pub struct FramePipeline {
     /// "you have gone away", and it means somebody who gets up and comes back sat
     /// slightly differently does not acquire a permanent offset.
     neutral: Option<[f64; 3]>,
+    /// The one-eye fallback's state: the last measured offset between the two
+    /// eyes, plus its age and the eye-count debounce.
+    ///
+    /// It lives here for the same reason [`FramePipeline::neutral`] does — it
+    /// is per-session tracking state, not configuration, and it has to survive
+    /// a settings change. Rebuilding the pipeline to pick up a new smoothing
+    /// strength would otherwise throw away the offset in the middle of an
+    /// outage, which is exactly when it is the only thing producing a pose.
+    pair: PairOffset,
+    /// Frames whose pose came from two measured eyes, and from one eye plus
+    /// the stored offset.
+    ///
+    /// Counted, not logged: this crate has no logger (it cross-compiles for
+    /// the Wine bridge), and a fallback that is invisible is the failure mode
+    /// the reconstruction risks — a guess that reads exactly like a
+    /// measurement. [`FramePipeline::fallback_stats`] is how a front end says
+    /// so out loud.
+    both_eye_frames: u64,
+    reconstructed_frames: u64,
+    /// Whether the pose most recently composed from the geometric path was a
+    /// reconstructed one.
+    last_was_reconstructed: bool,
+}
+
+/// What the one-eye fallback has done this session.
+///
+/// `reconstructed` counts *frames that exist because of it*: on this hardware
+/// they are frames that would otherwise have been dropped, so the ratio to
+/// `both_eyes` is the measurement of how much the fallback is carrying. A
+/// ratio that climbs towards parity is not a bug in this code — it is a
+/// tracker that cannot see one of the user's eyes, and the fix for that is
+/// physical (aim the tracker, raise the seat).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FallbackStats {
+    /// Poses composed from two measured eye origins.
+    pub both_eyes: u64,
+    /// Poses composed from one eye plus the last measured offset.
+    pub reconstructed: u64,
+    /// True if the most recent pose was a reconstructed one.
+    pub active: bool,
 }
 
 impl FramePipeline {
@@ -98,6 +138,23 @@ impl FramePipeline {
             gaze_lost_since: None,
             last_tracked: None,
             neutral: None,
+            pair: PairOffset::new(),
+            both_eye_frames: 0,
+            reconstructed_frames: 0,
+            last_was_reconstructed: false,
+        }
+    }
+
+    /// How many poses this session owes to the one-eye fallback.
+    ///
+    /// For a status line or a diagnostics report: a reconstructed pose is a
+    /// guess, and a consumer has to be able to say so rather than present it
+    /// as a measurement.
+    pub fn fallback_stats(&self) -> FallbackStats {
+        FallbackStats {
+            both_eyes: self.both_eye_frames,
+            reconstructed: self.reconstructed_frames,
+            active: self.last_was_reconstructed,
         }
     }
 
@@ -118,6 +175,11 @@ impl FramePipeline {
     /// eye origins cannot: `pose_from_sample` pins pitch at zero by
     /// construction. Passing `None` asks for the geometric pose, which is what
     /// a 5-DOF run gets.
+    ///
+    /// The geometric pose comes from [`PairOffset`], so a frame carrying only
+    /// one tracked eye still produces one — with the missing eye placed at the
+    /// last measured offset, and never past `RECONSTRUCTION_MAX_AGE`. With
+    /// both eyes tracked it is bit for bit the two-eye geometry, unchanged.
     pub fn offer(
         &mut self,
         sample: &GazeSample,
@@ -129,7 +191,27 @@ impl FramePipeline {
         let presence = Presence::from_validity(sample.validity_l, sample.validity_r);
         let gaze = gaze_of(sample);
 
-        let pose = pose_in.or_else(|| pose_from_sample(sample)).map(|raw| {
+        // Offered the sample even when the model's pose is going to win: the
+        // offset between the eyes can only be measured on a two-eye frame, so
+        // letting the model's presence skip this would leave the fallback with
+        // nothing to reconstruct from the moment the model itself drops out.
+        // It changes no output — `pose_in` still wins below.
+        let geometric = self.pair.pose_from_sample(sample, now);
+        if pose_in.is_none() {
+            self.last_was_reconstructed =
+                geometric.map(|g| g.source) == Some(PoseSource::Reconstructed);
+            match geometric.map(|g| g.source) {
+                Some(PoseSource::BothEyes) => {
+                    self.both_eye_frames = self.both_eye_frames.saturating_add(1)
+                }
+                Some(PoseSource::Reconstructed) => {
+                    self.reconstructed_frames = self.reconstructed_frames.saturating_add(1)
+                }
+                None => {}
+            }
+        }
+
+        let pose = pose_in.or(geometric.map(|g| g.pose)).map(|raw| {
             let (ev_yaw, ev_pitch) = match (cfg.extended_view.enabled, corners, gaze) {
                 (true, Some(c), Some(g)) => {
                     let ev = fusion::extended_view(
@@ -190,6 +272,14 @@ impl FramePipeline {
                 // Dropped with the rest of the state: whoever comes back is
                 // sitting down again, and that is the position to call centre.
                 self.neutral = None;
+                // The offset between the eyes is state about *this* head in
+                // *this* posture, so it goes with the rest. Its own
+                // `RECONSTRUCTION_MAX_AGE` is far shorter than this, which
+                // makes the reset belt-and-braces rather than load-bearing —
+                // but leaving a measurement behind that the pipeline has
+                // already declared a lie would be a trap for whoever shortens
+                // one of the two bounds later.
+                self.pair.reset();
             }
         }
 
@@ -520,6 +610,173 @@ mod tests {
             "sitting back down is the new centre, not a 60 mm offset: {}",
             back.z_mm
         );
+    }
+
+    /// `s` after the tracker loses the right eye, in the shape the device
+    /// really sends: validity 4 with the origin column still **present** and
+    /// zeroed. Every gaze frame in the committed capture
+    /// (`crates/tobii-usb/tests/captures/session.tobiicap`) looks like that.
+    fn right_eye_lost(s: &GazeSample) -> GazeSample {
+        GazeSample {
+            validity_r: 4,
+            eye_origin_r_mm: [0.0; 3],
+            ..s.clone()
+        }
+    }
+
+    /// The regression for the path that did **not** change. With two tracked
+    /// eyes the composed pose has to be exactly what it always was — asserted
+    /// against pieces this change never touched, not against a recording of
+    /// its own output: the first pose is the neutral, so translation is
+    /// exactly zero; Extended View is off, so `compose` adds 0.0; and the
+    /// filter adopts its first sample outright. What is left is the two-eye
+    /// geometry, unchanged.
+    #[test]
+    fn with_both_eyes_the_composed_pose_is_bit_for_bit_what_it_was() {
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        // Deliberately asymmetric in all three axes, so yaw and roll are both
+        // non-zero and a dropped component cannot pass unnoticed.
+        let mut s = tracked_sample(Some([0.5, 0.5]));
+        s.eye_origin_l_mm = [-30.0, 6.0, 670.0];
+        s.eye_origin_r_mm = [30.0, -4.0, 690.0];
+
+        let got = p.offer(&s, None, &c, None, now).pose.expect("a pose");
+        let geometry = tobii_headpose::pose_from_sample(&s).expect("two tracked eyes");
+        assert_eq!(got.yaw_deg, geometry.yaw_deg, "yaw moved");
+        assert_eq!(got.roll_deg, geometry.roll_deg, "roll moved");
+        assert_eq!(got.pitch_deg, 0.0, "the geometric path pins pitch at zero");
+        assert_eq!((got.x_mm, got.y_mm, got.z_mm), (0.0, 0.0, 0.0));
+        assert_eq!(
+            p.fallback_stats(),
+            FallbackStats {
+                both_eyes: 1,
+                reconstructed: 0,
+                active: false
+            }
+        );
+    }
+
+    /// The point of the change. One dropped eye used to cost the frame its
+    /// pose; about five times a second, on a tracker the user cannot aim
+    /// perfectly.
+    #[test]
+    fn one_dropped_eye_no_longer_costs_the_frame_its_pose() {
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let both = seated(680.0);
+        assert_eq!(
+            p.offer(&both, None, &c, None, now).pose.map(|p| p.z_mm),
+            Some(0.0),
+            "premise: the first pose is the neutral"
+        );
+
+        let one = right_eye_lost(&both);
+        assert!(
+            p.offer(&one, None, &c, None, now).pose.is_none(),
+            "a single flickering frame must not switch the path"
+        );
+        let f = p.offer(&one, None, &c, None, now);
+        let pose = f.pose.expect("a dropped eye must no longer cost the pose");
+        assert_eq!(f.presence, Presence::OneEye);
+        // The head did not lurch toward the eye still being seen: that eye
+        // sits 32 mm to the left of the centre this reports.
+        assert_eq!(pose.x_mm, 0.0, "the reported centre moved sideways");
+        assert_eq!(
+            p.fallback_stats(),
+            FallbackStats {
+                both_eyes: 1,
+                reconstructed: 1,
+                active: true
+            }
+        );
+    }
+
+    /// A reconstructed pose is a guess, so it must not be able to travel as a
+    /// measurement. Nothing here logs — this crate cross-compiles for the Wine
+    /// bridge and has no logger — so the fallback is counted instead, and a
+    /// front end is what says it out loud.
+    #[test]
+    fn the_fallback_is_counted_rather_than_being_silent() {
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        assert_eq!(p.fallback_stats(), FallbackStats::default());
+
+        let both = seated(680.0);
+        let one = right_eye_lost(&both);
+        p.offer(&both, None, &c, None, now);
+        for _ in 0..4 {
+            p.offer(&one, None, &c, None, now);
+        }
+        let stats = p.fallback_stats();
+        assert_eq!(stats.both_eyes, 1);
+        assert_eq!(stats.reconstructed, 3, "one frame went to the debounce");
+        assert!(stats.active);
+
+        // And it stops being "active" the moment two eyes come back.
+        p.offer(&both, None, &c, None, now);
+        assert!(!p.fallback_stats().active);
+    }
+
+    /// The model's pose wins, and is not counted as geometry — but the sample
+    /// still reaches the offset. Skipping it while a model was in charge would
+    /// leave the fallback with nothing to reconstruct from at the moment the
+    /// model itself dropped out, which is the moment it is needed.
+    #[test]
+    fn a_model_pose_wins_but_the_offset_is_still_measured_underneath_it() {
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let supplied = HeadPose {
+            pitch_deg: 17.0,
+            ..Default::default()
+        };
+        let both = seated(680.0);
+        let f = p.offer(&both, Some(supplied), &c, None, now);
+        assert_eq!(f.pose.expect("a pose").pitch_deg, 17.0, "the model won");
+        assert_eq!(
+            p.fallback_stats(),
+            FallbackStats::default(),
+            "a model frame is not the geometric path's business"
+        );
+
+        // The model drops out on the same frame an eye does. The offset was
+        // measured while the model was in charge, so there is still a pose.
+        let one = right_eye_lost(&both);
+        p.offer(&one, None, &c, None, now);
+        assert!(
+            p.offer(&one, None, &c, None, now).pose.is_some(),
+            "the offset was never measured while the model was supplying poses"
+        );
+    }
+
+    /// A loss long enough to drop the neutral drops the offset with it.
+    ///
+    /// This cannot fail today — `RECONSTRUCTION_MAX_AGE` (300 ms) expires long
+    /// before `TRACKING_LOSS_RESET` (1 s), so the offset is stale either way.
+    /// It is here for whoever changes one of those two numbers: lengthen the
+    /// age bound past the loss reset and the pipeline would otherwise resume
+    /// from an offset it has already called a lie.
+    #[test]
+    fn a_long_loss_forgets_the_offset_as_well_as_the_neutral() {
+        let now = Instant::now();
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        p.offer(&seated(680.0), None, &c, None, now);
+        p.offer(&lost(), None, &c, None, now + TRACKING_LOSS_RESET);
+        assert_eq!(p.neutral, None, "premise: the long loss reset the state");
+
+        let one = right_eye_lost(&seated(680.0));
+        let back = now + TRACKING_LOSS_RESET + Duration::from_millis(30);
+        for _ in 0..4 {
+            assert!(
+                p.offer(&one, None, &c, None, back).pose.is_none(),
+                "reconstructed from an offset measured before the user left"
+            );
+        }
     }
 
     /// A present bit is not validity. A sample can carry a stale gaze point
