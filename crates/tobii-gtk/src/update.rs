@@ -31,13 +31,20 @@
 //! release without one, the PKGBUILD and its hook — into a folder they pick, and
 //! says what to run, with every path quoted so the command survives a paste.
 //!
-//! Two more cases, both found on 2026-09-11. A copy nobody owns but that sits
-//! where this user cannot write — `sudo ./install.sh --system`, or one copied by
-//! hand into a system directory — also gets **Download**: the archive, and the
-//! one command that installs it for every user. And a copy that was replaced or
-//! removed while it ran has nothing at its path to update, so it gets **Quit**:
-//! relaunching would only hand off to this same process. The decision is
-//! `tobii_update::install::action_for`, and nothing is written to reach it.
+//! Four more cases. A copy nobody owns but that only an administrator can
+//! replace — `sudo ./install.sh --system`, one copied by hand into a system
+//! directory, or another account's files in a shared folder — also gets
+//! **Download**: the archive, and the one command that installs it for every
+//! user. A copy in this user's own directory whose files another account owns —
+//! root's, from an install into `~/.local/bin` run with sudo — gets
+//! **Download** too, with the plain `./install.sh`, no sudo, that replaces
+//! them. A folder that cannot be written but is the user's to fix — their own
+//! (`chmod u+w`), or one in their home that root made (a `sudo chown` of that
+//! one folder) — gets no button at all, only the command: there is nothing to
+//! download. And a copy that was replaced or removed while it ran has nothing
+//! at its path to update, so it gets **Quit**: relaunching would only hand off
+//! to this same process. The decision is `tobii_update::install::action_for`,
+//! and nothing is written to reach it.
 //!
 //! # What pressing Update or Download trusts
 //!
@@ -59,7 +66,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Align, Label, Orientation};
 
-use tobii_update::install::Action;
+use tobii_update::install::{Action, FolderFix};
 use tobii_update::release::{Asset, Blocked, Channel, Check, Release};
 
 /// How the banner reads for a release.
@@ -126,22 +133,38 @@ pub fn home_headline(version: &str, dir: &Path) -> String {
     )
 }
 
-/// How an archive download is installed, for a copy no package manager owns.
-#[derive(Clone)]
-enum ArchiveInstall {
-    /// Into a directory only an administrator can change.
-    System(PathBuf),
-    /// Into this user's own directory, over files another account owns.
-    Home(PathBuf),
-}
-
-/// The banner for a copy only an administrator can replace.
+/// The banner for a copy only an administrator can replace — in a folder this
+/// user cannot write, or in a shared one that is not theirs.
 pub fn system_headline(version: &str, dir: &Path) -> String {
     format!(
-        "Version {version} is available. This copy is in {}, which only an administrator \
-         can change, so it cannot be replaced from here. Download fetches the release and \
-         says the one command that installs it for every user.",
+        "Version {version} is available. This copy is in {}, where only an administrator \
+         can replace it, so it cannot be updated from here. Download fetches the release \
+         and says the one command that installs it for every user.",
         dir.display()
+    )
+}
+
+/// The banner for a folder the user cannot write but can fix with one
+/// command, which it ends with. Nothing is downloaded, so it ends by saying to
+/// reopen the app: the banner is decided once per launch, and the next one
+/// decides again — Update, or for root's files left in the folder a TakeBack
+/// gave back, the home download.
+pub fn fix_folder_headline(version: &str, dir: &Path, fix: FolderFix) -> String {
+    let (state, remedy) = match fix {
+        FolderFix::MakeWritable => (
+            "which is yours but not writable,",
+            "Make it writable, then reopen the app",
+        ),
+        FolderFix::TakeBack => (
+            "a folder in your home that another account owns — sudo made it, probably —",
+            "Give that one folder back to yourself, then reopen the app",
+        ),
+    };
+    format!(
+        "Version {version} is available. This copy is in {}, {state} so it cannot be \
+         updated from here, and nothing needs downloading. {remedy}:\n  {}",
+        dir.display(),
+        fix.command(dir)
     )
 }
 
@@ -169,7 +192,7 @@ pub fn saved_for_home(dir: &Path, files: &[PathBuf]) -> String {
     )
 }
 
-/// The shared shape of the two archive messages: where it went, and the
+/// The shared shape of every archive message: where it went, and the
 /// unpack-then-install command, with every path quoted.
 fn saved_archive(files: &[PathBuf], lead: &str, install: &str) -> String {
     let Some(first) = files.first() else {
@@ -256,13 +279,12 @@ pub fn saved(channel: Channel, files: &[PathBuf]) -> String {
         // installs into ~/.local/bin, which does not replace the packaged copy
         // — it shadows it, and a user who is not told that will wonder why the
         // version did not change after an upgrade.
-        Channel::Archive => format!(
-            "Saved {first_name} to {dir}.\nThis release publishes no package for your \
-             system, so this is the plain archive: it installs into ~/.local/bin, beside \
-             the copy your package manager owns rather than over it.\n  cd {dir} && tar \
-             -xzf {} && cd {} && ./install.sh",
-            sh_quote(&first_name),
-            sh_quote(first_name.trim_end_matches(".tar.gz"))
+        Channel::Archive => saved_archive(
+            files,
+            "This release publishes no package for your system, so this is the plain archive: \
+             it installs into ~/.local/bin, beside the copy your package manager owns rather \
+             than over it.",
+            "./install.sh",
         ),
     }
 }
@@ -397,7 +419,7 @@ pub fn banner() -> gtk::Box {
                 // claims it — so an unchecked one is a "click here" button
                 // pointing wherever the document says.
                 let url = url.clone();
-                notes_btn.connect_clicked(move |btn| {
+                notes_btn.connect_clicked(move |_| {
                     if tobii_update::net::is_trusted(&url) {
                         let _ = gtk::gio::AppInfo::launch_default_for_uri(
                             &url,
@@ -409,7 +431,6 @@ pub fn banner() -> gtk::Box {
                              allowlist: {url}"
                         ));
                     }
-                    let _ = btn;
                 });
                 crate::widget::set_button_text(notes_btn, "Releases");
                 row.set_visible(true);
@@ -423,8 +444,7 @@ pub fn banner() -> gtk::Box {
                 };
                 // Decided in `tobii_update::install::action_for`, where every
                 // case is tested. Logged, because "which button did it show,
-                // and why" is the first question about any update report, and
-                // until 2026-09-11 the log had nothing to answer it with.
+                // and why" is the first question about any update report.
                 let action = placed
                     .as_ref()
                     .map(tobii_update::install::action_for)
@@ -433,56 +453,45 @@ pub fn banner() -> gtk::Box {
                     "update {} available; this copy: {placed:?}; offering {action:?}",
                     release.version
                 ));
-                match action {
+                let version = release.version.to_string();
+                match &action {
                     // Nothing at this copy's path to update: it was replaced or
                     // removed while it ran. Relaunching would hand off to this
                     // same process, so the button quits it.
                     Action::Restart => {
-                        text.set_text(&restart_headline(&release.version.to_string()));
+                        text.set_text(&restart_headline(&version));
                         crate::widget::set_button_text(update_btn, "Quit");
                         wire_notes(&banner, &release);
-                        update_btn.connect_clicked(|_| {
-                            if let Some(app) = gtk::gio::Application::default() {
-                                app.activate_action("quit", None);
-                            }
-                        });
+                        update_btn.connect_clicked(|_| quit_app());
                     }
                     // The installer would refuse this one, and only after the
                     // user had pressed Update and waited for the download. Ask
                     // for less: fetch the file their package manager can
                     // install, and leave the installing to it.
                     Action::DownloadPackage { manager, package } => {
-                        text.set_text(&packaged_headline(
-                            &release.version.to_string(),
-                            &manager,
-                            &package,
-                        ));
-                        crate::widget::set_button_text(update_btn, "Download");
-                        wire_download(&banner, *release, manager, None);
+                        text.set_text(&packaged_headline(&version, manager, package));
+                        wire_download(&banner, *release, action.clone());
                     }
                     // Nobody owns it, but only an administrator can replace it:
                     // the archive, and the command that installs it for everyone.
                     Action::DownloadForSystem { dir } => {
-                        text.set_text(&system_headline(&release.version.to_string(), &dir));
-                        crate::widget::set_button_text(update_btn, "Download");
-                        wire_download(
-                            &banner,
-                            *release,
-                            String::new(),
-                            Some(ArchiveInstall::System(dir)),
-                        );
+                        text.set_text(&system_headline(&version, dir));
+                        wire_download(&banner, *release, action.clone());
                     }
                     // The folder is this user's and the files in it are not:
                     // the archive, and the plain ./install.sh that replaces them.
                     Action::DownloadForHome { dir } => {
-                        text.set_text(&home_headline(&release.version.to_string(), &dir));
-                        crate::widget::set_button_text(update_btn, "Download");
-                        wire_download(
-                            &banner,
-                            *release,
-                            String::new(),
-                            Some(ArchiveInstall::Home(dir)),
-                        );
+                        text.set_text(&home_headline(&version, dir));
+                        wire_download(&banner, *release, action.clone());
+                    }
+                    // A folder the user can fix with one command. There is
+                    // nothing to download, so no button: the command, selectable
+                    // so it can be copied out rather than retyped.
+                    Action::FixFolder { dir, fix } => {
+                        text.set_text(&fix_folder_headline(&version, dir, *fix));
+                        text.set_selectable(true);
+                        update_btn.set_visible(false);
+                        wire_notes(&banner, &release);
                     }
                     Action::Update => {
                         text.set_text(&headline(&release));
@@ -523,15 +532,35 @@ fn wire_notes(b: &Banner, release: &Release) {
     });
 }
 
+/// Quit through the application's `quit` action, the hub's own teardown.
+fn quit_app() {
+    if let Some(app) = gtk::gio::Application::default() {
+        app.activate_action("quit", None);
+    }
+}
+
 /// Attach the two actions once a release is actually in hand.
 fn wire(b: &Banner, release: Release) {
     wire_notes(b, &release);
-    let (text, dismiss, notes_btn) = (b.text.clone(), b.dismiss.clone(), b.notes.clone());
+    // Set once an install finds this copy replaced while it ran: from then on
+    // the button quits — see `install_finished`.
+    let quits = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (text, dismiss, notes) = (b.text.clone(), b.dismiss.clone(), b.notes.clone());
     b.action.connect_clicked(move |btn| {
-        btn.set_sensitive(false);
-        notes_btn.set_sensitive(false);
-        dismiss.set_sensitive(false);
-        text.set_text(&installing("starting"));
+        if quits.get() {
+            quit_app();
+            return;
+        }
+        let b = Banner {
+            text: text.clone(),
+            notes: notes.clone(),
+            action: btn.clone(),
+            dismiss: dismiss.clone(),
+        };
+        b.action.set_sensitive(false);
+        b.notes.set_sensitive(false);
+        b.dismiss.set_sensitive(false);
+        b.text.set_text(&installing("starting"));
 
         // Closing the window mid-install would otherwise end the process
         // between the two renames, leaving a new `tobii` beside an old
@@ -545,6 +574,7 @@ fn wire(b: &Banner, release: Release) {
         // no widgets.
         let (tx, rx) = std::sync::mpsc::channel();
         let (ptx, prx) = std::sync::mpsc::channel::<String>();
+        let version = release.version.to_string();
         let release = release.clone();
         std::thread::spawn(move || {
             let report = |s: &str| {
@@ -553,59 +583,93 @@ fn wire(b: &Banner, release: Release) {
             let _ = tx.send(tobii_update::install_release(&release, &report));
         });
 
-        let (text, btn, dismiss) = (text.clone(), btn.clone(), dismiss.clone());
         // `hold()` hands back an RAII guard, so releasing it is a drop.
         let guard = std::cell::RefCell::new(guard);
         let release_hold = move || drop(guard.borrow_mut().take());
+        let quits = quits.clone();
         glib::timeout_add_local(Duration::from_millis(150), move || {
             while let Ok(step) = prx.try_recv() {
-                text.set_text(&installing(&step));
+                b.text.set_text(&installing(&step));
             }
-            match rx.try_recv() {
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Ok(Ok(done)) => {
-                    release_hold();
-                    tobii_diagnostics::log::info(&format!("updated to {}", done.version));
-                    text.set_text(&format!("Updated to {}. Restart to run it.", done.version));
-                    btn.set_visible(false);
-                    dismiss.set_sensitive(true);
-                    crate::widget::set_button_text(&dismiss, "Close");
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(e)) => {
-                    release_hold();
-                    tobii_diagnostics::log::warn(&format!("update failed: {e}"));
-                    text.set_text(&format!("Update failed: {e}"));
-                    btn.set_sensitive(true);
-                    dismiss.set_sensitive(true);
-                    glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    release_hold();
-                    tobii_diagnostics::log::warn("update failed: the updater thread vanished");
-                    text.set_text("Update failed: the updater stopped unexpectedly.");
-                    btn.set_sensitive(true);
-                    dismiss.set_sensitive(true);
-                    glib::ControlFlow::Break
-                }
-            }
+            let outcome = match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Ok(outcome) => Some(outcome),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            };
+            release_hold();
+            quits.set(install_finished(&b, &version, outcome));
+            glib::ControlFlow::Break
         });
     });
 }
 
-/// Attach the two actions for a copy a package manager owns.
+/// The banner once an install has ended: `outcome` is `None` when the worker
+/// vanished without an answer. Returns whether the button now quits.
+///
+/// "What's new" and Later come back in every case: both were greyed out for the
+/// install, and nothing else turns them on again. A copy found replaced while it
+/// ran gets the Quit button the banner offers such a copy at launch — this
+/// banner was decided before it was replaced, and pressing Update again could
+/// only be refused again.
+fn install_finished(
+    b: &Banner,
+    version: &str,
+    outcome: Option<Result<tobii_update::Installed, tobii_update::InstallError>>,
+) -> bool {
+    b.notes.set_sensitive(true);
+    b.dismiss.set_sensitive(true);
+    match outcome {
+        Some(Ok(done)) => {
+            tobii_diagnostics::log::info(&format!("updated to {}", done.version));
+            b.text
+                .set_text(&format!("Updated to {}. Restart to run it.", done.version));
+            b.action.set_visible(false);
+            crate::widget::set_button_text(&b.dismiss, "Close");
+            false
+        }
+        Some(Err(tobii_update::InstallError::ReplacedWhileRunning)) => {
+            tobii_diagnostics::log::info(
+                "update refused: this copy was replaced while it ran; offering Quit",
+            );
+            b.text.set_text(&restart_headline(version));
+            crate::widget::set_button_text(&b.action, "Quit");
+            b.action.set_sensitive(true);
+            true
+        }
+        Some(Err(e)) => {
+            tobii_diagnostics::log::warn(&format!("update failed: {e}"));
+            b.text.set_text(&format!("Update failed: {e}"));
+            b.action.set_sensitive(true);
+            false
+        }
+        None => {
+            tobii_diagnostics::log::warn("update failed: the updater thread vanished");
+            b.text
+                .set_text("Update failed: the updater stopped unexpectedly.");
+            b.action.set_sensitive(true);
+            false
+        }
+    }
+}
+
+/// Attach the two actions for a copy that cannot be replaced from here.
 ///
 /// Same banner and the same changelog; the second button fetches instead of
-/// installing. `manager` is the tool that answered the ownership query — it
-/// picks the file, because a `.deb` is no use to somebody running `pacman`.
-///
-/// `system_dir` is set instead for a copy nobody owns in a directory only an
-/// administrator can write. `manager` is then empty, so the file is the plain
-/// archive, and the saved message is the `--system` install for that directory.
-fn wire_download(b: &Banner, release: Release, manager: String, archive: Option<ArchiveInstall>) {
+/// installing. For a packaged copy the manager that answered the ownership
+/// query picks the file, because a `.deb` is no use to somebody running
+/// `pacman`. A copy nobody owns has no manager, so the file is the plain
+/// archive, and the saved message is the matching command: `sudo ./install.sh
+/// --system DIR` for [`Action::DownloadForSystem`], a plain `./install.sh DIR`
+/// for [`Action::DownloadForHome`].
+fn wire_download(b: &Banner, release: Release, action: Action) {
     wire_notes(b, &release);
+    crate::widget::set_button_text(&b.action, "Download");
+    let manager = match &action {
+        Action::DownloadPackage { manager, .. } => manager.as_str(),
+        _ => "",
+    };
 
-    let Some(offer) = release.offer_for(&manager, &tobii_update::Target::triple()) else {
+    let Some(offer) = release.offer_for(manager, &tobii_update::Target::triple()) else {
         // `Check::Newer` is only reached when the release has an archive for
         // this machine, so there is always at least the fallback to offer. If
         // that ever stops being true, no button beats one that can only fail.
@@ -630,13 +694,13 @@ fn wire_download(b: &Banner, release: Release, manager: String, archive: Option<
         if let Some(d) = default_download_dir() {
             dialog.set_initial_folder(Some(&gtk::gio::File::for_path(d)));
         }
-        let (release, files, archive) = (release.clone(), files.clone(), archive.clone());
+        let (release, files, action) = (release.clone(), files.clone(), action.clone());
         dialog.select_folder(
             btn.root().and_downcast::<gtk::Window>().as_ref(),
             gtk::gio::Cancellable::NONE,
             move |chosen| match chosen {
                 Ok(folder) => match folder.path() {
-                    Some(into) => start_download(&b, release, files, channel, into, archive),
+                    Some(into) => start_download(&b, release, files, channel, into, action),
                     // A location gio can name and the filesystem cannot: a
                     // remote share that is not mounted, or a trash URI.
                     None => b.text.set_text(
@@ -667,7 +731,7 @@ fn start_download(
     files: Vec<Asset>,
     channel: Channel,
     into: PathBuf,
-    archive: Option<ArchiveInstall>,
+    action: Action,
 ) {
     b.action.set_sensitive(false);
     crate::widget::set_button_text(&b.action, "Downloading…");
@@ -704,10 +768,10 @@ fn start_download(
         match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Ok(Ok(written)) => {
-                b.text.set_text(&match &archive {
-                    Some(ArchiveInstall::System(dir)) => saved_for_system(dir, &written),
-                    Some(ArchiveInstall::Home(dir)) => saved_for_home(dir, &written),
-                    None => saved(channel, &written),
+                b.text.set_text(&match &action {
+                    Action::DownloadForSystem { dir } => saved_for_system(dir, &written),
+                    Action::DownloadForHome { dir } => saved_for_home(dir, &written),
+                    _ => saved(channel, &written),
                 });
                 // The message is now a command to run: selectable so it can be
                 // copied out of the banner instead of retyped from it.
@@ -757,11 +821,21 @@ fn ready_again(b: &Banner) {
 /// file chooser at a directory that is not there is worse than not pointing it
 /// anywhere. Neither is created — a program that makes folders in somebody's
 /// home directory to open a dialog has overstepped.
+///
+/// A folder the download would refuse is skipped too — a Downloads folder a
+/// service's group can write, as `tropaion:sabnzbd 0775` on the machine this
+/// was found on — so the chooser does not open where the download cannot go.
+/// Picking it by hand is still refused, and the refusal says who can write it.
 fn default_download_dir() -> Option<PathBuf> {
-    let usable = |p: PathBuf| p.is_dir().then_some(p);
     glib::user_special_dir(glib::UserDirectory::Downloads)
-        .and_then(usable)
-        .or_else(|| usable(glib::home_dir()))
+        .and_then(usable_download_dir)
+        .or_else(|| usable_download_dir(glib::home_dir()))
+}
+
+/// `p`, if the chooser may start there: it exists, and a download into it
+/// would not be refused.
+fn usable_download_dir(p: PathBuf) -> Option<PathBuf> {
+    (p.is_dir() && tobii_update::install::download_folder_ok(&p)).then_some(p)
 }
 
 /// A window showing the release notes.
@@ -988,9 +1062,15 @@ mod tests {
                 &["tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz"],
             ),
         );
-        assert!(a.contains("no package for your system"), "{a}");
-        assert!(a.contains("~/.local/bin"), "{a}");
-        assert!(a.contains("beside"), "{a}");
+        // Whole, so a space lost at a line continuation shows.
+        assert!(
+            a.contains(
+                "This release publishes no package for your system, so this is the plain \
+                 archive: it installs into ~/.local/bin, beside the copy your package manager \
+                 owns rather than over it."
+            ),
+            "{a}"
+        );
         // The unpacked directory, not the archive, is what install.sh is in.
         assert!(
             a.contains("cd 'tobii-linux-0.3.0-x86_64-unknown-linux-gnu' && ./install.sh"),
@@ -1121,12 +1201,6 @@ mod tests {
             assert!(!t.contains(overclaim), "{overclaim:?} overstates it: {t}");
         }
     }
-}
-
-/// The texts the banner shows for the two cases `action_for` added.
-#[cfg(test)]
-mod banner_text_tests {
-    use super::*;
 
     #[test]
     fn a_copy_replaced_while_running_is_told_to_quit_and_start_again() {
@@ -1164,6 +1238,8 @@ mod banner_text_tests {
         );
         let h = system_headline("0.3.1", Path::new("/usr/local/bin"));
         assert!(h.contains("/usr/local/bin") && h.contains("0.3.1"), "{h}");
+        // True for an unwritable folder and for a shared one alike.
+        assert!(h.contains("only an administrator can replace it"), "{h}");
     }
 
     /// Someone else's files in this user's own directory: the plain command, no
@@ -1204,9 +1280,109 @@ mod banner_text_tests {
         }
     }
 
+    /// A folder the user can fix: the command, the folder, and to reopen the
+    /// app — no download, and no sudo for a folder of their own.
     #[test]
-    fn a_quoted_word_survives_a_single_quote_inside_it() {
-        assert_eq!(sh_quote("it's"), r"'it'\''s'");
-        assert_eq!(sh_quote("/plain/path"), "'/plain/path'");
+    fn a_folder_the_user_can_fix_is_handed_the_command_and_told_to_reopen() {
+        let dir = Path::new("/home/u/My Apps");
+        let own = fix_folder_headline("0.3.1", dir, FolderFix::MakeWritable);
+        assert!(
+            own.contains("0.3.1") && own.contains("/home/u/My Apps"),
+            "{own}"
+        );
+        assert!(
+            own.ends_with("reopen the app:\n  chmod u+w '/home/u/My Apps'"),
+            "{own}"
+        );
+        assert!(!own.contains("sudo") && !own.contains("Download"), "{own}");
+
+        let root_s = fix_folder_headline("0.3.1", dir, FolderFix::TakeBack);
+        let chown = FolderFix::TakeBack.command(dir);
+        assert!(chown.starts_with("sudo chown "), "{chown}");
+        assert!(
+            root_s.ends_with(&format!("reopen the app:\n  {chown}")),
+            "{root_s}"
+        );
+        assert!(root_s.contains("another account owns"), "{root_s}");
+        assert!(!root_s.contains("--system"), "{root_s}");
+    }
+
+    /// The chooser does not open in a folder the download would refuse.
+    #[test]
+    fn the_chooser_does_not_start_in_a_folder_the_download_would_refuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("tobii-gtk-dlstart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir(&d).unwrap();
+        let mode = |m| std::fs::set_permissions(&d, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o755);
+        assert_eq!(usable_download_dir(d.clone()), Some(d.clone()));
+        mode(0o777);
+        let refused = usable_download_dir(d.clone());
+        mode(0o755);
+        let gone = usable_download_dir(d.join("missing"));
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(refused, None, "anyone can write it");
+        assert_eq!(gone, None, "not there");
+    }
+
+    /// After an install ends, whichever way, "What's new" and Later work again;
+    /// a copy found replaced while it ran turns the button into Quit.
+    ///
+    /// Needs a display: `cargo test -p tobii-gtk --lib -- --ignored
+    /// a_finished_install`.
+    #[test]
+    #[ignore = "needs a display"]
+    fn a_finished_install_gives_back_whats_new_and_a_replaced_copy_gets_quit() {
+        use tobii_update::{InstallError, Installed};
+        gtk::init().expect("a display");
+        let pressed = || {
+            let b = Banner {
+                text: Label::new(None),
+                notes: crate::widget::button("What's new"),
+                action: crate::widget::button("Update"),
+                dismiss: crate::widget::button("Later"),
+            };
+            b.action.set_sensitive(false);
+            b.notes.set_sensitive(false);
+            b.dismiss.set_sensitive(false);
+            b
+        };
+        let label = |btn: &gtk::Button| {
+            btn.child()
+                .and_downcast::<Label>()
+                .map(|l| l.text().to_string())
+                .unwrap_or_default()
+        };
+
+        let installed = Installed {
+            dir: PathBuf::from("/home/u/.local/bin"),
+            replaced: vec!["tobii".into()],
+            version: "0.3.1".into(),
+        };
+        let cases: [(Option<Result<Installed, InstallError>>, bool); 4] = [
+            (Some(Ok(installed)), false),
+            (Some(Err(InstallError::NoChecksums)), false),
+            (None, false),
+            (Some(Err(InstallError::ReplacedWhileRunning)), true),
+        ];
+        for (outcome, quits) in cases {
+            let what = format!("{outcome:?}");
+            let b = pressed();
+            assert_eq!(install_finished(&b, "0.3.1", outcome), quits, "{what}");
+            assert!(
+                b.notes.is_sensitive(),
+                "What's new stays greyed out: {what}"
+            );
+            assert!(b.dismiss.is_sensitive(), "{what}");
+            if quits {
+                assert_eq!(label(&b.action), "Quit", "{what}");
+                assert!(b.action.is_sensitive(), "{what}");
+                assert!(
+                    b.text.text().contains("Quit it and start it again"),
+                    "{what}"
+                );
+            }
+        }
     }
 }

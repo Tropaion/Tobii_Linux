@@ -120,14 +120,32 @@ pub enum InstallError {
         name: String,
         detail: String,
     },
-    /// The directory the binaries live in cannot be written to.
+    /// Only an administrator can replace the binaries in this directory: it
+    /// cannot be written to and is not this user's to fix, or it is shared and
+    /// the binaries in it are another account's.
     NotWritable(PathBuf),
+    /// The directory cannot be written to, and one command of this user's own
+    /// fixes that — see [`FolderFix`]. Nothing needs downloading by hand.
+    FolderNotWritable {
+        dir: PathBuf,
+        fix: FolderFix,
+    },
     /// The directory is this user's, but the binaries in it belong to another
     /// account, so the swap's backup of them cannot be made.
     NotYours(PathBuf),
+    /// Running as root on binaries that belong to another account: `sudo tobii
+    /// update --install` on an ordinary home install. Refused, since as root the
+    /// swap would work and leave root's files there — the state
+    /// [`InstallError::NotYours`] exists to undo — and the advice is only to
+    /// drop the sudo.
+    RunWithoutSudo(PathBuf),
     /// The folder a download would go into can be changed by someone other than
     /// this user, so what was checked could be swapped before it is installed.
-    UnsafeFolder(PathBuf),
+    /// `why` says who, and through which folder.
+    UnsafeFolder {
+        path: PathBuf,
+        why: String,
+    },
     /// The running binary was deleted or replaced after it started, so there is
     /// nothing at its path for an update to replace.
     ReplacedWhileRunning,
@@ -224,34 +242,64 @@ impl std::fmt::Display for InstallError {
                  package database wrong, and this cannot rule that out. Fix {manager}, or \
                  update through your package manager."
             ),
-            // Not "re-run with the permission to write there", which it said
-            // until 2026-09-11: in the hub that means running a GUI as root,
-            // and under sudo HOME is /root, so every follow-on step goes wrong.
+            // Not "re-run with the permission to write there": in the hub that
+            // means running a GUI as root, and under sudo HOME is /root, so
+            // every follow-on step goes wrong.
             InstallError::NotWritable(p) => write!(
                 f,
-                "{} is not writable by you, so the update cannot be installed there. \
-                 Download the release archive and SHA256SUMS from the releases page, check \
-                 them with `sha256sum -c --ignore-missing SHA256SUMS`, unpack the archive, \
-                 and run `sudo ./install.sh --system {}` in it.",
+                "only an administrator can replace the program's files in {}, so the update \
+                 cannot be installed there. {}.",
                 p.display(),
-                shell_word(&p.to_string_lossy())
+                by_hand(&format!(
+                    "sudo ./install.sh --system {}",
+                    shell_word(&p.to_string_lossy())
+                ))
             ),
+            InstallError::FolderNotWritable { dir, fix } => {
+                let (state, remedy) = match fix {
+                    FolderFix::MakeWritable => (
+                        "is yours but you cannot write to it",
+                        "It is not root's, so sudo would not help. Make it writable",
+                    ),
+                    FolderFix::TakeBack => (
+                        "is in your home folder but belongs to another account — made with \
+                         sudo, probably",
+                        "Give that one folder back to yourself, not what is in it",
+                    ),
+                };
+                write!(
+                    f,
+                    "{} {state}, so the update cannot be installed there. Nothing needs \
+                     downloading. {remedy}: `{}`, then run `tobii update --install` again.",
+                    dir.display(),
+                    fix.command(dir)
+                )
+            }
             InstallError::NotYours(p) => write!(
                 f,
                 "the program's files in {} belong to another account — installed with sudo, \
-                 probably — so they cannot be replaced in place. Download the release archive \
-                 and SHA256SUMS from the releases page, check them with \
-                 `sha256sum -c --ignore-missing SHA256SUMS`, unpack the archive, and run \
-                 `./install.sh {}` in it WITHOUT sudo: that replaces them with files you own.",
+                 probably — so they cannot be replaced in place. {} WITHOUT sudo: that \
+                 replaces them with files you own.",
                 p.display(),
-                shell_word(&p.to_string_lossy())
+                by_hand(&format!(
+                    "./install.sh {}",
+                    shell_word(&p.to_string_lossy())
+                ))
             ),
-            InstallError::UnsafeFolder(p) => write!(
+            InstallError::RunWithoutSudo(p) => write!(
                 f,
-                "{} can be changed by someone other than you, so a download there could be \
-                 swapped after its checksum was checked and before you install it as root. \
-                 Pick a folder only you can write to.",
+                "this is running as root — under sudo, probably — and the program's files in \
+                 {} belong to another account, so updating them as root would leave them \
+                 root's. Nothing was changed. Run `tobii update --install` again as the \
+                 account that owns them, without sudo.",
                 p.display()
+            ),
+            InstallError::UnsafeFolder { path, why } => write!(
+                f,
+                "{} can be changed by someone other than you ({why}), so a download there \
+                 could be swapped after its checksum was checked and before you install it. \
+                 Pick a folder only you can write to.",
+                path.display()
             ),
             InstallError::ReplacedWhileRunning => write!(
                 f,
@@ -517,15 +565,16 @@ fn read_capped<R: std::io::Read>(pipe: Option<R>) -> Vec<u8> {
 
 /// Wait for a child, killing it if it outstays `limit`.
 ///
-/// The 25 ms `try_wait` loop every subprocess in this file needs, written once
-/// so all three callers are bounded by construction rather than by remembering
-/// to be. It used to say exactly that while `probe` kept its own copy.
+/// The 25 ms `try_wait` loop every subprocess here and in `tobii uninstall`
+/// needs, written once so each caller is bounded by construction rather than by
+/// remembering to be. Public for that second caller: keep one copy, not two.
+/// Each pipe is read up to 256 KiB.
 ///
 /// The pipes are read *after* the child has exited, rather than with
 /// `wait_with_output`, which waits for the pipe to close — a probed binary that
 /// spawned a child holding it open would hang there, past the deadline that was
 /// supposed to bound this.
-fn wait_bounded(
+pub fn wait_bounded(
     mut child: std::process::Child,
     limit: std::time::Duration,
 ) -> Result<std::process::Output, String> {
@@ -583,15 +632,41 @@ pub struct Placement {
     pub owner: Ownership,
     /// Whether this user may write the directory: faccessat(W_OK), which counts
     /// read-only mounts and ACLs. One they cannot write is one only an
-    /// administrator can change — [`Action::DownloadForSystem`].
+    /// administrator can change — [`Action::DownloadForSystem`] — unless it is
+    /// their own ([`Placement::dir_mine`]) or in their home
+    /// ([`Placement::dir_in_home`]).
     pub dir_writable: bool,
     /// Whether every binary in it belongs to this user. Not implied by the first,
     /// and not the same case: with `fs.protected_hardlinks` on — the kernel
     /// default, and 1 on the machine this was found on — the swap's hard-linked
     /// backup of a file you do not own fails with EPERM even in a directory you
-    /// can write. That is what `sudo ./install.sh ~/.local/bin` leaves, and it
-    /// needs no administrator to fix — [`Action::DownloadForHome`].
+    /// can write. That is what an install into `~/.local/bin` run with sudo
+    /// leaves, and it needs no administrator to fix — [`Action::DownloadForHome`].
     pub binaries_mine: bool,
+    /// Whether the directory itself belongs to this user: `stat`, following a
+    /// symlink as the faccessat behind [`Placement::dir_writable`] does.
+    ///
+    /// It decides two things. An unwritable directory of their own needs
+    /// `chmod u+w`, not sudo: `sudo ./install.sh --system` there would put
+    /// root's files into it — the [`Action::DownloadForHome`] state — and a menu
+    /// entry for every user pointing into one user's folder. And the plain
+    /// install that replaces another account's files is offered only here: in a
+    /// sticky folder someone else owns, rename(2) over a file refuses anyone but
+    /// the file's owner or the folder's, so `./install.sh` stops at its first
+    /// `mv`; and a group-writable system folder (/usr/local/bin as root:staff
+    /// 2775) holds files every user runs, which a per-user install should not
+    /// take over.
+    pub dir_mine: bool,
+    /// Whether the directory is strictly inside this user's home, as `$HOME`
+    /// names it once symlinks are resolved (`current_exe` is the path the kernel
+    /// resolved, and /home may be a link to /var/home). False when `$HOME` is
+    /// unset, relative, or cannot be resolved.
+    ///
+    /// An unwritable folder in the home that is not the user's is what v0.3.0's
+    /// `sudo ./install.sh ~/.local/bin` left when ~/.local/bin did not exist yet:
+    /// root made it. A non-recursive chown gives it back — see
+    /// [`FolderFix::TakeBack`].
+    pub dir_in_home: bool,
     /// The running binary was deleted or replaced after it started.
     pub exe_gone: bool,
 }
@@ -603,20 +678,60 @@ pub enum Action {
     Update,
     /// A package manager owns this copy, so fetch the file it installs.
     DownloadPackage { manager: String, package: String },
-    /// Nobody owns it, but it is somewhere this user cannot replace — a
-    /// `sudo ./install.sh --system` install, or one copied by hand into a system
-    /// directory. Fetch the archive and hand over the one command that installs
-    /// it there.
+    /// Nobody owns it, but it is somewhere only an administrator can replace it
+    /// — a `sudo ./install.sh --system` install, one copied by hand into a
+    /// system directory, or another account's files in a folder that is not
+    /// this user's either. Fetch the archive and hand over the one command that
+    /// installs it there.
     DownloadForSystem { dir: PathBuf },
-    /// Nobody owns it and the directory is this user's to write, but the
-    /// binaries in it belong to another account. Fetch the archive, and hand over
-    /// the plain `./install.sh` — no sudo, which is what left them there — that
-    /// replaces them with files this user owns: rename(2) in a writable,
-    /// non-sticky directory does not care who owns the file it replaces.
+    /// Nobody owns it and the directory is this user's own, but the binaries in
+    /// it belong to another account. Fetch the archive, and hand over the plain
+    /// `./install.sh` — no sudo, which is what left them there — that replaces
+    /// them with files this user owns: rename(2) in a directory you own does not
+    /// care who owns the file it replaces, sticky bit or not.
     DownloadForHome { dir: PathBuf },
+    /// Nobody owns it, and the directory cannot be written, but one command of
+    /// this user's fixes that — see [`FolderFix`]. There is nothing to download:
+    /// the banner shows the command, and the next start decides again.
+    FixFolder { dir: PathBuf, fix: FolderFix },
     /// This copy was deleted or replaced while it ran. There is nothing here to
     /// update: quitting and starting again runs whatever is installed now.
     Restart,
+}
+
+/// What makes an unwritable install directory writable again, when that is the
+/// user's own to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderFix {
+    /// The folder is theirs and only its mode is wrong (0555): `chmod u+w`. Not
+    /// sudo — it would change nothing a chmod cannot, and `--system` would put
+    /// root's files into it.
+    MakeWritable,
+    /// The folder is in their home and another account owns it: a chown of that
+    /// one folder, not of what is in it. Afterwards the binaries in it are
+    /// still root's, and the next start offers [`Action::DownloadForHome`] for
+    /// them.
+    TakeBack,
+}
+
+impl FolderFix {
+    /// The command, for `dir`, with this process's own ids as numbers:
+    /// `$(id -u)` is not read by fish before 3.4, and the command is pasted
+    /// into whatever shell the user has. The only place either command is
+    /// written, for the CLI's refusal and the hub's banner alike.
+    pub fn command(self, dir: &Path) -> String {
+        // SAFETY: geteuid and getegid take no arguments and cannot fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        self.command_as(dir, uid, gid)
+    }
+
+    fn command_as(self, dir: &Path, uid: u32, gid: u32) -> String {
+        let dir = shell_word(&dir.to_string_lossy());
+        match self {
+            FolderFix::MakeWritable => format!("chmod u+w {dir}"),
+            FolderFix::TakeBack => format!("sudo chown {uid}:{gid} {dir}"),
+        }
+    }
 }
 
 /// The decision, kept apart from gathering its inputs so every case is tested.
@@ -627,48 +742,83 @@ pub enum Action {
 /// Nothing owned the deleted files any more, so the package check passed; and a
 /// GUI cannot sensibly be re-run as root. The first case now asks for a restart
 /// and the second offers a download, before anything is clicked.
+///
+/// "Only an administrator can change it" is the last answer for a folder this
+/// user cannot write, not the first: one of their own needs a chmod, and one in
+/// their home that root made needs a chown. Handing either the `--system`
+/// command would put root's files, and a menu entry for every user, into one
+/// user's folder.
 pub fn action_for(p: &Placement) -> Action {
     if p.exe_gone {
         return Action::Restart;
     }
+    let dir = p.dir.clone();
     match &p.owner {
         Ownership::Package { manager, package } => Action::DownloadPackage {
             manager: manager.clone(),
             package: package.clone(),
         },
-        Ownership::None if !p.dir_writable => Action::DownloadForSystem { dir: p.dir.clone() },
-        Ownership::None if !p.binaries_mine => Action::DownloadForHome { dir: p.dir.clone() },
         // `Unknown` keeps Update on purpose: a package manager could not be
         // *asked*, which is not the same as one owning this copy, and
         // `install_release` refuses with the reason when it is pressed.
-        Ownership::None | Ownership::Unknown { .. } => Action::Update,
+        Ownership::Unknown { .. } => Action::Update,
+        Ownership::None if !p.dir_writable && p.dir_mine => Action::FixFolder {
+            dir,
+            fix: FolderFix::MakeWritable,
+        },
+        Ownership::None if !p.dir_writable && p.dir_in_home => Action::FixFolder {
+            dir,
+            fix: FolderFix::TakeBack,
+        },
+        Ownership::None if !p.dir_writable => Action::DownloadForSystem { dir },
+        Ownership::None if !p.binaries_mine && p.dir_mine => Action::DownloadForHome { dir },
+        // Another account's files in a folder that is not this user's either —
+        // a shared or sticky one — so only an administrator can replace them.
+        Ownership::None if !p.binaries_mine => Action::DownloadForSystem { dir },
+        Ownership::None => Action::Update,
     }
+}
+
+/// What [`refuse_before_download`] may ask, each only when its answer decides
+/// something.
+///
+/// References to closures so a test can answer them, and so a probe that is no
+/// longer needed never runs: the write probe creates a file, and a directory a
+/// package manager owns must get none.
+#[derive(Clone, Copy)]
+struct Probes<'a> {
+    /// The running binary was deleted or replaced after it started.
+    exe_gone: bool,
+    /// Who owns the binaries: [`ownership_of`].
+    owner: &'a dyn Fn() -> Ownership,
+    /// Whether a file can be created in the directory: [`is_writable`].
+    writable: &'a dyn Fn() -> bool,
+    /// [`Placement::binaries_mine`].
+    binaries_mine: &'a dyn Fn() -> bool,
+    /// [`Placement::dir_mine`].
+    dir_mine: &'a dyn Fn() -> bool,
+    /// [`Placement::dir_in_home`].
+    dir_in_home: &'a dyn Fn() -> bool,
+    /// Whether this process runs as root.
+    as_root: &'a dyn Fn() -> bool,
 }
 
 /// The refusals [`install_release`] makes before it downloads anything, in the
 /// order it makes them — the facts [`placement`] gathers for the banner, asked
-/// again because `tobii update --install` has no banner in front of it.
-///
-/// The probes are closures so a test can answer them, and so a probe that is no
-/// longer needed never runs: the write probe creates a file, and a directory a
-/// package manager owns must get none.
-fn refuse_before_download(
-    dir: &Path,
-    exe_gone: bool,
-    owner: impl FnOnce() -> Ownership,
-    writable: impl FnOnce() -> bool,
-    mine: impl FnOnce() -> bool,
-) -> Result<(), InstallError> {
+/// again because `tobii update --install` has no banner in front of it. The
+/// same decision as [`action_for`], ending in a refusal where that ends in a
+/// banner.
+fn refuse_before_download(dir: &Path, p: Probes) -> Result<(), InstallError> {
     // A copy deleted or replaced while it ran has nothing at its path to update,
     // and pressing on reports whatever the next check trips over — "not
     // writable", for the orphaned package copy this was found with.
-    if exe_gone {
+    if p.exe_gone {
         return Err(InstallError::ReplacedWhileRunning);
     }
     // Asked before writability, because the two failures need opposite advice:
     // "you need permission" invites `sudo`, which is exactly the wrong thing to
     // do to a package-managed file.
-    match owner() {
+    match (p.owner)() {
         Ownership::Package { manager, package } => {
             return Err(InstallError::PackageManaged { manager, package })
         }
@@ -679,17 +829,37 @@ fn refuse_before_download(
         }
         Ownership::None => {}
     }
-    if !writable() {
-        return Err(InstallError::NotWritable(dir.to_path_buf()));
+    let dir = dir.to_path_buf();
+    if !(p.writable)() {
+        return Err(if (p.dir_mine)() {
+            InstallError::FolderNotWritable {
+                dir,
+                fix: FolderFix::MakeWritable,
+            }
+        } else if (p.dir_in_home)() {
+            InstallError::FolderNotWritable {
+                dir,
+                fix: FolderFix::TakeBack,
+            }
+        } else {
+            InstallError::NotWritable(dir)
+        });
     }
-    // Not the same as not writable, and it needs the opposite advice: the
-    // directory is this user's, the files in it are not (`sudo ./install.sh`
-    // into a home directory), and the swap's hard-linked backup of a file you do
-    // not own fails with EPERM under fs.protected_hardlinks — after the whole
+    // Not the same as not writable, and it needs the opposite advice — see
+    // `Placement::binaries_mine`; unasked, the swap fails after the whole
     // download. `tobii update --install` is the only updater a --lean install
     // has, so it is asked here and not only by the banner.
-    if !mine() {
-        return Err(InstallError::NotYours(dir.to_path_buf()));
+    if !(p.binaries_mine)() {
+        return Err(if (p.as_root)() {
+            // As root the same answer means the opposite: the files are an
+            // ordinary user's, and the sudo on this command is the problem,
+            // not a past install.
+            InstallError::RunWithoutSudo(dir)
+        } else if (p.dir_mine)() {
+            InstallError::NotYours(dir)
+        } else {
+            InstallError::NotWritable(dir)
+        });
     }
     Ok(())
 }
@@ -705,9 +875,31 @@ pub fn placement() -> Option<Placement> {
         owner: ownership_of(&dir),
         dir_writable: writable_by_me(&dir),
         binaries_mine: binaries_mine(&dir),
+        dir_mine: dir_is_mine(&dir),
+        dir_in_home: inside_home(&dir, std::env::var_os("HOME").as_deref()),
         exe_gone: exe_replaced_or_removed(&exe),
         dir,
     })
+}
+
+/// [`Placement::dir_mine`]. Also asked by [`install_release`].
+fn dir_is_mine(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    std::fs::metadata(dir).is_ok_and(|m| m.uid() == euid)
+}
+
+/// [`Placement::dir_in_home`], with `$HOME` passed in so a test can point it
+/// somewhere. Also asked by [`install_release`].
+fn inside_home(dir: &Path, home: Option<&std::ffi::OsStr>) -> bool {
+    let Some(home) = home.map(Path::new).filter(|h| h.is_absolute()) else {
+        return false;
+    };
+    let Ok(home) = std::fs::canonicalize(home) else {
+        return false;
+    };
+    dir != home && dir.starts_with(&home)
 }
 
 /// Whether `/proc/self/exe` says the running binary is no longer at its path.
@@ -736,9 +928,11 @@ pub(crate) fn binaries_mine(dir: &Path) -> bool {
         })
 }
 
-/// `s` as one shell word, quoted only when it needs it. Advice that ends in a
-/// command is copied and run, and a path with a space in it splits in two.
-fn shell_word(s: &str) -> String {
+/// A word of a command printed for a person to paste, as a POSIX shell reads it
+/// back: as it is when it holds only `[A-Za-z0-9_./-]`, otherwise in single
+/// quotes, each `'` in it written `'\''`. Advice that ends in a command is
+/// copied and run, and a path with a space in it splits in two.
+pub fn shell_word(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b))
@@ -749,38 +943,216 @@ fn shell_word(s: &str) -> String {
     }
 }
 
-/// Whether `m` can be written by someone other than this user: anyone at all,
-/// or a group other than this user's own primary group.
-fn foreign_writable(m: &std::fs::Metadata) -> bool {
+/// The by-hand route the refusals end in: fetch, check, unpack, run `cmd`.
+///
+/// One copy of it, because the checksum step has one right wording: an
+/// integrity check of the download, and nothing more.
+fn by_hand(cmd: &str) -> String {
+    format!(
+        "Download the release archive and SHA256SUMS from the releases page, check them \
+         with `sha256sum -c --ignore-missing SHA256SUMS`, unpack the archive, and run \
+         `{cmd}` in it"
+    )
+}
+
+/// The overflow uid: what a file whose owner has no mapping in this user
+/// namespace shows up as. Inside a toolbox or `unshare -c`, root's `/` and
+/// `/home` are owned by it.
+const OVERFLOW_UID: u32 = 65534;
+
+/// Whether a folder above a download may belong to `owner`, for the user `me`:
+/// see [`chosen_folder`].
+fn may_own(owner: u32, me: u32) -> bool {
+    owner == me || owner == 0 || owner == OVERFLOW_UID
+}
+
+/// Who other than its owner can write a file or directory, if anyone.
+///
+/// A group write bit counts unless the group is the user's own private group.
+/// A sticky directory is NOT left out here: whether one may be, and whose it
+/// must be, is the caller's to decide — in one, only an entry's owner or the
+/// directory's owner can rename or delete that entry.
+pub fn foreign_writer(
+    m: &std::fs::Metadata,
+    private_group: &dyn Fn(u32) -> bool,
+) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: getegid takes no arguments and cannot fail.
-    let egid = unsafe { libc::getegid() };
-    m.mode() & 0o002 != 0 || (m.mode() & 0o020 != 0 && m.gid() != egid)
+    let mode = m.mode();
+    if mode & 0o002 != 0 {
+        Some("anyone".into())
+    } else if mode & 0o020 != 0 && !private_group(m.gid()) {
+        Some(format!(
+            "its group (gid {}), which is not yours alone",
+            m.gid()
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether `gid` is the private group of the user `euid`: that user's primary
+/// group, with no other account in it.
+///
+/// Distributions that give each user a group of their own often set umask
+/// 002 (Fedora's /etc/bashrc does), so `mkdir -p ~/.local/bin` makes it
+/// group-writable — by that group, which holds only the user. Read from
+/// /etc/passwd and /etc/group only: a group they do not describe (LDAP, sssd)
+/// cannot be seen to be private, so it is not taken to be.
+pub fn is_private_group(gid: u32, euid: u32) -> bool {
+    match (
+        std::fs::read_to_string("/etc/passwd"),
+        std::fs::read_to_string("/etc/group"),
+    ) {
+        (Ok(passwd), Ok(group)) => private_group_in(&passwd, &group, gid, euid),
+        _ => false,
+    }
+}
+
+/// [`is_private_group`], over the text of /etc/passwd and /etc/group.
+pub fn private_group_in(passwd: &str, group: &str, gid: u32, euid: u32) -> bool {
+    // (name, uid, primary gid)
+    let accounts: Vec<(&str, u32, u32)> = passwd
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            Some((
+                *f.first()?,
+                f.get(2)?.parse().ok()?,
+                f.get(3)?.parse().ok()?,
+            ))
+        })
+        .collect();
+    let mine: Vec<&str> = accounts
+        .iter()
+        .filter(|a| a.1 == euid)
+        .map(|a| a.0)
+        .collect();
+    // Its primary group, and no one else's.
+    if !accounts.iter().any(|a| a.1 == euid && a.2 == gid)
+        || accounts.iter().any(|a| a.2 == gid && a.1 != euid)
+    {
+        return false;
+    }
+    // Listed in /etc/group, with no member but this user. Every line with
+    // that gid counts: a gid may appear twice.
+    let member_lists: Vec<&str> = group
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() >= 4 && f[2].parse::<u32>().ok() == Some(gid)).then(|| f[3])
+        })
+        .collect();
+    !member_lists.is_empty()
+        && member_lists.iter().all(|members| {
+            members
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .all(|m| mine.contains(&m))
+        })
+}
+
+/// Whether a download into `into` would be let through — so a folder chooser
+/// can start somewhere that works. The rule is [`chosen_folder`]'s.
+pub fn download_folder_ok(into: &Path) -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    chosen_folder(into, euid, &|g| is_private_group(g, euid)).is_ok()
+}
+
+/// The folder a user chose for a download, and every folder above it, are
+/// such that nobody but this user or root can rename an entry out of the way
+/// and put their own in its place — see [`download_release_files`].
+///
+/// A directory's owner can always do that, sticky bit or not (rename(2)), so
+/// each one must be this user's or root's — or, above the chosen folder, the
+/// overflow uid, which is how root's `/` and `/home` look inside a toolbox.
+/// Anyone else can only through a write bit, and not in a sticky directory,
+/// where only an entry's owner or the directory's can move it. So the chosen
+/// folder may be /tmp, but not a sticky folder another account owns.
+///
+/// The folders above are walked both as written and as resolved: the banner
+/// prints the path as written, so the folder holding a symlink on it counts,
+/// and the files land where it resolves to, so those folders count too.
+///
+/// `me` is this process's euid, and `private_group` answers
+/// [`is_private_group`] — both passed in, so a test can make its own folders
+/// look like someone else's.
+fn chosen_folder(
+    into: &Path,
+    me: u32,
+    private_group: &dyn Fn(u32) -> bool,
+) -> Result<(), InstallError> {
+    use std::os::unix::fs::MetadataExt;
+    let unsafe_folder = |path: &Path, why: String| InstallError::UnsafeFolder {
+        path: path.to_path_buf(),
+        why,
+    };
+    let chosen = std::fs::metadata(into)?;
+    if chosen.mode() & 0o1000 != 0 && chosen.uid() != me && chosen.uid() != 0 {
+        return Err(unsafe_folder(
+            into,
+            format!(
+                "it is shared, and its owner, uid {}, can move anything in it",
+                chosen.uid()
+            ),
+        ));
+    }
+    let resolved = std::fs::canonicalize(into)?;
+    let mut seen: Vec<&Path> = Vec::new();
+    for folder in into.ancestors().chain(resolved.ancestors()) {
+        if folder.as_os_str().is_empty() || seen.contains(&folder) {
+            continue;
+        }
+        seen.push(folder);
+        let m = std::fs::metadata(folder)?;
+        let owner = m.uid();
+        if !may_own(owner, me) {
+            return Err(unsafe_folder(
+                folder,
+                format!("it belongs to uid {owner}, who can move anything in it"),
+            ));
+        }
+        if m.mode() & 0o1000 == 0 {
+            if let Some(who) = foreign_writer(&m, private_group) {
+                return Err(unsafe_folder(folder, format!("{who} can write to it")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The folder a download goes into, and the folder chosen for it, are this
 /// user's alone — see [`download_release_files`].
 ///
-/// The chosen folder may be shared if it is sticky (in /tmp only an entry's
-/// owner can rename it), but not otherwise: someone else could rename the
-/// version folder out of it and put their own in its place. The version folder,
-/// when it exists, must be a real directory — not a symlink — owned by this user
-/// and writable by nobody else.
-fn private_folder(into: &Path, dir: &Path) -> Result<(), InstallError> {
+/// The chosen folder and those above it follow [`chosen_folder`]. The version
+/// folder, when it exists, must be a real directory — not a symlink — owned by
+/// this user and writable by nobody else: not by anyone, and not by a group
+/// unless it is this user's private group. No sticky exemption there, because
+/// the files in it are what gets checked.
+fn private_folder(
+    into: &Path,
+    dir: &Path,
+    me: u32,
+    private_group: &dyn Fn(u32) -> bool,
+) -> Result<(), InstallError> {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    let chosen = std::fs::metadata(into)?;
-    if foreign_writable(&chosen) && chosen.mode() & 0o1000 == 0 {
-        return Err(InstallError::UnsafeFolder(into.to_path_buf()));
-    }
-    match std::fs::symlink_metadata(dir) {
+    chosen_folder(into, me, private_group)?;
+    let why = match std::fs::symlink_metadata(dir) {
         // Not there yet: it will be made, and checked again once it is.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-        Ok(m) if m.is_dir() && m.uid() == euid && !foreign_writable(&m) => Ok(()),
-        Ok(_) => Err(InstallError::UnsafeFolder(dir.to_path_buf())),
-    }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(m) if !m.is_dir() => "it is already there, and is not a folder".to_string(),
+        Ok(m) if m.uid() != me => format!("it is already there, made by uid {}", m.uid()),
+        Ok(m) => match foreign_writer(&m, private_group) {
+            Some(who) => format!("{who} can write to it"),
+            None => return Ok(()),
+        },
+    };
+    Err(InstallError::UnsafeFolder {
+        path: dir.to_path_buf(),
+        why,
+    })
 }
 
 /// The kernel's own answer to "may I write here", with the effective ids, so it
@@ -872,12 +1244,16 @@ pub fn download_release_files(
     }
     // The folder the files go into is checked BEFORE anything is fetched, and
     // again once it exists. The banner ends by telling the user to run a command
-    // on these files as root (`sudo pacman -U`, `sudo ./install.sh --system`), so
-    // nobody else may be able to change them between the checksum check and that
-    // command. A /tmp/tobii-linux-<version> made in advance by another account,
-    // which create_dir_all silently reused, was the way in.
+    // on these files (`sudo pacman -U`, `sudo ./install.sh --system`, or a plain
+    // `./install.sh`), so nobody else may be able to change them between the
+    // checksum check and that command. A /tmp/tobii-linux-<version> made in
+    // advance by another account, which create_dir_all silently reused, was the
+    // way in.
     let dir = into.join(format!("tobii-linux-{}", release.version));
-    private_folder(into, &dir)?;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let private_group = |g| is_private_group(g, euid);
+    private_folder(into, &dir, euid, &private_group)?;
     let sums_asset = release.checksums().ok_or(InstallError::NoChecksums)?;
 
     progress("the checksums");
@@ -892,9 +1268,7 @@ pub fn download_release_files(
         }
     }
 
-    std::fs::create_dir_all(&dir)?;
-    // Again: made by someone else between the check above and here, it is theirs.
-    private_folder(into, &dir)?;
+    make_version_folder(into, &dir, euid, &private_group)?;
     let mut written = Vec::new();
     match fetch_each(
         files,
@@ -911,6 +1285,35 @@ pub fn download_release_files(
         }
     }
 }
+/// Make the version folder `dir` in `into`, or take the one already there, and
+/// check it again now that it exists: made by someone else between the first
+/// check and here, it is theirs.
+///
+/// 0o755, not the default 0o777 less the umask: under umask 002 — or in a
+/// chosen folder whose default ACL grants a group, or a setgid one whose group
+/// is not this user's — the default is group-writable, which the check refuses
+/// unless the group is this user's private one. umask can only clear bits, so
+/// this is never more. A folder this call made and the check then refused is
+/// removed, or every retry would find it there and refuse it again.
+fn make_version_folder(
+    into: &Path,
+    dir: &Path,
+    me: u32,
+    private_group: &dyn Fn(u32) -> bool,
+) -> Result<(), InstallError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let made = match std::fs::DirBuilder::new().mode(0o755).create(dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => return Err(e.into()),
+    };
+    private_folder(into, dir, me, private_group).inspect_err(|_| {
+        if made {
+            let _ = std::fs::remove_dir(dir);
+        }
+    })
+}
+
 /// Undo a failed download: remove what this call wrote, and the directory if
 /// it is now empty.
 ///
@@ -995,10 +1398,16 @@ pub fn install_release(
     let dir = install_dir()?;
     refuse_before_download(
         &dir,
-        std::env::current_exe().is_ok_and(|e| exe_replaced_or_removed(&e)),
-        || ownership_of(&dir),
-        || is_writable(&dir),
-        || binaries_mine(&dir),
+        Probes {
+            exe_gone: std::env::current_exe().is_ok_and(|e| exe_replaced_or_removed(&e)),
+            owner: &|| ownership_of(&dir),
+            writable: &|| is_writable(&dir),
+            binaries_mine: &|| binaries_mine(&dir),
+            dir_mine: &|| dir_is_mine(&dir),
+            dir_in_home: &|| inside_home(&dir, std::env::var_os("HOME").as_deref()),
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            as_root: &|| unsafe { libc::geteuid() } == 0,
+        },
     )?;
 
     // Anything an earlier run left behind, first.
@@ -1143,11 +1552,6 @@ pub fn install_verified_archive(
     // `tobii-gtk` — the exact mismatched pair the backups and rollback exist to
     // prevent, arriving by the front door and reported as success.
     let mut missing: Vec<&str> = Vec::new();
-    let discard = |staged: &[(PathBuf, PathBuf)]| {
-        for (s, _) in staged {
-            let _ = std::fs::remove_file(s);
-        }
-    };
     for name in BINARIES {
         let target = dir.join(name);
         // Only replace what is already installed here.
@@ -1160,30 +1564,28 @@ pub fn install_verified_archive(
         };
         let staging = dir.join(format!(".{name}.new-{}", std::process::id()));
         let _ = std::fs::remove_file(&staging);
-        if let Err(e) = std::fs::copy(&src, &staging) {
-            // A copy that failed part-way still created the file, and nothing
-            // else would ever remove it: it lives in the install directory, not
-            // the scratch directory that gets cleaned up.
-            let _ = std::fs::remove_file(&staging);
-            discard(&staged);
-            return Err(e.into());
-        }
-        set_executable(&staging)?;
-        if let Err(detail) = probe(&staging) {
-            discard(&staged);
-            let _ = std::fs::remove_file(&staging);
-            return Err(InstallError::WillNotRun {
-                name: name.to_string(),
-                detail,
+        // Recorded before the copy: a copy that fails part-way still creates the
+        // file, in the install directory rather than the scratch directory.
+        staged.push((staging.clone(), target));
+        let ready = std::fs::copy(&src, &staging)
+            .map_err(InstallError::from)
+            .and_then(|_| set_executable(&staging))
+            .and_then(|()| {
+                probe(&staging).map_err(|detail| InstallError::WillNotRun {
+                    name: name.to_string(),
+                    detail,
+                })
             });
+        if let Err(e) = ready {
+            remove_staged(&staged);
+            return Err(e);
         }
-        staged.push((staging, target));
     }
     if staged.is_empty() {
         return Err(InstallError::NothingToInstall);
     }
     if !missing.is_empty() {
-        discard(&staged);
+        remove_staged(&staged);
         return Err(InstallError::Incomplete {
             missing: missing.join(", "),
         });
@@ -1198,6 +1600,14 @@ pub fn install_verified_archive(
         // back to the release tag.
         version: installed_version(dir).unwrap_or_default(),
     })
+}
+
+/// Remove every staged copy: the cleanup for a refusal before the swap, and for
+/// a rollback.
+fn remove_staged(staged: &[(PathBuf, PathBuf)]) {
+    for (s, _) in staged {
+        let _ = std::fs::remove_file(s);
+    }
 }
 
 /// Move every staged binary into place, or put everything back.
@@ -1261,9 +1671,7 @@ fn swap_in(staged: &[(PathBuf, PathBuf)]) -> Result<Vec<String>, InstallError> {
                         );
                     }
                 }
-                for (s, _) in staged {
-                    let _ = std::fs::remove_file(s);
-                }
+                remove_staged(staged);
                 return Err(InstallError::RolledBack { detail });
             }
         }
@@ -1333,11 +1741,13 @@ fn spawn_probe(path: &Path) -> Result<std::process::Child, String> {
     Err(format!("it could not be started: {last}"))
 }
 
-/// `<path> --version`, set up the way both callers below need it.
+/// `<path> --version`, with stdin closed and no display: how this program asks
+/// any of its binaries what version it is. Pipes and the deadline are the
+/// caller's — [`wait_bounded`] — and `tobii uninstall` asks the same way.
 ///
 /// The display is taken out of the environment because a GUI binary must not
 /// try to talk to the session's display just to say what version it is.
-fn version_command(path: &Path) -> std::process::Command {
+pub fn version_command(path: &Path) -> std::process::Command {
     let mut c = std::process::Command::new(path);
     c.arg("--version")
         .stdin(std::process::Stdio::null())
@@ -1454,6 +1864,21 @@ fn set_executable(p: &Path) -> Result<(), InstallError> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn pkg(manager: &str, package: &str) -> Ownership {
+        Ownership::Package {
+            manager: manager.into(),
+            package: package.into(),
+        }
+    }
+
+    fn unknown(manager: &str) -> Ownership {
+        Ownership::Unknown {
+            manager: manager.into(),
+            why: "timed out".into(),
+        }
+    }
 
     /// A release carrying just these assets; nothing else here reads the rest.
     fn release_with(assets: Vec<crate::release::Asset>) -> crate::release::Release {
@@ -1475,8 +1900,8 @@ mod tests {
     #[test]
     fn a_download_refuses_an_asset_whose_name_is_a_path() {
         use crate::release::Asset;
-        let dir = std::env::temp_dir().join(format!("tobii-dl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let s = Scratch::new("dl-unsafe-name");
+        let dir = s.path();
 
         for bad in ["../evil", "a/b", "/etc/passwd", ".."] {
             let asset = Asset {
@@ -1484,7 +1909,7 @@ mod tests {
                 url: "https://example.invalid/x".to_string(),
             };
             let release = release_with(vec![asset.clone()]);
-            let err = download_release_files(&release, &[&asset], &dir, &|_| {})
+            let err = download_release_files(&release, &[&asset], dir, &|_| {})
                 .expect_err("a name that is a path must be refused");
             assert!(
                 matches!(err, InstallError::UnsafeName(ref n) if n == bad),
@@ -1492,24 +1917,20 @@ mod tests {
             );
         }
         assert!(
-            std::fs::read_dir(&dir).expect("dir").next().is_none(),
+            std::fs::read_dir(dir).expect("dir").next().is_none(),
             "nothing may be written before the name is checked"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Nothing to download is its own answer, not an empty success — a caller
     /// that got `Ok(vec![])` would report a finished download of no files.
     #[test]
     fn a_download_with_no_assets_says_there_is_no_build() {
-        let dir = std::env::temp_dir().join(format!("tobii-dl-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let err = download_release_files(&release_with(Vec::new()), &[], &dir, &|_| {})
+        let s = Scratch::new("dl-empty");
+        let err = download_release_files(&release_with(Vec::new()), &[], s.path(), &|_| {})
             .expect_err("an empty set must be refused");
         assert!(matches!(err, InstallError::NoBuildForTarget(_)), "{err:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
-    use super::*;
 
     /// A directory this test owns, removed on the way out.
     struct Scratch(PathBuf);
@@ -1626,6 +2047,8 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         let w = InstallError::NotWritable(PathBuf::from("/usr/bin")).to_string();
         assert!(!w.contains("re-run with the permission"), "{w}");
         assert!(w.contains("sudo ./install.sh --system /usr/bin"), "{w}");
+        // True for a folder that is not writable, and for a shared one that is.
+        assert!(w.starts_with("only an administrator can replace"), "{w}");
     }
 
     /// A killed or panicking install left up to 73 MB in the install directory
@@ -1727,13 +2150,7 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         let o = with_stub("dpkg", "echo 'tobii-linux: /usr/bin/tobii'; exit 0", || {
             package_owner(Path::new("/usr/bin/tobii"))
         });
-        assert_eq!(
-            o,
-            Ownership::Package {
-                manager: "dpkg".into(),
-                package: "tobii-linux".into()
-            }
-        );
+        assert_eq!(o, pkg("dpkg", "tobii-linux"));
     }
 
     /// dpkg answers a diverted path with a line whose first colon-field is the
@@ -1748,13 +2165,7 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
              echo 'tobii-linux: /usr/bin/tobii'; exit 0",
             || package_owner(Path::new("/usr/bin/tobii")),
         );
-        assert_eq!(
-            o,
-            Ownership::Package {
-                manager: "dpkg".into(),
-                package: "tobii-linux".into()
-            }
-        );
+        assert_eq!(o, pkg("dpkg", "tobii-linux"));
     }
 
     /// A broken database exits non-zero for a reason that is not "no match".
@@ -2133,10 +2544,7 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         let o = with_stub("dpkg", owns_the_gui, || ownership_of(Path::new("/usr/bin")));
         assert_eq!(
             o,
-            Ownership::Package {
-                manager: "dpkg".into(),
-                package: "tobii-linux".into()
-            },
+            pkg("dpkg", "tobii-linux"),
             "the second binary being owned is still ownership"
         );
 
@@ -2191,12 +2599,23 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         let empty = Scratch::new("version-empty");
         assert_eq!(installed_version(empty.path()), None);
     }
-}
 
-/// The update banner's decision — see [`action_for`] and [`placement`].
-#[cfg(test)]
-mod placement_tests {
-    use super::*;
+    // The update banner's decision — see `action_for` and `placement` — and the
+    // refusals `install_release` makes from the same facts.
+
+    /// Every probe unasked: each panics if it runs. A case overrides the ones
+    /// its answer needs, so a probe asked out of order fails the test.
+    fn unasked() -> Probes<'static> {
+        Probes {
+            exe_gone: false,
+            owner: &|| panic!("the package managers were asked"),
+            writable: &|| panic!("the write probe ran"),
+            binaries_mine: &|| panic!("the files' owner was asked"),
+            dir_mine: &|| panic!("the folder's owner was asked"),
+            dir_in_home: &|| panic!("$HOME was asked"),
+            as_root: &|| panic!("the euid was asked"),
+        }
+    }
 
     /// `install_release`'s own refusals, in order. A probe must not run once an
     /// earlier answer has refused: the write probe creates a file, and a
@@ -2204,124 +2623,370 @@ mod placement_tests {
     #[test]
     fn install_release_refuses_before_downloading_in_the_order_the_advice_needs() {
         let dir = Path::new("/home/u/.local/bin");
-        let unasked_owner = || -> Ownership { panic!("the package managers were asked") };
-        let unasked_write = || -> bool { panic!("the write probe ran") };
-        let unasked_mine = || -> bool { panic!("the files' owner was asked") };
+        let refuse = |p| refuse_before_download(dir, p);
+        let yes: &dyn Fn() -> bool = &|| true;
+        let no: &dyn Fn() -> bool = &|| false;
+        let nobody: &dyn Fn() -> Ownership = &|| Ownership::None;
+        let base = unasked();
+
+        let gone = Probes {
+            exe_gone: true,
+            ..base
+        };
         assert!(matches!(
-            refuse_before_download(dir, true, unasked_owner, unasked_write, unasked_mine),
+            refuse(gone),
             Err(InstallError::ReplacedWhileRunning)
         ));
-        let pacman = || Ownership::Package {
-            manager: "pacman".into(),
-            package: "tobii-linux-bin".into(),
-        };
+        let pacman = || pkg("pacman", "tobii-linux-bin");
         assert!(matches!(
-            refuse_before_download(dir, false, pacman, unasked_write, unasked_mine),
+            refuse(Probes {
+                owner: &pacman,
+                ..base
+            }),
             Err(InstallError::PackageManaged { .. })
         ));
-        let unknown = || Ownership::Unknown {
-            manager: "rpm".into(),
-            why: "timed out".into(),
-        };
         assert!(matches!(
-            refuse_before_download(dir, false, unknown, unasked_write, unasked_mine),
+            refuse(Probes {
+                owner: &|| unknown("rpm"),
+                ..base
+            }),
             Err(InstallError::OwnerUnknown { .. })
         ));
+
+        // Not writable. Whose the folder is decides the advice; the files are
+        // not asked about, since nothing can be installed there either way.
+        let unwritable = Probes {
+            owner: nobody,
+            writable: no,
+            ..base
+        };
         assert!(matches!(
-            refuse_before_download(dir, false, || Ownership::None, || false, unasked_mine),
+            refuse(Probes { dir_mine: yes, ..unwritable }),
+            Err(InstallError::FolderNotWritable { dir: p, fix: FolderFix::MakeWritable }) if p == dir
+        ));
+        assert!(matches!(
+            refuse(Probes { dir_mine: no, dir_in_home: yes, ..unwritable }),
+            Err(InstallError::FolderNotWritable { dir: p, fix: FolderFix::TakeBack }) if p == dir
+        ));
+        assert!(matches!(
+            refuse(Probes { dir_mine: no, dir_in_home: no, ..unwritable }),
             Err(InstallError::NotWritable(p)) if p == dir
         ));
+
+        // Writable, and someone else's files in it. $HOME is not asked.
+        let not_mine = Probes {
+            owner: nobody,
+            writable: yes,
+            binaries_mine: no,
+            ..base
+        };
         assert!(matches!(
-            refuse_before_download(dir, false, || Ownership::None, || true, || false),
+            refuse(Probes { as_root: yes, ..not_mine }),
+            Err(InstallError::RunWithoutSudo(p)) if p == dir
+        ));
+        assert!(matches!(
+            refuse(Probes { as_root: no, dir_mine: yes, ..not_mine }),
             Err(InstallError::NotYours(p)) if p == dir
         ));
-        assert!(refuse_before_download(dir, false, || Ownership::None, || true, || true).is_ok());
+        // A shared or sticky folder that is not this user's: the plain install
+        // would stop at its first `mv`, or take over files everyone runs.
+        assert!(matches!(
+            refuse(Probes { as_root: no, dir_mine: no, ..not_mine }),
+            Err(InstallError::NotWritable(p)) if p == dir
+        ));
+
+        // The ordinary home install asks nothing past the files' owner.
+        assert!(refuse(Probes {
+            owner: nobody,
+            writable: yes,
+            binaries_mine: yes,
+            ..base
+        })
+        .is_ok());
     }
 
-    fn placed(
-        owner: Ownership,
+    /// A placement in `/usr/local/bin`, with the facts `action_for` reads.
+    struct Facts {
         dir_writable: bool,
         binaries_mine: bool,
-        exe_gone: bool,
-    ) -> Placement {
+        dir_mine: bool,
+        dir_in_home: bool,
+    }
+
+    fn placed(owner: Ownership, f: Facts, exe_gone: bool) -> Placement {
         Placement {
             dir: PathBuf::from("/usr/local/bin"),
             owner,
-            dir_writable,
-            binaries_mine,
+            dir_writable: f.dir_writable,
+            binaries_mine: f.binaries_mine,
+            dir_mine: f.dir_mine,
+            dir_in_home: f.dir_in_home,
             exe_gone,
         }
+    }
+
+    /// Every combination of the four facts, for the cases that ignore them.
+    fn every_fact() -> impl Iterator<Item = Facts> {
+        (0..16u8).map(|b| Facts {
+            dir_writable: b & 1 != 0,
+            binaries_mine: b & 2 != 0,
+            dir_mine: b & 4 != 0,
+            dir_in_home: b & 8 != 0,
+        })
+    }
+
+    fn at_usr_local() -> PathBuf {
+        PathBuf::from("/usr/local/bin")
     }
 
     /// The reported case first: a copy whose package was removed while it ran.
     #[test]
     fn a_copy_replaced_or_removed_while_running_is_told_to_restart_whoever_owns_it() {
-        assert_eq!(
-            action_for(&placed(Ownership::None, false, false, true)),
-            Action::Restart
-        );
-        let pkg = Ownership::Package {
-            manager: "pacman".into(),
-            package: "tobii-linux".into(),
-        };
-        assert_eq!(
-            action_for(&placed(pkg, false, false, true)),
-            Action::Restart
-        );
+        for f in every_fact() {
+            assert_eq!(
+                action_for(&placed(Ownership::None, f, true)),
+                Action::Restart
+            );
+        }
+        for f in every_fact() {
+            assert_eq!(
+                action_for(&placed(pkg("pacman", "tobii-linux"), f, true)),
+                Action::Restart
+            );
+        }
     }
 
     #[test]
     fn an_unowned_copy_in_a_directory_this_user_cannot_write_gets_the_system_download() {
-        for mine in [true, false] {
+        for binaries_mine in [true, false] {
+            let f = Facts {
+                dir_writable: false,
+                binaries_mine,
+                dir_mine: false,
+                dir_in_home: false,
+            };
             assert_eq!(
-                action_for(&placed(Ownership::None, false, mine, false)),
+                action_for(&placed(Ownership::None, f, false)),
                 Action::DownloadForSystem {
-                    dir: PathBuf::from("/usr/local/bin")
+                    dir: at_usr_local()
                 }
             );
         }
     }
 
-    /// `sudo ./install.sh ~/.local/bin`: the folder is the user's, the files are
-    /// root's. Not a system install, and no sudo needed to fix it.
+    /// A folder of the user's own that they cannot write (0555): `chmod u+w`.
+    /// The `--system` install there would put root's files into it.
+    #[test]
+    fn an_unwritable_folder_of_the_users_own_gets_chmod_not_sudo() {
+        for (binaries_mine, dir_in_home) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let f = Facts {
+                dir_writable: false,
+                binaries_mine,
+                dir_mine: true,
+                dir_in_home,
+            };
+            assert_eq!(
+                action_for(&placed(Ownership::None, f, false)),
+                Action::FixFolder {
+                    dir: at_usr_local(),
+                    fix: FolderFix::MakeWritable
+                }
+            );
+        }
+    }
+
+    /// Root's folder in the user's home — what v0.3.0's `sudo ./install.sh
+    /// ~/.local/bin` left when that folder did not exist yet: a chown of that
+    /// one folder, not `--system` into a home directory.
+    #[test]
+    fn root_s_folder_in_the_home_gets_chown_not_a_system_install() {
+        for binaries_mine in [true, false] {
+            let f = Facts {
+                dir_writable: false,
+                binaries_mine,
+                dir_mine: false,
+                dir_in_home: true,
+            };
+            assert_eq!(
+                action_for(&placed(Ownership::None, f, false)),
+                Action::FixFolder {
+                    dir: at_usr_local(),
+                    fix: FolderFix::TakeBack
+                }
+            );
+        }
+    }
+
+    /// Root's files in a folder of the user's own: not a system install, and no
+    /// sudo needed to fix it.
     #[test]
     fn someone_elses_files_in_a_directory_this_user_can_write_get_the_home_download() {
+        let f = Facts {
+            dir_writable: true,
+            binaries_mine: false,
+            dir_mine: true,
+            dir_in_home: false,
+        };
         assert_eq!(
-            action_for(&placed(Ownership::None, true, false, false)),
+            action_for(&placed(Ownership::None, f, false)),
             Action::DownloadForHome {
-                dir: PathBuf::from("/usr/local/bin")
+                dir: at_usr_local()
             }
         );
+    }
+
+    /// Writable is not the same as the user's: in a sticky folder another
+    /// account owns, `./install.sh` stops at its first `mv`, and in a
+    /// group-writable system folder it would take over files everyone runs.
+    #[test]
+    fn someone_elses_files_in_a_shared_folder_get_the_system_download() {
+        for dir_in_home in [true, false] {
+            let f = Facts {
+                dir_writable: true,
+                binaries_mine: false,
+                dir_mine: false,
+                dir_in_home,
+            };
+            assert_eq!(
+                action_for(&placed(Ownership::None, f, false)),
+                Action::DownloadForSystem {
+                    dir: at_usr_local()
+                }
+            );
+        }
     }
 
     #[test]
     fn the_ordinary_home_install_still_gets_update() {
-        assert_eq!(
-            action_for(&placed(Ownership::None, true, true, false)),
-            Action::Update
-        );
+        for (dir_mine, dir_in_home) in [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let f = Facts {
+                dir_writable: true,
+                binaries_mine: true,
+                dir_mine,
+                dir_in_home,
+            };
+            assert_eq!(
+                action_for(&placed(Ownership::None, f, false)),
+                Action::Update
+            );
+        }
     }
 
     #[test]
     fn a_packaged_copy_gets_its_package_and_an_unknown_owner_keeps_update() {
-        let pkg = Ownership::Package {
-            manager: "dpkg".into(),
-            package: "tobii-linux".into(),
-        };
+        for f in every_fact() {
+            assert_eq!(
+                action_for(&placed(pkg("dpkg", "tobii-linux"), f, false)),
+                Action::DownloadPackage {
+                    manager: "dpkg".into(),
+                    package: "tobii-linux".into()
+                }
+            );
+        }
+        for f in every_fact() {
+            assert_eq!(
+                action_for(&placed(unknown("rpm"), f, false)),
+                Action::Update
+            );
+        }
+    }
+
+    /// The commands, as pasted into any shell: the ids are numbers, not
+    /// `$(id -u)`, which older fish rejects; the folder is one word.
+    #[test]
+    fn the_folder_fixes_are_one_command_with_numeric_ids() {
+        let spaced = Path::new("/home/u/My Apps");
         assert_eq!(
-            action_for(&placed(pkg, false, false, false)),
-            Action::DownloadPackage {
-                manager: "dpkg".into(),
-                package: "tobii-linux".into()
-            }
+            FolderFix::MakeWritable.command_as(spaced, 1000, 1000),
+            "chmod u+w '/home/u/My Apps'"
         );
-        let unknown = Ownership::Unknown {
-            manager: "rpm".into(),
-            why: "timed out".into(),
-        };
         assert_eq!(
-            action_for(&placed(unknown, true, true, false)),
-            Action::Update
+            FolderFix::TakeBack.command_as(spaced, 1000, 100),
+            "sudo chown 1000:100 '/home/u/My Apps'"
+        );
+        // SAFETY: geteuid and getegid take no arguments and cannot fail.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        assert_eq!(
+            FolderFix::TakeBack.command(spaced),
+            format!("sudo chown {uid}:{gid} '/home/u/My Apps'")
+        );
+
+        let yours = InstallError::FolderNotWritable {
+            dir: spaced.to_path_buf(),
+            fix: FolderFix::MakeWritable,
+        }
+        .to_string();
+        assert!(yours.contains("`chmod u+w '/home/u/My Apps'`"), "{yours}");
+        // It may say sudo would not help; it must not hand over a sudo command.
+        assert!(
+            !yours.contains("`sudo") && !yours.contains("--system"),
+            "{yours}"
+        );
+        assert!(yours.contains("tobii update --install"), "{yours}");
+        let back = InstallError::FolderNotWritable {
+            dir: spaced.to_path_buf(),
+            fix: FolderFix::TakeBack,
+        }
+        .to_string();
+        assert!(
+            back.contains(&format!("`sudo chown {uid}:{gid} '/home/u/My Apps'`")),
+            "{back}"
+        );
+        assert!(!back.contains("$(") && !back.contains("--system"), "{back}");
+    }
+
+    /// `sudo tobii update --install` on an ordinary install: the fix is to drop
+    /// the sudo, not the by-hand install `NotYours` describes.
+    #[test]
+    fn root_updating_someone_elses_files_is_told_to_drop_the_sudo() {
+        let t = InstallError::RunWithoutSudo(PathBuf::from("/home/u/My Apps")).to_string();
+        assert!(
+            t.contains("without sudo") && t.contains("/home/u/My Apps"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("sudo ./install.sh") && !t.contains("sudo tobii"),
+            "{t}"
+        );
+        assert!(!t.contains("SHA256SUMS"), "nothing needs downloading: {t}");
+    }
+
+    /// `$HOME` as the kernel sees it: through a symlink, and strictly inside.
+    #[test]
+    fn inside_home_resolves_home_and_wants_a_folder_strictly_below_it() {
+        let s = Scratch::new("home");
+        let real = s.path().join("real");
+        let bin = real.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let link = s.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        let bin = real.join(".local/bin");
+
+        assert!(
+            inside_home(&bin, Some(link.as_os_str())),
+            "HOME through a link"
+        );
+        assert!(inside_home(&bin, Some(real.as_os_str())));
+        assert!(
+            !inside_home(&real, Some(real.as_os_str())),
+            "the home itself"
+        );
+        assert!(!inside_home(
+            Path::new("/usr/local/bin"),
+            Some(real.as_os_str())
+        ));
+        assert!(!inside_home(&bin, None), "no HOME");
+        assert!(
+            !inside_home(&bin, Some("relative/home".as_ref())),
+            "a relative HOME"
+        );
+        assert!(
+            !inside_home(&bin, Some(s.path().join("gone").as_os_str())),
+            "a HOME that does not resolve"
         );
     }
 
@@ -2341,30 +3006,32 @@ mod placement_tests {
     #[test]
     fn writability_and_ownership_are_asked_without_creating_anything() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tobii-placement-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(writable_by_me(&dir));
+        let s = Scratch::new("placement");
+        let dir = s.path();
+        assert!(writable_by_me(dir));
+        assert!(dir_is_mine(dir), "a folder this user made");
         assert!(
-            binaries_mine(&dir),
+            binaries_mine(dir),
             "an empty directory has nothing to refuse"
         );
         std::fs::write(dir.join("tobii"), b"x").unwrap();
-        assert!(binaries_mine(&dir), "a binary this user owns");
+        assert!(binaries_mine(dir), "a binary this user owns");
         assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
+            std::fs::read_dir(dir).unwrap().count(),
             1,
             "asking created nothing"
         );
         // Read-only, as a system directory is to a user. Root ignores modes, so
         // the assertion only means something when this does not run as root.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         // SAFETY: geteuid takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } != 0 {
-            assert!(!writable_by_me(&dir));
+            assert!(!writable_by_me(dir));
         }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dir_is_mine(dir), "still this user's, unwritable or not");
+        // Drop's remove_dir_all needs to write it.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!dir_is_mine(Path::new("/nonexistent-tobii-placement-dir")));
         assert!(!writable_by_me(Path::new(
             "/nonexistent-tobii-placement-dir"
         )));
@@ -2401,6 +3068,49 @@ mod placement_tests {
         assert!(!y.contains("sudo ./install.sh"), "{y}");
         assert_eq!(shell_word("/usr/local/bin"), "/usr/local/bin");
         assert_eq!(shell_word("it's"), r"'it'\''s'");
+
+        // The download-folder refusal says who can write it, and no "as root":
+        // for the home download and the archive fallback the next command is a
+        // plain ./install.sh.
+        let u = InstallError::UnsafeFolder {
+            path: PathBuf::from("/home/u/Downloads"),
+            why: "its group (gid 958), which is not yours alone, can write to it".into(),
+        }
+        .to_string();
+        assert!(
+            u.contains("/home/u/Downloads") && u.contains("gid 958"),
+            "{u}"
+        );
+        assert!(u.contains("before you install it."), "{u}");
+        assert!(!u.contains("as root"), "{u}");
+    }
+
+    fn mode(p: &Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+    }
+
+    fn me() -> u32 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    /// Which folder a refusal names.
+    fn refused_at(r: Result<(), InstallError>) -> Option<PathBuf> {
+        match r {
+            Err(InstallError::UnsafeFolder { path, .. }) => Some(path),
+            Ok(()) => None,
+            Err(e) => panic!("expected UnsafeFolder, got {e:?}"),
+        }
+    }
+
+    /// A folder for download tests, 0755 whatever the umask: under 002 the
+    /// scratch folder itself would be group-writable, and refused as an
+    /// ancestor by a test that says the group is not private.
+    fn download_scratch(tag: &str) -> Scratch {
+        let s = Scratch::new(tag);
+        mode(s.path(), 0o755);
+        s
     }
 
     /// The download folder: a version folder someone else made in advance, or a
@@ -2408,53 +3118,243 @@ mod placement_tests {
     /// fetched. A sticky shared folder with no version folder yet is fine.
     #[test]
     fn a_download_folder_someone_else_can_change_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let base = std::env::temp_dir().join(format!("tobii-dlfolder-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let mode = |p: &Path, m: u32| {
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
-        };
+        let s = download_scratch("dlfolder");
+        let base = s.path();
+        let private = |_| true;
+        let check = |into: &Path, dir: &Path| refused_at(private_folder(into, dir, me(), &private));
 
         let into = base.join("mine");
-        std::fs::create_dir_all(&into).unwrap();
+        std::fs::create_dir(&into).unwrap();
         mode(&into, 0o755);
         let dir = into.join("tobii-linux-9.9.9");
-        assert!(private_folder(&into, &dir).is_ok(), "nothing there yet");
+        assert_eq!(check(&into, &dir), None, "nothing there yet");
         std::fs::create_dir(&dir).unwrap();
         mode(&dir, 0o755);
-        assert!(
-            private_folder(&into, &dir).is_ok(),
-            "made by this user, private"
-        );
+        assert_eq!(check(&into, &dir), None, "made by this user, private");
         mode(&dir, 0o777);
-        assert!(
-            matches!(private_folder(&into, &dir), Err(InstallError::UnsafeFolder(p)) if p == dir)
-        );
+        assert_eq!(check(&into, &dir), Some(dir.clone()));
+        // No sticky exemption for the version folder: its files are what is
+        // checked, and in it this user's are the only entries that matter.
+        mode(&dir, 0o1777);
+        assert_eq!(check(&into, &dir), Some(dir.clone()));
         mode(&dir, 0o755);
         std::fs::remove_dir(&dir).unwrap();
-        std::os::unix::fs::symlink(&base, &dir).unwrap();
-        assert!(
-            matches!(
-                private_folder(&into, &dir),
-                Err(InstallError::UnsafeFolder(_))
-            ),
+        std::os::unix::fs::symlink(base, &dir).unwrap();
+        assert_eq!(
+            check(&into, &dir),
+            Some(dir.clone()),
             "a symlink is not a folder of this user's"
         );
 
         let shared = base.join("shared");
-        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir(&shared).unwrap();
         mode(&shared, 0o777);
         let there = shared.join("tobii-linux-9.9.9");
-        assert!(
-            matches!(private_folder(&shared, &there), Err(InstallError::UnsafeFolder(p)) if p == shared)
-        );
+        assert_eq!(check(&shared, &there), Some(shared.clone()));
+        assert!(!download_folder_ok(&shared));
         mode(&shared, 0o1777);
-        assert!(
-            private_folder(&shared, &there).is_ok(),
-            "sticky: only an entry's owner can rename it"
+        assert_eq!(
+            check(&shared, &there),
+            None,
+            "sticky and this user's: only an entry's owner can rename it"
+        );
+        assert!(download_folder_ok(&shared));
+        assert!(download_folder_ok(&into));
+    }
+
+    /// A folder above the chosen one that others can write lets them rename the
+    /// chosen folder away and put their own in its place, with the same path.
+    #[test]
+    fn a_folder_above_the_chosen_one_is_checked_too() {
+        let s = download_scratch("dlabove");
+        let private = |_| true;
+        let open = s.path().join("open");
+        let into = open.join("mine");
+        std::fs::create_dir_all(&into).unwrap();
+        mode(&into, 0o755);
+        mode(&open, 0o777);
+        let dir = into.join("tobii-linux-9.9.9");
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &private)),
+            Some(open.clone())
+        );
+        assert!(!download_folder_ok(&into));
+        // Sticky, and this user's: nobody else can move `mine`.
+        mode(&open, 0o1777);
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &private)),
+            None
         );
 
-        mode(&shared, 0o755);
-        let _ = std::fs::remove_dir_all(&base);
+        // The folder holding a symlink on the way counts, as the path is
+        // printed with the link in it — even when the link's target is fine.
+        mode(&open, 0o777);
+        let safe = s.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        mode(&safe, 0o755);
+        let link = open.join("link");
+        std::os::unix::fs::symlink(&safe, &link).unwrap();
+        assert_eq!(
+            refused_at(private_folder(&link, &link.join("v"), me(), &private)),
+            Some(open.clone())
+        );
+        assert_eq!(
+            refused_at(private_folder(&safe, &safe.join("v"), me(), &private)),
+            None,
+            "the target, reached directly, is fine"
+        );
+        mode(&open, 0o755);
+    }
+
+    /// A group that can write counts as this user's only when it is their
+    /// private group — asked, not assumed from the gid.
+    #[test]
+    fn a_group_writable_download_folder_is_refused_unless_the_group_is_private() {
+        let s = download_scratch("dlgroup");
+        let into = s.path().join("into");
+        std::fs::create_dir(&into).unwrap();
+        mode(&into, 0o775);
+        let dir = into.join("tobii-linux-9.9.9");
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &|_| false)),
+            Some(into.clone())
+        );
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &|_| true)),
+            None
+        );
+
+        mode(&into, 0o755);
+        std::fs::create_dir(&dir).unwrap();
+        mode(&dir, 0o775);
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &|_| false)),
+            Some(dir.clone())
+        );
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &|_| true)),
+            None
+        );
+
+        // The shared rule has no sticky exemption: that is each caller's.
+        let m = std::fs::metadata(&dir).unwrap();
+        assert_eq!(
+            foreign_writer(&m, &|_| false)
+                .as_deref()
+                .map(|w| w.contains("gid")),
+            Some(true)
+        );
+        mode(&dir, 0o1777);
+        let m = std::fs::metadata(&dir).unwrap();
+        assert_eq!(foreign_writer(&m, &|_| true).as_deref(), Some("anyone"));
+        mode(&dir, 0o755);
+    }
+
+    /// Whose a folder is, told apart with a stand-in euid — making one that
+    /// belongs to another real account needs root. To a process that is not
+    /// this test's user, every folder this test made is someone else's.
+    #[test]
+    fn a_folder_another_account_owns_is_refused_sticky_or_not() {
+        let s = download_scratch("dlowner");
+        let into = s.path().join("into");
+        std::fs::create_dir(&into).unwrap();
+        mode(&into, 0o755);
+        let dir = into.join("tobii-linux-9.9.9");
+        let private = |_| true;
+        let stranger = me().wrapping_add(4242);
+        // Its owner can rename anything in it, so the chosen folder — the
+        // first on the way up — is the one refused.
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, stranger, &private)),
+            Some(into.clone())
+        );
+        assert_eq!(
+            refused_at(private_folder(&into, &dir, me(), &private)),
+            None
+        );
+        // A sticky shared folder is fine only when its owner is this user or
+        // root: the owner can move entries in it, sticky bit or not.
+        mode(&into, 0o1777);
+        let why = match chosen_folder(&into, stranger, &private) {
+            Err(InstallError::UnsafeFolder { path, why }) => {
+                assert_eq!(path, into);
+                why
+            }
+            other => panic!("{other:?}"),
+        };
+        assert!(why.contains("its owner"), "{why}");
+        mode(&into, 0o755);
+    }
+
+    /// Who may own a folder on the way to a download: this user, root, and the
+    /// overflow uid root's `/` and `/home` show up as inside a toolbox or
+    /// `unshare -c` — and nobody else.
+    #[test]
+    fn root_and_the_overflow_uid_may_own_the_folders_above_a_download() {
+        assert!(may_own(1000, 1000));
+        assert!(may_own(0, 1000));
+        assert!(may_own(65534, 1000));
+        assert!(!may_own(1001, 1000));
+        assert!(!may_own(1000, 1001));
+    }
+
+    /// The folder the download makes is 0755 whatever the umask, so it passes
+    /// its own check; and one it made and then refused is not left behind for
+    /// every retry to be refused on.
+    #[test]
+    fn the_version_folder_is_made_private_and_not_left_behind_when_refused() {
+        let s = download_scratch("dlmake");
+        let into = s.path().join("into");
+        std::fs::create_dir(&into).unwrap();
+        mode(&into, 0o755);
+        let dir = into.join("tobii-linux-9.9.9");
+        make_version_folder(&into, &dir, me(), &|_| false).expect("made and kept");
+        let m = std::fs::symlink_metadata(&dir).unwrap();
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::mode(&m) & 0o022,
+            0,
+            "nobody else may write the folder the download makes"
+        );
+        // Taken as it is when it is already there and fine.
+        make_version_folder(&into, &dir, me(), &|_| false).expect("reused");
+        std::fs::remove_dir(&dir).unwrap();
+
+        // Refused after it was made — here, by a stand-in euid it does not
+        // belong to — and so removed again.
+        let stranger = me().wrapping_add(4242);
+        assert!(make_version_folder(&into, &dir, stranger, &|_| true).is_err());
+        assert!(!dir.exists(), "the refused folder this call made is gone");
+        // One this call did not make stays: it is not ours to remove.
+        std::fs::create_dir(&dir).unwrap();
+        mode(&dir, 0o777);
+        assert!(make_version_folder(&into, &dir, me(), &|_| true).is_err());
+        assert!(dir.exists(), "a folder already there is left as it was");
+        mode(&dir, 0o755);
+    }
+
+    #[test]
+    fn a_private_group_is_the_users_own_with_no_one_else_in_it() {
+        let passwd = "root:x:0:0::/root:/bin/bash\nu:x:1000:1000::/home/u:/bin/bash\n\
+                      v:x:1001:100::/home/v:/bin/bash\n";
+        assert!(private_group_in(passwd, "u:x:1000:\n", 1000, 1000));
+        assert!(private_group_in(passwd, "u:x:1000:u\n", 1000, 1000));
+        // Someone else listed in it.
+        assert!(!private_group_in(passwd, "u:x:1000:u,v\n", 1000, 1000));
+        // A second line for the same gid, with someone in it.
+        assert!(!private_group_in(
+            passwd,
+            "u:x:1000:\nalias:x:1000:v\n",
+            1000,
+            1000
+        ));
+        // Not in /etc/group at all: LDAP or sssd, which cannot be seen from here.
+        assert!(!private_group_in(passwd, "users:x:100:\n", 1000, 1000));
+        // Not the user's primary group, however empty.
+        assert!(!private_group_in(passwd, "users:x:100:\n", 100, 1000));
+        // Another account's primary group too.
+        let shared = format!("{passwd}w:x:1002:1000::/home/w:/bin/sh\n");
+        assert!(!private_group_in(&shared, "u:x:1000:\n", 1000, 1000));
+        // Asked for another user.
+        assert!(!private_group_in(passwd, "u:x:1000:\n", 1000, 1001));
     }
 }

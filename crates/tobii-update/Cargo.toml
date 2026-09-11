@@ -7,6 +7,9 @@ description = "Checks for, verifies and installs new releases of the Tobii ET5 L
 
 [dependencies]
 tobii-config = { path = "../tobii-config" }
-# faccessat and geteuid: asking the kernel whether a directory is writable
-# without creating a file in it. See `install::placement`.
+# faccessat, geteuid and getegid. faccessat asks the kernel whether a directory
+# is writable without creating a file in it (`install::placement`); the ids say
+# whether the binaries, their folder and a download folder are this user's
+# (`install::binaries_mine`, `install::private_folder`), and are printed as
+# numbers in the chown `install::FolderFix` hands over.
 libc = "0.2"

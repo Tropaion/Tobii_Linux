@@ -416,13 +416,12 @@ mod tests {
         assert_eq!(parse_releases(json).unwrap(), None);
     }
 
-    /// An asset name is only a name — it must be a plain file name before it
-    /// is joined onto a directory, and `archive_for` is where the name that
-    /// gets downloaded is chosen.
+    /// `archive_for` matches the whole triple, so a musl build is not handed
+    /// the gnu archive.
     #[test]
     fn an_archive_is_matched_by_the_full_triple_not_a_prefix() {
         let r = parse_releases(LISTING).unwrap().unwrap();
-        // `x86_64-unknown-linux-gnu` must not be satisfied by a musl archive.
+        // The listing's only archive is gnu; a musl build must not get it.
         assert!(r.archive_for("x86_64-unknown-linux-musl").is_none());
         assert!(
             r.archive_for("").is_some(),
@@ -484,7 +483,7 @@ mod tests {
                 assert!(!url.is_empty(), "the user needs somewhere to go");
                 assert_eq!(why, Blocked::NoBuildForTarget);
             }
-            o => panic!("expected NotForThisTarget, got {o:?}"),
+            o => panic!("expected CannotInstall(NoBuildForTarget), got {o:?}"),
         }
 
         // An archive for us but no checksums: also not installable, and it must
@@ -497,9 +496,6 @@ mod tests {
                 "https://github.com/a/b/x.tar.gz",
             )],
         );
-        // ...and it must be reported as MISSING CHECKSUMS, not as "no build
-        // for your machine": the build is right there, and sending the user to
-        // look for one that exists is the worse of the two wrong answers.
         assert!(matches!(
             decide(Some(no_sums), &running, TRIPLE),
             Check::CannotInstall {
