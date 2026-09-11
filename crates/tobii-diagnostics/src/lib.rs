@@ -123,6 +123,7 @@ pub fn report() -> String {
         let _ = writeln!(o, "  {:<16} {}", "enabled eye", enabled_eye());
         let _ = writeln!(o, "  {:<16} {}", "pitch offset", pitch_offset());
         let _ = writeln!(o, "  {:<16} {}", "update check", update_check());
+        let _ = writeln!(o, "  {:<16} {}", "text scale", text_scale());
         let _ = writeln!(o, "  {:<16} {}", "head-pose model", head_model());
         salted
     };
@@ -562,6 +563,16 @@ fn update_check() -> String {
         (true, _) => "on".into(),
         (false, _) => "off".into(),
     }
+}
+
+/// The hub's text size, as a percentage.
+///
+/// Here because "the window opens too big" and "the last card is cut off" are
+/// the two reports this setting produces, and neither is answerable without the
+/// number. `text_scale` clamps and falls back to 1.0 on its own, so this cannot
+/// report a value the UI is not actually using.
+fn text_scale() -> String {
+    format!("{:.0}%", tobii_config::text_scale() * 100.0)
 }
 
 fn head_model() -> String {

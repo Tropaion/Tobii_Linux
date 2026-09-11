@@ -214,7 +214,14 @@ pub fn run() -> glib::ExitCode {
     // already handled a host restarting.
     app.connect_startup(|app| {
         load_css();
-        publish_tray(app);
+        // Not in accuracy mode. That runs as a SECOND process (NON_UNIQUE,
+        // above), so publishing from it puts a second identical icon in the
+        // panel — and clicking that one activates the diagnostic's own
+        // application, starting another measurement run rather than raising the
+        // hub. Two icons where one does the wrong thing reads as a broken tray.
+        if !accuracy_mode() {
+            publish_tray(app);
+        }
     });
 
     // The device thread, started once. In background mode it exists before any
@@ -1696,8 +1703,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // without the hub focused — calibration, setup, the gaze overlay — holds
     // its own claim.
     //
-    // Driven from the tick above, from `window.is_active()`, and from nowhere
-    // else. It was previously an unconditional claim taken at build time plus a
+    // Driven from the tick above, from `window.is_active()`, plus one release
+    // in the unmap handler for the case where the tick itself is stopped (the
+    // window hidden to the tray) and in the close handler for a real quit. It
+    // was previously an unconditional claim taken at build time plus a
     // `notify::is-active` handler to release it — and where a compositor never
     // granted focus the notification never fired, so the claim was never
     // released and the tracker stayed lit for the life of the process. Polling
@@ -2023,8 +2032,9 @@ fn text_size_row() -> gtk::Box {
 
     settings_row(
         "Text size",
-        "Scales this window's text. The tracker, the games and everything else \
-         are unaffected — this is only how large the program draws itself.",
+        "Scales the text in every window this program draws, including the \
+         full-screen setup and calibration flows. The tracker, the games and \
+         the gaze overlay are unaffected.",
         &controls,
     )
 }

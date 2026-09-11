@@ -74,8 +74,8 @@ Not negotiable, and most of them are the device's doing rather than ours.
               layer-shell overlay)  both only when asked, and both opt-out-able)
                             │
                      ~/.config/tobii-linux/
-                (geometry, calibration blob, eye selection,
-                 pitch offset, update-check preference, models/)
+                (geometry, calibration blob, eye selection, pitch offset,
+                 update-check preference, hub text size, models/)
 ```
 
 **In scope:** speaking the ET5 protocol, deriving screen geometry, running

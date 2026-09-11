@@ -211,6 +211,58 @@ because the reasoning is worth more than the tidiness.
   discarded by the caller, so a DLL that is waiting on a port held by another
   wineserver session looks identical to one with nothing sending.
 
+### 11.3b The hub's window, the tray and the download path (new in v0.3.0)
+
+- **The tray has only ever been seen on KDE Plasma.** It is a
+  `StatusNotifierItem` on D-Bus, the interface waybar, xfce4-panel, LXQt and
+  GNOME's AppIndicator extension all implement — none of which has been tried.
+  Verified on Plasma against the live `kded6` watcher: the item appears in
+  `RegisteredStatusNotifierItems` and `ToolTip` reads back correctly.
+- **"A watcher is up" is not "an icon is visible", and the hub cannot tell the
+  difference.** It hides itself when something owns the watcher bus name; the
+  reply to `RegisterStatusNotifierItem` is discarded, because there is nothing
+  useful to do with a refusal. So a host that rejects the item, or a panel
+  configured to hide unknown items, leaves the window hidden with no icon. The
+  way back still exists — launching the app again presents the existing hub —
+  but nothing on screen says so.
+- **The Download path for package-managed copies has never been clicked
+  through.** It is unit-tested, and its asset matching was checked against the
+  real v0.2.0 release assets, but the branch is reachable only when a package
+  manager owns the running binary *and* a newer release exists — which no
+  development build can produce. v0.3.0 is the release that first makes it
+  reachable, and its first users are its first test.
+- **Only the pacman branch of the ownership query has run against a real
+  package database.** `dpkg` and `rpm` are not installed on the development
+  machine, so those two branches are unit-test-only — and they are what decides
+  whether a Debian or Fedora user is offered Update or Download.
+- **A failed re-download discards an earlier complete one.** The cleanup is
+  scoped to the version directory, not to the files that call added, so
+  retrying the same version into the same folder and failing part-way takes the
+  previous copy with it.
+- **The text-size ceiling is reachable and costs more than it looks.** At 160%
+  the hub's own minimum is 1395x857 — measured — which is larger than a
+  1366x768 screen, so the window opens clipped, and the control that reverses
+  it is in a popover anchored to that oversized window. The recovery is to
+  delete `~/.config/tobii-linux/text_scale`. Only `font-size` follows the
+  setting: every fixed pixel dimension in the hub stays where it is, so
+  *lowering* the text size does not make the window fit a small screen either.
+- **The layout breakpoints are measured once, when the window is built.**
+  Changing the text size during a session leaves the column thresholds
+  belonging to the old scale; only the window's height is re-fitted.
+- **The window auto-fit stops for good once the user resizes by hand.** That is
+  deliberate — a hub that fights a size you chose is worse — but it means
+  raising the text size after a manual resize scrolls the content instead of
+  growing the window, which reads as the setting half-working.
+- **The two- and one-column layouts are effectively unreachable by dragging on
+  a floating desktop**, because the window's minimum width and the three-column
+  breakpoint derive from the same measurement. A tiling compositor, or a screen
+  narrower than the hub, still reaches them. Established from the code and from
+  measuring each layout, not from a drag.
+- **The fullscreen setup and calibration flows scale with the text-size setting
+  and have not been looked at at either end of its range.** The setting rewrites
+  the display-wide stylesheet and the process's font DPI, so it is not confined
+  to the hub.
+
 ### 11.4 Environmental
 
 - **Glyph clipping at fractional display scale.** Tops of tall glyphs appear

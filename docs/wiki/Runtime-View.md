@@ -167,11 +167,26 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
    triple **and** checksums. Otherwise the banner says which of those is missing
    — "no build for your machine" told to somebody whose build is right there
    sends them looking for something that exists.
-3. On **Update**: `app.hold()` (so closing the window cannot kill the process
+3. Still on the worker: **who owns this copy?** `install_dir()` then
+   `ownership_of()`, which asks `dpkg`, `rpm` and `pacman` in turn about each
+   installed binary — up to three subprocess calls, each with a deadline,
+   before the banner is shown. The answer picks the banner:
+   - **Nobody owns it** → *Update*, the path below.
+   - **A package manager owns it** → *Download*. A folder picker, then
+     `download_release_files` fetches the artifact matching that manager (the
+     `.deb`, the `.rpm`, or the `PKGBUILD` **and** its install hook) into a
+     version-named subdirectory, digest-checked against `SHA256SUMS` exactly as
+     the archive would be — and stops. It installs nothing, so it deliberately
+     takes **no** `app.hold()`: there is no window of two-half-written binaries
+     to protect.
+   - **Could not tell** → refuse, and say which query failed. Overwriting a
+     packaged file on the strength of a query that failed is the one outcome
+     worth refusing outright.
+4. On **Update**: `app.hold()` (so closing the window cannot kill the process
    between two renames), then an install thread.
-4. `net::download` → digest against `SHA256SUMS` → `tar -xzf` → find the
+5. `net::download` → digest against `SHA256SUMS` → `tar -xzf` → find the
    binaries **skipping symlinks** → **run each one with `--version`** → swap.
-5. The swap: hard-link the old binary aside as a backup, then a single atomic
+6. The swap: hard-link the old binary aside as a backup, then a single atomic
    rename over the target — so the path is never absent — and roll **all** of
    them back if any step fails.
 

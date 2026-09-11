@@ -249,8 +249,20 @@ Collected from the source and from bugs that actually happened.
 
 ## Releasing
 
-Bump `[workspace.package] version`, commit, then `git tag v0.2.0 && git push
-origin v0.2.0`. CI builds in a Debian 13 container, enforces the glibc floor,
+Four things go in the release commit; the tag build fails without the first two.
+`release.sh` refuses when `Cargo.toml` disagrees with the tag, and every gate
+runs `--locked`, so a bumped manifest with a stale lock fails before it builds:
+
+1. `[workspace.package] version` in **both** `Cargo.toml` and `bridge/Cargo.toml`.
+2. **Both** lock files — a separate step: `cargo update -w --offline`, then the
+   same with `--manifest-path bridge/Cargo.toml`.
+3. `docs/releases/vX.Y.Z.md`. This is the published changelog and the in-app
+   *What's new*; without it CI falls back to raw commit subjects.
+4. A `docs/wiki/Quality-and-Risks.md` section for whatever new surface ships.
+
+Then `git push origin main` (the tag must point at a pushed commit) and
+`git tag vX.Y.Z && git push origin vX.Y.Z`. CI builds in a Debian 13 container,
+enforces the glibc floor,
 checks that the `.deb` and `.rpm` actually *declare* it, verifies the checksums
 and publishes a **draft** — the release notes are the changelog every user's
 updater shows them, so a human sees them first.

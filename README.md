@@ -51,8 +51,11 @@ inspired by the original Tobii Experience UI.
 - **GTK4 hub** (`tobii-gtk`): a live instrument panel — the trackbox with a
   graticule and the tolerance region drawn, your eyes as dots, the head drawn
   around them turning as you turn, a readout of position, distance, yaw, pitch
-  and roll, and the infrared sensor view. Responsive: the columns stack on a
-  narrow window.
+  and roll, and the infrared sensor view, across the top; six setting cards in
+  three columns beneath. The layout has three column counts and drops to two,
+  then one, as the window narrows — though on a floating desktop the window's
+  own minimum width is the three-column width, so reaching the narrower ones
+  takes a tiling compositor or a screen smaller than the hub.
 - **Preview my gaze** — a translucent click-through dot that follows your gaze
   (Wayland `layer-shell`).
 - **Accuracy diagnostic** (`tobii-gtk --accuracy`) — a 39-target sweep reporting
@@ -107,8 +110,9 @@ makepkg -si
 
 `install.sh` copies the two binaries, adds the application-menu entry, and asks
 before using `sudo` for the udev rule. The packages do all of that as part of
-installing, into `/usr/bin` — which is also why the built-in updater declines to
-touch them and points you at your package manager instead.
+installing, into `/usr/bin` — which is also why the built-in updater will not
+replace them. It offers to **download** the file your package manager wants
+instead; see [Updates](#updates).
 
 **Re-plug the Eye Tracker 5 afterwards** so the udev rule takes effect.
 </details>
@@ -328,10 +332,12 @@ Or pick **Tobii Eye Tracker** from your application menu, once
 The hub shows connection status, the live instrument panel, and the tracking
 settings: improve calibration, head tracking, preview my gaze, select eyes,
 change screen. The cogwheel beside the connection status holds the rest — start
-at login, check for updates, and saving or copying the diagnostics report.
+at login, check for updates, **text size** (80–160%, for the whole program), and
+saving or copying the diagnostics report.
 
 ```sh
-tobii-gtk --background   # resident, no window, tracker off (see below)
+tobii-gtk --background   # resident, no window, tracker off — but an icon in
+                         # the status area, where there is one (see below)
 tobii-gtk --version
 ```
 
@@ -507,17 +513,27 @@ through `FTGetData` as `yaw=0.1309, pitch=-0.0567, roll=0.0262` radians and
 
 ### Closing the window does not quit
 
-Pressing **X** minimises the hub to the taskbar and leaves it running. That is
+Pressing **X** puts the hub in the background and leaves it running. That is
 deliberate: only one process can claim the tracker over USB, so the program that
 owns the device has to be the same one that feeds a game — and configuring it
 means opening this window. A hub that died when you dismissed it would take the
 game's head tracking with it.
 
-The tracker still goes dark. The claim on the device is polled from whether the
-window is active, so minimising drops it within a frame; measured on a minimised
-hub: **no USB file descriptors and no GPU file descriptors held**. If you left
-*Preview my gaze* on, that has its own claim and the tracker stays on, which is
-correct — something is asking for data.
+**Where it goes depends on your desktop.** If something on your session bus owns
+`org.kde.StatusNotifierWatcher` — KDE Plasma, and the panels and bars that
+implement the same interface — the window is *hidden* and a tray icon is your
+way back. With no such host, stock GNOME included, the window is *minimised*
+exactly as it was before, and Alt-Tab or the overview is the way back. Either
+way, launching the app again raises the hub you already have.
+
+The tray icon has no menu on purpose: left-, right- and middle-click all just
+raise the hub, and *Quit* lives in the cogwheel inside it.
+
+The tracker still goes dark. Hiding releases the claim as it hides; minimising
+drops it within a frame, because the claim is polled from whether the window is
+active. Measured on a **minimised** hub: **no USB file descriptors and no GPU
+file descriptors held**. If you left *Preview my gaze* on, that has its own claim
+and the tracker stays on, which is correct — something is asking for data.
 
 Launching the app again — from the menu, the dock, or `tobii-gtk` — raises the
 existing window rather than starting a second copy.
@@ -530,9 +546,10 @@ existing window rather than starting a second copy.
 settings that are about the program rather than the tracker — writes an XDG
 autostart entry that runs
 `tobii-gtk --background`: no window, and — because nothing is asking for data —
-no tracker either. It exists so the tracker's saved display area and calibration
-are re-applied as soon as anything wants them, which matters because **the ET5
-wipes both every time it reboots**.
+no tracker either. Where your desktop has a status area there is an icon in it,
+which is the way to open the hub; otherwise the application menu is. It exists so
+the hub is already running when you want it, and so that launching the app hands
+off to the one process that can claim the tracker rather than starting a second.
 
 Launching the application again, from the menu or the command line, raises the
 hub belonging to that background process rather than starting a second copy.
@@ -547,6 +564,8 @@ GNOME Tweaks or KDE's Autostart page is also honoured — the switch reads their
 Stored under `$XDG_CONFIG_HOME/tobii-linux/` (default `~/.config/tobii-linux/`):
 `config.toml` (display geometry), `calibration.bin` and `calibration.meta.toml`,
 `enabled_eye`, `headpose_pitch_offset`, `update_check`, `setup_monitor_id`,
+`text_scale` (the hub's text size, as a bare number — delete it to get back to
+100%),
 `report_salt` (32 random bytes, mode 0600, which is what makes the monitor id in
 a diagnostics report meaningless to anyone else), and `models/` (the fetched
 head-pose model).
@@ -573,9 +592,11 @@ confirmed against the geometric pose (slope +1.03 and +0.96, r = 0.998 and
 download — checksum, unpack, symlink refusal, the runnability probe, the swap
 and the rollback — is exercised end to end against real `tar.gz` archives built
 from real executables (`crates/tobii-update/tests/install_end_to_end.rs`). The
-network half has only run against GitHub's live releases endpoint returning an
-empty list, because this repository has no tags yet, so the *first real release
-is still the first real test of the download itself*.
+listing and asset-selection halves have now run against two real published
+releases. What is still unproven is the *install* half against a release
+downloaded from GitHub rather than built locally, and the **Download** path for
+package-managed copies, which no one has clicked through against a real release
+— v0.3.0 is the first release that makes it reachable.
 
 The trust model is the honest limitation, not a missing test: the checksums are
 an integrity check, not a signature. See [Updates](#updates).
@@ -625,6 +646,8 @@ A Cargo workspace of focused crates:
 | `tobii-diagnostics` | The `tobii debug` report and the log it quotes. |
 | `tobii-cli`      | The `tobii` command-line tool. |
 | `tobii-gtk`      | The GTK4 hub, guided flows and gaze overlay. |
+| `tobii-output`   | Game output: the virtual joystick, opentrack/TrackIR encoding, the frame pipeline. |
+| `tobii-ipc`      | The local socket other programs read tracking from. |
 | `tobii-recap`    | Decodes a usbmon pcap capture into a readable TTP op catalog. |
 
 ## Updates
@@ -633,6 +656,15 @@ The GUI asks GitHub for the latest release when its window opens — the one
 thing this program does on the network without being asked — and shows a banner
 only if there is something newer. `tobii update` does the same from the command
 line. Nothing is downloaded until you choose to update.
+
+**If a package manager owns your copy**, the button says *Download* rather than
+*Update*, because overwriting a packaged file behind `dpkg`/`rpm`/`pacman`'s
+back is how a package database comes to describe files that are no longer there.
+It asks where to put it, fetches the artifact that matches your manager — the
+`.deb`, the `.rpm`, or the `PKGBUILD` and its install hook together — into a
+version-named folder there, and prints the one command that installs it. It
+never installs anything itself. This is the hub only; `tobii update` on the
+command line still just refuses and tells you why.
 
 **Turning the check off:** the switch in the hub under *Check for updates*, or
 `TOBII_NO_UPDATE_CHECK=1` in the environment, which also wins over the switch.
@@ -671,11 +703,25 @@ compiled into the binary; there isn't one.
 
 ### Publishing a release
 
-Bump `[workspace.package] version` in `Cargo.toml`, commit, then:
+Four things go in the release commit, and the tag build fails without the first
+two. `release.sh` refuses when `Cargo.toml` disagrees with the tag, and every
+gate runs `--locked`, so a bumped manifest with a stale lock fails CI:
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+# 1. both workspaces' [workspace.package] version -> the new number
+# 2. both lock files, which is a separate step:
+cargo update -w --offline
+cargo update -w --offline --manifest-path bridge/Cargo.toml
+# 3. docs/releases/vX.Y.Z.md — this is what the published changelog and the
+#    in-app "What's new" show. Without it CI falls back to raw commit subjects.
+# 4. docs/wiki/Quality-and-Risks.md — a section for whatever new surface ships.
+
+git commit -am "release: vX.Y.Z"
+git push origin main          # the tag must point at a pushed commit
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
+
+CI drafts the release; publishing it is a human click.
 
 **Releases are built by CI, not on a developer's machine, and that is the
 point.** The machine a binary is compiled on *is* its compatibility floor: on

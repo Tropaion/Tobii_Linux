@@ -43,7 +43,8 @@ display area first (the device wipes it on reboot; see [[Display-Area]]).
 | `tobii enabled-eye [both\|left\|right]` | Get (and optionally set) "Select eyes to detect" (`0xc62`/`0xc58`). See [[Select-Eyes]]. |
 
 The GUI (`crates/tobii-gtk`) provides the follow-the-dot calibration flow
-(Quick-5 / Full-9), the display-setup UI, and an eye-position/gaze overlay.
+(seven points, shown in three groups), the display-setup UI, and an
+eye-position/gaze overlay.
 
 ## `tobii-recap` — pcap → TTP op catalog
 
