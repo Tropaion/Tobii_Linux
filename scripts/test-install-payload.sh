@@ -39,7 +39,7 @@ entry=com.tobiilinux.Configuration.desktop
 fresh_home user
 payload_as 1000 "$HOME/.local/bin" "$src" "$assets" >/dev/null 2>&1
 check "user: both binaries installed" '[[ -x "$HOME/.local/bin/tobii" && -x "$HOME/.local/bin/tobii-gtk" ]]'
-check "user: the menu entry runs the absolute path" 'grep -qx "Exec=$HOME/.local/bin/tobii-gtk" "$XDG_DATA_HOME/applications/$entry"'
+check "user: the menu entry runs the absolute path, quoted" 'grep -qx "Exec=\"$HOME/.local/bin/tobii-gtk\"" "$XDG_DATA_HOME/applications/$entry"'
 check "user: the icon is installed" '[[ -f "$XDG_DATA_HOME/icons/hicolor/scalable/apps/com.tobiilinux.Configuration.svg" ]]'
 check "user: the manifest names the bindir" 'grep -qx "bindir=$HOME/.local/bin" "$XDG_DATA_HOME/tobii-linux/installs"'
 check "user: no icon cache is created" '[[ ! -e "$XDG_DATA_HOME/icons/hicolor/icon-theme.cache" ]]'
@@ -99,6 +99,76 @@ mkdir -p "$tmp/elsewhere"; cp "$(command -v sleep)" "$tmp/elsewhere/tobii-gtk"
 out="$(payload_as 1000 "$HOME/.local/bin" "$src" "$assets" 2>&1)"
 check "running: another running copy is named with its pid" '[[ "$out" == *"$tmp/elsewhere/tobii-gtk (pid $sleeper)"* ]]'
 kill "$sleeper"; wait "$sleeper" 2>/dev/null || true; sleeper=""
+
+# --- a relative bindir comes out absolute, in the entry and in the manifest
+fresh_home relative
+( cd "$HOME" && payload_as 1000 "rel/bin" "$src" "$assets" >/dev/null 2>&1 )
+check "relative: the menu entry names the absolute path" 'grep -qx "Exec=\"$HOME/rel/bin/tobii-gtk\"" "$XDG_DATA_HOME/applications/$entry"'
+check "relative: so does the manifest" 'grep -qx "bindir=$HOME/rel/bin" "$XDG_DATA_HOME/tobii-linux/installs"'
+
+# --- a --system run leaves the invoking user's login entry alone, dead or not
+fresh_home sysauto
+mkdir -p "$XDG_CONFIG_HOME/autostart"; a="$XDG_CONFIG_HOME/autostart/$entry"
+printf '[Desktop Entry]\nExec="/nonexistent/tobii-gtk" --background\n' > "$a"; cp "$a" "$tmp/sysauto.before"
+TOBII_SYSTEM_DATA_DIR="$tmp/sysauto-share" payload_as 0 "$tmp/sysauto-bin" "$src" "$assets" --system >/dev/null 2>&1
+check "--system: the user's login entry is byte-identical" 'cmp -s "$a" "$tmp/sysauto.before"'
+
+# --- installing over a running hub says it is still the previous version
+fresh_home previous
+mkdir -p "$HOME/.local/bin"; cp "$(command -v sleep)" "$HOME/.local/bin/tobii-gtk"
+"$HOME/.local/bin/tobii-gtk" 60 & sleeper=$!
+out="$(payload_as 1000 "$HOME/.local/bin" "$src" "$assets" 2>&1)"
+check "previous: a hub running the replaced binary is named, with its pid" '[[ "$out" == *"still running the previous version"*"(pid $sleeper)"* ]]'
+kill "$sleeper"; wait "$sleeper" 2>/dev/null || true; sleeper=""
+
+# --- a directory with a space, &, | and % in its name
+# (A failing install is not fatal here: it is what the checks below report, by name.)
+fresh_home odd
+odd="$HOME/odd dir &|%/bin"
+payload_as 1000 "$odd" "$src" "$assets" >/dev/null 2>&1 || true
+check "odd: the install completed (manifest written)" 'grep -qxF "bindir=$odd" "$XDG_DATA_HOME/tobii-linux/installs"'
+check "odd: Exec is quoted, with % doubled" 'grep -qxF "Exec=\"$HOME/odd dir &|%%/bin/tobii-gtk\"" "$XDG_DATA_HOME/applications/$entry"'
+mkdir -p "$XDG_CONFIG_HOME/autostart"; a="$XDG_CONFIG_HOME/autostart/$entry"
+printf '[Desktop Entry]\nExec="/nonexistent/tobii-gtk" --background\n' > "$a"
+payload_as 1000 "$odd" "$src" "$assets" >/dev/null 2>&1 || true
+check "odd: the dead login entry is repaired to the quoted path" 'grep -qxF "Exec=\"$HOME/odd dir &|%%/bin/tobii-gtk\" --background" "$a"'
+
+# --- a directory with a double quote gets no menu entry, but is installed
+fresh_home quote
+qd="$HOME/say \"hi\"/bin"
+out="$(payload_as 1000 "$qd" "$src" "$assets" 2>&1)" || true
+check "quote: no menu entry is written" '[[ ! -e "$XDG_DATA_HOME/applications/$entry" ]]'
+check "quote: and it says why" '[[ "$out" == *"No menu entry"* ]]'
+check "quote: the install completed (manifest written)" 'grep -qxF "bindir=$qd" "$XDG_DATA_HOME/tobii-linux/installs"'
+
+# --- login entries the repair must leave alone
+fresh_home keep
+mkdir -p "$XDG_CONFIG_HOME/autostart" "$tmp/pathbin" "$tmp/pct%dir"; a="$XDG_CONFIG_HOME/autostart/$entry"
+cp "$src/tobii-gtk" "$tmp/pathbin/"; cp "$src/tobii-gtk" "$tmp/pct%dir/"
+printf '[Desktop Entry]\nExec=tobii-gtk --background\n' > "$a"
+PATH="$tmp/pathbin:$PATH" payload_as 1000 "$HOME/.local/bin" "$src" "$assets" >/dev/null 2>&1
+check "keep: a bare name found on PATH is left alone" 'grep -qx "Exec=tobii-gtk --background" "$a"'
+printf '[Desktop Entry]\nExec=env GDK_BACKEND=x11 /nonexistent/tobii-gtk --background\n' > "$a"
+payload_as 1000 "$HOME/.local/bin" "$src" "$assets" >/dev/null 2>&1
+check "keep: an env wrapper is left alone" 'grep -qx "Exec=env GDK_BACKEND=x11 /nonexistent/tobii-gtk --background" "$a"'
+printf '[Desktop Entry]\nExec="%s" --background\n' "$tmp/pct%%dir/tobii-gtk" > "$a"; cp "$a" "$tmp/keep.before"
+payload_as 1000 "$HOME/.local/bin" "$src" "$assets" >/dev/null 2>&1
+check "keep: a quoted path escaped as the hub writes it (%%) is read as the copy it is" 'cmp -s "$a" "$tmp/keep.before"'
+rm -f "$a"; printf '[Desktop Entry]\nExec="/nonexistent/tobii-gtk" --background\n' > "$tmp/dotfile.desktop"
+ln -s "$tmp/dotfile.desktop" "$a"
+payload_as 1000 "$HOME/.local/bin" "$src" "$assets" >/dev/null 2>&1
+check "keep: a symlinked login entry stays a symlink, its target unchanged" '[[ -L "$a" ]] && grep -qx "Exec=\"/nonexistent/tobii-gtk\" --background" "$tmp/dotfile.desktop"'
+
+# --- a bindir reached through a symlink that is on PATH is on PATH
+fresh_home linkpath
+mkdir -p "$tmp/realbin"; ln -s "$tmp/realbin" "$HOME/linkbin"
+out="$(PATH="$HOME/linkbin:$PATH" payload_as 1000 "$HOME/linkbin" "$src" "$assets" 2>&1)"
+check "path: a symlinked PATH entry counts as on PATH" '[[ "$out" != *"is not in your PATH"* ]]'
+
+# --- a relative XDG_DATA_HOME is ignored
+fresh_home relxdg
+( cd "$HOME" && XDG_DATA_HOME="rel-share" payload_as 1000 "$HOME/.local/bin" "$src" "$assets" >/dev/null 2>&1 )
+check "xdg: a relative XDG_DATA_HOME is ignored" '[[ -f "$HOME/.local/share/applications/$entry" && ! -e "$HOME/rel-share" ]]'
 
 # --- a mistyped flag is refused, not ignored
 if TOBII_TEST_EUID=1000 bash "$payload" "$tmp/typo" "$src" "$assets" --no-udve </dev/null >/dev/null 2>&1; then

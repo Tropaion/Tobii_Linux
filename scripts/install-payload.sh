@@ -67,14 +67,66 @@ fi
 # Root runs the udev commands directly; a user goes through sudo, announced.
 as_root() { if [[ $euid -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
 
+# A relative XDG_* is ignored, as the XDG spec says and as every reader in the
+# program does (tobii_config::paths): otherwise this writes where nothing else
+# ever looks, the uninstaller included.
+cfg="$HOME/.config"
+if [[ ${XDG_CONFIG_HOME:-} == /* ]]; then cfg="$XDG_CONFIG_HOME"; fi
 if [[ $system -eq 1 ]]; then
     data="${TOBII_SYSTEM_DATA_DIR:-/usr/local/share}"
 else
-    data="${XDG_DATA_HOME:-$HOME/.local/share}"
+    data="$HOME/.local/share"
+    if [[ ${XDG_DATA_HOME:-} == /* ]]; then data="$XDG_DATA_HOME"; fi
 fi
 # Absolute: it goes into a desktop entry's Exec and into the manifest, and a
 # relative path in either means somewhere else the moment the cwd changes.
 bindir="$(realpath -m -- "$bindir")"
+
+# One Exec argument as the Desktop Entry spec wants it: in double quotes, with
+# `%` doubled (a lone `%` starts a field code). A path with `"`, `` ` ``, `$` or
+# `\` would need the spec's backslash escaping, which applies at two levels that
+# launchers do not agree on — so it gets no entry rather than a wrong one.
+desktop_arg() {
+    case "$1" in
+        *[\"\`\$\\]*) return 1 ;;
+    esac
+    local pct='%'
+    printf '"%s"' "${1//"$pct"/%%}"
+}
+
+# Replace the first Exec line of a desktop file, line by line: the value is data,
+# and sed would read `|` and `&` in it as syntax.
+set_exec() {
+    local file="$1" value="$2" line done=0 tmp="$1.new-$$"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ $done -eq 0 && "$line" == Exec=* ]]; then
+            printf 'Exec=%s\n' "$value"; done=1
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$file" > "$tmp"
+    mv -f "$tmp" "$file"
+}
+
+# The program an Exec line runs: its first argument with the quoting and the
+# hub's own escaping undone (`%%` is `%`, a backslash escapes the next character),
+# so a path containing one of those is read as the path it is.
+exec_program() {
+    local s="$1" out="" i c pct='%%'
+    s="${s//"$pct"/%}"
+    if [[ "$s" == \"* ]]; then
+        s="${s:1}"
+        for (( i = 0; i < ${#s}; i++ )); do
+            c="${s:i:1}"
+            if [[ "$c" == "\\" ]]; then i=$((i + 1)); out+="${s:i:1}"
+            elif [[ "$c" == '"' ]]; then break
+            else out+="$c"; fi
+        done
+    else
+        out="${s%% *}"
+    fi
+    printf '%s' "$out"
+}
 
 if [[ $bins_wanted -eq 1 ]]; then
     echo "${bold}Installing into $bindir${reset}"
@@ -98,15 +150,19 @@ if [[ $bins_wanted -eq 1 ]]; then
         echo "  $bindir/$b"
     done
 
-    case ":${PATH}:" in
-        *":$bindir:"*) ;;
-        *)
-            echo
-            echo "  ${bold}Note:${reset} $bindir is not in your PATH."
-            echo "  ${dim}fish:  fish_add_path $bindir${reset}"
-            echo "  ${dim}bash:  echo 'export PATH=\"$bindir:\$PATH\"' >> ~/.bashrc${reset}"
-            ;;
-    esac
+    # -ef, not string equality: a PATH entry that is a symlink to this directory,
+    # or this directory named through one, is the same place.
+    on_path=0
+    IFS=: read -r -a path_dirs <<< "${PATH:-}"
+    for e in "${path_dirs[@]}"; do
+        if [[ -n "$e" && -d "$e" && "$e" -ef "$bindir" ]]; then on_path=1; break; fi
+    done
+    if [[ $on_path -eq 0 ]]; then
+        echo
+        echo "  ${bold}Note:${reset} $bindir is not in your PATH."
+        echo "  ${dim}fish:  fish_add_path $bindir${reset}"
+        echo "  ${dim}bash:  echo 'export PATH=\"$bindir:\$PATH\"' >> ~/.bashrc${reset}"
+    fi
 fi
 
 # The application menu entry and the icon. Only the GUI has anything to show,
@@ -122,14 +178,22 @@ if [[ $bins_wanted -eq 1 && $lean -eq 0 && -f "$assets/com.tobiilinux.Configurat
     if [[ ! -d "$icons" ]]; then new_icon_dir=1; fi
     mkdir -p "$apps" "$icons"
 
-    # Exec is rewritten to the absolute path. The shipped entry says a bare
-    # `tobii-gtk` because the .deb/.rpm put it in /usr/bin, which is always on
-    # PATH — but a desktop launcher does not read your shell profile, so for a
+    # Exec is rewritten to the absolute path, quoted. The shipped entry says a
+    # bare `tobii-gtk` because the .deb/.rpm put it in /usr/bin, which is always
+    # on PATH — but a desktop launcher does not read your shell profile, so for a
     # ~/.local/bin install the bare name is a menu entry that silently does
     # nothing. The updater replaces the binary at the same path, so an absolute
-    # Exec stays correct across updates.
-    sed "s|^Exec=tobii-gtk\$|Exec=$bindir/tobii-gtk|" \
-        "$assets/com.tobiilinux.Configuration.desktop" > "$apps/com.tobiilinux.Configuration.desktop"
+    # Exec stays correct across updates. Written line by line, not with sed: sed
+    # read `|` in the path as syntax and aborted the install, and `&` as "the
+    # match" and wrote a wrong path.
+    if exec_arg="$(desktop_arg "$bindir/tobii-gtk")"; then
+        cp "$assets/com.tobiilinux.Configuration.desktop" "$apps/com.tobiilinux.Configuration.desktop"
+        set_exec "$apps/com.tobiilinux.Configuration.desktop" "$exec_arg"
+    else
+        rm -f "$apps/com.tobiilinux.Configuration.desktop"
+        echo "  ${bold}No menu entry:${reset} $bindir holds a character a menu entry cannot name"
+        echo "  reliably (a quote, a backtick, \$ or a backslash). Start it with $bindir/tobii-gtk."
+    fi
     cp "$assets/com.tobiilinux.Configuration.svg" "$icons/"
 
     # Without this the entry can take minutes to appear, or not appear until the
@@ -147,7 +211,9 @@ if [[ $bins_wanted -eq 1 && $lean -eq 0 && -f "$assets/com.tobiilinux.Configurat
             gtk-update-icon-cache -qtf "$hicolor" 2>/dev/null || true
         fi
     fi
-    echo "  $apps/com.tobiilinux.Configuration.desktop"
+    if [[ -f "$apps/com.tobiilinux.Configuration.desktop" ]]; then
+        echo "  $apps/com.tobiilinux.Configuration.desktop"
+    fi
     if [[ $new_icon_dir -eq 1 ]] && pgrep -x plasmashell >/dev/null 2>&1; then
         echo "  ${dim}Plasma looks only in icon folders that existed when it started, so the${reset}"
         echo "  ${dim}menu entry may show a generic icon until you next log in.${reset}"
@@ -178,31 +244,39 @@ fi
 # and the next login started nothing. Repaired only when it points at nothing:
 # pointed at another copy that still exists, it is left alone and named, because
 # which copy starts at login is the user's choice.
+#
+# Only an ABSOLUTE path that no longer exists is repaired. A bare name is looked
+# up on PATH by the launcher and may well work; an `env …` wrapper is something
+# the user wrote; a symlinked entry belongs to a dotfile manager, and rewriting
+# it would replace the link with a plain file. Those are named, never touched.
 if [[ $system -eq 0 && $bins_wanted -eq 1 && $lean -eq 0 ]]; then
-    auto="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/com.tobiilinux.Configuration.desktop"
-    if [[ -f "$auto" ]]; then
-        exec_line="$(sed -n 's/^Exec=//p' "$auto" | head -n1)"
-        # The first word of Exec, quoted (as the hub writes it) or bare.
-        if [[ "$exec_line" == \"* ]]; then
-            target="${exec_line#\"}"; target="${target%%\"*}"
-        else
-            target="${exec_line%% *}"
-        fi
-        want="$bindir/tobii-gtk"
-        if [[ -n "$target" && "$target" != "$want" && ! -e "$target" ]]; then
-            case "$want" in
-                # Characters the Exec quoting or this sed would have to escape.
-                *[\"\\\`\$%\|\&]*)
-                    echo "  ${bold}Start at login${reset} runs $target, which is gone — switch it off and on in the hub." ;;
-                *)
-                    sed -i "s|^Exec=.*|Exec=\"$want\" --background|" "$auto"
-                    echo "  repaired start at login: it ran $target, which no longer exists"
-                    ;;
-            esac
-        elif [[ -n "$target" && "$target" != "$want" ]]; then
-            echo "  ${dim}Start at login runs $target, not this copy. To change that, switch it${reset}"
-            echo "  ${dim}off and on in the hub you want to start.${reset}"
-        fi
+    auto="$cfg/autostart/com.tobiilinux.Configuration.desktop"
+    want="$bindir/tobii-gtk"
+    if [[ -L "$auto" ]]; then
+        echo "  ${dim}Start at login is a symlink ($auto); left as it is.${reset}"
+    elif [[ -f "$auto" ]]; then
+        target="$(exec_program "$(sed -n 's/^Exec=//p' "$auto" | head -n1)")"
+        case "$target" in
+            "") ;;
+            env|*/env)
+                echo "  ${dim}Start at login runs the program through env; left as it is.${reset}" ;;
+            /*)
+                if [[ "$target" != "$want" && ! -e "$target" ]]; then
+                    if exec_arg="$(desktop_arg "$want")"; then
+                        set_exec "$auto" "$exec_arg --background"
+                        echo "  repaired start at login: it ran $target, which no longer exists"
+                    else
+                        echo "  ${bold}Start at login${reset} runs $target, which is gone — switch it off and on in the hub."
+                    fi
+                elif [[ "$target" != "$want" ]]; then
+                    echo "  ${dim}Start at login runs $target, not this copy. To change that, switch it${reset}"
+                    echo "  ${dim}off and on in the hub you want to start.${reset}"
+                fi ;;
+            *)
+                if ! command -v -- "$target" >/dev/null 2>&1; then
+                    echo "  ${dim}Start at login runs \`$target\`, which is not on this PATH; left as it is.${reset}"
+                fi ;;
+        esac
     fi
 fi
 
@@ -213,8 +287,14 @@ fi
 # a terminal, this install — with the old program for as long as it lives. On
 # 2026-09-11 a v0.1.0 hub whose package had been removed absorbed five launches
 # and four installs this way. Named here, because nothing on screen says so.
+#
+# Only the invoking user's processes: as a user the kernel hides everyone else's
+# anyway, but a --system run is root, and "kill <pid>" advice about another
+# person's session hub is not advice to give.
 if [[ $bins_wanted -eq 1 ]]; then
+    me="${SUDO_UID:-$(id -u)}"
     for p in /proc/[0-9]*; do
+        [[ "$(stat -c %u "$p" 2>/dev/null)" == "$me" ]] || continue
         exe="$(readlink "$p/exe" 2>/dev/null)" || continue
         [[ "$(basename -- "${exe% (deleted)}")" == tobii-gtk ]] || continue
         pid="${p#/proc/}"
