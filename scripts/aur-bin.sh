@@ -37,7 +37,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: scripts/aur-bin.sh <version> <tarball> <outdir>" >&2
+    echo "usage: scripts/aur-bin.sh <version> <tarball> <outdir> [pkgrel]" >&2
     echo "  e.g. scripts/aur-bin.sh 0.3.0 dist/tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz aur/tobii-linux-bin" >&2
     exit 2
 }
@@ -46,10 +46,15 @@ die() {
     exit 1
 }
 
-[[ $# -eq 3 ]] || usage
+[[ $# -eq 3 || $# -eq 4 ]] || usage
 version="$1"
 tarball="$2"
 outdir="$3"
+# The package release: 1 for a new version, higher to re-publish the same one
+# after a packaging fix — AUR helpers upgrade only when pkgver-pkgrel changes,
+# so a fix pushed under the same pkgrel reaches new installs only.
+pkgrel="${4:-1}"
+[[ "$pkgrel" =~ ^[1-9][0-9]*$ ]] || die "'$pkgrel' is not a pkgrel (a positive integer)"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -159,7 +164,7 @@ _ver=${version}
 # makepkg forbids '-' in pkgver, so 1.0.0-rc1 becomes 1.0.0rc1 — which vercmp
 # sorts below 1.0.0, as a pre-release should.
 pkgver=\${_ver//-/}
-pkgrel=1
+pkgrel=${pkgrel}
 pkgdesc="Linux runtime and GUI for the Tobii Eye Tracker 5 (clean-room, prebuilt)"
 arch=('x86_64')
 url="https://github.com/Tropaion/Tobii_Linux"

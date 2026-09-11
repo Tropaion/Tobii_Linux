@@ -195,7 +195,8 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
    - **Nobody owns it** → *Update*, the path below.
    - **A package manager owns it** → *Download*. A folder picker, then
      `download_release_files` fetches the artifact matching that manager (the
-     `.deb`, the `.rpm`, or the `PKGBUILD` **and** its install hook) into a
+     `.deb`, the `.rpm`, or the prebuilt Arch package — for a release without one,
+     the `PKGBUILD` **and** its install hook) into a
      version-named subdirectory, digest-checked against `SHA256SUMS` exactly as
      the archive would be — and stops. It installs nothing, so it deliberately
      takes **no** `app.hold()`: there is no window of two-half-written binaries

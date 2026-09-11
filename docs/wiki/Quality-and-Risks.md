@@ -103,7 +103,10 @@ derived (from `objdump`), the rest is not.
 **The PKGBUILD's `sha256sums` is `SKIP`.** GitHub's generated source tarballs
 have not been byte-stable across their own tooling changes, and a pinned digest
 that breaks is worse than an absent one — but it does mean the source-build
-channel verifies nothing about what it downloads.
+channel verifies nothing about what it downloads. The prebuilt `tobii-linux-bin`
+is the pinned alternative on Arch: its PKGBUILD pins the release tarball's sha256,
+taken from the release's own `SHA256SUMS` — an integrity check, not a signature,
+like every checksum in this project.
 
 **The binaries ship unstripped**, about 9 MB of symbol table each — a 34 MB
 binary strips to 25 MB (measured with `strip` on both, September 2026).

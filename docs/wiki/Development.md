@@ -289,8 +289,8 @@ over every file, and every file must be listed and named the way a hub's
 matcher looks for it. `publish` uploads that set. The tested PKGBUILD and its
 `.SRCINFO` are kept as the `aur-bin` artifact.
 
-**The AUR.** `.github/workflows/aur.yml` runs when the draft is **published**
-(pre-releases are skipped), or by hand: *Actions → AUR → Run workflow*, with a
+**The AUR.** `.github/workflows/aur.yml` runs when a release becomes a full
+release — published as one, or a pre-release promoted later — or by hand: *Actions → AUR → Run workflow*, with a
 tag. It downloads the published tarball and `SHA256SUMS`, checks one against the
 other, regenerates the PKGBUILD, compares its pin with the release's
 `SHA256SUMS` entry, lets `makepkg --verifysource` download from the published
@@ -308,8 +308,14 @@ One-time setup, before the first push:
 3. The private key, `aur_key`, as the repository secret `AUR_SSH_KEY`
    (*Settings → Secrets and variables → Actions*). Then delete the local copy,
    or keep it somewhere you would keep a password.
-4. Run the workflow by hand for the latest release. **The first push creates the
-   package** under your account; there is nothing to register beforehand.
+4. Run the workflow by hand for the first release that ships `tobii-linux-bin`
+   — v0.3.1 or later, not v0.3.0, whose hub does not know the prebuilt package
+   and whose `tobii` has no `uninstall`. **The first push creates the package**
+   under your account; there is nothing to register beforehand.
+
+To re-publish a release after a packaging fix, run it by hand with a higher
+`pkgrel`: AUR helpers upgrade only when `pkgver-pkgrel` changes, so a fix pushed
+under the same pkgrel reaches new installs only.
 
 Until the secret exists, the job does everything except the push, prints what it
 would have pushed, and ends green with a notice. The AUR's SSH host keys are

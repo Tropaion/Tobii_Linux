@@ -131,7 +131,13 @@ pub fn saved_for_system(dir: &Path, files: &[PathBuf]) -> String {
         // Unreachable: a download that succeeded wrote at least one file.
         return "The download finished, but reported no files.".to_string();
     };
-    let folder = first.parent().unwrap_or(Path::new("."));
+    // The same rule as `saved`: every path quoted, and a bare file name's empty
+    // parent read as the current directory rather than printed as `cd ''`.
+    let folder = first
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let folder = sh_quote(&folder.to_string_lossy());
     let name = first
         .file_name()
         .unwrap_or_default()
@@ -139,10 +145,8 @@ pub fn saved_for_system(dir: &Path, files: &[PathBuf]) -> String {
         .to_string();
     let stem = name.trim_end_matches(".tar.gz");
     format!(
-        "Saved {name} to {}.\nInstall it for every user with:\n  cd {} && tar -xzf {} && cd {} \
-         && sudo ./install.sh --system {}",
-        folder.display(),
-        sh_quote(&folder.to_string_lossy()),
+        "Saved {name} to {folder}.\nInstall it for every user with:\n  cd {folder} && tar -xzf {} \
+         && cd {} && sudo ./install.sh --system {}",
         sh_quote(&name),
         sh_quote(stem),
         sh_quote(&dir.to_string_lossy()),
@@ -1099,6 +1103,22 @@ mod banner_text_tests {
         );
         let h = system_headline("0.3.1", Path::new("/usr/local/bin"));
         assert!(h.contains("/usr/local/bin") && h.contains("0.3.1"), "{h}");
+    }
+
+    /// A bare file name has an empty parent. It must read as the current
+    /// directory, never as `cd ''`; `saved` and `saved_for_system` share the rule.
+    #[test]
+    fn a_bare_file_name_is_saved_to_the_current_directory() {
+        let archive = [PathBuf::from(
+            "tobii-linux-0.3.1-x86_64-unknown-linux-gnu.tar.gz",
+        )];
+        for t in [
+            saved(Channel::Archive, &archive),
+            saved_for_system(Path::new("/usr/local/bin"), &archive),
+        ] {
+            assert!(t.contains("to '.'") && t.contains("cd '.'"), "{t}");
+            assert!(!t.contains("''"), "{t}");
+        }
     }
 
     #[test]

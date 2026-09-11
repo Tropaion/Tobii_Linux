@@ -9,14 +9,18 @@
 #
 # # When
 #
-# - A release is PUBLISHED — which for this project is the maintainer pressing
-#   Publish on the draft release.yml made. Pre-releases are skipped: an AUR
+# - A release becomes a full release (`released`): the maintainer publishing the
+#   draft release.yml made, or promoting a pre-release later — `published` fires
+#   only once, at the pre-release stage, so a promoted release never arrived.
+#   Pre-releases are skipped: an AUR
 #   helper upgrades everybody who has the package, and a pre-release is not
 #   something to push at people who did not ask for one.
 # - By hand (Actions → AUR → Run workflow) with a tag, to publish an existing
 #   release, including the first push, which is what creates the AUR package.
 #   A manual run uses the scripts from the branch it is started on, so a fixed
-#   aur-bin.sh can re-publish a release without a new tag.
+#   aur-bin.sh can re-publish a release without a new tag. Give such a run a
+#   higher pkgrel: AUR helpers upgrade only when pkgver-pkgrel changes, so a fix
+#   pushed under the same pkgrel reaches new installs only.
 #
 # # What the pin is — and is not
 #
@@ -39,12 +43,17 @@ name: AUR
 
 on:
   release:
-    types: [published]
+    types: [released]
   workflow_dispatch:
     inputs:
       tag:
         description: "The release tag to publish to the AUR, e.g. v0.4.0"
         required: true
+        type: string
+      pkgrel:
+        description: "The package release. Bump it to re-publish a release after a packaging fix."
+        required: false
+        default: "1"
         type: string
 
 permissions:
@@ -73,14 +82,23 @@ jobs:
       - name: Check the tag is a version
         env:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          PKGREL: ${{ inputs.pkgrel || '1' }}
         run: |
           set -euo pipefail
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z][A-Za-z0-9.]*)?$'; then
+          # bash's =~, not grep: grep matches line by line, so a dispatched tag
+          # with a newline in it passed on its first line and wrote the rest into
+          # $GITHUB_ENV as variables of their own.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z][A-Za-z0-9.]*)?$ ]]; then
             echo "::error::'$TAG' is not a release tag (vMAJOR.MINOR.PATCH, optionally -rc1-style)" >&2
             exit 1
           fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          if [[ ! "$PKGREL" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::'$PKGREL' is not a pkgrel (a positive integer)" >&2
+            exit 1
+          fi
+          echo "PKGREL=$PKGREL" >> "$GITHUB_ENV"
 
       # git and ssh for the push. base-devel has makepkg, binutils (objdump,
       # for aur-bin.sh) and curl already. Mirrors flake, hence the retry.
@@ -123,7 +141,7 @@ jobs:
       - name: Generate the PKGBUILD
         run: |
           set -euo pipefail
-          scripts/aur-bin.sh "$VERSION" "fetched/tobii-linux-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" out
+          scripts/aur-bin.sh "$VERSION" "fetched/tobii-linux-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" out "$PKGREL"
           if ! grep -Fxq "sha256sums_x86_64=('$PIN')" out/PKGBUILD; then
             echo "::error::the PKGBUILD's pin is not the value the release's SHA256SUMS lists" >&2
             exit 1

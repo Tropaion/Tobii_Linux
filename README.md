@@ -88,10 +88,12 @@ updater, or do you want your system to own this?**
 | **A release** — `.tar.gz`, `.deb`, `.rpm`, an Arch package, or a `PKGBUILD` | [Releases](https://github.com/Tropaion/Tobii_Linux/releases) | the built-in updater (`.tar.gz` only) or your package manager |
 | **From source** | the steps below | `git pull` and rebuild |
 
-The prebuilt binaries are built in a Debian 13 container, so they need **glibc
-2.41 or newer**; on an older distribution, build from source. The `.deb`, the
-`.rpm` and the Arch package declare that floor, so your package manager refuses
-rather than installing something that cannot start.
+The prebuilt binaries are built in a Debian 13 container, which caps the glibc
+they can need at **2.41**. What they actually need is measured from the binaries
+when they are built — **2.39** for v0.3.0 — and the `.deb`, the `.rpm` and the
+Arch package declare that measured floor, so your package manager refuses rather
+than installing something that cannot start. On an older distribution, build
+from source.
 
 <details>
 <summary><b>Installing a release</b></summary>
@@ -100,6 +102,7 @@ rather than installing something that cannot start.
 # the tar.gz — the only one the built-in updater can update
 tar -xzf tobii-linux-*.tar.gz
 cd tobii-linux-*/ && ./install.sh          # ~/.local/bin, menu entry, udev rule
+sudo ./install.sh --system                 # the same for every user, /usr/local/bin
 
 sudo apt install ./tobii-linux_*.deb       # Debian, Ubuntu, Mint, Pop!_OS
 sudo dnf install ./tobii-linux-*.rpm       # Fedora, RHEL (gtk4-layer-shell is in EPEL)
@@ -108,10 +111,13 @@ sudo pacman -U ./tobii-linux-bin-*-x86_64.pkg.tar.zst   # Arch — see below
 ```
 
 **On Arch, CachyOS, Manjaro or EndeavourOS**, use the prebuilt package. It needs
-no Rust toolchain and has nothing to compile:
+no Rust toolchain and has nothing to compile. Every release from v0.3.1 on has
+one; v0.3.0 has only the `PKGBUILD` described below.
 
 ```sh
-curl -LO https://github.com/Tropaion/Tobii_Linux/releases/download/vX.Y.Z/tobii-linux-bin-X.Y.Z-1-x86_64.pkg.tar.zst
+curl -fLO https://github.com/Tropaion/Tobii_Linux/releases/download/vX.Y.Z/tobii-linux-bin-X.Y.Z-1-x86_64.pkg.tar.zst
+curl -fLO https://github.com/Tropaion/Tobii_Linux/releases/download/vX.Y.Z/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
 sudo pacman -U ./tobii-linux-bin-X.Y.Z-1-x86_64.pkg.tar.zst
 ```
 
@@ -122,9 +128,9 @@ Download the file first and install it from disk. `pacman -U` with the URL
 refuses this package: pacman checks a remote file at `RemoteFileSigLevel`, which
 defaults to `SigLevel`, and Arch's stock `pacman.conf` sets that to `Required`.
 The package is not signed. A file on disk is checked at `LocalFileSigLevel`,
-which the same `pacman.conf` sets to `Optional`. The release's `SHA256SUMS`
-lists the package, so a download can be checked for damage. That proves the file
-arrived intact and says nothing about who built it; see
+which the same `pacman.conf` sets to `Optional`. The `sha256sum -c` step checks
+the download against the release's `SHA256SUMS`. That proves the file arrived
+intact and says nothing about who built it; see
 [What installing an update trusts](#what-installing-an-update-trusts).
 
 **To build it yourself** instead, download `PKGBUILD` *and*
@@ -134,7 +140,10 @@ package called `tobii-linux`. It and `tobii-linux-bin` conflict, so installing
 either one offers to remove the other.
 
 `install.sh` copies the two binaries, adds the application-menu entry, and asks
-before using `sudo` for the udev rule. The packages do all of that as part of
+before using `sudo` for the udev rule. Do not run it with plain `sudo`: under
+sudo your home directory is `/root`, so it would install for the root account.
+It refuses, and names the two commands that are meant — `./install.sh` as
+yourself, or `sudo ./install.sh --system` for every user. The packages do all of that as part of
 installing, into `/usr/bin` — which is also why the built-in updater will not
 replace them. It offers to **download** the file your package manager wants
 instead; see [Updates](#updates).
@@ -704,7 +713,8 @@ line. Nothing is downloaded until you choose to update.
 *Update*, because overwriting a packaged file behind `dpkg`/`rpm`/`pacman`'s
 back is how a package database comes to describe files that are no longer there.
 It asks where to put it, fetches the artifact that matches your manager — the
-`.deb`, the `.rpm`, or the `PKGBUILD` and its install hook together — into a
+`.deb`, the `.rpm`, or the prebuilt Arch package (for a release without one, the
+`PKGBUILD` and its install hook together) — into a
 version-named folder there, and prints the one command that installs it. It
 never installs anything itself. This is the hub only; `tobii update` on the
 command line still just refuses and tells you why.

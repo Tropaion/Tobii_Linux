@@ -34,8 +34,8 @@ _tobii_post() {
 _tobii_shadow_note() {
     cat <<'EOF'
 If you also installed Tobii Linux from the tar.gz (its install.sh), that copy
-still wins: ~/.local/bin usually comes first on PATH, its menu entry hides this
-one, and /etc/udev/rules.d/60-tobii.rules overrides the packaged
+still wins: if ~/.local/bin is on your PATH it comes before /usr/bin, its menu
+entry hides this one, and /etc/udev/rules.d/60-tobii.rules overrides the packaged
 /usr/lib/udev/rules.d/60-tobii.rules. Remove it with:  tobii uninstall
 EOF
 }
