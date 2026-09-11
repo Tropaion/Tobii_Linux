@@ -50,13 +50,24 @@ jobs:
     name: Build in the compatibility container
     runs-on: ubuntu-latest
     container: debian:trixie
+    # The validated version, for the arch job: GITHUB_ENV does not cross jobs.
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
 
     steps:
       # The tag is the only untrusted input here — anyone able to push a tag
       # chooses its name, and it reaches a shell. It is validated against a
       # strict pattern before it is used for anything, and passed through the
       # environment rather than interpolated into a script.
+      #
+      # A pre-release suffix has to start with a LETTER (v1.0.0-rc1). The Arch
+      # packages spell 1.0.0-rc1 as 1.0.0rc1, which vercmp sorts below 1.0.0,
+      # as a pre-release should sort; a numeric suffix (v1.0.0-1) would become
+      # 1.0.01, which vercmp sorts ABOVE 1.0.0 — so pacman would treat the
+      # pre-release as an upgrade from its own release. scripts/package.sh and
+      # scripts/aur-bin.sh apply the same pattern.
       - name: Check the tag is a version
+        id: tag
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -65,11 +76,12 @@ jobs:
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "tag '$TAG' is not vMAJOR.MINOR.PATCH" >&2; exit 1 ;;
           esac
-          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$' || {
-            echo "tag '$TAG' has characters a version tag may not have" >&2
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z][A-Za-z0-9.]*)?$' || {
+            echo "tag '$TAG' is not vMAJOR.MINOR.PATCH with an optional suffix like -rc1 (starting with a letter)" >&2
             exit 1
           }
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -124,7 +136,8 @@ jobs:
       # The .deb, the .rpm and the PKGBUILD, from the SAME binaries the tarball
       # ships — package.sh unpacks the archive rather than reaching into
       # target/, so the two channels cannot diverge. It also rewrites
-      # SHA256SUMS to cover everything in dist/.
+      # SHA256SUMS to cover everything in dist/, and writes
+      # aur/tobii-linux-bin/PKGBUILD, which the arch job builds.
       - name: Build the distribution packages
         run: scripts/package.sh "$VERSION"
 
@@ -221,9 +234,260 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # The prebuilt Arch package's PKGBUILD, for the arch job. An artifact and
+      # not a release asset: package.sh writes it to aur/, not dist/, because
+      # everything in dist/ is hashed into SHA256SUMS and published, and a
+      # second file named PKGBUILD would collide with the source one a v0.3.0
+      # hub downloads by name.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur-pkgbuild
+          path: aur/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The prebuilt Arch package, built and then installed on a clean Arch system.
+  #
+  # A job of its own because makepkg and pacman exist only on Arch, while the
+  # binaries have to come from the Debian container, which is what fixes the
+  # glibc floor. So nothing is compiled here: package.sh already wrote the
+  # PKGBUILD (scripts/aur-bin.sh), and this repackages the tarball `build` made.
+  #
+  # makepkg finds that tarball in its start directory and still checks it
+  # against the PKGBUILD's pin — the draft release's URL would 404, so the pin
+  # is the only way that step can pass. pacman then installs the result on a
+  # container that has never seen it, and both binaries must start from
+  # /usr/bin with every library resolved.
+  #
+  # The .pkg.tar.zst joins the release, so this job writes the final
+  # SHA256SUMS, and `publish` uploads what this job hands it.
+  #
+  # Every gate below is written so that finding the problem FAILS the step.
+  # Under `bash -e`, a grep that finds nothing exits 1 — which is the pass
+  # condition for some checks and the failure for others — so each one is an
+  # explicit `if`, never a bare grep whose exit status decides.
+  arch:
+    name: Build and install the Arch package
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The tag without its v, validated by build's first step.
+      VERSION: ${{ needs.build.outputs.version }}
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aur-pkgbuild
+          path: aur
+
+      # Mirrors flake, so every pacman call that downloads is retried.
+      #
+      # makepkg without -s stops when a `depends` entry is not installed, and
+      # -s would need sudo. So they are installed here — read from the PKGBUILD
+      # itself rather than listed a second time, which also proves each name in
+      # aur-bin.sh's soname table is a package the Arch repositories have.
+      - name: Update the system and install the package's dependencies
+        run: |
+          set -euo pipefail
+          retry() {
+            local i
+            for i in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt $i of 5 failed: $*" >&2
+              sleep $((i * 15))
+            done
+            return 1
+          }
+          retry pacman -Syu --noconfirm
+          mapfile -t deps < <(bash -c 'source aur/tobii-linux-bin/PKGBUILD && printf "%s\n" "${depends[@]}"')
+          if [ "${#deps[@]}" -eq 0 ]; then
+            echo "::error::could not read depends= from aur/tobii-linux-bin/PKGBUILD" >&2
+            exit 1
+          fi
+          echo "depends: ${deps[*]}"
+          # 'glibc>=2.39' is a dependency, and pacman -S wants the package name.
+          retry pacman -S --needed --noconfirm "${deps[@]%%[<>=]*}"
+
+      # makepkg refuses to run as root. The tarball goes into the start
+      # directory, where makepkg uses it instead of downloading it — and checks
+      # it against sha256sums_x86_64 all the same.
+      - name: Build the package as an unprivileged user
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          install -d -o builder -g builder /home/builder/pkg
+          cp aur/tobii-linux-bin/PKGBUILD aur/tobii-linux-bin/tobii-linux.install \
+             "dist/tobii-linux-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" /home/builder/pkg/
+          chown -R builder:builder /home/builder/pkg
+          su builder -c 'cd ~/pkg && PKGEXT=.pkg.tar.zst makepkg --noconfirm && makepkg --printsrcinfo > .SRCINFO'
+
+      - name: Check the package, install it, and run it
+        run: |
+          set -euo pipefail
+          retry() {
+            local i
+            for i in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt $i of 5 failed: $*" >&2
+              sleep $((i * 15))
+            done
+            return 1
+          }
+          pkgver="${VERSION//-/}"
+          want="tobii-linux-bin-${pkgver}-1-x86_64.pkg.tar.zst"
+
+          # Exactly one package, named as the hub's matcher expects, and no
+          # split -debug- package (options=('!debug') must be in effect).
+          mapfile -t built < <(find /home/builder/pkg -maxdepth 1 -name '*.pkg.tar*' -printf '%f\n' | sort)
+          echo "makepkg produced: ${built[*]:-nothing}"
+          for f in "${built[@]}"; do
+            case "$f" in
+              *-debug-*)
+                echo "::error::makepkg split off a debug package, $f — options=('!debug') is not in effect" >&2
+                exit 1 ;;
+            esac
+          done
+          if [ "${#built[@]}" -ne 1 ] || [ "${built[0]}" != "$want" ]; then
+            echo "::error::expected exactly $want" >&2
+            exit 1
+          fi
+
+          # On a container that has never had it.
+          retry pacman -U --noconfirm "/home/builder/pkg/$want"
+
+          # Both answer --version before any GTK or device code runs, so this
+          # needs no display and no tracker.
+          for bin in tobii tobii-gtk; do
+            out="$("/usr/bin/$bin" --version)"
+            echo "$out"
+            if [ "$out" != "$bin $VERSION" ]; then
+              echo "::error::/usr/bin/$bin --version printed '$out', not '$bin $VERSION'" >&2
+              exit 1
+            fi
+          done
+
+          # Captured, then searched: `ldd | grep -q` under pipefail can report
+          # a MATCH as a failure (grep exits at the first hit and ldd dies of
+          # SIGPIPE), and here that would pass the gate.
+          libs="$(ldd /usr/bin/tobii /usr/bin/tobii-gtk)"
+          if grep -q 'not found' <<<"$libs"; then
+            echo "::error::a library the binaries need is missing after pacman -U, so depends= is incomplete:" >&2
+            grep 'not found' <<<"$libs" >&2
+            exit 1
+          fi
+
+          info="$(LC_ALL=C pacman -Qi tobii-linux-bin)"
+          echo "$info"
+          if ! grep -Eq '^Depends On +:.*glibc>=[0-9]' <<<"$info"; then
+            echo "::error::the installed package declares no glibc>= dependency" >&2
+            exit 1
+          fi
+
+      # SHA256SUMS is rewritten from scratch over every file in dist/, not
+      # appended to: a list kept by hand is how a file ends up published and
+      # unlisted.
+      - name: Add the package to the release and rewrite SHA256SUMS
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          cp "/home/builder/pkg/tobii-linux-bin-${VERSION//-/}-1-x86_64.pkg.tar.zst" dist/
+          cd dist
+          # `gh release create dist/*` uploads files; anything else breaks it.
+          others="$(find . -mindepth 1 -maxdepth 1 ! -type f)"
+          if [ -n "$others" ]; then
+            echo "::error::dist/ holds something that is not a plain file: $others" >&2
+            exit 1
+          fi
+          rm -f SHA256SUMS
+          # Captured first, so the list is complete before SHA256SUMS exists.
+          sums="$(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' \
+            | sort -z | xargs -0 -r sha256sum)"
+          printf '%s\n' "$sums" > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+          # COMPLETENESS. sha256sum -c checks what is listed and says nothing
+          # about what is not, and the updater refuses an unlisted file
+          # (NotListed). And each name must survive upload: GitHub rewrites
+          # characters such as '~' in an asset's name to '.', after which the
+          # published name is one SHA256SUMS does not list.
+          listed="$(sed -E 's/^[0-9a-f]{64}  //' SHA256SUMS)"
+          bad=0
+          for f in *; do
+            if [ "$f" = SHA256SUMS ]; then continue; fi
+            if ! grep -Fxq -- "$f" <<<"$listed"; then
+              echo "::error::$f is in dist/ but not listed in SHA256SUMS" >&2
+              bad=1
+            fi
+            case "$f" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::$f has a character GitHub rewrites in asset names" >&2
+                bad=1 ;;
+            esac
+          done
+
+          # NAMES. Every asset a hub's matcher looks for
+          # (crates/tobii-update/src/release.rs), exactly once. A file present
+          # under a name no matcher accepts is a channel that silently offers
+          # nothing, and two that match leave the choice to listing order.
+          shopt -s nullglob
+          one() {
+            local what="$1"
+            shift
+            if [ "$#" -ne 1 ]; then
+              echo "::error::expected exactly one $what in dist/, found $#: $*" >&2
+              return 1
+            fi
+            echo "ok  $what: $1"
+          }
+          one "archive for x86_64-unknown-linux-gnu" ./*-x86_64-unknown-linux-gnu.tar.gz || bad=1
+          one ".deb for dpkg (amd64)" ./*_amd64.deb || bad=1
+          one ".rpm for rpm (x86_64)" ./*.x86_64.rpm || bad=1
+          one "prebuilt package for pacman (x86_64)" tobii-linux-bin-*-x86_64.pkg.tar.zst || bad=1
+          one "PKGBUILD" PKGBUILD || bad=1
+          one "PKGBUILD install hook" tobii-linux.install || bad=1
+          one "SHA256SUMS" SHA256SUMS || bad=1
+          if [ "$bad" -ne 0 ]; then
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # For the maintainer: the PKGBUILD this release was tested with and its
+      # .SRCINFO. aur.yml regenerates both from the published release rather
+      # than trusting this artifact; this is what to compare them against.
+      - name: Keep the .SRCINFO beside its PKGBUILD
+        run: cp /home/builder/pkg/.SRCINFO aur/tobii-linux-bin/.SRCINFO
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur-bin
+          path: aur/
+          # .SRCINFO starts with a dot, and upload-artifact skips those unless told.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish the GitHub release
-    needs: build
+    # arch as well as build: arch adds the Arch package and writes the final
+    # SHA256SUMS, and a release whose Arch package did not install is not one
+    # to publish.
+    needs: [build, arch]
     runs-on: ubuntu-latest
     # Not in the container: `gh` is preinstalled on the runner image, and
     # publishing needs no particular glibc.
@@ -237,7 +501,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: release-artifacts
+          name: release-dist
           path: dist
 
       - name: List what will be published
