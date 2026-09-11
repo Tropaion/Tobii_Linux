@@ -2,7 +2,7 @@
 
 This wiki documents the USB protocol of the **Tobii Eye Tracker 5** (ET5, USB
 `2104:0313`) as reverse-engineered by the [TobiiLinux](https://github.com/Tropaion/Tobii_Linux)
-project — a clean-room Rust reimplementation. The device speaks a message
+project — an independent Rust reimplementation, with no Tobii code copied. The device speaks a message
 protocol Tobii calls **TTP** over USB **bulk** transfers, wrapped in a small
 length-prefixed USB envelope. A host opens a session, performs a
 hello → query-realm → open-realm (HMAC-MD5 on the auth path) → subscribe
@@ -45,6 +45,7 @@ How the software is put together, for anyone changing it.
 | [[Architecture-Decisions]] | §8–9: cross-cutting concepts, and the ~24 decisions that are expensive to reverse |
 | [[Quality-and-Risks]] | §10–12: measured numbers with their sources, known defects, untested surfaces, glossary |
 | [[Development]] | Build, the three CI checks, the test suite, testing the protocol with no tracker, conventions and traps |
+| [[Planned-Work]] | What is queued and why, with the measurement each item rests on |
 
 ### The protocol
 

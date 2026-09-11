@@ -21,7 +21,12 @@ building block view. The rest of the architecture documentation:
 ## 1. Introduction and goals
 
 A native Linux runtime and GUI for the **Tobii Eye Tracker 5**, in Rust, with no
-Tobii software installed. The USB protocol was reverse-engineered clean-room.
+Tobii software installed. The USB protocol was reverse-engineered: mapped from
+this project's own USB captures, cross-checked against the third-party
+`tobiifree` project, and with op *names* and enum orderings read from a decompile
+of Tobii's own software. No Tobii code was copied, and
+[Reverse-Engineering-Methodology](Reverse-Engineering-Methodology.md) records
+which source backs which claim.
 
 **Top three goals, in order:**
 

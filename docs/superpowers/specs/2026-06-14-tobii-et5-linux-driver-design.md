@@ -236,6 +236,9 @@ correlation in the protocol core.
   byte-exact. The device shipped with an uninitialised 4×4 mm placeholder display
   area (never configured by real Tobii software). Real captured gaze + display-area
   frames are now golden decode vectors (`tobii-protocol` `gaze.rs`/`display.rs`).
-- **R3 — Firmware mode.** Device may appear in bootloader mode (`2104:0102`);
-  reuse `tobiifree`'s DFU tooling/notes if a flash is ever required (not expected
-  for v1).
+- **R3 — Firmware mode.** The device may appear in bootloader mode
+  (`2104:0102`). Out of scope, permanently: this project never flashes firmware.
+  The tooling that exists elsewhere for it extracts firmware from Tobii's own
+  Windows service binary and replays a signed DFU header captured from a vendor
+  update — a provenance this project does not touch. A device stuck in bootloader
+  mode is a job for the vendor's own updater.

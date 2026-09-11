@@ -4,7 +4,11 @@
 //! return `Vec<u8>`; the inbound [`parser::Parser`] yields complete frames;
 //! decoders produce typed [`gaze::GazeSample`] / [`display::DisplayCorners`].
 //!
-//! Protocol decoded by the `tobiifree` project (GPL-3.0) from USB captures.
+//! The wire protocol was mapped from this project's own USB captures, with the
+//! third-party `tobiifree` project (GPL-3.0) as a cross-check and op names and
+//! enum orderings read from a decompile of Tobii's software. No Tobii code was
+//! copied; `docs/wiki/Reverse-Engineering-Methodology.md` says which source
+//! backs which claim.
 
 pub mod bytes;
 pub mod calibration;

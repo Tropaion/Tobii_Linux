@@ -365,10 +365,14 @@ no game has yet consumed it:
 * The per-axis **signs** of the TrackIR encoding, and whether a game ignores a
   frame whose `wPFrameSignature` did not change.
 
-## Clean room
+## Provenance
 
-The clean-room claim in the README covers the **ET5's USB protocol**, which was
-derived from captured traffic and nothing else. It does not cover the
+What the README claims about the **ET5's USB protocol** is that no Tobii code was
+copied: the protocol was mapped from this project's own USB captures,
+cross-checked against the third-party `tobiifree` project, with op *names* and
+enum orderings read from a decompile of Tobii's software
+([Reverse-Engineering-Methodology](Reverse-Engineering-Methodology.md) says which
+source backs which claim). It does not cover the
 TrackIR/FreeTrack ABIs or the evdev/uinput interface: those are public
 interfaces, and interoperating with them means matching facts about them that
 are not ours to invent. Where opentrack was read for such a fact, the file that
