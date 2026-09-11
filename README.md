@@ -230,6 +230,91 @@ build into `target/release/`.
 **After installing, re-plug the Eye Tracker 5** so the udev rule takes effect,
 then run `tobii-gtk` or pick it from the menu.
 
+## Uninstalling
+
+**Installed with `install.sh` or `scripts/build.sh --install`:** `tobii` removes
+itself. Look at the plan first:
+
+```sh
+tobii uninstall --dry-run     # prints what it would do; changes nothing
+tobii uninstall               # asks, then does it
+```
+
+It finds the install through the install manifest, the menu entry and the
+start-at-login entry, asks before stopping a hub that is still running, and
+removes the binaries, the menu entry, its icon and the start-at-login entry. It
+deletes only file names it knows, never a directory tree. It leaves:
+
+- **your settings, calibration, head-pose model and log.** Add `--purge` to
+  remove those too. Only the files this program writes are deleted, and
+  anything else it finds there — a backup of your own — stays and is listed.
+  `calibration.bin` is the part that is costly to redo.
+- **the udev rule.** Add `--udev`; that step uses `sudo`.
+- **the TrackIR/FreeTrack bridge in Wine prefixes.** It lists the Steam
+  prefixes the bridge is in, with the command for each. Run those first, while
+  `tobii` is still installed.
+- **a copy your package manager installed.** It prints the command instead:
+
+```sh
+sudo pacman -R tobii-linux     # Arch (the PKGBUILD)
+sudo apt remove tobii-linux    # Debian, Ubuntu, Mint, Pop!_OS
+sudo dnf remove tobii-linux    # Fedora, RHEL   (openSUSE: sudo zypper remove tobii-linux)
+```
+
+A system-wide install (`sudo ./install.sh --system`) comes out with
+`sudo tobii uninstall --system`. Without `--system`, `tobii uninstall` refuses to
+run as root. Under `sudo`, HOME is `/root`, so it would search root's home
+instead of yours.
+
+<details>
+<summary><b>By hand — for v0.1.0 to v0.3.0, whose <code>tobii</code> has no <code>uninstall</code></b></summary>
+
+Every path an install writes, and every path the program writes while it runs.
+The directory is `~/.local/bin` unless you gave `install.sh` or `--install`
+another one; the `Exec=` line of the menu entry names it. If you set
+`$XDG_DATA_HOME`, `$XDG_CONFIG_HOME` or `$XDG_STATE_HOME`, those replace
+`~/.local/share`, `~/.config` and `~/.local/state` below.
+
+```sh
+# the program
+rm -f ~/.local/bin/tobii ~/.local/bin/tobii-gtk
+# temporaries an interrupted update can leave beside them
+rm -rf ~/.local/bin/.tobii-update-[0-9]*
+rm -f ~/.local/bin/.tobii.new-* ~/.local/bin/.tobii-gtk.new-* \
+      ~/.local/bin/.tobii.old-* ~/.local/bin/.tobii-gtk.old-*
+
+# the menu entry, its icon, and start-at-login
+rm -f ~/.local/share/applications/com.tobiilinux.Configuration.desktop
+rm -f ~/.local/share/icons/hicolor/scalable/apps/com.tobiilinux.Configuration.svg
+rm -f ~/.config/autostart/com.tobiilinux.Configuration.desktop
+# only if this file already exists — do not create one:
+#   gtk4-update-icon-cache -qtf ~/.local/share/icons/hicolor
+#   (~/.local/share/icons/hicolor/icon-theme.cache)
+
+# optional: settings, calibration, models and log
+# (this also deletes anything of your own you keep in these directories)
+rm -r ~/.config/tobii-linux ~/.local/state/tobii-linux
+
+# optional: the udev rule
+sudo rm -f /etc/udev/rules.d/60-tobii.rules /etc/udev/rules.d/99-tobii.rules
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=usb
+sudo udevadm trigger --subsystem-match=misc
+```
+
+If you ever ran `sudo ./install.sh`, it installed a second copy into root's
+home:
+
+```sh
+sudo rm -f /root/.local/bin/tobii /root/.local/bin/tobii-gtk \
+     /root/.local/share/applications/com.tobiilinux.Configuration.desktop \
+     /root/.local/share/icons/hicolor/scalable/apps/com.tobiilinux.Configuration.svg
+```
+
+The bridge, if you installed it into a Wine prefix, is removed with
+`tobii bridge uninstall --prefix PATH`. Run that before removing `tobii`.
+</details>
+
 ## Requirements
 
 - **Rust** (stable, edition 2021) — e.g. via [rustup](https://rustup.rs).
