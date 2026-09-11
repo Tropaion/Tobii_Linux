@@ -19,6 +19,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+caller_pwd="$PWD"
 cd "$root"
 
 # Not as root. cargo run under sudo leaves a root-owned target/ that the next
@@ -32,8 +33,7 @@ fi
 
 lean=0
 do_install=0
-install_dir="$HOME/.local/bin"
-dir_given=0
+install_dir=""
 system=0
 do_udev=0
 check_only=0
@@ -46,18 +46,17 @@ while [[ $# -gt 0 ]]; do
         --system)  system=1 ;;
         --install)
             do_install=1
-            # An optional directory may follow, but not another flag.
+            # An optional directory may follow, but not another flag. Relative
+            # to where build.sh was run, not the repository it cd's into.
             if [[ ${2:-} && ${2:0:1} != "-" ]]; then
                 install_dir="$2"
-                dir_given=1
+                if [[ "$install_dir" != /* ]]; then install_dir="$caller_pwd/$install_dir"; fi
                 shift
             fi
             ;;
         -h|--help)
-            # The header comment, however long it is. A stored line range
-            # goes stale the first time a line is added above it — this one
-            # said 2,17 against a header that had grown, and cut the last
-            # sentence in half.
+            # The header comment, however long it is: a stored line range goes
+            # stale the first time a line is added above it.
             awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"
             exit 0
             ;;
@@ -68,6 +67,14 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# --system says who an install is for, so on its own it has nothing to act on.
+# Refused here, before the build, rather than ignored after it with nothing to
+# say that nothing was installed.
+if [[ $system -eq 1 && $do_install -eq 0 && $do_udev -eq 0 ]]; then
+    echo "--system is for an install:  scripts/build.sh --install --system [DIR]" >&2
+    exit 2
+fi
 
 bold=""; dim=""; red=""; green=""; reset=""
 if [[ -t 1 ]]; then
@@ -116,9 +123,7 @@ need_command() {
 # "gtk4-layer-shell" reports it missing on a machine where it is installed and
 # the build works.
 need_module() {
-    # The module to probe and, optionally, what to call it in the output — two
-    # plain arguments, like `need_command` above. It used to pack both into one
-    # pipe-separated string, which is a hand-rolled second parameter.
+    # The module to probe and, optionally, what to call it in the output.
     local probe="$1" label="${2:-$1}"
     if pkg-config --exists "$probe" 2>/dev/null; then
         printf '  %s%-24s%s %s\n' "$green" "$label" "$reset" "${dim}$(pkg-config --modversion "$probe")${reset}"
@@ -200,7 +205,9 @@ done
 
 if [[ $do_install -eq 1 || $do_udev -eq 1 ]]; then
     echo
-    if [[ $system -eq 1 && $dir_given -eq 0 ]]; then install_dir=/usr/local/bin; fi
+    if [[ -z $install_dir ]]; then
+        if [[ $system -eq 1 ]]; then install_dir=/usr/local/bin; else install_dir="$HOME/.local/bin"; fi
+    fi
     args=("$install_dir" "target/release" "assets")
     if [[ $do_udev -eq 1 ]]; then args+=(--udev); else args+=(--no-udev); fi
     if [[ $lean -eq 1 ]]; then args+=(--lean); fi
@@ -236,8 +243,7 @@ fi
 say "$run_cli stream" "# decoded gaze samples"
 say "$run_cli headpose --fetch-model" "# optional: adds pitch (6 DOF)"
 # Not when --install ran: install-payload.sh already said this, and saying it
-# twice in one run reads as two different problems. This is the seam the
-# delegation introduced.
+# twice in one run reads as two different problems.
 if [[ $do_install -eq 0 && $do_udev -eq 0 && ! -e /etc/udev/rules.d/60-tobii.rules ]]; then
     echo
     echo "  ${bold}The udev rule is not installed${reset}, so the tracker needs root."

@@ -63,6 +63,10 @@ if [[ $system -eq 1 && $euid -ne 0 ]]; then
     echo "--system installs for every user and needs root:  sudo ./install.sh --system" >&2
     exit 1
 fi
+# Everything --system writes is for every account to read. sudo keeps the
+# caller's umask (ORed with 022), so a caller's 027 would leave a root-only menu
+# entry, icon and install directory that no desktop session can see or run.
+if [[ $system -eq 1 ]]; then umask 022; fi
 
 # Root runs the udev commands directly; a user goes through sudo, announced.
 as_root() { if [[ $euid -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
@@ -81,6 +85,45 @@ fi
 # Absolute: it goes into a desktop entry's Exec and into the manifest, and a
 # relative path in either means somewhere else the moment the cwd changes.
 bindir="$(realpath -m -- "$bindir")"
+
+# --system: root writes here, and every user's menu entry runs what is here. A
+# directory another account can change — a home directory, or anything under
+# one — lets that account replace the program everyone starts, or plant a
+# symlink at the staging name below for root to write through. So the target
+# and every directory above it must belong to root and be writable by nobody
+# else. A shared sticky directory such as /tmp may sit above it (there only an
+# entry's owner can rename it), but is never the target itself. Group-writable
+# is someone else's unless the group is the caller's, as install.rs's
+# foreign_writable has it. `id -u`/`id -g` as well as 0: under a real --system
+# they are 0, and under scripts/test-install-payload.sh they are the test user
+# who owns its temp tree, while / and /tmp above it are root's.
+if [[ $system -eq 1 && $bins_wanted -eq 1 ]]; then
+    self_uid="$(id -u)"; self_gid="$(id -g)"
+    d="$bindir"
+    while [[ ! -e "$d" ]]; do d="$(dirname -- "$d")"; done
+    first=1
+    while :; do
+        read -r owner group mode < <(stat -c '%u %g %a' -- "$d")
+        foreign=$(( 8#$mode & 8#002 ))
+        if (( 8#$mode & 8#020 )) && [[ $group -ne $self_gid ]]; then foreign=1; fi
+        if [[ $owner -ne 0 && $owner -ne $self_uid ]] \
+           || (( foreign && (first || !(8#$mode & 8#1000)) )); then
+            q="$(printf '%q' "$bindir")"
+            {
+                echo "${bold}--system installs for every user${reset}, so $bindir must be somewhere"
+                echo "only root can change, and $d is not."
+                if [[ "$bindir" != /usr/local/bin ]]; then
+                    echo "  For every user:  sudo ./install.sh --system        (into /usr/local/bin)"
+                fi
+                echo "  Only for you:    ./install.sh $q        (without sudo)"
+                echo "  If an earlier sudo install left it root's, first:  sudo chown -R \"\$USER\" $q"
+            } >&2
+            exit 1
+        fi
+        if [[ "$d" == / ]]; then break; fi
+        d="$(dirname -- "$d")"; first=0
+    done
+fi
 
 # One Exec argument as the Desktop Entry spec wants it: in double quotes, with
 # `%` doubled (a lone `%` starts a field code). A path with `"`, `` ` ``, `$` or
@@ -108,24 +151,50 @@ set_exec() {
     mv -f "$tmp" "$file"
 }
 
-# The program an Exec line runs: its first argument with the quoting and the
-# hub's own escaping undone (`%%` is `%`, a backslash escapes the next character),
-# so a path containing one of those is read as the path it is.
+# The program an Exec line runs: its first argument, read the way GLib reads it
+# and in the order autostart::exec_arguments reads it. First the key-file value
+# escapes (`\s \n \t \r \\`), then the Exec quoting (inside double quotes a
+# backslash escapes `"`, `` ` ``, `$` or `\` and is otherwise itself; outside
+# them it escapes any character), then `%%` is `%`. The hub escapes a reserved
+# character at both levels — `$` as `\\$`, `\` as four backslashes — so a
+# reader that undid only one would name a path that does not exist, and the
+# login entry of a copy that does would be "repaired" away. What a launcher
+# would not run (an unterminated quote, a trailing backslash) and what the spec
+# does not define (a single quote) read as nothing, which leaves the entry alone.
 exec_program() {
-    local s="$1" out="" i c pct='%%'
-    s="${s//"$pct"/%}"
-    if [[ "$s" == \"* ]]; then
-        s="${s:1}"
-        for (( i = 0; i < ${#s}; i++ )); do
-            c="${s:i:1}"
-            if [[ "$c" == "\\" ]]; then i=$((i + 1)); out+="${s:i:1}"
-            elif [[ "$c" == '"' ]]; then break
-            else out+="$c"; fi
-        done
-    else
-        out="${s%% *}"
-    fi
-    printf '%s' "$out"
+    local v="$1" s="" out="" i c n q=0 pct='%%'
+    for (( i = 0; i < ${#v}; i++ )); do
+        c="${v:i:1}"
+        if [[ "$c" == "\\" && $((i + 1)) -lt ${#v} ]]; then
+            i=$((i + 1))
+            case "${v:i:1}" in
+                s) s+=" " ;; n) s+=$'\n' ;; t) s+=$'\t' ;; r) s+=$'\r' ;;
+                "\\") s+="\\" ;; *) s+="\\${v:i:1}" ;;
+            esac
+        else
+            s+="$c"
+        fi
+    done
+    s="${s#"${s%%[![:space:]]*}"}"
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            '"') q=$((1 - q)) ;;
+            "'") if [[ $q -eq 0 ]]; then return 0; fi; out+="$c" ;;
+            "\\")
+                n="${s:i+1:1}"
+                if [[ -z "$n" ]]; then return 0; fi
+                case "$q$n" in
+                    0?|1[\"\`\$\\]) out+="$n"; i=$((i + 1)) ;;
+                    *) out+="$c" ;;
+                esac ;;
+            *)
+                if [[ $q -eq 0 && "$c" == [[:space:]] ]]; then break; fi
+                out+="$c" ;;
+        esac
+    done
+    if [[ $q -eq 1 ]]; then return 0; fi
+    printf '%s' "${out//"$pct"/%}"
 }
 
 if [[ $bins_wanted -eq 1 ]]; then
@@ -133,8 +202,6 @@ if [[ $bins_wanted -eq 1 ]]; then
     mkdir -p "$bindir"
 
     bins=(tobii)
-    # `if`, not `[[ ]] &&`: under `set -e` a false test as the whole command
-    # aborts the script, so a --lean install would exit here silently.
     if [[ $lean -eq 0 ]]; then bins+=(tobii-gtk); fi
 
     for b in "${bins[@]}"; do
@@ -186,15 +253,31 @@ if [[ $bins_wanted -eq 1 && $lean -eq 0 && -f "$assets/com.tobiilinux.Configurat
     # Exec stays correct across updates. Written line by line, not with sed: sed
     # read `|` in the path as syntax and aborted the install, and `&` as "the
     # match" and wrote a wrong path.
+    entry_file="$apps/com.tobiilinux.Configuration.desktop"
     if exec_arg="$(desktop_arg "$bindir/tobii-gtk")"; then
-        cp "$assets/com.tobiilinux.Configuration.desktop" "$apps/com.tobiilinux.Configuration.desktop"
-        set_exec "$apps/com.tobiilinux.Configuration.desktop" "$exec_arg"
+        # Written beside it and renamed, like the binaries: a file another
+        # account owns (what a HOME-keeping `sudo ./install.sh` leaves) cannot be
+        # opened for writing, but a rename in this user's own folder replaces
+        # it. And never fatal: the binaries are in place by now, and stopping
+        # here would skip the manifest, the login-entry repair and the udev rule.
+        staged="$entry_file.new-$$"
+        if { cp "$assets/com.tobiilinux.Configuration.desktop" "$staged" \
+             && set_exec "$staged" "$exec_arg" && mv -f "$staged" "$entry_file"; } 2>/dev/null; then
+            echo "  $entry_file"
+        else
+            rm -f "$staged" 2>/dev/null || true
+            echo "  ${bold}The menu entry was not updated:${reset} you cannot write in $apps"
+            echo "  (left by an install as another account?). Start it with $bindir/tobii-gtk."
+        fi
     else
-        rm -f "$apps/com.tobiilinux.Configuration.desktop"
+        rm -f "$entry_file" 2>/dev/null || true
         echo "  ${bold}No menu entry:${reset} $bindir holds a character a menu entry cannot name"
         echo "  reliably (a quote, a backtick, \$ or a backslash). Start it with $bindir/tobii-gtk."
     fi
-    cp "$assets/com.tobiilinux.Configuration.svg" "$icons/"
+    # -f: a file that cannot be opened is removed and copied again, which a
+    # folder this user can write allows whoever owns the file.
+    cp -f "$assets/com.tobiilinux.Configuration.svg" "$icons/" 2>/dev/null \
+        || echo "  ${dim}The icon could not be written to $icons.${reset}"
 
     # Without this the entry can take minutes to appear, or not appear until the
     # next login — which reads as "the install did not work".
@@ -210,9 +293,6 @@ if [[ $bins_wanted -eq 1 && $lean -eq 0 && -f "$assets/com.tobiilinux.Configurat
         elif command -v gtk-update-icon-cache >/dev/null 2>&1; then
             gtk-update-icon-cache -qtf "$hicolor" 2>/dev/null || true
         fi
-    fi
-    if [[ -f "$apps/com.tobiilinux.Configuration.desktop" ]]; then
-        echo "  $apps/com.tobiilinux.Configuration.desktop"
     fi
     if [[ $new_icon_dir -eq 1 ]] && pgrep -x plasmashell >/dev/null 2>&1; then
         echo "  ${dim}Plasma looks only in icon folders that existed when it started, so the${reset}"
@@ -296,7 +376,7 @@ if [[ $bins_wanted -eq 1 ]]; then
     for p in /proc/[0-9]*; do
         [[ "$(stat -c %u "$p" 2>/dev/null)" == "$me" ]] || continue
         exe="$(readlink "$p/exe" 2>/dev/null)" || continue
-        [[ "$(basename -- "${exe% (deleted)}")" == tobii-gtk ]] || continue
+        [[ "${exe% (deleted)}" == */tobii-gtk ]] || continue
         pid="${p#/proc/}"
         if [[ "$exe" == "$bindir/tobii-gtk (deleted)" ]]; then
             echo "  ${bold}The hub is still running the previous version${reset} (pid $pid)."
@@ -376,13 +456,11 @@ else
             echo "  removed $legacy (the old rule, which overrode the new one's mode)"
         fi
         as_root udevadm control --reload
-        # Only the USB subsystem. A bare `udevadm trigger` re-events every
-        # device on the machine, which on a desktop means re-probing disks,
-        # input devices and graphics for the sake of one tracker.
+        # usb for the tracker; misc for the /dev/uinput grant the virtual
+        # joystick needs, a virtual device no tracker re-plug ever re-events.
+        # Not a bare `udevadm trigger`, which re-events every device on the
+        # machine: disks, input devices and graphics, for the sake of one tracker.
         as_root udevadm trigger --subsystem-match=usb
-        # And misc, for the /dev/uinput grant the virtual joystick needs. The
-        # comment above explains why this is not a bare `udevadm trigger`; it
-        # was written when the rule only covered the tracker.
         as_root udevadm trigger --subsystem-match=misc
         echo "  installed — ${bold}re-plug the Eye Tracker 5${reset} for it to take effect"
     fi
