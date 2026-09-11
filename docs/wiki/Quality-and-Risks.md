@@ -90,9 +90,18 @@ nothing local could have noticed. `release.yml` now opens both finished packages
 and fails if those declarations are missing, which is the only check that runs
 where the packages are actually built.
 
-**Nobody has installed any of them.** The `.deb` has been unpacked and read
-field by field, the PKGBUILD parses under real `makepkg --printsrcinfo`, and CI
-checks their declared dependencies — but no `apt install` or `dnf install` has
+**Only the Arch package is installed by anything, and only in a container.**
+From v0.3.1, `release.yml`'s `arch` job installs `tobii-linux-bin` with
+`pacman -U` on a fresh `archlinux:base-devel` container. Both binaries must then
+answer `--version` from `/usr/bin` with every library resolved. `publish` waits
+for that job, so no release from v0.3.1 on is published unless its package
+installed there. `--version` returns before any GTK or device code runs, so this
+checks the package's files and libraries, not the program: no display, no
+tracker, no upgrade over an earlier version. The job runs only on a `v*` tag, so
+its first run is the first tag after v0.3.0. Nothing installs the other
+packages. The `.deb` has been unpacked and read field by field, the source
+PKGBUILD parses under real `makepkg --printsrcinfo`, and CI checks the `.deb`'s
+and `.rpm`'s declared dependencies — but no `apt install` or `dnf install` has
 been run on a clean machine of the distribution it targets.
 
 **The `.deb`'s `Depends` is hand-written.** `dpkg-shlibdeps` is the tool for
@@ -266,7 +275,7 @@ because the reasoning is worth more than the tidiness.
   the display-wide stylesheet and the process's font DPI, so it is not confined
   to the hub.
 
-### 11.3c Update decisions, the installer and quitting from outside (after v0.3.0)
+### 11.3c Update decisions, the installer and quitting from outside (new in v0.3.1)
 
 - **The three new banners have never been shown by a real update.** *Download*
   for a system copy, *Download* for a home-directory copy whose files are root's,
@@ -275,16 +284,55 @@ because the reasoning is worth more than the tidiness.
   bites, and not clicked. The *Quit* case is the reported one: a v0.1.0 hub whose
   package was removed while it ran. The root-owned home copy is the other
   reported one — `sudo ./install.sh` put it there.
+- **The folder fixes, the refusal under sudo and the shared folder are
+  unit-tested only.** `FixFolder` (a banner with a command and no button:
+  `chmod u+w` for an unwritable folder of the user's own, `sudo chown` of one
+  folder in the home that another account owns), `RunWithoutSudo`
+  (`sudo tobii update --install` on another account's files) and the `--system`
+  *Download* for another account's files in a shared or sticky folder have not
+  run outside unit tests. The banner's state after an install attempt — *What's
+  new* usable again, and *Quit* once the install finds this copy replaced while
+  it ran — is covered by a display test that is ignored by default:
+  `cargo test -p tobii-gtk --lib -- --ignored a_finished_install`.
+- **A group member without sudo is sent to an administrator.** Another
+  account's files in a group-writable folder the user does not own get the
+  `--system` *Download*, where a plain `./install.sh` by a member of that group
+  would have worked. Accepted: the folder is not theirs, and what is in it may
+  be what every user runs.
 - **The download folder is refused if another user could change it**
   (`UnsafeFolder`), because the command printed for it is run later, perhaps with
-  `sudo`, on files that must still be the ones checked. A sticky shared folder
-  such as `/tmp` is accepted. Checked with folders a test makes, never with a
-  second real user.
+  `sudo`, on files that must still be the ones checked. The chosen folder and
+  every folder above it, both as written and as resolved, must belong to the
+  user, root or uid 65534 (how root's `/` and `/home` look inside a toolbox),
+  and be writable by no one else. A sticky folder is exempt from the write rule,
+  but as the chosen folder only when the user or root owns it, so `/tmp` is
+  accepted and another account's sticky folder is not. The refusal names who
+  can write the folder. Checked with folders a test makes, never with a second
+  real user.
+- **A group write bit is harmless only when `/etc/passwd` and `/etc/group` show
+  the group is the user's alone**, the rule `tobii uninstall` applies too. An
+  LDAP or sssd account's private group is not in those files, so on such an
+  account a download folder made group-writable by umask 002 is refused, and
+  the user has to pick another. The version folder the download makes inside
+  the chosen one is created 0755 whatever the umask, and removed again if the
+  check refuses it.
+- **The folder chooser skips a Downloads folder the download would refuse** and
+  opens in the home folder instead. Seen on the development machine, whose
+  Downloads folder a download service's group can write (0775). Chosen by hand
+  it is still refused, with the reason.
 - **`faccessat` answers for the directory, not the swap.** It counts read-only
   mounts and ACLs; the ownership check covers `protected_hardlinks`. Anything
   else that fails the rename still reaches `install_release`'s real attempt and
   its rollback — the button can still fail, only no longer for the reasons
   known in advance.
+- **A read-only mount the user owns gets the `chmod u+w` advice**, which cannot
+  help there, and neither can `sudo`: root gets EROFS too. `tobii uninstall`
+  gives the same advice in the same case.
+- **The `sudo chown` advice gives back one folder.** Where v0.3.0's
+  `sudo ./install.sh ~/.local/bin` also made `~/.local`, that stays root's, and
+  if `~/.local/share` does not exist either, the plain install afterwards stops
+  when it makes the menu entry's folder, after the binaries are in place. Rare,
+  and not handled.
 - **The tray's `IconThemePath` is read by Plasma** — its `GetAll` reply was seen
   carrying it — **but drawing from it in the first-install case is unmeasured.**
   This session's Plasma had already been restarted after `~/.local/share/icons`
@@ -294,20 +342,69 @@ because the reasoning is worth more than the tidiness.
 - **Any process of the same user can quit the hub**, through the `quit` action
   GApplication exports on the session bus. By design: that is what the
   uninstaller and scripts use, and a same-user process can already signal it.
+- **A `quit` from outside closes an open calibration or setup flow first**, so
+  the flow's own close handler runs and its tracker claim is released. It is the
+  same `quit` action the cogwheel's *Quit*, `tobii uninstall` and the update
+  banner use. The calibration's cancel is queued by that handler, but the
+  process can exit before the device thread sends it; what that leaves on the
+  device is unmeasured on hardware. The display tests for it
+  (`crates/tobii-gtk/tests/quit_action.rs` and
+  `crates/tobii-gtk/tests/flows_release_the_tracker.rs`) are ignored by default,
+  and their negative controls — the flow left open on quit, the gaze-preview
+  claim, the Quit row's wiring, and Cancel through `close_on_click` — have not
+  been run.
 - **`install.sh --system` has never installed as real root here.** The root
   refusal, `--system`, the manifest, the autostart repair and the running-copy
   warning are checked by `scripts/test-install-payload.sh` in CI through its test
   seams (`TOBII_TEST_EUID`, `TOBII_SYSTEM_DATA_DIR`), with each check broken once
-  to prove it bites. An end-to-end `sudo ./install.sh --system` has not run.
+  to prove it bites. The same script checks `--system`'s refusal of a target
+  another account can change: the other-account branch with a directory
+  `chown`ed to 65534 when the test runs as root, as in CI, and otherwise against
+  an existing directory another account owns; the group branch with `chgrp` to
+  a group that is not the caller's. Each is skipped where there is no such
+  directory or group. `--system` sets umask 022, so what it writes is 644 and
+  755 whatever the caller's umask (checked under 027). An end-to-end
+  `sudo ./install.sh --system` has not run.
+- **On a Debian system upgraded from before bullseye, `/usr/local` and the
+  folders in it can be `root:staff` 2775.** There `install.sh --system` refuses
+  its default target, `/usr/local/bin` (`--system /opt/…` works);
+  `sudo tobii uninstall --system` refuses a `--system` install there, whether
+  the manifest lists it or `--bindir` names it; and the user's own run leaves it
+  as "in a directory others can write". Accepted: that group can change what
+  every user runs.
 - **The installer edits a file the user owns**: the login entry, and only its
   `Exec` line, only when that names an absolute path that no longer exists, and
-  never through a symlink. A bare name, an `env` wrapper or a symlinked entry
-  is named and left alone.
+  never through a symlink. It reads that line as GLib does, with both escaping
+  levels undone, so the hub's own entry for a copy in a directory with `$`,
+  `` ` ``, `"` or `\` names the copy it is, and is left alone while that copy
+  exists. A bare name, an `env` wrapper or a symlinked entry is left alone. The
+  wrapper and the symlink are always named; a bare name is named only when the
+  installer's PATH does not find it. Only the `[Desktop Entry]` group's `Exec`
+  is read, and an entry with two is named and left alone, as `tobii uninstall`
+  leaves it; one with an unterminated quote or a single quote outside double
+  quotes is left alone without a word.
+- **`tobii uninstall` keeps a desktop entry whose `Exec` it cannot read**,
+  rather than guess and switch start-at-login or a menu entry off for a copy
+  that stays: one with no `Exec`, with two (GKeyFile and KConfig take the last,
+  systemd's xdg-autostart generator the first), or with escaping and quoting the
+  spec leaves undefined, which GLib and KDE read differently. Such an entry is
+  not used to find an install either, so one reached only through it — a
+  v0.3.0 menu entry, unquoted, for a directory with a reserved character in its
+  name — needs `--bindir DIR`.
 - **A menu entry needs a path the Desktop Entry spec can quote.** `install.sh`
   writes `Exec` in double quotes with `%` doubled; for a directory containing
   `"`, `` ` ``, `$` or `\` it writes no menu entry and says so, because those
   need escaping that launchers do not apply alike. Checked by the install-script
-  tests with a directory containing a space, `&`, `|` and `%`, and one with `"`.
+  tests with a directory containing a space, `&`, `|` and `%`, and one with `"`,
+  and with the hub's own login entry for a directory with every character its
+  escaping covers, for a copy that exists and for one that is gone.
+- **The menu entry and the icon cannot stop an install.** The entry is written
+  beside its place and renamed in, so one another account owns in the user's
+  folder is replaced; and once the binaries are in place, an applications
+  folder that cannot be written is said and skipped, and the install still
+  writes the manifest, repairs the login entry and runs the udev step. Checked
+  by the install-script tests with an entry, an icon and an applications folder
+  the user cannot write (skipped as root, whom chmod does not bind).
 
 ### 11.4 Environmental
 

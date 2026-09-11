@@ -21,6 +21,19 @@ Run it as yourself. It refuses under sudo — cargo as root leaves a root-owned
 `target/`, and an install under sudo lands in `/root` — and asks for sudo itself
 for exactly the steps that need it (`--system`'s install, the udev rule).
 
+A relative `--install DIR` is taken from where `build.sh` was run, not from the
+repository it changes into. `--system` on its own, with neither `--install` nor
+`--udev`, is refused before anything is built. And `--system`, here and in a
+release's `install.sh`, refuses a target another account can change, because
+root writes into it and every user's menu entry runs what is there: the target
+and every directory above it must be root's and writable by no one else — not
+by anyone, and not by a group other than root's. A home directory, anything
+under one, and a folder anyone or another group can write are refused, and so
+is a shared sticky folder as the target itself; one above the target, such as
+`/tmp`, is allowed. The refusal names the folder and the ways out. On a Debian
+system upgraded from before bullseye `/usr/local/bin` can be `root:staff` 2775,
+and then even the default target is refused; see [[Quality-and-Risks]] §11.3c.
+
 `--install` and `--udev` both hand off to `scripts/install-payload.sh`, which is
 also what the `install.sh` inside a release tarball runs. One definition of what
 "installed" means, so a source install and a release install cannot drift — the
@@ -37,15 +50,29 @@ runs. Distribution Rust ignores the pin and may be too old to build this at all.
 
 ---
 
-## The three checks
+## The checks
 
-These are exactly what CI runs, and they pass on `main`:
+CI runs these on every pull request and every push to `main`, and they pass on
+`main`:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+bash scripts/test-install-payload.sh
 ```
+
+The last one tests the install scripts, which have no compiler checking them.
+It runs `install-payload.sh`, the release archive's `install.sh` and
+`build.sh`'s install front end against temporary directories, with
+`TOBII_TEST_EUID` and `TOBII_SYSTEM_DATA_DIR` standing in for root, so it needs
+no root. `build.sh` runs from a copy of the scripts with stand-in `cargo`,
+`pkg-config`, `cc` and `sudo`, so nothing is built.
+
+CI adds one check of its own, which needs `python3-yaml`: *release.yml flags an
+rc tag's draft as a pre-release* takes the draft step's script out of
+`release.yml` and runs it with a stand-in `gh`, because that step otherwise runs
+only on a tag.
 
 `-D warnings` on a floating toolchain would be a time bomb — a new clippy turns
 every open pull request red with no code change. That is why the toolchain is
@@ -266,11 +293,14 @@ runs `--locked`, so a bumped manifest with a stale lock fails before it builds:
 4. A `docs/wiki/Quality-and-Risks.md` section for whatever new surface ships.
 
 Then `git push origin main` (the tag must point at a pushed commit) and
-`git tag vX.Y.Z && git push origin vX.Y.Z`. CI builds in a Debian 13 container,
-enforces the glibc floor,
-checks that the `.deb` and `.rpm` actually *declare* it, verifies the checksums
-and publishes a **draft** — the release notes are the changelog every user's
-updater shows them, so a human sees them first.
+`git tag vX.Y.Z && git push origin vX.Y.Z`. In a Debian 13 container, CI runs
+fmt, clippy, the tests and `scripts/test-install-payload.sh` on the tagged
+commit (a tag need not have been through main's CI), builds, enforces the glibc
+floor, checks that the `.deb` and `.rpm` actually *declare* it and verifies the
+checksums. The `arch` job then builds and installs the Arch package (see *The
+Arch package* below), and only when both jobs pass does CI publish a **draft**:
+the release notes are the changelog every user's updater shows them, so a human
+sees them first.
 
 **Pre-release tags** must look like `v1.0.0-rc1`: the suffix starts with a
 letter, and `release.yml` rejects anything else. Each format has its own
@@ -281,6 +311,9 @@ such as `-1` would become `1.0.01`, which `vercmp` sorts *above* `1.0.0`. File
 names keep the tag's `-` — except the Arch package, which makepkg names from
 pkgver (`tobii-linux-bin-1.0.0rc1-1-x86_64.pkg.tar.zst`) — because GitHub rewrites `~` in an asset's name to `.`
 and `SHA256SUMS` would then list a file the release does not have.
+`release.yml` creates the draft of such a tag as a pre-release, so neither the
+hub nor `aur.yml` picks it up; promoting it to a full release later is what
+publishes it to both.
 
 **The Arch package.** After `build`, the `arch` job repackages the same tarball
 in an `archlinux:base-devel` container. `package.sh` has already written
@@ -307,6 +340,11 @@ would upgrade anyone to. The pin is an integrity check
 taken from the same release, not a signature. It proves an AUR user got what was
 published, and nothing about who published it.
 
+Runs share one concurrency group, and GitHub keeps only one pending run per
+group: when two runs queue behind a running one, the waiting one is cancelled,
+whatever its version. Check the AUR's version afterwards, and start the
+cancelled run by hand if it was the newer one.
+
 One-time setup, before the first push:
 
 1. An AUR account: <https://aur.archlinux.org/register>.
@@ -315,20 +353,37 @@ One-time setup, before the first push:
    `aur_key.pub` into *My Account → SSH Public Key* on the AUR.
 3. A GitHub **Environment** named `aur` (*Settings → Environments → New
    environment*), with *Deployment branches and tags* limited to `main` and
-   tags matching `v*` — and a required reviewer if you want one. Store the
-   private key, `aur_key`, there as the secret `AUR_SSH_KEY`, NOT as a
-   repository secret: a repository secret is readable by a workflow on any
-   branch, and this key pushes a PKGBUILD that every AUR helper runs on its
-   users' machines. Then delete the local copy, or keep it somewhere you would
+   tags matching `v*`. The `v*` rule cannot be dropped, because a `release`
+   event runs on the tag. It also lets through any `v*` tag, not only yours: a
+   manual run can be started on a tag and runs that tag's copy of `aur.yml`.
+   So the Environment keeps the key safe only together with one of these:
+   (a) rulesets (*Settings → Rules → Rulesets*): one on tags `v*` that
+   restricts creations, updates and deletions, and one on the branch `main`
+   that restricts updates and deletions, both with *Repository admin* as the
+   only bypass. Classic branch protection on a personal repository does not
+   limit who can push. Or (b) a required reviewer on this Environment: every
+   run then waits for you to approve it, whichever ref it came from, so check
+   that ref before approving. Without one of them, anyone with write access can
+   push a `v*` tag, or a commit to `main`, whose `aur.yml` prints the key, and
+   start the workflow on it. Neither protects against a leaked credential of
+   your own admin account. Store the private key, `aur_key`, there as the
+   secret `AUR_SSH_KEY`, NOT as a repository secret: a repository secret is
+   readable by a workflow on any branch, and this key pushes a PKGBUILD that
+   every AUR helper runs on its users' machines. Then delete the local copy, or keep it somewhere you would
    keep a password.
-4. Run the workflow by hand for the first release that ships `tobii-linux-bin`
-   — v0.3.1 or later, not v0.3.0, whose hub does not know the prebuilt package
-   and whose `tobii` has no `uninstall`. **The first push creates the package**
-   under your account; there is nothing to register beforehand.
+4. The first release to push is one that ships `tobii-linux-bin` — v0.3.1 or
+   later, not v0.3.0, whose hub does not know the prebuilt package and whose
+   `tobii` has no `uninstall`. If the secret exists when that release is
+   published, publishing it runs the workflow and pushes; otherwise run the
+   workflow by hand from `main`, with its tag, once the secret is there. **The
+   first push creates the package** under your account; there is nothing to
+   register beforehand.
 
-To re-publish a release after a packaging fix, run it by hand with a higher
-`pkgrel`: AUR helpers upgrade only when `pkgver-pkgrel` changes, so a fix pushed
-under the same pkgrel reaches new installs only.
+To re-publish a release after a packaging fix, merge the fix to `main`, then run
+it by hand from `main` with a higher `pkgrel`: the `aur` Environment refuses
+other branches, and a run started on a tag uses that tag's old `aur-bin.sh`.
+AUR helpers upgrade only when `pkgver-pkgrel` changes, so a fix pushed under the
+same pkgrel reaches new installs only.
 
 Until the secret exists, the job does everything except the push, prints what it
 would have pushed, and ends green with a notice. The AUR's SSH host keys are

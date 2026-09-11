@@ -145,13 +145,15 @@ package called `tobii-linux`. It and `tobii-linux-bin` conflict, so installing
 either one offers to remove the other.
 
 `install.sh` copies the two binaries, adds the application-menu entry, and asks
-before using `sudo` for the udev rule. Do not run it with plain `sudo`: under
-sudo your home directory is `/root`, so it would install for the root account.
-It refuses, and names the two commands that are meant — `./install.sh` as
-yourself, or `sudo ./install.sh --system` for every user. The packages do all of that as part of
+before using `sudo` for the udev rule. The packages do all of that as part of
 installing, into `/usr/bin` — which is also why the built-in updater will not
 replace them. It offers to **download** the file your package manager wants
 instead; see [Updates](#updates).
+
+Do not run `install.sh` with plain `sudo`: under sudo your home directory is
+`/root`, so it would install for the root account. It refuses, and names the two
+commands that are meant — `./install.sh` as yourself, or
+`sudo ./install.sh --system` for every user.
 
 **Re-plug the Eye Tracker 5 afterwards** so the udev rule takes effect.
 </details>
@@ -260,11 +262,14 @@ command-line tool with neither GTK package.
 </details>
 
 `--install` puts `tobii` and `tobii-gtk` in `~/.local/bin`; pass a directory to
-choose another, or add `--system` for `/usr/local/bin` and every user's menu
-(`scripts/build.sh --install --system`). `--udev` installs the device rule
-described below. Run it as yourself, not with `sudo` — it refuses, and asks for
-`sudo` itself for the steps that need it. Leave both off to just build into
-`target/release/`.
+choose another (a relative one is taken from where you ran `build.sh`), or add
+`--system` for `/usr/local/bin` and every user's menu
+(`scripts/build.sh --install --system`). Every user's menu entry runs what is in
+that directory, so `--system` refuses one that another account could change, and
+names the folder that stops it; [Development](docs/wiki/Development.md) has the
+rule. `--udev` installs the device rule described below. Run it as yourself, not
+with `sudo` — it refuses, and asks for `sudo` itself for the steps that need it.
+Leave both off to just build into `target/release/`.
 
 `--install` also adds **Tobii Eye Tracker** to your application menu.
 
@@ -288,13 +293,23 @@ It looks in these places, and only these: the install manifest the installer
 writes (`~/.local/share/tobii-linux/installs`), the directory named in the menu
 entry's `Exec=` and in the start-at-login entry's, `~/.local/bin`, the
 directory of the `tobii` you run it with, and any `--bindir DIR` you give it.
-It does not search your `PATH`. An install somewhere else that none of these
-lead to — one made into a directory of your choice by v0.3.0 or earlier, with
-no menu entry — is found with `--bindir DIR`.
+It also reads the system-wide manifest,
+`/usr/local/share/tobii-linux/installs`. A directory listed there is a
+`--system` install, which it leaves and prints the command for — unless
+`sudo tobii uninstall --system` would refuse that directory too (a `~/bin` of
+yours, say), and then it is checked like any other place. With
+`--system` it looks only in that manifest and in `--bindir`. It does not search
+your `PATH`. An install somewhere else that none of these lead to — one made
+into a directory of your choice by v0.3.0 or earlier, with no menu entry — is
+found with `--bindir DIR`.
 
 It asks before stopping a hub that is still running, then removes the
 binaries, the menu entry, its icon and the start-at-login entry. It deletes
-only file names it knows, never a directory tree.
+only names it knows. The only directories it removes with everything in them
+are the `.tobii-update-<pid>` work folders an interrupted update left beside
+the binaries. Every other directory it touches (the install manifest's, and
+with `--purge` the settings, models and log directories) is removed only once
+it is empty.
 
 **What it will not touch, and why.** A copy found any way but the manifest is
 checked before it is run or removed. It is left where it is, never run, and
@@ -302,15 +317,17 @@ listed with the reason, if:
 
 - it is not a program. A script called `tobii-gtk` in `~/.local/bin` is a
   wrapper of yours, not a build of this program.
-- it belongs to another user. It is theirs to remove, with their own
-  `tobii uninstall`. That holds for a copy the manifest lists too.
+- it belongs to a user other than you or root. It is theirs to remove, with
+  their own `tobii uninstall`. That holds for a copy the manifest lists too.
+  Root's files pass this check, so a copy an older `sudo ./install.sh` left in
+  a folder of yours is treated as yours.
 - others can write where it is: the file, or a directory that decides which
   file its name leads to — the one it is in, the one of each symlink on the
-  way, and every directory above those — belongs to another user, or can be
-  written by another user or by a group other than your own private group
-  (the group of your own that Fedora and others give each user is fine; so is
-  a sticky directory such as `/tmp`). Whoever can write there chooses what
-  would run.
+  way, and every directory above those — belongs to a user other than you or
+  root, or can be written by another user or by a group other than your own
+  private group (the group of your own that Fedora and others give each user is
+  fine; so is a sticky directory such as `/tmp`). Whoever can write there
+  chooses what would run.
 
 A copy that passes must still name itself when asked `--version`. It also
 leaves alone:
@@ -333,18 +350,28 @@ leaves alone:
   after. Otherwise it is a system-wide install, and the command for that is
   printed (see below).
 - a menu or start-at-login entry that runs a copy which stays — a package's, a
-  build directory's — and one whose program it cannot tell.
+  build directory's — and one whose program it cannot tell. That includes an
+  entry whose `Exec` line cannot be read here: there is none, there are two, or
+  it is quoted in a way launchers read differently, as a v0.3.0 menu entry is
+  for a directory whose name holds one of `' \ & | ; $ ~ # * ? < >` or a
+  backtick. Such an entry is not used to find an install either; `--bindir DIR`
+  finds one it would have led to.
 
-`--yes` answers every question with yes. That includes stopping running copies
-with `SIGTERM` if they do not quit when asked — a `tobii game` wrapper among
-them, which is a running game's head tracking. A hub still running from a
-program that has been deleted (a package removed while it ran) is shown, and
-offered to be stopped the same way.
+`--yes` goes ahead without asking, which is what a run with no terminal needs.
+It does not stop for the bridge question below; it goes on. It stops running
+copies: a hub is first asked to quit over D-Bus (except when a hub from a copy
+that stays is also running, because D-Bus could reach that hub instead), and
+whatever is still running 5 seconds later gets `SIGTERM`. That includes a
+`tobii game` wrapper, which is a running game's head tracking and is never
+asked first. A hub still running from a program that has been deleted (a
+package removed while it ran) is shown and stopped the same way. Without
+`--yes`, stopping it is only offered, and declining leaves it running.
 
-If `~/.local/share/icons/hicolor/icon-theme.cache` exists, it is refreshed
-after the icon is removed. When no icons are left under that directory, the
-cache tool deletes the cache, which puts the directory back as it was before
-the install. No cache is ever created.
+If an `icon-theme.cache` exists in the `hicolor` directory the icon is removed
+from (`~/.local/share/icons/hicolor`, or `/usr/local/share/icons/hicolor` with
+`--system`), it is refreshed after the icon is removed. When no icons are left
+under that directory, the cache tool deletes the cache, which puts the
+directory back as it was before the install. No cache is ever created.
 
 It leaves:
 
@@ -352,7 +379,9 @@ It leaves:
   remove those too. Only the files this program writes are deleted, and
   anything else it finds there — a backup of your own — stays and is listed.
   `calibration.bin` is the part that is costly to redo.
-- **the udev rule.** Add `--udev`; that step uses `sudo`.
+- **the udev rule.** Add `--udev`. That step asks first, and uses `sudo` unless
+  it already runs as root (`--system`); `--yes` runs it without asking. With no
+  terminal it only prints the commands, for you to run.
 - **the TrackIR/FreeTrack bridge in Wine prefixes.** It lists the prefixes it
   finds the bridge in — Steam's, `$WINEPREFIX` and `~/.wine` — with the command
   for each. Removing the bridge needs a `tobii`. When the `tobii` you run is
@@ -374,7 +403,11 @@ A system-wide install (`sudo ./install.sh --system`) comes out with
 `sudo tobii uninstall --system`. Without `--system`, `tobii uninstall` refuses to
 run as root. Under `sudo`, HOME is `/root`, so it would search root's home
 instead of yours. As root it neither runs nor opens anything in a directory
-that someone other than root could have changed.
+that someone other than root could have changed — a directory the system
+manifest lists included. One it refuses is left, with the reason and the
+command for whoever controls it: `tobii uninstall --bindir DIR`, run as that
+user. Its line in the system manifest stays until a later
+`sudo tobii uninstall --system` finds the directory empty.
 
 <details>
 <summary><b>By hand — for v0.1.0 to v0.3.0, whose <code>tobii</code> has no <code>uninstall</code></b></summary>
@@ -782,11 +815,16 @@ which is the way to open the hub; otherwise the application menu is. It exists s
 the hub is already running when you want it, and so that launching the app hands
 off to the one process that can claim the tracker rather than starting a second.
 
-The entry runs whichever copy switched it on, by its full path. If that copy is
-removed or moved, the entry points at nothing and the next login starts nothing;
-`install.sh` repairs it when that is so, and when it points at a different copy
-that still exists it leaves it alone and tells you, because which copy starts at
-login is your choice.
+The entry runs whichever copy switched it on, by its full path. Switched on from
+a copy that was replaced while it ran — by `install.sh`, the updater or a
+package upgrade — it names the path the new copy is at. From a copy that was
+removed while it ran, the switch refuses, and its tooltip says why. If that copy
+is later removed or moved, the entry points at nothing and the next login starts
+nothing; `install.sh` repairs it when that is so, and when it points at a
+different copy that still exists it leaves it alone and tells you, because which
+copy starts at login is your choice. It reads the entry's `Exec` line as GLib
+does, and leaves alone one it cannot read for certain: two `Exec` lines, an
+unterminated quote, or a single quote outside double quotes.
 
 Launching the application again, from the menu or the command line, raises the
 hub belonging to that background process rather than starting a second copy.
@@ -904,23 +942,37 @@ version-named folder there, and prints the one command that installs it. It
 never installs anything itself. This is the hub only; `tobii update` on the
 command line still just refuses and tells you why.
 
-Three more cases get something other than *Update*, all decided before the
+Four more cases get something other than *Update*, all decided before the
 banner appears, so the button you see is one that can work:
 
 - **A copy in a folder only an administrator can change** — one installed with
-  `sudo ./install.sh --system`, or copied into a system folder by hand — also gets
+  `sudo ./install.sh --system`, copied into a system folder by hand, or another
+  account's files in a shared folder that is not yours either — also gets
   *Download*: the release archive, and the one command that installs it for every
   user, `sudo ./install.sh --system <that folder>`.
-- **A copy in your own folder whose files are someone else's** — what
-  `sudo ./install.sh` into your home directory leaves behind — gets *Download*
-  as well, with a plain `./install.sh <that folder>`, no `sudo`. That replaces
-  root's files with your own, which an update in place cannot: its backup step
-  hard-links the old file, and the kernel refuses that for a file you do not
-  own. `tobii update --install` refuses the same copy and says so.
+- **A copy in your own folder whose files are someone else's** — what an older
+  `sudo ./install.sh ~/.local/bin` left behind — gets *Download* as well, with a
+  plain `./install.sh <that folder>`, no `sudo`. That replaces root's files
+  with your own, which an update in place cannot: its backup step hard-links
+  the old file, and the kernel refuses that for a file you do not own.
+  `tobii update --install` refuses the same copy and says so.
+- **A copy in a folder you cannot write but can fix yourself** — your own
+  folder with its write permission off, or a folder in your home that another
+  account owns, which that same older `sudo ./install.sh ~/.local/bin` made
+  when the folder did not exist yet — gets no button. The banner shows the one
+  command, `chmod u+w <that folder>` or
+  `sudo chown <your uid>:<your gid> <that folder>` (that folder alone, not what
+  is in it), selectable so you can copy it, and says to reopen the app
+  afterwards. `tobii update --install` prints the same command and says to run
+  it again.
 - **A copy that was replaced or removed while it was running** — its package
   uninstalled, or a newer version installed over it — gets *Quit*. There is
   nothing at its path to update, and starting the app again would only hand off
   to the same old process, so quitting it is the step that helps.
+
+`sudo tobii update --install` on a copy whose files are an ordinary account's
+refuses, and says to run it again as that account, without `sudo`: as root the
+update would work, and leave root's files behind.
 
 The decision and any failure are written to the log, which `tobii debug` quotes.
 
@@ -1000,19 +1052,20 @@ updater runs before installing.
 
 ## Contributing
 
-Pull requests run three checks, and they pass on `main`:
+Pull requests run these checks, and they pass on `main`:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+bash scripts/test-install-payload.sh   # the install scripts; needs no root
 ```
 
 `rust-toolchain.toml` pins the compiler, and **rustup** honours it
 automatically, so your `clippy` and `rustfmt` are the ones CI runs. A
 distribution Rust ignores the pin entirely — the install blocks above use rustup
 for exactly that reason, and `dnf install rust cargo` or `zypper install rust
-cargo` would give you a compiler these three commands do not describe.
+cargo` would give you a compiler these checks do not describe.
 
 **Most of what "needs an ET5" does not** — `tobii record` captures a real session
 and `cargo test -p tobii-usb --test replay` regression-tests the protocol against

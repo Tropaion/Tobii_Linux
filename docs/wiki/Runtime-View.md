@@ -174,27 +174,48 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
    - `ownership_of()`, which asks `dpkg`, `rpm` and `pacman` in turn about each
      installed binary — up to three subprocess calls, each with a deadline;
    - whether this user can replace the binaries in place — two answers, because
-     their failures need opposite advice: `faccessat(W_OK)` on the directory,
+     their failures need opposite advice: `faccessat(W_OK | X_OK)` on the
+     directory (search as well as write, because a directory that cannot be
+     searched refuses every rename into it),
      and whether every installed binary is owned by this user (with
      `fs.protected_hardlinks` on, the swap's hard-linked backup of a file you do
      not own fails even in a writable directory);
+   - whose the directory is (`stat`), and whether it is inside the user's home
+     once symlinks are resolved — which decide the advice when either answer
+     above is no;
    - whether `/proc/self/exe` ends in ` (deleted)` — replaced or removed while
      it ran.
 
    `install::action_for()` turns that into the banner, and the choice is logged:
    - **Replaced or removed while running** → *Quit*, through the hub's `quit`
-     action. Nothing is at the path to update, and relaunching would hand off
-     to this same process.
+     action, the one the cogwheel's *Quit* and `tobii uninstall` use as well.
+     Nothing is at the path to update, and relaunching would hand off to this
+     same process.
    - **Unowned, the directory writable and the binaries this user's** →
      *Update*, the path below.
+   - **Unowned, not writable, and the directory this user's** (its write bit
+     off) → no download and no button (`FixFolder`): the banner shows
+     `chmod u+w <dir>`, selectable, and says to reopen the app. Not sudo:
+     `--system` there would put root's files, and a menu entry for every user,
+     into one user's folder.
+   - **Unowned, not writable, inside the home and another account's** (what
+     v0.3.0's `sudo ./install.sh ~/.local/bin` made when that folder did not
+     exist) → the same, with `sudo chown <uid>:<gid> <dir>` of that one folder,
+     not of what is in it. The next start finds root's binaries in a folder of
+     the user's, and offers the plain-install *Download* below.
    - **Unowned, but only an administrator can change the directory** →
      *Download* of the archive, and the `sudo ./install.sh --system <dir>` that
      installs it.
    - **Unowned, the directory this user's but the binaries someone else's** (a
      `sudo ./install.sh` into a home directory) → *Download* of the archive,
      and a plain `./install.sh <dir>`: the installer renames its files into
-     place, and a rename in a directory you can write ignores the old file's
-     owner.
+     place, and a rename in a directory you own ignores the old file's owner.
+   - **Unowned, another account's binaries in a folder that is not this user's
+     either** (a shared or sticky one) → the `--system` *Download*. In a sticky
+     folder someone else owns, rename(2) refuses anyone but the file's owner or
+     the folder's, so a plain install would stop at its first `mv`; and a
+     group-writable system folder holds files every user runs, which a per-user
+     install should not take over.
    - **Owner unknown** (a package manager could not be asked) → *Update*, which
      `install_release` then refuses, saying which query failed. Overwriting a
      packaged file on the strength of a query that failed is the one outcome
@@ -215,7 +236,11 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
 4. On **Update**: `app.hold()` (so closing the window cannot kill the process
    between two renames), then an install thread. `install_release` asks step 3's
    questions again itself — `tobii update --install` has no banner in front of
-   it — and refuses with the matching reason.
+   it — and refuses with the matching reason: for a folder the user can fix,
+   the same command, then "run `tobii update --install` again". Run as root on
+   binaries another account owns, it refuses and says to run it again as that
+   account, without sudo (`RunWithoutSudo`): as root the swap would work, and
+   leave root's files there.
 5. `net::download` → digest against `SHA256SUMS` → `tar -xzf` → find the
    binaries **skipping symlinks** → **run each one with `--version`** → swap.
 6. The swap: hard-link the old binary aside as a backup, then a single atomic
@@ -236,15 +261,21 @@ sequence from §6.1, which is why an unplug/replug is invisible to the user.
 ```
    Developer machine                     GitHub Actions
    ─────────────────                     ──────────────
-   scripts/build.sh                      ci.yml     — fmt, clippy, 593 tests
-     ├── checks deps, names what's         (debian:trixie container,
-     │   missing per distro                 pinned toolchain 1.98.0)
-     ├── cargo build --release
+   scripts/build.sh                      ci.yml     — fmt, clippy, tests,
+     ├── checks deps, names what's         install-script tests,
+     │   missing per distro                rc pre-release flag
+     ├── cargo build --release             (debian:trixie container,
+     │                                      pinned toolchain 1.98.0)
      └── --install → ~/.local/bin        release.yml — on a v* tag
-         + desktop entry + icon            ├── builds in debian:trixie
+         + desktop entry + icon            ├── the checks, on the tagged commit
+                                           ├── builds in debian:trixie
                                            ├── ENFORCES the glibc floor
-   User machine                            ├── verifies SHA256SUMS
-   ────────────                            └── publishes a DRAFT release
+                                           ├── verifies SHA256SUMS
+                                           ├── builds + installs the Arch pkg
+                                           └── publishes a DRAFT release
+                                         aur.yml — on a full release,
+   User machine                            pushes tobii-linux-bin to the AUR
+   ────────────
    ~/.local/bin/{tobii,tobii-gtk}    ◄────────────┐  tobii update --install
      (/usr/local/bin with --system)               │  or the hub's banner
    ~/.config/tobii-linux/…                        │  (BINARIES ONLY — the
@@ -258,8 +289,11 @@ sequence from §6.1, which is why an unplug/replug is invisible to the user.
 `installs` is the installer's manifest — the directories `install.sh` put
 binaries in, `/usr/local/share/tobii-linux/installs` for `--system`. It is a
 hint for `tobii uninstall`, which checks every binary it names before
-touching it. `icons` is the tray's private copy of its icon, rewritten only
-when it differs, and gone with the session.
+touching it. A directory it lists that cannot be looked at (no permission to
+search it, say) keeps its line and is reported as `cannot be looked at`, not
+taken for empty: that line may be the only record of a `--lean` install.
+`icons` is the tray's private copy of its icon, rewritten only when it differs,
+and gone with the session.
 
 **Why the container matters.** The machine a binary is compiled on *is* its
 compatibility floor. Built on a current rolling distribution both binaries
