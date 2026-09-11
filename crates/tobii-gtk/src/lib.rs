@@ -473,37 +473,21 @@ fn tray_is_published() -> bool {
     TRAY.with(|c| c.borrow().is_some())
 }
 
-/// Share a column's spare height out between its cards, rather than inside one.
-///
-/// The alternative — letting the last card expand — puts the empty space
-/// *inside* a card, where it reads as content that failed to load. Growing the
-/// gaps instead keeps every card exactly as tall as what it contains, which is
-/// the thing a card is supposed to communicate.
-///
-/// Only takes effect when a column is shorter than the row it sits in; the
-/// tallest column's spacers get nothing and it looks exactly as it did.
-fn justify_column(col: &gtk::Box) {
-    let mut child = col.first_child();
-    let mut cards = Vec::new();
-    while let Some(w) = child {
-        child = w.next_sibling();
-        cards.push(w);
-    }
-    // Between the cards, never before the first or after the last: leading or
-    // trailing slack would move the whole stack instead of spreading it.
-    for card in cards.iter().skip(1) {
-        let gap = gtk::Box::new(Orientation::Vertical, 0);
-        gap.set_vexpand(true);
-        col.insert_child_after(&gap, card.prev_sibling().as_ref());
-    }
-}
-
 /// A "fit the window to its content" callback, filled once the window exists.
 ///
 /// Late-bound because the cogwheel — which is what changes the text size — is
 /// built as part of the header, and the header is built before the window it
 /// would have to resize.
 type Refit = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// The gap between any two cards, whichever direction they are stacked.
+///
+/// One number for both the grid's row spacing and the spacing inside a column,
+/// because the eye reads them as the same gap: the live band sits above the
+/// first row of cards in the grid, and the second row of cards sits below the
+/// first inside each column. Two different values there — 16 and 12, plus
+/// whatever a justify added on top — made the rows visibly unevenly spaced.
+const CARD_GAP: i32 = 16;
 
 /// How wide a control column is.
 ///
@@ -1026,12 +1010,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // both game sections together at 447 against 293, and a row is as tall as
     // its tallest column.
     //
-    // Fill, not Start: each column takes the whole height of its grid row and
-    // the expanding gaps added by `justify_column` share out the difference.
-    // See there for why the gaps and not the cards.
-    let col_calib = gtk::Box::new(Orientation::Vertical, 12);
+    // They pack from the top and every gap is `CARD_GAP`. Stretching the gaps
+    // to level the bottoms — which is what this did while the columns were
+    // badly unbalanced — is no longer worth it: with 341/354/342 the levelling
+    // buys at most 13px, and it costs a gap inside a column that visibly
+    // differs from the gap between the rows.
+    let col_calib = gtk::Box::new(Orientation::Vertical, CARD_GAP);
     col_calib.set_size_request(COLUMN_WIDTH, -1);
-    col_calib.set_valign(Align::Fill);
+    col_calib.set_valign(Align::Start);
     col_calib.set_hexpand(true);
     col_calib.append(&section(
         "Improve my calibration",
@@ -1097,9 +1083,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     }
 
     // What the tracker measures: which eyes to look for, and head pose.
-    let col_display = gtk::Box::new(Orientation::Vertical, 12);
+    let col_display = gtk::Box::new(Orientation::Vertical, CARD_GAP);
     col_display.set_size_request(COLUMN_WIDTH, -1);
-    col_display.set_valign(Align::Fill);
+    col_display.set_valign(Align::Start);
     col_display.set_hexpand(true);
     col_display.append(&section(
         "Select eyes to detect",
@@ -1114,9 +1100,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     ));
 
     // Where the result goes: onto the screen, and out to a game.
-    let col_games = gtk::Box::new(Orientation::Vertical, 12);
+    let col_games = gtk::Box::new(Orientation::Vertical, CARD_GAP);
     col_games.set_size_request(COLUMN_WIDTH, -1);
-    col_games.set_valign(Align::Fill);
+    col_games.set_valign(Align::Start);
     col_games.set_hexpand(true);
     col_games.append(&section(
         "Preview my gaze",
@@ -1132,13 +1118,6 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
          `tobii game -- <command>` — in Steam, put that in Launch Options.",
         &games_row.controls,
     ));
-
-    // Level bottoms. Both racks are shorter than the instrument, and three
-    // stacks ending within ~100px of each other read as a misalignment rather
-    // than as a deliberate stagger.
-    justify_column(&col_calib);
-    justify_column(&col_display);
-    justify_column(&col_games);
 
     // --- Responsive split -------------------------------------------------
     // Side by side when there is room, stacked when there is not. GTK4 has no
@@ -1160,7 +1139,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     split.set_vexpand(false);
     split.set_valign(Align::Start);
     split.set_column_spacing(16);
-    split.set_row_spacing(16);
+    split.set_row_spacing(CARD_GAP as u32);
     // Attached here in the widest layout, and re-placed by the breakpoint below
     // if the window turns out to be narrower. Not left to the breakpoint alone:
     // the window's opening height is MEASURED from this tree further down, and
