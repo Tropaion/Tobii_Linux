@@ -263,6 +263,33 @@ because the reasoning is worth more than the tidiness.
   the display-wide stylesheet and the process's font DPI, so it is not confined
   to the hub.
 
+### 11.3c Update decisions, the installer and quitting from outside (after v0.3.0)
+
+- **The two new banners have never been shown by a real update.** *Download* for
+  a system copy and *Quit* for a replaced one need a release newer than the
+  running copy, so they are unit-tested, with each decision's branch broken once
+  to prove its test bites, and not clicked. The *Quit* case is the reported one:
+  a v0.1.0 hub whose package was removed while it ran.
+- **`faccessat` answers for the directory, not the swap.** It counts read-only
+  mounts and ACLs; the ownership check covers `protected_hardlinks`. Anything
+  else that fails the rename still reaches `install_release`'s real attempt and
+  its rollback — the button can still fail, only no longer for the reasons
+  known in advance.
+- **The tray's `IconThemePath` is read by Plasma** — its `GetAll` reply was seen
+  carrying it — **but drawing from it in the first-install case is unmeasured.**
+  This session's Plasma had already been restarted after `~/.local/share/icons`
+  existed, so the case needs a fresh login to recreate.
+- **Any process of the same user can quit the hub**, through the `quit` action
+  GApplication exports on the session bus. By design: that is what the
+  uninstaller and scripts use, and a same-user process can already signal it.
+- **`install.sh --system` has never installed as real root here.** The root
+  refusal, `--system`, the manifest, the autostart repair and the running-copy
+  warning are checked by `scripts/test-install-payload.sh` in CI through its test
+  seams (`TOBII_TEST_EUID`, `TOBII_SYSTEM_DATA_DIR`), with each check broken once
+  to prove it bites. An end-to-end `sudo ./install.sh --system` has not run.
+- **The installer edits a file the user owns**: the login entry, and only its
+  `Exec` line, only when that points at a binary that no longer exists.
+
 ### 11.4 Environmental
 
 - **Glyph clipping at fractional display scale.** Tops of tall glyphs appear

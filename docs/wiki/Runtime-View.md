@@ -167,10 +167,31 @@ Threads, in order: **launch-check thread** → GTK main → **install thread**.
    triple **and** checksums. Otherwise the banner says which of those is missing
    — "no build for your machine" told to somebody whose build is right there
    sends them looking for something that exists.
-3. Still on the worker: **who owns this copy?** `install_dir()` then
-   `ownership_of()`, which asks `dpkg`, `rpm` and `pacman` in turn about each
-   installed binary — up to three subprocess calls, each with a deadline,
-   before the banner is shown. The answer picks the banner:
+3. Still on the worker: **where is this copy, and what can be done to it?**
+   `install::placement()` gathers it without writing anything — the hub promises
+   nothing on disk changes before a click, which is why the probe-file
+   `is_writable` is not used here:
+   - `ownership_of()`, which asks `dpkg`, `rpm` and `pacman` in turn about each
+     installed binary — up to three subprocess calls, each with a deadline;
+   - whether this user can replace the binaries in place: `faccessat(W_OK)` on
+     the directory **and** every binary owned by this user (with
+     `fs.protected_hardlinks` on, the swap's hard-linked backup of a file you do
+     not own fails even in a writable directory);
+   - whether `/proc/self/exe` ends in ` (deleted)` — replaced or removed while
+     it ran.
+
+   `install::action_for()` turns that into the banner, and the choice is logged:
+   - **Replaced or removed while running** → *Quit*, through the hub's `quit`
+     action. Nothing is at the path to update, and relaunching would hand off
+     to this same process.
+   - **Unowned, and replaceable** → *Update*, the path below.
+   - **Unowned, but only an administrator can replace it** → *Download* of the
+     archive, and the `sudo ./install.sh --system <dir>` that installs it.
+   - **Owner unknown** (a package manager could not be asked) → *Update*, which
+     `install_release` then refuses with the reason.
+   - **A package manager owns it** → as follows.
+
+   The previous version of this step, for the package-owned case:
    - **Nobody owns it** → *Update*, the path below.
    - **A package manager owns it** → *Download*. A folder picker, then
      `download_release_files` fetches the artifact matching that manager (the

@@ -527,7 +527,11 @@ exactly as it was before, and Alt-Tab or the overview is the way back. Either
 way, launching the app again raises the hub you already have.
 
 The tray icon has no menu on purpose: left-, right- and middle-click all just
-raise the hub, and *Quit* lives in the cogwheel inside it.
+raise the hub, and *Quit* lives in the cogwheel inside it. The icon carries its
+own copy of the picture, so it shows even when Plasma started before the icon
+was installed — Plasma looks only in icon folders that existed when it started,
+so after a first install the *application menu* can still show a generic icon
+until your next login.
 
 The tracker still goes dark. Hiding releases the claim as it hides; minimising
 drops it within a frame, because the claim is polled from whether the window is
@@ -538,7 +542,15 @@ and the tracker stays on, which is correct — something is asking for data.
 Launching the app again — from the menu, the dock, or `tobii-gtk` — raises the
 existing window rather than starting a second copy.
 
-**To exit for real**, use *Quit* in the cogwheel menu.
+**To exit for real**, use *Quit* in the cogwheel menu. From a script, or when the
+window is somewhere you cannot reach, the same thing is an action on the session
+bus:
+
+```sh
+gdbus call --session --dest com.tobiilinux.Configuration \
+  --object-path /com/tobiilinux/Configuration \
+  --method org.freedesktop.Application.ActivateAction quit '[]' '{}'
+```
 
 ### Start at login
 
@@ -550,6 +562,12 @@ no tracker either. Where your desktop has a status area there is an icon in it,
 which is the way to open the hub; otherwise the application menu is. It exists so
 the hub is already running when you want it, and so that launching the app hands
 off to the one process that can claim the tracker rather than starting a second.
+
+The entry runs whichever copy switched it on, by its full path. If that copy is
+removed or moved, the entry points at nothing and the next login starts nothing;
+`install.sh` repairs it when that is so, and when it points at a different copy
+that still exists it leaves it alone and tells you, because which copy starts at
+login is your choice.
 
 Launching the application again, from the menu or the command line, raises the
 hub belonging to that background process rather than starting a second copy.
@@ -665,6 +683,20 @@ It asks where to put it, fetches the artifact that matches your manager — the
 version-named folder there, and prints the one command that installs it. It
 never installs anything itself. This is the hub only; `tobii update` on the
 command line still just refuses and tells you why.
+
+Two more cases get something other than *Update*, and both are decided before the
+banner appears, so the button you see is one that can work:
+
+- **A copy in a folder only an administrator can change** — one installed with
+  `sudo ./install.sh --system`, or copied into a system folder by hand — also gets
+  *Download*: the release archive, and the one command that installs it for every
+  user, `sudo ./install.sh --system <that folder>`.
+- **A copy that was replaced or removed while it was running** — its package
+  uninstalled, or a newer version installed over it — gets *Quit*. There is
+  nothing at its path to update, and starting the app again would only hand off
+  to the same old process, so quitting it is the step that helps.
+
+The decision and any failure are written to the log, which `tobii debug` quotes.
 
 **Turning the check off:** the switch in the hub under *Check for updates*, or
 `TOBII_NO_UPDATE_CHECK=1` in the environment, which also wins over the switch.
