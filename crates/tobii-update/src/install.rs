@@ -122,6 +122,9 @@ pub enum InstallError {
     },
     /// The directory the binaries live in cannot be written to.
     NotWritable(PathBuf),
+    /// The running binary was deleted or replaced after it started, so there is
+    /// nothing at its path for an update to replace.
+    ReplacedWhileRunning,
     /// This copy was installed by a package manager, which owns it.
     ///
     /// Not a permissions problem, and emphatically not something to solve by
@@ -215,11 +218,22 @@ impl std::fmt::Display for InstallError {
                  package database wrong, and this cannot rule that out. Fix {manager}, or \
                  update through your package manager."
             ),
+            // Not "re-run with the permission to write there", which it said
+            // until 2026-09-11: in the hub that means running a GUI as root,
+            // and under sudo HOME is /root, so every follow-on step goes wrong.
             InstallError::NotWritable(p) => write!(
                 f,
-                "{} cannot be written to, so the update cannot be installed there. \
-                 Install it by hand, or re-run with the permission to write there.",
+                "{} is not writable by you, so the update cannot be installed there. \
+                 Download the release archive from the releases page, unpack it, and run \
+                 `sudo ./install.sh --system {}` in it.",
+                p.display(),
                 p.display()
+            ),
+            InstallError::ReplacedWhileRunning => write!(
+                f,
+                "this copy was replaced or removed while it was running, so there is \
+                 nothing here to update. Quit it and start it again to run whichever \
+                 version is installed now."
             ),
             InstallError::RolledBack { detail } => write!(
                 f,
@@ -529,6 +543,127 @@ pub fn is_writable(dir: &Path) -> bool {
     }
 }
 
+/// Where the running copy lives, and what can be done to it.
+///
+/// Read by the hub's update banner before it offers anything, so that the
+/// button it shows is one that can work. Everything here is *read*: the hub
+/// promises that nothing on disk changes until a button is pressed, and
+/// [`is_writable`] proves writability by creating a file, so it is not used
+/// here. [`install_release`] still makes that real attempt, and refuses on its
+/// own answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placement {
+    /// The directory the running binary was started from.
+    pub dir: PathBuf,
+    /// Who owns the binaries in it.
+    pub owner: Ownership,
+    /// Whether this user can replace them in place: the directory is writable
+    /// by them AND every binary in it is theirs. The second half is not
+    /// redundant. With `fs.protected_hardlinks` on — the kernel default, and 1
+    /// on the machine this was found on — the swap's hard-linked backup of a
+    /// file you do not own fails with EPERM even in a directory you can write,
+    /// so a root-owned binary in ~/.local/bin got an Update that could only roll
+    /// back.
+    pub replaceable: bool,
+    /// The running binary was deleted or replaced after it started.
+    pub exe_gone: bool,
+}
+
+/// What the update banner offers for a [`Placement`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Replace the binaries in place: the tarball install in ~/.local/bin.
+    Update,
+    /// A package manager owns this copy, so fetch the file it installs.
+    DownloadPackage { manager: String, package: String },
+    /// Nobody owns it, but it is somewhere this user cannot replace — a
+    /// `sudo ./install.sh --system` install, or one copied by hand into a system
+    /// directory. Fetch the archive and hand over the one command that installs
+    /// it there.
+    DownloadForSystem { dir: PathBuf },
+    /// This copy was deleted or replaced while it ran. There is nothing here to
+    /// update: quitting and starting again runs whatever is installed now.
+    Restart,
+}
+
+/// The decision, kept apart from gathering its inputs so every case is tested.
+///
+/// Reported on 2026-09-11: a hub whose package had been removed while it kept
+/// running offered Update, and after the click said "/usr/bin cannot be written
+/// to … re-run with the permission to write there". Both halves were dead ends.
+/// Nothing owned the deleted files any more, so the package check passed; and a
+/// GUI cannot sensibly be re-run as root. The first case now asks for a restart
+/// and the second offers a download, before anything is clicked.
+pub fn action_for(p: &Placement) -> Action {
+    if p.exe_gone {
+        return Action::Restart;
+    }
+    match &p.owner {
+        Ownership::Package { manager, package } => Action::DownloadPackage {
+            manager: manager.clone(),
+            package: package.clone(),
+        },
+        Ownership::None if !p.replaceable => Action::DownloadForSystem { dir: p.dir.clone() },
+        // `Unknown` keeps Update on purpose: a package manager could not be
+        // *asked*, which is not the same as one owning this copy, and
+        // `install_release` refuses with the reason when it is pressed.
+        Ownership::None | Ownership::Unknown { .. } => Action::Update,
+    }
+}
+
+/// Gather a [`Placement`] for the running program.
+///
+/// `None` when its own path cannot be read — and then the banner keeps Update,
+/// whose click reports that same failure.
+pub fn placement() -> Option<Placement> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    Some(Placement {
+        owner: ownership_of(&dir),
+        replaceable: can_replace_in_place(&dir),
+        exe_gone: exe_replaced_or_removed(&exe),
+        dir,
+    })
+}
+
+/// Whether `/proc/self/exe` says the running binary is no longer at its path.
+///
+/// The kernel appends " (deleted)" to the link once the file it names is
+/// unlinked — by a package removal, or by any install that renames a new file
+/// over it, which is how both `install.sh` and this updater replace a binary.
+/// `current_exe` returns the link as it reads. Measured on this machine with a
+/// copy of `sleep` deleted while it ran.
+pub fn exe_replaced_or_removed(exe: &Path) -> bool {
+    std::os::unix::ffi::OsStrExt::as_bytes(exe.as_os_str()).ends_with(b" (deleted)")
+}
+
+/// [`Placement::replaceable`], without writing anything.
+fn can_replace_in_place(dir: &Path) -> bool {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    writable_by_me(dir)
+        && BINARIES
+            .iter()
+            .all(|b| match std::fs::symlink_metadata(dir.join(b)) {
+                Ok(m) => std::os::unix::fs::MetadataExt::uid(&m) == euid,
+                // Not installed here — a --lean install has no tobii-gtk — so
+                // nothing to replace and nothing to refuse.
+                Err(_) => true,
+            })
+}
+
+/// The kernel's own answer to "may I write here", with the effective ids, so it
+/// counts read-only mounts and ACLs — and creates nothing.
+fn writable_by_me(dir: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(dir.as_os_str()))
+    else {
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated path that outlives the call, and
+    // faccessat only reads it.
+    unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0 }
+}
+
 /// Whether `name` is a plain file name, safe to join onto a directory.
 ///
 /// Asset names are attacker-controlled in the same sense the rest of the
@@ -718,6 +853,12 @@ pub fn install_release(
     }
 
     let dir = install_dir()?;
+    // A copy deleted or replaced while it ran has nothing at its path to update,
+    // and pressing on reports whatever the next check trips over — "not
+    // writable", for the orphaned package copy this was found with.
+    if std::env::current_exe().is_ok_and(|e| exe_replaced_or_removed(&e)) {
+        return Err(InstallError::ReplacedWhileRunning);
+    }
     // Asked before writability, because the two failures need opposite advice:
     // "you need permission" invites `sudo`, which is exactly the wrong thing to
     // do to a package-managed file.
@@ -1359,7 +1500,8 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
 
         // And the permissions message stays about permissions.
         let w = InstallError::NotWritable(PathBuf::from("/usr/bin")).to_string();
-        assert!(w.contains("cannot be written to"), "{w}");
+        assert!(!w.contains("re-run with the permission"), "{w}");
+        assert!(w.contains("sudo ./install.sh --system /usr/bin"), "{w}");
     }
 
     /// A killed or panicking install left up to 73 MB in the install directory
@@ -1924,5 +2066,125 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
 
         let empty = Scratch::new("version-empty");
         assert_eq!(installed_version(empty.path()), None);
+    }
+}
+
+/// The update banner's decision — see [`action_for`] and [`placement`].
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn placed(owner: Ownership, replaceable: bool, exe_gone: bool) -> Placement {
+        Placement {
+            dir: PathBuf::from("/usr/local/bin"),
+            owner,
+            replaceable,
+            exe_gone,
+        }
+    }
+
+    /// The reported case first: a copy whose package was removed while it ran.
+    #[test]
+    fn a_copy_replaced_or_removed_while_running_is_told_to_restart_whoever_owns_it() {
+        assert_eq!(
+            action_for(&placed(Ownership::None, false, true)),
+            Action::Restart
+        );
+        let pkg = Ownership::Package {
+            manager: "pacman".into(),
+            package: "tobii-linux".into(),
+        };
+        assert_eq!(action_for(&placed(pkg, false, true)), Action::Restart);
+    }
+
+    #[test]
+    fn an_unowned_copy_this_user_cannot_replace_gets_a_download_not_a_dead_update() {
+        assert_eq!(
+            action_for(&placed(Ownership::None, false, false)),
+            Action::DownloadForSystem {
+                dir: PathBuf::from("/usr/local/bin")
+            }
+        );
+    }
+
+    #[test]
+    fn the_ordinary_home_install_still_gets_update() {
+        assert_eq!(
+            action_for(&placed(Ownership::None, true, false)),
+            Action::Update
+        );
+    }
+
+    #[test]
+    fn a_packaged_copy_gets_its_package_and_an_unknown_owner_keeps_update() {
+        let pkg = Ownership::Package {
+            manager: "dpkg".into(),
+            package: "tobii-linux".into(),
+        };
+        assert_eq!(
+            action_for(&placed(pkg, false, false)),
+            Action::DownloadPackage {
+                manager: "dpkg".into(),
+                package: "tobii-linux".into()
+            }
+        );
+        let unknown = Ownership::Unknown {
+            manager: "rpm".into(),
+            why: "timed out".into(),
+        };
+        assert_eq!(action_for(&placed(unknown, true, false)), Action::Update);
+    }
+
+    /// The suffix the kernel uses, measured with a copy of `sleep` deleted while
+    /// it ran.
+    #[test]
+    fn a_deleted_binary_is_recognised_by_the_kernels_suffix() {
+        assert!(exe_replaced_or_removed(Path::new(
+            "/usr/bin/tobii-gtk (deleted)"
+        )));
+        assert!(!exe_replaced_or_removed(Path::new("/usr/bin/tobii-gtk")));
+        assert!(!exe_replaced_or_removed(Path::new(
+            "/home/u/(deleted)/tobii-gtk"
+        )));
+    }
+
+    #[test]
+    fn writability_is_asked_of_the_kernel_without_creating_anything() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tobii-placement-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(writable_by_me(&dir));
+        assert!(
+            can_replace_in_place(&dir),
+            "an empty directory has nothing to refuse"
+        );
+        std::fs::write(dir.join("tobii"), b"x").unwrap();
+        assert!(can_replace_in_place(&dir), "a binary this user owns");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "asking created nothing"
+        );
+        // Read-only, as a system directory is to a user. Root ignores modes, so
+        // the assertion only means something when this does not run as root.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!writable_by_me(&dir));
+            assert!(!can_replace_in_place(&dir));
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!writable_by_me(Path::new(
+            "/nonexistent-tobii-placement-dir"
+        )));
+    }
+
+    #[test]
+    fn the_running_program_has_a_placement() {
+        let p = placement().expect("current_exe is readable");
+        assert!(!p.exe_gone);
+        assert!(p.dir.is_dir());
     }
 }

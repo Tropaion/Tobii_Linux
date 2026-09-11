@@ -15,7 +15,7 @@
 //! and then no request is made at all. A program that reaches out on its own
 //! needs a way to say no that is not "stop using the program".
 //!
-//! # Two buttons, because there are two kinds of install
+//! # Which button, decided before it is shown
 //!
 //! An install the updater owns — the `.tar.gz` unpacked into `~/.local/bin` —
 //! can be replaced in place, and the button says **Update**.
@@ -29,6 +29,14 @@
 //! button says **Download**: it fetches the file their own package manager can
 //! install — the `.deb`, the `.rpm`, or the PKGBUILD and its hook — into a
 //! folder they pick, and says what to run.
+//!
+//! Two more cases, both found on 2026-09-11. A copy nobody owns but that sits
+//! where this user cannot write — `sudo ./install.sh --system`, or one copied by
+//! hand into a system directory — also gets **Download**: the archive, and the
+//! one command that installs it for every user. And a copy that was replaced or
+//! removed while it ran has nothing at its path to update, so it gets **Quit**:
+//! relaunching would only hand off to this same process. The decision is
+//! `tobii_update::install::action_for`, and nothing is written to reach it.
 //!
 //! # What pressing Update or Download trusts
 //!
@@ -50,7 +58,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::{Align, Label, Orientation};
 
-use tobii_update::install::Ownership;
+use tobii_update::install::Action;
 use tobii_update::release::{Asset, Blocked, Channel, Check, Release};
 
 /// How the banner reads for a release.
@@ -94,6 +102,57 @@ pub fn packaged_headline(version: &str, manager: &str, package: &str) -> String 
          {package}, so it has to be installed by your package manager rather than replaced \
          from here."
     )
+}
+
+/// The banner for a copy that was replaced or removed while it ran.
+pub fn restart_headline(version: &str) -> String {
+    format!(
+        "Version {version} is available, but this copy of the program was replaced or \
+         removed while it was running, so there is nothing here to update. Quit it and \
+         start it again to run whichever version is installed now."
+    )
+}
+
+/// The banner for a copy only an administrator can replace.
+pub fn system_headline(version: &str, dir: &Path) -> String {
+    format!(
+        "Version {version} is available. This copy is in {}, which only an administrator \
+         can change, so it cannot be replaced from here. Download fetches the release and \
+         says the one command that installs it for every user.",
+        dir.display()
+    )
+}
+
+/// Where the archive went, and the command that installs it into `dir` for
+/// every user. The counterpart of [`saved`] for a copy no package manager owns.
+pub fn saved_for_system(dir: &Path, files: &[PathBuf]) -> String {
+    let Some(first) = files.first() else {
+        // Unreachable: a download that succeeded wrote at least one file.
+        return "The download finished, but reported no files.".to_string();
+    };
+    let folder = first.parent().unwrap_or(Path::new("."));
+    let name = first
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let stem = name.trim_end_matches(".tar.gz");
+    format!(
+        "Saved {name} to {}.\nInstall it for every user with:\n  cd {} && tar -xzf {} && cd {} \
+         && sudo ./install.sh --system {}",
+        folder.display(),
+        sh_quote(&folder.to_string_lossy()),
+        sh_quote(&name),
+        sh_quote(stem),
+        sh_quote(&dir.to_string_lossy()),
+    )
+}
+
+/// `s` as one shell word: single-quoted, each embedded `'` closed, escaped and
+/// reopened. The banner's text is a command meant to be copied out and run, and
+/// a folder with a space in it split an unquoted one into two words.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Where a download went, and the one command that installs it.
@@ -240,17 +299,17 @@ pub fn banner() -> gtk::Box {
         // `package_owner`, which bounds each of them — and the answer decides
         // which button the user gets, so it has to be in hand before the banner
         // appears. Nearly every launch finds no update and pays nothing.
-        let owner = match &found {
-            Ok(Check::Newer(_)) => current_ownership(),
-            _ => Ownership::None,
+        let placed = match &found {
+            Ok(Check::Newer(_)) => tobii_update::install::placement(),
+            _ => None,
         };
-        let _ = tx.send((found, owner));
+        let _ = tx.send((found, placed));
     });
 
     let widgets = (row.clone(), text.clone(), notes_btn, update_btn, dismiss);
     glib::timeout_add_local(Duration::from_millis(400), move || {
         let (row, text, notes_btn, update_btn, dismiss) = &widgets;
-        let (found, owner) = match rx.try_recv() {
+        let (found, placed) = match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
             // The worker went away without answering: nothing to show, and
             // nothing left to wait for.
@@ -299,25 +358,53 @@ pub fn banner() -> gtk::Box {
                     action: update_btn.clone(),
                     dismiss: dismiss.clone(),
                 };
-                match owner {
+                // Decided in `tobii_update::install::action_for`, where every
+                // case is tested. Logged, because "which button did it show,
+                // and why" is the first question about any update report, and
+                // until 2026-09-11 the log had nothing to answer it with.
+                let action = placed
+                    .as_ref()
+                    .map(tobii_update::install::action_for)
+                    .unwrap_or(Action::Update);
+                tobii_diagnostics::log::info(&format!(
+                    "update {} available; this copy: {placed:?}; offering {action:?}",
+                    release.version
+                ));
+                match action {
+                    // Nothing at this copy's path to update: it was replaced or
+                    // removed while it ran. Relaunching would hand off to this
+                    // same process, so the button quits it.
+                    Action::Restart => {
+                        text.set_text(&restart_headline(&release.version.to_string()));
+                        crate::widget::set_button_text(update_btn, "Quit");
+                        wire_notes(&banner, &release);
+                        update_btn.connect_clicked(|_| {
+                            if let Some(app) = gtk::gio::Application::default() {
+                                app.activate_action("quit", None);
+                            }
+                        });
+                    }
                     // The installer would refuse this one, and only after the
                     // user had pressed Update and waited for the download. Ask
                     // for less: fetch the file their package manager can
                     // install, and leave the installing to it.
-                    Ownership::Package { manager, package } => {
+                    Action::DownloadPackage { manager, package } => {
                         text.set_text(&packaged_headline(
                             &release.version.to_string(),
                             &manager,
                             &package,
                         ));
                         crate::widget::set_button_text(update_btn, "Download");
-                        wire_download(&banner, *release, manager);
+                        wire_download(&banner, *release, manager, None);
                     }
-                    // `Unknown` keeps the Update button on purpose. It means a
-                    // package manager could not be *asked*, not that one owns
-                    // this copy, so guessing which package format to hand over
-                    // would be guessing. Update refuses with the reason.
-                    Ownership::None | Ownership::Unknown { .. } => {
+                    // Nobody owns it, but only an administrator can replace it:
+                    // the archive, and the command that installs it for everyone.
+                    Action::DownloadForSystem { dir } => {
+                        text.set_text(&system_headline(&release.version.to_string(), &dir));
+                        crate::widget::set_button_text(update_btn, "Download");
+                        wire_download(&banner, *release, String::new(), Some(dir));
+                    }
+                    Action::Update => {
                         text.set_text(&headline(&release));
                         wire(&banner, *release);
                     }
@@ -344,20 +431,6 @@ struct Banner {
     /// that holds the closure.
     action: gtk::Button,
     dismiss: gtk::Button,
-}
-
-/// Who owns the binaries an update would replace.
-///
-/// `install_dir` fails only when the running program's own path cannot be read,
-/// and then there is nothing to ask about; the answer that keeps the Update
-/// button is right, because pressing it reports that same failure. Nothing is
-/// written on the strength of this — `install_release` asks again and refuses on
-/// its own answer.
-fn current_ownership() -> Ownership {
-    match tobii_update::install::install_dir() {
-        Ok(dir) => tobii_update::install::ownership_of(&dir),
-        Err(_) => Ownership::None,
-    }
 }
 
 /// The "What's new" button, which both banner variants have and which does the
@@ -412,6 +485,7 @@ fn wire(b: &Banner, release: Release) {
                 Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Ok(Ok(done)) => {
                     release_hold();
+                    tobii_diagnostics::log::info(&format!("updated to {}", done.version));
                     text.set_text(&format!("Updated to {}. Restart to run it.", done.version));
                     btn.set_visible(false);
                     dismiss.set_sensitive(true);
@@ -420,6 +494,7 @@ fn wire(b: &Banner, release: Release) {
                 }
                 Ok(Err(e)) => {
                     release_hold();
+                    tobii_diagnostics::log::warn(&format!("update failed: {e}"));
                     text.set_text(&format!("Update failed: {e}"));
                     btn.set_sensitive(true);
                     dismiss.set_sensitive(true);
@@ -427,6 +502,7 @@ fn wire(b: &Banner, release: Release) {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     release_hold();
+                    tobii_diagnostics::log::warn("update failed: the updater thread vanished");
                     text.set_text("Update failed: the updater stopped unexpectedly.");
                     btn.set_sensitive(true);
                     dismiss.set_sensitive(true);
@@ -442,7 +518,11 @@ fn wire(b: &Banner, release: Release) {
 /// Same banner and the same changelog; the second button fetches instead of
 /// installing. `manager` is the tool that answered the ownership query — it
 /// picks the file, because a `.deb` is no use to somebody running `pacman`.
-fn wire_download(b: &Banner, release: Release, manager: String) {
+///
+/// `system_dir` is set instead for a copy nobody owns in a directory only an
+/// administrator can write. `manager` is then empty, so the file is the plain
+/// archive, and the saved message is the `--system` install for that directory.
+fn wire_download(b: &Banner, release: Release, manager: String, system_dir: Option<PathBuf>) {
     wire_notes(b, &release);
 
     let Some(offer) = release.offer_for(&manager, &tobii_update::Target::triple()) else {
@@ -470,13 +550,13 @@ fn wire_download(b: &Banner, release: Release, manager: String) {
         if let Some(d) = default_download_dir() {
             dialog.set_initial_folder(Some(&gtk::gio::File::for_path(d)));
         }
-        let (release, files) = (release.clone(), files.clone());
+        let (release, files, system_dir) = (release.clone(), files.clone(), system_dir.clone());
         dialog.select_folder(
             btn.root().and_downcast::<gtk::Window>().as_ref(),
             gtk::gio::Cancellable::NONE,
             move |chosen| match chosen {
                 Ok(folder) => match folder.path() {
-                    Some(into) => start_download(&b, release, files, channel, into),
+                    Some(into) => start_download(&b, release, files, channel, into, system_dir),
                     // A location gio can name and the filesystem cannot: a
                     // remote share that is not mounted, or a trash URI.
                     None => b.text.set_text(
@@ -507,6 +587,7 @@ fn start_download(
     files: Vec<Asset>,
     channel: Channel,
     into: PathBuf,
+    system_dir: Option<PathBuf>,
 ) {
     b.action.set_sensitive(false);
     crate::widget::set_button_text(&b.action, "Downloading…");
@@ -543,7 +624,10 @@ fn start_download(
         match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
             Ok(Ok(written)) => {
-                b.text.set_text(&saved(channel, &written));
+                b.text.set_text(&match &system_dir {
+                    Some(dir) => saved_for_system(dir, &written),
+                    None => saved(channel, &written),
+                });
                 // The message is now a command to run: selectable so it can be
                 // copied out of the banner instead of retyped from it.
                 b.text.set_selectable(true);
@@ -554,6 +638,7 @@ fn start_download(
                 glib::ControlFlow::Break
             }
             Ok(Err(e)) => {
+                tobii_diagnostics::log::warn(&format!("download failed: {e}"));
                 b.text.set_text(&download_failed(&e.to_string()));
                 ready_again(&b);
                 glib::ControlFlow::Break
@@ -561,6 +646,7 @@ fn start_download(
             // The worker vanished mid-download, so its cleanup did not run:
             // this is the one failure that cannot promise an empty folder.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                tobii_diagnostics::log::warn("download failed: the downloader thread vanished");
                 b.text.set_text(
                     "Download failed: the downloader stopped unexpectedly. Check the folder \
                      you chose for a part-written file.",
@@ -851,5 +937,55 @@ mod tests {
         for overclaim in ["verified", "safe", "secure", "trusted source"] {
             assert!(!t.contains(overclaim), "{overclaim:?} overstates it: {t}");
         }
+    }
+}
+
+/// The texts the banner shows for the two cases `action_for` added.
+#[cfg(test)]
+mod banner_text_tests {
+    use super::*;
+
+    #[test]
+    fn a_copy_replaced_while_running_is_told_to_quit_and_start_again() {
+        let t = restart_headline("0.3.1");
+        assert!(t.contains("0.3.1") && t.contains("Quit"), "{t}");
+    }
+
+    #[test]
+    fn a_system_copy_gets_the_system_install_command_quoted() {
+        let t = saved_for_system(
+            Path::new("/usr/local/bin"),
+            &[PathBuf::from(
+                "/home/u/My Downloads/tobii-linux-0.3.1/tobii-linux-0.3.1-x86_64-unknown-linux-gnu.tar.gz",
+            )],
+        );
+        assert!(
+            t.contains("cd '/home/u/My Downloads/tobii-linux-0.3.1'"),
+            "{t}"
+        );
+        assert!(
+            t.contains("tar -xzf 'tobii-linux-0.3.1-x86_64-unknown-linux-gnu.tar.gz'"),
+            "{t}"
+        );
+        assert!(
+            t.contains("cd 'tobii-linux-0.3.1-x86_64-unknown-linux-gnu'"),
+            "{t}"
+        );
+        assert!(
+            t.contains("sudo ./install.sh --system '/usr/local/bin'"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("package manager") && !t.contains(".local/bin"),
+            "{t}"
+        );
+        let h = system_headline("0.3.1", Path::new("/usr/local/bin"));
+        assert!(h.contains("/usr/local/bin") && h.contains("0.3.1"), "{h}");
+    }
+
+    #[test]
+    fn a_quoted_word_survives_a_single_quote_inside_it() {
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+        assert_eq!(sh_quote("/plain/path"), "'/plain/path'");
     }
 }

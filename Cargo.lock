@@ -1548,6 +1548,7 @@ dependencies = [
 name = "tobii-update"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "tobii-config",
 ]
 
