@@ -1,0 +1,50 @@
+# The pacman install hook BOTH Arch packages name with `install=`:
+#
+#   tobii-linux      the source PKGBUILD scripts/package.sh publishes
+#   tobii-linux-bin  the prebuilt one scripts/aur-bin.sh writes for the AUR
+#
+# One file, so the two packages cannot drift apart in what they do on install.
+# It is published as a release asset under exactly this name, beside the source
+# PKGBUILD: a v0.3.0 hub's Download button looks for that pair by name.
+#
+# This is the only post-install hook makepkg offers. Without it the Arch
+# channels would be the ones that never remove the pre-v0.1.0 99-tobii.rules.
+
+_tobii_post() {
+    # The pre-v0.1.0 rule was called 99-tobii.rules and said MODE="0666".
+    # Because 99- sorts AFTER 60-, its mode assignment wins — so a machine that
+    # installed this project before v0.1.0 would keep an infrared camera
+    # readable by every local process while the release notes announce the rule
+    # as hardened to 0660.
+    if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
+        rm -f /etc/udev/rules.d/99-tobii.rules
+        echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
+    fi
+    udevadm control --reload >/dev/null 2>&1 || true
+    udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || true
+    # misc too: the rule also grants /dev/uinput for the virtual joystick, and
+    # that is a virtual device no tracker re-plug ever re-events.
+    udevadm trigger --subsystem-match=misc >/dev/null 2>&1 || true
+    echo "Re-plug the Eye Tracker 5 so the udev rule takes effect."
+}
+
+# A copy installed from the tar.gz is not replaced by this package — it shadows
+# it, and nothing else would tell the user why the version did not change. Only
+# on a first install: an upgrade has already said it once.
+_tobii_shadow_note() {
+    cat <<'EOF'
+If you also installed Tobii Linux from the tar.gz (its install.sh), that copy
+still wins: ~/.local/bin usually comes first on PATH, its menu entry hides this
+one, and /etc/udev/rules.d/60-tobii.rules overrides the packaged
+/usr/lib/udev/rules.d/60-tobii.rules. Remove it with:  tobii uninstall
+EOF
+}
+
+post_install() {
+    _tobii_post
+    _tobii_shadow_note
+}
+
+post_upgrade() {
+    _tobii_post
+}
