@@ -250,6 +250,19 @@ check "keep: a quoted path escaped as the hub writes it (%%) is read as the copy
 login_entry "Exec=$tmp/mid\" q\"/tobii-gtk --background"; cp "$a" "$tmp/keep.before"
 payload_as 1000 "$HOME/.local/bin" >/dev/null 2>&1
 check "keep: quotes inside the program's path are read as a launcher reads them" 'cmp -s "$a" "$tmp/keep.before"'
+# Two Exec keys: a dead one first, a live one second. A reader that took the
+# first would "repair" an entry GKeyFile starts the live copy from.
+login_entry 'Exec="/nonexistent/tobii-gtk" --background' "Exec=\"$tmp/pathbin/tobii-gtk\" --background"
+cp "$a" "$tmp/keep.before"
+out="$(payload_as 1000 "$HOME/.local/bin" 2>&1)"
+check "keep: an entry with two Exec keys is left alone, as tobii uninstall leaves it" 'cmp -s "$a" "$tmp/keep.before"'
+check "keep: and it says why" '[[ "$out" == *"two Exec lines"* ]]'
+# An Exec in another group comes first: only [Desktop Entry]'s is read, and
+# only that line is rewritten.
+mkdir -p "${a%/*}"
+printf '[Desktop Action other]\nExec=%s\n[Desktop Entry]\n  Exec = "/nonexistent/tobii-gtk" --background\n' "$tmp/pathbin/tobii-gtk" > "$a"
+payload_as 1000 "$HOME/.local/bin" >/dev/null 2>&1
+check "repair: only the [Desktop Entry] group's Exec is read and rewritten" '[[ "$(sed -n 2p "$a")" == "Exec=$tmp/pathbin/tobii-gtk" && "$(sed -n 4p "$a")" == "Exec=\"$HOME/.local/bin/tobii-gtk\" --background" ]]'
 rm -f "$a"; printf '[Desktop Entry]\nExec="/nonexistent/tobii-gtk" --background\n' > "$tmp/dotfile.desktop"
 ln -s "$tmp/dotfile.desktop" "$a"
 payload_as 1000 "$HOME/.local/bin" >/dev/null 2>&1

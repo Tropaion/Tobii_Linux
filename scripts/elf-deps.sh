@@ -3,8 +3,10 @@
 #
 # Sourced, not run: scripts/package.sh uses it for the .deb's glibc floor and
 # the .rpm's soname requirements, scripts/aur-bin.sh for the Arch package's
-# `depends`. Two copies of "which glibc do these binaries need" is how two
-# packages of the same binaries would come to declare two different floors.
+# `depends`, scripts/release.sh for the glibc floor it reports for the archive,
+# and the release workflow for its glibc gate. Two copies of "which glibc do
+# these binaries need" is how two packages of the same binaries would come to
+# declare two different floors.
 #
 # LC_ALL=C on every objdump: it TRANSLATES its field names — `objdump -f` reads
 # "Dateiformat elf64-x86-64" on a German machine, so a probe for "file format"

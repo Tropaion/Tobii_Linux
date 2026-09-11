@@ -908,19 +908,8 @@ fn changelog_dialog(parent: Option<&gtk::Window>, release: &Release) {
     if let Some(p) = parent {
         win.set_transient_for(Some(p));
     }
-    let w = win.clone();
-    close.connect_clicked(move |_| w.close());
-    let keys = gtk::EventControllerKey::new();
-    let w = win.clone();
-    keys.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
-            w.close();
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    win.add_controller(keys);
+    crate::close_on_click(&close);
+    crate::add_escape_to_close(&win);
     win.present();
     close.grab_focus();
 }

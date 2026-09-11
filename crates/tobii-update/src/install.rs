@@ -43,6 +43,47 @@ use crate::release::Release;
 /// these are replaced, and only where one is already installed.
 pub const BINARIES: [&str; 2] = ["tobii", "tobii-gtk"];
 
+/// A temporary the updater, or `install-payload.sh`, leaves in an install
+/// directory, each named with the pid that made it: `.tobii-update-<pid>` (the
+/// updater's work directory), `.tobii-update-probe-<pid>`, `.<bin>.new-<pid>`
+/// (staged by the updater and by `install-payload.sh`) and `.<bin>.old-<pid>`
+/// (the updater's rollback link, left only if it was killed mid-swap).
+///
+/// Parsed here, beside the code that writes them, so `tobii uninstall` — which
+/// removes every one of them with the install — cannot fall behind a new shape
+/// and leave it holding the directory open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScratchKind {
+    Work,
+    Probe,
+    Staged,
+    Backup,
+}
+
+/// Which [`ScratchKind`] `name` is, and the pid that made it; `None` for
+/// anything else, a real binary and `.tobii-update-notes` included.
+pub fn scratch_of(name: &str) -> Option<(ScratchKind, &str)> {
+    let found = if let Some(pid) = name.strip_prefix(".tobii-update-probe-") {
+        (ScratchKind::Probe, pid)
+    } else if let Some(pid) = name.strip_prefix(".tobii-update-") {
+        (ScratchKind::Work, pid)
+    } else {
+        // `.tobii.new-1` cannot be misread as a `tobii-gtk` name, or the
+        // reverse: what follows the binary's name must be `.new-` or `.old-`.
+        BINARIES.iter().find_map(|b| {
+            let rest = name.strip_prefix('.')?.strip_prefix(b)?;
+            rest.strip_prefix(".new-")
+                .map(|pid| (ScratchKind::Staged, pid))
+                .or_else(|| {
+                    rest.strip_prefix(".old-")
+                        .map(|pid| (ScratchKind::Backup, pid))
+                })
+        })?
+    };
+    let pid = found.1;
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then_some(found)
+}
+
 /// How long a newly downloaded binary gets to answer `--version`.
 ///
 /// It loads the dynamic linker and prints one line, so this is generous. The
@@ -630,7 +671,7 @@ pub struct Placement {
     pub dir: PathBuf,
     /// Who owns the binaries in it.
     pub owner: Ownership,
-    /// Whether this user may write the directory: faccessat(W_OK), which counts
+    /// Whether this user may write the directory: faccessat(W_OK | X_OK), which counts
     /// read-only mounts and ACLs. One they cannot write is one only an
     /// administrator can change — [`Action::DownloadForSystem`] — unless it is
     /// their own ([`Placement::dir_mine`]) or in their home
@@ -957,8 +998,8 @@ fn by_hand(cmd: &str) -> String {
 
 /// The overflow uid: what a file whose owner has no mapping in this user
 /// namespace shows up as. Inside a toolbox or `unshare -c`, root's `/` and
-/// `/home` are owned by it.
-const OVERFLOW_UID: u32 = 65534;
+/// `/home` are owned by it. `tobii uninstall` takes it from here.
+pub const OVERFLOW_UID: u32 = 65534;
 
 /// Whether a folder above a download may belong to `owner`, for the user `me`:
 /// see [`chosen_folder`].
@@ -1155,16 +1196,27 @@ fn private_folder(
     })
 }
 
-/// The kernel's own answer to "may I write here", with the effective ids, so it
-/// counts read-only mounts and ACLs — and creates nothing.
-fn writable_by_me(dir: &Path) -> bool {
+/// The kernel's own answer to "may I create, rename and remove entries here":
+/// write AND search permission, with the effective ids, so it counts read-only
+/// mounts, ACLs and supplementary groups — and creates nothing. Search too,
+/// because a directory that can be written but not searched (0o600) refuses
+/// every rename into it. `tobii uninstall` asks the same question of a user's
+/// install directories.
+pub fn writable_by_me(dir: &Path) -> bool {
     let Ok(c) = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(dir.as_os_str()))
     else {
         return false;
     };
     // SAFETY: `c` is a valid NUL-terminated path that outlives the call, and
     // faccessat only reads it.
-    unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0 }
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 /// Whether `name` is a plain file name, safe to join onto a directory.
@@ -1431,12 +1483,14 @@ pub fn install_release(
 
 /// Delete scratch files left by a run that did not finish.
 ///
-/// Matched by name, not by age: `.tobii-update-<pid>`,
-/// `.tobii-update-probe-<pid>` and `.<binary>.new-<pid>` are this program's own
-/// shapes, and nothing else in an install directory looks like them. The
-/// current process's own files are skipped, since a second updater running
+/// Matched by name, not by age: the [`ScratchKind`] shapes are this program's
+/// own, and nothing else in an install directory looks like them. The current
+/// process's own files are skipped, since a second updater running
 /// concurrently would otherwise delete the first's staging out from under it —
-/// and a live pid is a poor signal here, because pids are reused.
+/// and a live pid is a poor signal here, because pids are reused. A `.old-`
+/// rollback link is not swept: a swap killed after its rename may have left the
+/// previous binary reachable only through it, and `tobii uninstall` removes it
+/// with the install.
 fn sweep_stale_scratch(dir: &Path) {
     let me = format!("{}", std::process::id());
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1445,18 +1499,10 @@ fn sweep_stale_scratch(dir: &Path) {
     for e in entries.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        let Some(pid) = name
-            .strip_prefix(".tobii-update-probe-")
-            .or_else(|| name.strip_prefix(".tobii-update-"))
-            .or_else(|| {
-                BINARIES
-                    .iter()
-                    .find_map(|b| name.strip_prefix(&format!(".{b}.new-")))
-            })
-        else {
+        let Some((kind, pid)) = scratch_of(&name) else {
             continue;
         };
-        if pid == me || pid.is_empty() || !pid.bytes().all(|c| c.is_ascii_digit()) {
+        if kind == ScratchKind::Backup || pid == me {
             continue;
         }
         let path = e.path();
@@ -2065,6 +2111,9 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         std::fs::write(dir.join(".tobii-update-probe-999999"), b"x").unwrap();
         std::fs::write(dir.join(".tobii.new-999999"), b"x").unwrap();
         std::fs::write(dir.join(".tobii-gtk.new-999999"), b"x").unwrap();
+        // A rollback link a swap killed half-way left, possibly the previous
+        // binary's last name: it stays.
+        std::fs::write(dir.join(".tobii.old-999999"), b"x").unwrap();
         // This run's, which a concurrent updater must not have deleted.
         std::fs::create_dir_all(dir.join(format!(".tobii-update-{me}"))).unwrap();
         // And things that merely look similar.
@@ -2085,6 +2134,7 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
             "own work dir"
         );
         assert!(dir.join("tobii").exists(), "a real binary");
+        assert!(dir.join(".tobii.old-999999").exists(), "a rollback link");
         assert!(
             dir.join(".tobii-update-notes").exists(),
             "a non-numeric suffix is not a pid and must be left alone"
@@ -2198,13 +2248,20 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
     /// diagnostics report is built on the GTK main thread.
     #[test]
     fn a_package_manager_that_hangs_is_killed_rather_than_waited_for() {
+        // `sleep` by its absolute path: with_stub leaves only the stub on PATH,
+        // so a bare `sleep` would exit 127 at once, and the test would pass on
+        // that exit code without the deadline ever being reached.
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .expect("a sleep binary");
         let started = std::time::Instant::now();
-        let o = with_stub("dpkg", "sleep 3600", || {
+        let o = with_stub("dpkg", &format!("exec {sleep} 3600"), || {
             package_owner(Path::new("/usr/bin/tobii"))
         });
         assert!(
-            matches!(o, Ownership::Unknown { .. }),
-            "a hung manager must not read as unowned: {o:?}"
+            matches!(&o, Ownership::Unknown { why, .. } if why.contains("did not answer")),
+            "a hung manager must be killed at the deadline, not read as unowned: {o:?}"
         );
         assert!(
             started.elapsed() < OWNER_TIMEOUT * 3,
@@ -3025,10 +3082,17 @@ FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210 *./dist/b.tar.g
         // the assertion only means something when this does not run as root.
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         // SAFETY: geteuid takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } != 0 {
+        let root = unsafe { libc::geteuid() } == 0;
+        if !root {
             assert!(!writable_by_me(dir));
         }
         assert!(dir_is_mine(dir), "still this user's, unwritable or not");
+        // Writable but not searchable: nothing can be renamed into it, so it is
+        // not writable in the sense every caller means.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if !root {
+            assert!(!writable_by_me(dir), "0o600 cannot take a rename");
+        }
         // Drop's remove_dir_all needs to write it.
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(!dir_is_mine(Path::new("/nonexistent-tobii-placement-dir")));

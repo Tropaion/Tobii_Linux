@@ -137,18 +137,53 @@ desktop_arg() {
     printf '"%s"' "${1//"$pct"/%%}"
 }
 
-# Replace the first Exec line of a desktop file, line by line: the value is data,
-# and sed would read `|` and `&` in it as syntax.
+# Replace line `at` of a desktop file — its Exec key, as `exec_key` found it —
+# line by line: the value is data, and sed would read `|` and `&` in it as syntax.
 set_exec() {
-    local file="$1" value="$2" line done=0 tmp="$1.new-$$"
+    local file="$1" at="$2" value="$3" line n=0 tmp="$1.new-$$"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ $done -eq 0 && "$line" == Exec=* ]]; then
-            printf 'Exec=%s\n' "$value"; done=1
+        n=$((n + 1))
+        if [[ $n -eq $at ]]; then
+            printf 'Exec=%s\n' "$value"
         else
             printf '%s\n' "$line"
         fi
     done < "$file" > "$tmp"
     mv -f "$tmp" "$file"
+}
+
+# The `[Desktop Entry]` group's Exec key, found the way autostart::exec_arguments
+# finds it: each line read with its surrounding whitespace ignored, a key as the
+# text before its first `=`, every other group skipped, and a `[Desktop Entry]`
+# repeated further down read as the same group. Sets `exec_at` to its line and
+# `exec_value` to its value, both empty when there is none. Fails, with both
+# empty, when there are two: GKeyFile and KConfig keep the last, systemd's
+# xdg-autostart generator the first, so which program such an entry starts
+# depends on who starts it — and a repair that picked either could rewrite the
+# one nobody runs. `tobii uninstall` leaves such an entry alone too.
+exec_key() {
+    local line key n=0 main=0
+    exec_at="" exec_value=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ "$line" == "["* ]]; then
+            main=0
+            if [[ "$line" == "[Desktop Entry]" ]]; then main=1; fi
+            continue
+        fi
+        if [[ $main -eq 0 || "$line" != *=* ]]; then continue; fi
+        key="${line%%=*}"
+        if [[ "${key%"${key##*[![:space:]]}"}" != Exec ]]; then continue; fi
+        if [[ -n "$exec_at" ]]; then
+            exec_at="" exec_value=""
+            return 1
+        fi
+        exec_at=$n
+        exec_value="${line#*=}"
+        exec_value="${exec_value#"${exec_value%%[![:space:]]*}"}"
+    done < "$1"
 }
 
 # The program an Exec line runs: its first argument, read the way GLib reads it
@@ -262,7 +297,8 @@ if [[ $bins_wanted -eq 1 && $lean -eq 0 && -f "$assets/com.tobiilinux.Configurat
         # here would skip the manifest, the login-entry repair and the udev rule.
         staged="$entry_file.new-$$"
         if { cp "$assets/com.tobiilinux.Configuration.desktop" "$staged" \
-             && set_exec "$staged" "$exec_arg" && mv -f "$staged" "$entry_file"; } 2>/dev/null; then
+             && exec_key "$staged" && [[ -n "$exec_at" ]] \
+             && set_exec "$staged" "$exec_at" "$exec_arg" && mv -f "$staged" "$entry_file"; } 2>/dev/null; then
             echo "  $entry_file"
         else
             rm -f "$staged" 2>/dev/null || true
@@ -335,7 +371,10 @@ if [[ $system -eq 0 && $bins_wanted -eq 1 && $lean -eq 0 ]]; then
     if [[ -L "$auto" ]]; then
         echo "  ${dim}Start at login is a symlink ($auto); left as it is.${reset}"
     elif [[ -f "$auto" ]]; then
-        target="$(exec_program "$(sed -n 's/^Exec=//p' "$auto" | head -n1)")"
+        if ! exec_key "$auto"; then
+            echo "  ${dim}Start at login has two Exec lines, which launchers read differently; left as it is.${reset}"
+        fi
+        target="$(exec_program "$exec_value")"
         case "$target" in
             "") ;;
             env|*/env)
@@ -343,7 +382,7 @@ if [[ $system -eq 0 && $bins_wanted -eq 1 && $lean -eq 0 ]]; then
             /*)
                 if [[ "$target" != "$want" && ! -e "$target" ]]; then
                     if exec_arg="$(desktop_arg "$want")"; then
-                        set_exec "$auto" "$exec_arg --background"
+                        set_exec "$auto" "$exec_at" "$exec_arg --background"
                         echo "  repaired start at login: it ran $target, which no longer exists"
                     else
                         echo "  ${bold}Start at login${reset} runs $target, which is gone — switch it off and on in the hub."

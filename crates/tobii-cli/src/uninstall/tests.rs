@@ -500,7 +500,13 @@ fn an_entry_run_through_env_or_by_a_bare_name_is_judged_by_the_program_it_runs()
             "env's options",
         ),
         ("bin/tobii-gtk", "relative path"),
-        ("\"/home/u/.local/bin/tobii-gtk", "no Exec line"),
+        ("\"/home/u/.local/bin/tobii-gtk", "cannot be read here"),
+        // A backslash outside quotes, which the spec leaves undefined: GLib
+        // reads `My Projects`, a reader that took the spec literally would not.
+        (
+            r"/home/u/My\\ Projects/tobii-gtk --background",
+            "cannot be read here",
+        ),
     ] {
         autostart_says(exec);
         let p = plan_with_path(&[]);
@@ -511,7 +517,20 @@ fn an_entry_run_through_env_or_by_a_bare_name_is_judged_by_the_program_it_runs()
         );
     }
     t.put(AUTOSTART, "[Desktop Entry]\nName=no exec\n");
-    assert!(why_kept(&plan_with_path(&[]), AUTOSTART).contains("no Exec line"));
+    assert!(why_kept(&plan_with_path(&[]), AUTOSTART).contains("cannot be read here"));
+    // Two Exec keys, the first naming the copy being removed and the second
+    // one that stays. GKeyFile and KConfig run the second, systemd's
+    // xdg-autostart generator the first: neither is taken, and the entry stays.
+    t.put(
+        AUTOSTART,
+        &format!("[Desktop Entry]\nExec={BIN}/tobii-gtk --background\nExec=/usr/bin/tobii-gtk\n"),
+    );
+    let p = plan_with_path(&[]);
+    let why = why_kept(&p, AUTOSTART);
+    assert!(
+        why.contains("there are two") && why.contains("left as it is"),
+        "{why}"
+    );
 }
 
 /// A build tree or an unpacked archive is not an install, however it was
@@ -2272,32 +2291,6 @@ fn a_binary_somewhere_others_can_write_is_neither_run_nor_removed() {
     );
 }
 
-#[test]
-fn a_private_group_is_the_users_own_with_no_one_else_in_it() {
-    let passwd = "root:x:0:0::/root:/bin/bash\nu:x:1000:1000::/home/u:/bin/bash\n\
-                  v:x:1001:100::/home/v:/bin/bash\n";
-    assert!(private_group_in(passwd, "u:x:1000:\n", 1000, 1000));
-    assert!(private_group_in(passwd, "u:x:1000:u\n", 1000, 1000));
-    // Someone else listed in it.
-    assert!(!private_group_in(passwd, "u:x:1000:u,v\n", 1000, 1000));
-    // A second line for the same gid, with someone in it.
-    assert!(!private_group_in(
-        passwd,
-        "u:x:1000:\nalias:x:1000:v\n",
-        1000,
-        1000
-    ));
-    // Not in /etc/group at all: LDAP or sssd, which cannot be seen from here.
-    assert!(!private_group_in(passwd, "users:x:100:\n", 1000, 1000));
-    // Not the user's primary group, however empty.
-    assert!(!private_group_in(passwd, "users:x:100:\n", 100, 1000));
-    // Another account's primary group too.
-    let shared = format!("{passwd}w:x:1002:1000::/home/w:/bin/sh\n");
-    assert!(!private_group_in(&shared, "u:x:1000:\n", 1000, 1000));
-    // Asked for another user.
-    assert!(!private_group_in(passwd, "u:x:1000:\n", 1000, 1001));
-}
-
 /// A release archive has install.sh AND assets/install-payload.sh. An
 /// install.sh of the user's own in ~/.local/bin is only that.
 #[test]
@@ -3257,11 +3250,12 @@ fn a_tobii_that_could_not_remove_itself_says_so() {
 }
 
 /// dir_writable, the probe `run` uses: entries in a directory can be created
-/// and removed only with both w and x for this user's class — the owner's
-/// bits for its owner, the group's for a member (the effective gid included).
+/// and removed only with both w and x for this user's class. Only the owner's
+/// rows can be tried here: faccessat asks with this process's own ids, so
+/// another user's view — the group's bits — cannot be staged, and which of its
+/// groups count is the kernel's to say.
 #[test]
 fn dir_writable_needs_write_and_search_for_this_user() {
-    use std::os::unix::fs::MetadataExt;
     let t = Tree::new("dir-writable");
     t.mkdir("/d");
     let d = t.real("/d");
@@ -3282,23 +3276,6 @@ fn dir_writable_needs_write_and_search_for_this_user() {
     ] {
         t.chmod("/d", mode);
         assert_eq!(dir_writable(&d, real_uid()), want, "owner {mode:o}");
-    }
-    // As another uid, the directory's group is this process's effective gid
-    // (unless a setgid parent gave it another), so the group bits decide.
-    let egid = std::fs::metadata("/proc/self").unwrap().gid();
-    if std::fs::metadata(&d).unwrap().gid() == egid {
-        for (mode, want) in [
-            (0o770, true),
-            (0o730, true),
-            (0o750, false),
-            (0o720, false),
-            (0o707, false),
-        ] {
-            t.chmod("/d", mode);
-            assert_eq!(dir_writable(&d, real_uid() + 1), want, "group {mode:o}");
-        }
-    } else {
-        eprintln!("skipped the group rows: the temp directory hands out another group");
     }
     t.chmod("/d", 0o755);
 }

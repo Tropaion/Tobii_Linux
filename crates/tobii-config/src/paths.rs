@@ -75,6 +75,16 @@ pub const CONFIG_FILES: [&str; 11] = [
 /// that is a name this program writes too.
 pub const ATOMIC_TMP_SUFFIX: &str = ".tmp";
 
+/// Whether `name` is `<base>.new-<pid>`: the temporary a write-and-rename of
+/// `base` leaves if it is stopped between the two. The autostart entry and the
+/// install manifest are both written that way, one by the hub and one by
+/// `install-payload.sh`, and `tobii uninstall` removes what either left.
+pub fn is_scratch_of(base: &str, name: &str) -> bool {
+    name.strip_prefix(base)
+        .and_then(|r| r.strip_prefix(".new-"))
+        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
 // ------------------------------------------------------------------ state dir
 
 /// The log, under [`state_dir`]. `TOBII_LOG_FILE` overrides where it goes.

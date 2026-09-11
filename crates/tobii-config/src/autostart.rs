@@ -37,9 +37,7 @@ pub fn scratch_name(pid: u32) -> String {
 
 /// Whether `name` is a temporary left by an interrupted [`scratch_name`] write.
 pub fn is_scratch_name(name: &str) -> bool {
-    name.strip_prefix(ENTRY_NAME)
-        .and_then(|r| r.strip_prefix(".new-"))
-        .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    paths::is_scratch_of(ENTRY_NAME, name)
 }
 
 /// The text of the autostart entry.

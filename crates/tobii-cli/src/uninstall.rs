@@ -51,7 +51,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tobii_config::{autostart, paths};
-use tobii_update::install::{is_build_tree, Ownership, BINARIES};
+use tobii_update::install::{
+    is_build_tree, is_private_group, shell_word as sh_quote, Ownership, BINARIES, OVERFLOW_UID,
+};
 
 use crate::{bridge, CmdResult};
 
@@ -505,11 +507,6 @@ fn owner_of(_: &Path, m: &std::fs::Metadata) -> u32 {
     m.uid()
 }
 
-/// The overflow uid: what a file whose owner has no mapping in this user
-/// namespace shows up as. Inside a toolbox or `unshare -c`, root's `/` and
-/// `/home` are owned by it.
-const OVERFLOW_UID: u32 = 65534;
-
 #[cfg(test)]
 thread_local! {
     /// Every path [`Fs::program_check`] opened, for the tests that check it is
@@ -569,28 +566,17 @@ enum Unvetted {
     NotAsRoot(String),
 }
 
-/// Who other than its owner can write a file or directory, if anyone.
-///
-/// A group write bit counts unless the group is the user's own private group.
-/// A directory with the sticky bit is left out: in one, only an entry's owner
-/// (or the directory's, or root) can rename or delete that entry, and the
-/// entry below it is checked on its own.
+/// Who other than its owner can write a file or directory, if anyone: the
+/// updater's rule ([`tobii_update::install::foreign_writer`]), with a directory
+/// that has the sticky bit left out. In one, only an entry's owner (or the
+/// directory's, or root) can rename or delete that entry, and the entry below
+/// it is checked on its own.
 fn foreign_writer(m: &std::fs::Metadata, private_group: &dyn Fn(u32) -> bool) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let mode = m.mode();
-    if m.is_dir() && mode & 0o1000 != 0 {
+    if m.is_dir() && m.mode() & 0o1000 != 0 {
         return None;
     }
-    if mode & 0o002 != 0 {
-        Some("anyone".into())
-    } else if mode & 0o020 != 0 && !private_group(m.gid()) {
-        Some(format!(
-            "its group (gid {}), which is not yours alone",
-            m.gid()
-        ))
-    } else {
-        None
-    }
+    tobii_update::install::foreign_writer(m, private_group)
 }
 
 impl<'a> Fs<'a> {
@@ -957,39 +943,6 @@ fn manifest_line_survives(line: &str, dropped: &dyn Fn(&Path) -> bool) -> bool {
     }
 }
 
-fn is_pid(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// An updater or installer temporary in an install directory.
-///
-/// `.tobii-update-<pid>` (the updater's work directory),
-/// `.tobii-update-probe-<pid>`, `.<bin>.new-<pid>` (staged by the updater and
-/// by `install-payload.sh`) and `.<bin>.old-<pid>` (the updater's rollback
-/// backup, left if it was killed mid-swap).
-fn is_install_scratch(name: &str) -> bool {
-    if let Some(rest) = name.strip_prefix(".tobii-update-probe-") {
-        return is_pid(rest);
-    }
-    if let Some(rest) = name.strip_prefix(".tobii-update-") {
-        return is_pid(rest);
-    }
-    BINARIES.iter().any(|b| {
-        [".new-", ".old-"].iter().any(|kind| {
-            name.strip_prefix(&format!(".{b}{kind}"))
-                .is_some_and(is_pid)
-        })
-    })
-}
-
-/// The temporary `install-payload.sh` writes the manifest to before renaming
-/// it into place: `installs.new-<pid>`.
-fn is_manifest_scratch(name: &str) -> bool {
-    name.strip_prefix(paths::MANIFEST_FILE)
-        .and_then(|r| r.strip_prefix(".new-"))
-        .is_some_and(is_pid)
-}
-
 /// A build tree or an unpacked release archive: somewhere a copy of this
 /// program runs from, which no install made.
 ///
@@ -1349,7 +1302,14 @@ enum ExecTarget {
 /// unknown rather than as gone.
 fn exec_target(fs: &Fs, text: &str, path: &[PathBuf]) -> ExecTarget {
     let Some(args) = autostart::exec_arguments(text) else {
-        return ExecTarget::Unknown("it has no Exec line that names a program".into());
+        // One answer for three cases, because `exec_arguments` gives one: no
+        // Exec at all, two of them (which launchers settle differently), or a
+        // value quoted or escaped in a way the spec leaves undefined.
+        return ExecTarget::Unknown(
+            "its Exec line cannot be read here (there is none, there are two, or it is \
+             quoted in a way launchers read differently)"
+                .into(),
+        );
     };
     let mut words = args.iter().map(String::as_str);
     let mut prog = words.next().unwrap_or_default();
@@ -2003,7 +1963,9 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             cleared.push(c.dir.clone());
         }
         for name in fs.list(&c.dir).unwrap_or_default() {
-            if is_install_scratch(&name) {
+            // Every shape the updater and the installer leave, rollback links
+            // included: see `ScratchKind`, which owns them.
+            if tobii_update::install::scratch_of(&name).is_some() {
                 let path = c.dir.join(&name);
                 let tree = fs.is_real_dir(&path);
                 p.push_remove(path, "a temporary left by the updater or installer", tree);
@@ -2096,7 +2058,7 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
                 // renames it into place; one stopped in between leaves that
                 // behind, and it would keep this directory from going.
                 for name in fs.list(dir).unwrap_or_default() {
-                    if is_manifest_scratch(&name) {
+                    if paths::is_scratch_of(paths::MANIFEST_FILE, &name) {
                         p.push_remove(
                             dir.join(name),
                             "a temporary left by the installer's manifest write",
@@ -2479,9 +2441,12 @@ fn refresh_icon_cache(hicolor: &Path, out: &mut Outcome) {
     ));
 }
 
-/// Run a command with a deadline, killing it if it outstays it.
+/// Run a command with a deadline, killing it if it outstays it: the updater's
+/// [`tobii_update::install::wait_bounded`], so there is one such loop. A
+/// program that is not installed comes back as `Err("not found")`, which
+/// [`refresh_icon_cache`] steps past to the next tool.
 fn run_bounded(mut c: Command, limit: Duration) -> Result<std::process::Output, String> {
-    let mut child = c
+    let child = c
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2493,34 +2458,7 @@ fn run_bounded(mut c: Command, limit: Duration) -> Result<std::process::Output, 
                 e.to_string()
             }
         })?;
-    let deadline = Instant::now() + limit;
-    loop {
-        match child.try_wait() {
-            Err(e) => return Err(e.to_string()),
-            Ok(Some(status)) => {
-                use std::io::Read;
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(o) = child.stdout.take() {
-                    let _ = o.take(64 * 1024).read_to_end(&mut stdout);
-                }
-                if let Some(e) = child.stderr.take() {
-                    let _ = e.take(64 * 1024).read_to_end(&mut stderr);
-                }
-                return Ok(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("it did not finish within {limit:?}"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-        }
-    }
+    tobii_update::install::wait_bounded(child, limit)
 }
 
 // ------------------------------------------------------------ real probes
@@ -2605,13 +2543,11 @@ fn safe_to_signal(p: &Proc) -> bool {
 /// "tobii 0.3.0". What it rules out is deleting an unrelated program that
 /// happens to be called `tobii` in a directory found by inference.
 fn identify_binary(path: &Path) -> Option<String> {
-    let mut c = Command::new(path);
-    c.arg("--version")
-        // A GUI binary must not reach for the session's display just to say
-        // what version it is; tobii-gtk answers before GTK starts anyway.
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY");
-    let out = run_bounded(c, Duration::from_secs(10)).ok()?;
+    let out = run_bounded(
+        tobii_update::install::version_command(path),
+        Duration::from_secs(10),
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2621,111 +2557,28 @@ fn identify_binary(path: &Path) -> Option<String> {
         .map(|l| l.trim().to_string())
 }
 
-/// Whether this user can create and remove entries in `dir`.
+/// Whether this user can create and remove entries in `dir`: the probe `run`
+/// hands the plan. `euid` is this process's, and only picks root's rule —
+/// faccessat asks with the process's own ids.
 ///
-/// Read from the mode bits rather than by creating a probe file, so a dry run
-/// writes nothing. It does not see a read-only mount; a removal there fails and
-/// is reported as failed.
+/// Asked of the kernel, as the updater's placement asks
+/// ([`tobii_update::install::writable_by_me`]), so a user's ACL grant,
+/// supplementary group or read-only mount counts, and a dry run creates
+/// nothing. A read-only mount reads as NotWritable, whose chmod hint cannot fix
+/// it — the classification the updater makes too.
+///
+/// Root is told yes for any directory that exists. faccessat refuses root only
+/// on a read-only mount or an immutable directory, and both verdicts for a
+/// directory that cannot be written are wrong for root: NotWritable's hint says
+/// "it is not root's, so sudo would not help", and SystemInstall's says to run
+/// the `sudo … --system` that is already running. There the removal fails in
+/// execute() and is reported with the OS's reason.
 fn dir_writable(dir: &Path, euid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(m) = std::fs::metadata(dir) else {
-        return false;
-    };
     if euid == 0 {
-        return true;
-    }
-    let groups: Vec<u32> = std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .map(|s| {
-            let mut g: Vec<u32> = s
-                .lines()
-                .find_map(|l| l.strip_prefix("Groups:"))
-                .map(|v| {
-                    v.split_whitespace()
-                        .filter_map(|x| x.parse().ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Some(egid) = s
-                .lines()
-                .find_map(|l| l.strip_prefix("Gid:"))
-                .and_then(|v| v.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
-            {
-                g.push(egid);
-            }
-            g
-        })
-        .unwrap_or_default();
-    let need = if m.uid() == euid {
-        0o300
-    } else if groups.contains(&m.gid()) {
-        0o030
+        dir.exists()
     } else {
-        0o003
-    };
-    m.mode() & need == need
-}
-
-/// Whether `gid` is the private group of the user `euid`: that user's primary
-/// group, with no other account in it.
-///
-/// Distributions that give each user a group of their own often set umask
-/// 002 (Fedora's /etc/bashrc does), so `mkdir -p ~/.local/bin` makes it
-/// group-writable — by that group, which holds only the user. Read from
-/// /etc/passwd and /etc/group only: a group they do not describe (LDAP, sssd)
-/// cannot be seen to be private, so it is not taken to be.
-fn is_private_group(gid: u32, euid: u32) -> bool {
-    match (
-        std::fs::read_to_string("/etc/passwd"),
-        std::fs::read_to_string("/etc/group"),
-    ) {
-        (Ok(passwd), Ok(group)) => private_group_in(&passwd, &group, gid, euid),
-        _ => false,
+        tobii_update::install::writable_by_me(dir)
     }
-}
-
-fn private_group_in(passwd: &str, group: &str, gid: u32, euid: u32) -> bool {
-    // (name, uid, primary gid)
-    let accounts: Vec<(&str, u32, u32)> = passwd
-        .lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split(':').collect();
-            Some((
-                *f.first()?,
-                f.get(2)?.parse().ok()?,
-                f.get(3)?.parse().ok()?,
-            ))
-        })
-        .collect();
-    let mine: Vec<&str> = accounts
-        .iter()
-        .filter(|a| a.1 == euid)
-        .map(|a| a.0)
-        .collect();
-    // Its primary group, and no one else's.
-    if !accounts.iter().any(|a| a.1 == euid && a.2 == gid)
-        || accounts.iter().any(|a| a.2 == gid && a.1 != euid)
-    {
-        return false;
-    }
-    // Listed in /etc/group, with no member but this user. Every line with
-    // that gid counts: a gid may appear twice.
-    let member_lists: Vec<&str> = group
-        .lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split(':').collect();
-            (f.len() >= 4 && f[2].parse::<u32>().ok() == Some(gid)).then(|| f[3])
-        })
-        .collect();
-    !member_lists.is_empty()
-        && member_lists.iter().all(|members| {
-            members
-                .split(',')
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .all(|m| mine.contains(&m))
-        })
 }
 
 // -------------------------------------------------------------- the command
@@ -2738,18 +2591,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// A word of a command printed for a person to paste, as a POSIX shell
-/// reads it back: as it is when it holds only `[A-Za-z0-9_./-]`, otherwise
-/// in single quotes, each `'` in it written `'\''`.
-fn sh_quote(s: &str) -> String {
-    let plain = |b: u8| b.is_ascii_alphanumeric() || b"_./-".contains(&b);
-    if !s.is_empty() && s.bytes().all(plain) {
-        return s.to_string();
-    }
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// A path, as [`sh_quote`] prints it.
+/// A path, as [`sh_quote`] — the updater's `shell_word` — prints it.
 fn q(p: &Path) -> String {
     sh_quote(&p.to_string_lossy())
 }

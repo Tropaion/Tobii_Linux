@@ -693,15 +693,16 @@ pub(crate) fn screen_height() -> i32 {
         .unwrap_or(1080)
 }
 
-/// Make Esc close `win`. Closing is the flows' single exit route, so each flow's
-/// own `close_request` handler still runs (that is where calibration aborts its
+/// Make Esc close `win`. Closing is a window's single exit route, so its own
+/// `close_request` handler still runs (that is where calibration aborts its
 /// session) — this only triggers it.
-pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
+pub(crate) fn add_escape_to_close(win: &impl IsA<gtk::Window>) {
+    let win: &gtk::Window = win.upcast_ref();
     let keys = gtk::EventControllerKey::new();
     // Weak, because the controller belongs to the window: a strong reference
-    // here is a cycle, and the window could never be freed. Both fullscreen
-    // flows use this, and a flow window that is never freed keeps everything it
-    // holds alive — see `hold_while_open`.
+    // here is a cycle, and the window could never be freed. The fullscreen
+    // flows and the modal dialogs use this, and a window that is never freed
+    // keeps everything it holds alive — see `hold_while_open`.
     let win_for_key = win.downgrade();
     keys.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::Escape {

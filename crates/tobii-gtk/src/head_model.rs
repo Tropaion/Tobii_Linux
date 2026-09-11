@@ -591,17 +591,7 @@ pub fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F
         on_agree();
     });
     // Escape is a "no", like every other refusal path here.
-    let keys = gtk::EventControllerKey::new();
-    let w = win.clone();
-    keys.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
-            w.close();
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    win.add_controller(keys);
+    crate::add_escape_to_close(&win);
     win.present();
     // Focus the refusal, not the download. Nothing here should be one stray
     // Return away from a network fetch the user has not read the terms for.
