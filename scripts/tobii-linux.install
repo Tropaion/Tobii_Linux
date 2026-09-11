@@ -31,12 +31,19 @@ _tobii_post() {
 # A copy installed from the tar.gz is not replaced by this package — it shadows
 # it, and nothing else would tell the user why the version did not change. Only
 # on a first install: an upgrade has already said it once.
+#
+# The command is /usr/bin/tobii, spelled out: `tobii` alone is whichever copy is
+# first on PATH, and for exactly this audience that is the old tar.gz copy,
+# which (v0.3.0 and earlier) has no `uninstall`. This package's copy finds the
+# old one through its menu entry's Exec, and --udev removes the /etc rule.
 _tobii_shadow_note() {
     cat <<'EOF'
 If you also installed Tobii Linux from the tar.gz (its install.sh), that copy
 still wins: if ~/.local/bin is on your PATH it comes before /usr/bin, its menu
 entry hides this one, and /etc/udev/rules.d/60-tobii.rules overrides the packaged
-/usr/lib/udev/rules.d/60-tobii.rules. Remove it with:  tobii uninstall
+/usr/lib/udev/rules.d/60-tobii.rules. Remove both with THIS package's copy —
+the older one on your PATH has no uninstall command:
+  /usr/bin/tobii uninstall --udev      (add --dry-run first to see the plan)
 EOF
 }
 
