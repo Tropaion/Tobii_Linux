@@ -103,3 +103,10 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+      # The install scripts have no compiler checking them, and the root
+      # refusal, the manifest and the autostart repair are exactly the things
+      # that break silently. No root needed: TOBII_TEST_EUID stands in for it,
+      # and every path points into a temp directory.
+      - name: install scripts
+        run: bash scripts/test-install-payload.sh

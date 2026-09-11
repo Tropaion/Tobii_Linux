@@ -4,7 +4,7 @@
 #   scripts/build.sh                 # check dependencies, build everything
 #   scripts/build.sh --lean          # the CLI only, without the neural backend
 #   scripts/build.sh --install       # build, install, add to the app menu
-#   scripts/build.sh --install /usr/local/bin
+#   scripts/build.sh --install --system   # for every user, /usr/local/bin (uses sudo)
 #   scripts/build.sh --udev          # also install the udev rule (needs sudo)
 #   scripts/build.sh --check         # only check dependencies, build nothing
 #
@@ -21,9 +21,20 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+# Not as root. cargo run under sudo leaves a root-owned target/ that the next
+# plain build cannot write, and an install under sudo lands in /root. This asks
+# for sudo itself, for exactly the steps that need it.
+if [[ ${TOBII_TEST_EUID:-$(id -u)} -eq 0 ]]; then
+    echo "Run scripts/build.sh as yourself; it asks for sudo where it needs it." >&2
+    echo "For an install every user gets:  scripts/build.sh --install --system" >&2
+    exit 1
+fi
+
 lean=0
 do_install=0
 install_dir="$HOME/.local/bin"
+dir_given=0
+system=0
 do_udev=0
 check_only=0
 
@@ -32,11 +43,13 @@ while [[ $# -gt 0 ]]; do
         --lean)    lean=1 ;;
         --check)   check_only=1 ;;
         --udev)    do_udev=1 ;;
+        --system)  system=1 ;;
         --install)
             do_install=1
             # An optional directory may follow, but not another flag.
             if [[ ${2:-} && ${2:0:1} != "-" ]]; then
                 install_dir="$2"
+                dir_given=1
                 shift
             fi
             ;;
@@ -187,12 +200,18 @@ done
 
 if [[ $do_install -eq 1 || $do_udev -eq 1 ]]; then
     echo
+    if [[ $system -eq 1 && $dir_given -eq 0 ]]; then install_dir=/usr/local/bin; fi
     args=("$install_dir" "target/release" "assets")
     if [[ $do_udev -eq 1 ]]; then args+=(--udev); else args+=(--no-udev); fi
     if [[ $lean -eq 1 ]]; then args+=(--lean); fi
     # --udev without --install means the rule and nothing else.
     if [[ $do_install -eq 0 ]]; then args+=(--no-bins); fi
-    bash scripts/install-payload.sh "${args[@]}"
+    if [[ $system -eq 1 ]]; then
+        echo "Installing for every user into $install_dir — this uses sudo."
+        sudo bash scripts/install-payload.sh "${args[@]}" --system
+    else
+        bash scripts/install-payload.sh "${args[@]}"
+    fi
 fi
 
 # ----------------------------------------------------------------------- next

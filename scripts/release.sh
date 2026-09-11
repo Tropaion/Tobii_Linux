@@ -144,24 +144,48 @@ cat > "$dist/$name/install.sh" <<'INSTALLER'
 # Install this release. Everything lands in your home directory except the udev
 # rule, which needs sudo and which the script asks about before using it.
 #
-#   ./install.sh                    # into ~/.local/bin
-#   ./install.sh /usr/local/bin     # somewhere else (may need sudo)
-#   ./install.sh --no-udev          # skip the one step that needs sudo
-#   ./install.sh --lean             # the CLI only, no menu entry
+#   ./install.sh                         # into ~/.local/bin
+#   ./install.sh ~/bin                   # somewhere else in your home
+#   sudo ./install.sh --system           # for every user, into /usr/local/bin
+#   sudo ./install.sh --system /opt/bin  # for every user, somewhere else
+#   ./install.sh --no-udev               # skip the one step that needs sudo
+#   ./install.sh --lean                  # the CLI only, no menu entry
+#
+# Not plain `sudo ./install.sh`: under sudo your home is /root, so it would
+# install for the root account. It refuses, and says what to run instead.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# A leading non-flag argument is the install directory; everything else is
-# passed straight through. This used to forward only "$1", so every flag the
-# payload script documents was silently dropped — including --no-udev, the one
-# a user reaches for precisely because they do not want it running sudo.
-bindir="$HOME/.local/bin"
-if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then
-    bindir="$1"
-    shift
+# The first non-flag argument is the install directory, --system may appear
+# anywhere, and everything else is passed straight through. This once forwarded
+# only "$1", so every flag the payload script documents was silently dropped —
+# including --no-udev, the one a user reaches for precisely because they do not
+# want it running sudo.
+bindir=""
+system=0
+pass=()
+for a in "$@"; do
+    case "$a" in
+        --system) system=1; pass+=("$a") ;;
+        -*)       pass+=("$a") ;;
+        *)        if [ -z "$bindir" ]; then bindir="$a"; else pass+=("$a"); fi ;;
+    esac
+done
+if [ -z "$bindir" ]; then
+    if [ "$system" -eq 1 ]; then bindir=/usr/local/bin; else bindir="$HOME/.local/bin"; fi
 fi
-exec bash "$here/assets/install-payload.sh" "$bindir" "$here" "$here/assets" "$@"
+exec bash "$here/assets/install-payload.sh" "$bindir" "$here" "$here/assets" ${pass[@]+"${pass[@]}"}
 INSTALLER
-chmod 755 "$dist/$name/install.sh" "$dist/$name/assets/install-payload.sh"
+cat > "$dist/$name/uninstall.sh" <<'UNINSTALLER'
+#!/usr/bin/env bash
+# Remove an install made with install.sh. `tobii uninstall` does the work — it
+# knows every path the program writes — and this runs the copy in this folder,
+# so it works even if the installed one is already gone. Try --dry-run first.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$here/tobii" uninstall "$@"
+UNINSTALLER
+chmod 755 "$dist/$name/install.sh" "$dist/$name/uninstall.sh" \
+    "$dist/$name/assets/install-payload.sh"
 
 tar -czf "$dist/$name.tar.gz" -C "$dist" "$name"
 rm -rf "${dist:?}/$name"
