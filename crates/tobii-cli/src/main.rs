@@ -1,5 +1,5 @@
 //! `tobii` CLI. Subcommands: `stream`, `headpose`, `setup`, `display get|set`,
-//! `calibrate`.
+//! `calibrate`, `uninstall`.
 
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -16,6 +16,7 @@ use tobii_usb::{Connection, UsbTransport};
 type CmdResult = Result<(), Box<dyn std::error::Error>>;
 
 mod bridge;
+mod uninstall;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
             args.iter().any(|a| a == "--eyes"),
         ),
         (Some("update"), _) => update(&args),
+        (Some("uninstall"), _) => uninstall::run(&args),
         // Returns its own exit code rather than a CmdResult: the whole point is
         // to be transparent to whatever launched it, and a launcher reads the
         // status of the thing it launched.
@@ -70,6 +72,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage:\n  \
                  tobii update [--install]\n  \
+                 tobii uninstall [--dry-run] [--yes] [--purge] [--udev] [--system] [--bindir DIR]\n  \
                  tobii stream [--json] [--eyes]\n  \
                  tobii game -- <command> [args...]\n  \
                  tobii games [set KEY VALUE]\n  \

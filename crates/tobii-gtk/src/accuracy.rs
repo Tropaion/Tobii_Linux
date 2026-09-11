@@ -866,7 +866,7 @@ fn finish(
     );
     println!("\nverdict: {:?}\n  {}", d.cause, d.detail);
 
-    let path = tobii_config::config_path().with_file_name("accuracy.csv");
+    let path = tobii_config::config_path().with_file_name(tobii_config::paths::ACCURACY_CSV);
     let mut csv = String::from(
         "target_x,target_y,reported_x,reported_y,error_x,samples,eye_x_mm,eye_y_mm,eye_z_mm,gaze_angle_deg,reported_l_x,reported_r_x\n",
     );

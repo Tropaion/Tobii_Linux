@@ -642,7 +642,7 @@ fn short_hash(s: &str) -> String {
 /// — in which case the hash is no better than before, so the report says so
 /// rather than pretending. See [`monitor`].
 fn report_salt() -> Vec<u8> {
-    let path = tobii_config::config_path().with_file_name("report_salt");
+    let path = tobii_config::config_path().with_file_name(tobii_config::paths::REPORT_SALT);
     if let Ok(existing) = std::fs::read(&path) {
         if existing.len() >= 16 {
             return existing;

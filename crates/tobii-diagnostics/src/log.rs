@@ -69,16 +69,11 @@ pub fn log_path() -> PathBuf {
     if let Some(p) = std::env::var_os("TOBII_LOG_FILE").filter(|v| !v.is_empty()) {
         return PathBuf::from(p);
     }
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default();
-            home.join(".local").join("state")
-        });
-    base.join("tobii-linux").join("tobii.log")
+    // The directory and the name both come from `tobii_config::paths`, which
+    // `tobii uninstall --purge` reads too. That also means an absent HOME gives
+    // `/nonexistent/...` rather than a RELATIVE `.local/state`, which appended
+    // the log to a file under whatever the working directory happened to be.
+    tobii_config::paths::state_dir().join(tobii_config::paths::LOG_FILE)
 }
 
 /// Record a warning: stderr, memory, and the file.

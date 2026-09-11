@@ -81,6 +81,32 @@ pub const HEAD_LOCALIZER: ModelSource = ModelSource {
     bytes: 279_403,
 };
 
+/// Every model this store knows how to fetch or install.
+pub const SOURCES: [&ModelSource; 2] = [&HEAD_POSE, &HEAD_LOCALIZER];
+
+/// The temporary [`install`] writes before renaming into place.
+fn partial_name(src: &ModelSource) -> String {
+    format!("{}.partial", src.file)
+}
+
+/// The file [`download_to`] is pointed at while a fetch is in flight.
+fn download_name(src: &ModelSource) -> String {
+    format!("{}.download", src.file)
+}
+
+/// Every file name this module can leave in [`model_dir`]: each model, its
+/// install temporary and its in-flight download.
+///
+/// `tobii uninstall --purge` deletes exactly these and nothing else, so a file
+/// a user put in the directory themselves survives and is reported. Built from
+/// the same helpers the writers use, so the two cannot drift.
+pub fn file_names() -> Vec<String> {
+    SOURCES
+        .iter()
+        .flat_map(|s| [s.file.to_string(), partial_name(s), download_name(s)])
+        .collect()
+}
+
 /// Shown before any download, and required to be acknowledged.
 pub const TERMS: &str = "\
 This model is not part of this program. It belongs to the opentrack project and \
@@ -217,7 +243,7 @@ pub fn install(src: &ModelSource, bytes: &[u8]) -> Result<PathBuf, StoreError> {
     let dir = model_dir();
     std::fs::create_dir_all(&dir)?;
     let final_path = dir.join(src.file);
-    let tmp = dir.join(format!("{}.partial", src.file));
+    let tmp = dir.join(partial_name(src));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, &final_path)?;
     Ok(final_path)
@@ -312,7 +338,7 @@ pub fn installed(src: &ModelSource) -> Option<crate::model::ModelConfig> {
 /// Public so a GUI can size its progress against [`ModelSource::bytes`] by
 /// stat-ing this path, rather than re-deriving the name and drifting from it.
 pub fn download_path(src: &ModelSource) -> PathBuf {
-    model_dir().join(format!("{}.download", src.file))
+    model_dir().join(download_name(src))
 }
 
 /// The saved head-pose pitch zero, in degrees, if it has been measured.
