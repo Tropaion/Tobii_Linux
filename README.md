@@ -274,19 +274,43 @@ tobii uninstall --dry-run     # prints what it would do; changes nothing
 tobii uninstall               # asks, then does it
 ```
 
-It finds the install through the install manifest, the menu entry and the
-start-at-login entry, asks before stopping a hub that is still running, and
-removes the binaries, the menu entry, its icon and the start-at-login entry. It
-deletes only file names it knows, never a directory tree. It leaves:
+If that `tobii` is gone already, the release archive runs its own copy for you:
+`./uninstall.sh --dry-run`, then `./uninstall.sh`, from the unpacked folder.
+
+It looks for the install through the install manifest, the menu entry, the
+start-at-login entry, `~/.local/bin` and your `PATH`. A copy found any way but
+the manifest has to name itself when asked `--version` before it is removed. A
+Cargo build directory or an unpacked release archive is never taken for an
+install. It asks before stopping a hub that is still running, then removes the
+binaries, the menu entry, its icon and the start-at-login entry. A menu or
+start-at-login entry that runs a copy which stays — a package's, a build
+directory's — is left alone, and so is one whose program it cannot tell. It
+deletes only file names it knows, never a directory tree.
+
+`--yes` answers every question with yes. That includes stopping running copies
+with `SIGTERM` if they do not quit when asked — a `tobii game` wrapper among
+them, which is a running game's head tracking. A hub still running from a
+program that has been deleted (a package removed while it ran) is shown, and
+offered to be stopped the same way.
+
+If `~/.local/share/icons/hicolor/icon-theme.cache` exists, it is refreshed
+after the icon is removed. When no icons are left under that directory, the
+cache tool deletes the cache, which puts the directory back as it was before
+the install. No cache is ever created.
+
+It leaves:
 
 - **your settings, calibration, head-pose model and log.** Add `--purge` to
   remove those too. Only the files this program writes are deleted, and
   anything else it finds there — a backup of your own — stays and is listed.
   `calibration.bin` is the part that is costly to redo.
 - **the udev rule.** Add `--udev`; that step uses `sudo`.
-- **the TrackIR/FreeTrack bridge in Wine prefixes.** It lists the Steam
-  prefixes the bridge is in, with the command for each. Run those first, while
-  `tobii` is still installed.
+- **the TrackIR/FreeTrack bridge in Wine prefixes.** It lists the prefixes it
+  finds the bridge in — Steam's, `$WINEPREFIX` and `~/.wine` — with the command
+  for each. Removing the bridge needs `tobii`, so before it removes anything it
+  offers to stop and let you run those first. With `--yes` it goes on, and
+  repeats the commands at the end: the `tobii` in a release archive runs them
+  just as well.
 - **a copy your package manager installed.** It prints the command instead:
 
 ```sh
@@ -314,7 +338,8 @@ another one; the `Exec=` line of the menu entry names it. If you set
 rm -f ~/.local/bin/tobii ~/.local/bin/tobii-gtk
 # temporaries an interrupted update can leave beside them
 rm -rf ~/.local/bin/.tobii-update-[0-9]*
-rm -f ~/.local/bin/.tobii.new-* ~/.local/bin/.tobii-gtk.new-* \
+rm -f ~/.local/bin/.tobii-update-probe-* \
+      ~/.local/bin/.tobii.new-* ~/.local/bin/.tobii-gtk.new-* \
       ~/.local/bin/.tobii.old-* ~/.local/bin/.tobii-gtk.old-*
 
 # the menu entry, its icon, and start-at-login
@@ -323,11 +348,31 @@ rm -f ~/.local/share/icons/hicolor/scalable/apps/com.tobiilinux.Configuration.sv
 rm -f ~/.config/autostart/com.tobiilinux.Configuration.desktop
 # only if this file already exists — do not create one:
 #   gtk4-update-icon-cache -qtf ~/.local/share/icons/hicolor
-#   (~/.local/share/icons/hicolor/icon-theme.cache)
+#   (~/.local/share/icons/hicolor/icon-theme.cache; with no icons left under
+#   hicolor, that command deletes the cache — as it was before the install)
 
-# optional: settings, calibration, models and log
-# (this also deletes anything of your own you keep in these directories)
-rm -r ~/.config/tobii-linux ~/.local/state/tobii-linux
+# optional: settings, calibration, models and log — the names this program
+# writes, so anything of your own in these directories stays. A save that was
+# interrupted can also leave one of these names with .tmp added.
+rm -f ~/.config/tobii-linux/config.toml ~/.config/tobii-linux/calibration.bin \
+      ~/.config/tobii-linux/calibration.meta.toml ~/.config/tobii-linux/enabled_eye \
+      ~/.config/tobii-linux/update_check ~/.config/tobii-linux/text_scale \
+      ~/.config/tobii-linux/headpose_pitch_offset \
+      ~/.config/tobii-linux/setup_monitor_id ~/.config/tobii-linux/games.toml \
+      ~/.config/tobii-linux/accuracy.csv ~/.config/tobii-linux/report_salt
+rm -f ~/.config/tobii-linux/models/head-pose-0.5-small.onnx \
+      ~/.config/tobii-linux/models/head-pose-0.5-small.onnx.partial \
+      ~/.config/tobii-linux/models/head-pose-0.5-small.onnx.download \
+      ~/.config/tobii-linux/models/head-localizer.onnx \
+      ~/.config/tobii-linux/models/head-localizer.onnx.partial \
+      ~/.config/tobii-linux/models/head-localizer.onnx.download
+rm -f ~/.local/state/tobii-linux/tobii.log ~/.local/state/tobii-linux/diagnostics.txt
+# then the directories: rmdir refuses one that still holds something, and says so
+rmdir ~/.config/tobii-linux/models ~/.config/tobii-linux ~/.local/state/tobii-linux
+
+# or instead, the directories with EVERYTHING in them — which also deletes any
+# backup of your own kept there, such as a copy of calibration.bin:
+#   rm -r ~/.config/tobii-linux ~/.local/state/tobii-linux
 
 # optional: the udev rule
 sudo rm -f /etc/udev/rules.d/60-tobii.rules /etc/udev/rules.d/99-tobii.rules
