@@ -2,7 +2,8 @@
 # Build distribution packages from an already-built dist/ tree.
 #
 #   scripts/release.sh 0.1.0      # builds dist/tobii-linux-0.1.0-<triple>.tar.gz
-#   scripts/package.sh  0.1.0     # adds the .deb, the PKGBUILD and the .rpm
+#   scripts/package.sh  0.1.0     # adds the .deb, the PKGBUILD and the .rpm,
+#                                 # and aur/tobii-linux-bin/ (NOT in dist/)
 #
 # # Two channels, and they are not the same channel
 #
@@ -34,9 +35,37 @@ if [[ -z "$version" ]]; then
     echo "usage: scripts/package.sh <version>   e.g. scripts/package.sh 0.1.0" >&2
     exit 2
 fi
+# What release.yml accepts as a tag, and nothing else: the version is written
+# into a deb control file, an rpm spec and two PKGBUILDs, and the mapping below
+# only sorts correctly for a suffix that starts with a letter.
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z][A-Za-z0-9.]*)?$ ]]; then
+    echo "'$version' is not MAJOR.MINOR.PATCH with an optional -rc1-style suffix" >&2
+    exit 2
+fi
+
+# # One rule for a pre-release, per format
+#
+#   tag            v1.0.0-rc1
+#   .deb, .rpm     1.0.0~rc1   '~' is both formats' "sorts before": dpkg and rpm
+#                              put 1.0.0~rc1 below 1.0.0, and an rpm Version may
+#                              not contain '-' at all.
+#   PKGBUILDs      1.0.0rc1    makepkg forbids '-' in pkgver, and vercmp puts an
+#                              alphabetic tail below the bare version.
+#
+# That last line is why release.yml refuses a suffix that starts with a digit:
+# -1 would become 1.0.01, which vercmp sorts ABOVE 1.0.0.
+#
+# The package FILE names keep the tag's '-'. GitHub rewrites '~' in an asset
+# name to '.', so a .deb named with it would be published under a name
+# SHA256SUMS does not list, and the hub's download would refuse it (NotListed).
+# dpkg and rpm read the version from inside the file, never from its name.
+# For a normal release all three spellings are the same.
+pkg_version="${version//-/\~}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+# shellcheck source=scripts/elf-deps.sh
+. "$root/scripts/elf-deps.sh"
 
 triple="${2:-$(uname -m)-unknown-linux-gnu}"
 # The architecture comes from the TRIPLE, not from `uname -m`. They are the
@@ -143,21 +172,14 @@ glibc_req=""
 # this: a hard-coded "(64bit)" is a second definition of the same fact, and the
 # one that is wrong the first time somebody builds for a 32-bit target.
 rpm_bits=""
+# Both read by scripts/elf-deps.sh, which scripts/aur-bin.sh also uses, so the
+# .deb, the .rpm and the Arch package declare the same floor.
+bins=("$payload/usr/bin/tobii" "$payload/usr/bin/tobii-gtk")
 if command -v objdump >/dev/null 2>&1; then
-    for bin in tobii tobii-gtk; do
-        this="$(LC_ALL=C objdump -T "$payload/usr/bin/$bin" 2>/dev/null \
-            | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 || true)"
-        [[ -n "$this" ]] || continue
-        glibc_req="$(printf '%s\n%s\n' "$glibc_req" "${this#GLIBC_}" | sort -V | tail -1)"
-        # LC_ALL=C: objdump TRANSLATES its field names — this reads
-        # "Dateiformat elf64-x86-64" on a German machine, so the probe found
-        # nothing and every rpm requirement lost its (64bit) tag. The same trap
-        # this file already documents for `pacman -Qo`, walked into again.
-        if [[ -z "$rpm_bits" ]] && LC_ALL=C objdump -f "$payload/usr/bin/$bin" 2>/dev/null \
-            | grep -q 'file format elf64'; then
-            rpm_bits="(64bit)"
-        fi
-    done
+    glibc_req="$(elf_glibc_floor "${bins[@]}")"
+    if elf_is_64 "${bins[0]}" || elf_is_64 "${bins[1]}"; then
+        rpm_bits="(64bit)"
+    fi
 fi
 # The SONAMEs the binaries link, as rpm dependency syntax.
 #
@@ -169,19 +191,14 @@ fi
 # it from the ELF means it cannot drift from what the binaries need.
 rpm_sonames=""
 if command -v objdump >/dev/null 2>&1; then
-    for bin in tobii tobii-gtk; do
-        while read -r so; do
-            # libc is covered by the versioned symbol requirement below, and
-            # nobody declares a dependency on the dynamic loader.
-            case "$so" in libc.so.*|ld-linux*|"") continue ;; esac
-            # Separator-exact: the accumulator joins with ", ", so a pattern
-            # built with "," alone matches nothing and every soname the two
-            # binaries share is listed twice.
-            case ", $rpm_sonames, " in *", $so()${rpm_bits}, "*) continue ;; esac
-            rpm_sonames="${rpm_sonames:+$rpm_sonames, }$so()${rpm_bits}"
-        done < <(LC_ALL=C objdump -p "$payload/usr/bin/$bin" 2>/dev/null \
-                 | awk '/NEEDED/ {print $2}')
-    done
+    # elf_needed lists each soname once across both binaries, so the ones they
+    # share are not required twice.
+    while read -r so; do
+        # libc is covered by the versioned symbol requirement below, and
+        # nobody declares a dependency on the dynamic loader.
+        case "$so" in libc.so.*|ld-linux*|"") continue ;; esac
+        rpm_sonames="${rpm_sonames:+$rpm_sonames, }$so()${rpm_bits}"
+    done < <(elf_needed "${bins[@]}")
 fi
 if [[ -n "$rpm_sonames" ]]; then
     echo "  rpm sonames: $rpm_sonames"
@@ -214,7 +231,7 @@ ctl="$work/control-dir"
 mkdir -p "$ctl"
 cat > "$ctl/control" <<EOF
 Package: tobii-linux
-Version: ${version}
+Version: ${pkg_version}
 Section: utils
 Priority: optional
 Architecture: ${deb_arch}
@@ -313,14 +330,17 @@ echo "  $(basename "$deb")"
 
 # ---------------------------------------------------------------- the PKGBUILD
 
-# Source-based on purpose: Arch users expect to build from a PKGBUILD, and it
-# means the package is compiled against the system's own GTK rather than
-# whatever the release container had.
+# Source-based on purpose: this is the build-it-yourself Arch channel, compiled
+# against the system's own GTK rather than whatever the release container had.
+# The prebuilt one, tobii-linux-bin, is further down; the two conflict.
 pkgbuild="$dist/PKGBUILD"
 cat > "$pkgbuild" <<EOF
 # Maintainer: Fabian Plaimauer
 pkgname=tobii-linux
-pkgver=${version}
+_ver=${version}
+# makepkg forbids '-' in pkgver: 1.0.0-rc1 becomes 1.0.0rc1, which vercmp sorts
+# below 1.0.0. The tag, and so the URL and the directory, keep the '-'.
+pkgver=\${_ver//-/}
 pkgrel=1
 pkgdesc="Linux runtime and GUI for the Tobii Eye Tracker 5 (clean-room)"
 arch=('x86_64' 'aarch64')
@@ -329,32 +349,34 @@ license=('GPL-3.0-only')
 depends=('gtk4' 'gtk4-layer-shell' 'libusb')
 makedepends=('rust' 'pkgconf')
 optdepends=('curl: fetching the head-pose model and updates')
+# The prebuilt package installs the same files; either one replaces the other.
+conflicts=('tobii-linux-bin')
 # The only post-install hook makepkg offers. Without it the Arch channel is the
 # one that never removes the pre-v0.1.0 99-tobii.rules, whose MODE="0666" wins
 # over this rule because 99- sorts after 60-.
 install=tobii-linux.install
-source=("\$pkgname-\$pkgver.tar.gz::\$url/archive/refs/tags/v\$pkgver.tar.gz")
+source=("\$pkgname-\$_ver.tar.gz::\$url/archive/refs/tags/v\$_ver.tar.gz")
 # SKIP, deliberately. GitHub generates this tarball on demand and its bytes
 # have not been stable across GitHub's own tooling changes, so a pinned digest
 # breaks the PKGBUILD for everyone the day that happens — which is worse than an
 # absent one, because it looks like a compromised download. The trade is
 # recorded in docs/wiki/Quality-and-Risks.md section 11.1a: this channel verifies
-# nothing about what it downloads. Use the .tar.gz release if you want a
-# checksum; it ships SHA256SUMS.
+# nothing about what it downloads. If you want a checksum, use the prebuilt
+# tobii-linux-bin, which pins its download, or the .tar.gz and its SHA256SUMS.
 sha256sums=('SKIP')
 
 build() {
-    cd "Tobii_Linux-\$pkgver"
+    cd "Tobii_Linux-\$_ver"
     cargo build --release --locked
 }
 
 check() {
-    cd "Tobii_Linux-\$pkgver"
+    cd "Tobii_Linux-\$_ver"
     cargo test --workspace --locked
 }
 
 package() {
-    cd "Tobii_Linux-\$pkgver"
+    cd "Tobii_Linux-\$_ver"
     install -Dm755 target/release/tobii     "\$pkgdir/usr/bin/tobii"
     install -Dm755 target/release/tobii-gtk "\$pkgdir/usr/bin/tobii-gtk"
     install -Dm644 assets/com.tobiilinux.Configuration.desktop \\
@@ -368,26 +390,8 @@ package() {
 EOF
 
 # makepkg reads this beside the PKGBUILD; both have to be downloaded together.
-cat > "$dist/tobii-linux.install" <<'EOF'
-_tobii_post() {
-    # The pre-v0.1.0 rule was called 99-tobii.rules and said MODE="0666".
-    # Because 99- sorts AFTER 60-, its mode assignment wins — so a machine that
-    # installed this project before v0.1.0 would keep an infrared camera
-    # readable by every local process while the release notes announce the rule
-    # as hardened to 0660.
-    if [ -e /etc/udev/rules.d/99-tobii.rules ]; then
-        rm -f /etc/udev/rules.d/99-tobii.rules
-        echo "Removed the old /etc/udev/rules.d/99-tobii.rules, which overrode this rule's mode."
-    fi
-    udevadm control --reload >/dev/null 2>&1 || true
-    udevadm trigger --subsystem-match=usb >/dev/null 2>&1 || true
-    # misc too — see the deb hook: /dev/uinput is a virtual device.
-    udevadm trigger --subsystem-match=misc >/dev/null 2>&1 || true
-    echo "Re-plug the Eye Tracker 5 so the udev rule takes effect."
-}
-post_install() { _tobii_post; }
-post_upgrade() { _tobii_post; }
-EOF
+# The same file is tobii-linux-bin's hook — one definition, see its header.
+install -m 644 scripts/tobii-linux.install "$dist/tobii-linux.install"
 echo "  PKGBUILD"
 
 # --------------------------------------------------------------------- the rpm
@@ -397,15 +401,20 @@ echo "  PKGBUILD"
 if command -v rpmbuild >/dev/null 2>&1; then
     rpmtop="$work/rpm"
     mkdir -p "$rpmtop"/{BUILD,RPMS,SOURCES,SPECS,BUILDROOT}
+    # An UNQUOTED heredoc, because it fills in the version and requirements —
+    # so a backtick in the spec's own comments has to be escaped. Unescaped,
+    # bash ran each one as a command substitution while writing the file:
+    # `gtk4` and `libusb1` as commands, and `libc.so.6(GLIBC_x.y)` as a syntax
+    # error, all swallowed because only cat's exit status counts.
     cat > "$rpmtop/SPECS/tobii-linux.spec" <<EOF
 Name:           tobii-linux
-Version:        ${version}
+Version:        ${pkg_version}
 Release:        1
 Summary:        Linux runtime and GUI for the Tobii Eye Tracker 5
 License:        GPL-3.0-only
 URL:            https://github.com/Tropaion/Tobii_Linux
 BuildArch:      ${arch}
-# No package NAMES here, deliberately. `gtk4`, `gtk4-layer-shell` and `libusb1`
+# No package NAMES here, deliberately. \`gtk4\`, \`gtk4-layer-shell\` and \`libusb1\`
 # are Fedora's names; openSUSE ships the same libraries as libgtk-4-1,
 # libgtk4-layer-shell0 and libusb-1_0-0, so those three lines made the package
 # uninstallable there with three unsatisfiable requirements — on a distribution
@@ -415,8 +424,8 @@ BuildArch:      ${arch}
 # AutoReqProv is on. release.yml opens the finished package and fails if they
 # are missing.
 Requires:       ${rpm_sonames}${rpm_sonames:+${glibc_req:+, }}${glibc_req:+libc.so.6(GLIBC_${glibc_req})${rpm_bits}}
-# Automatic dependency generation left ON deliberately (it was `AutoReqProv:
-# no`). Turning it off also turns off the `libc.so.6(GLIBC_x.y)` requirement rpm
+# Automatic dependency generation left ON deliberately (it was \`AutoReqProv:
+# no\`). Turning it off also turns off the \`libc.so.6(GLIBC_x.y)\` requirement rpm
 # derives from the ELF — exactly the check that stops this installing on a
 # system too old to run it. The explicit Requires above are a floor, not a
 # replacement for it: this script has no rpmbuild on most developer machines, so
@@ -458,10 +467,34 @@ udevadm trigger --subsystem-match=misc >/dev/null 2>&1 || :
 EOF
     cp -a "$payload" "$rpmtop/SOURCES/payload"
     rpmbuild --define "_topdir $rpmtop" -bb "$rpmtop/SPECS/tobii-linux.spec" >/dev/null
-    find "$rpmtop/RPMS" -name '*.rpm' -exec cp {} "$dist/" \;
-    echo "  $(cd "$dist" && ls *.rpm 2>/dev/null | tail -1)"
+    # Named with the tag's '-', not the '~' rpmbuild wrote — see the version
+    # rule at the top. For a normal release it is rpmbuild's own name.
+    mapfile -t built < <(find "$rpmtop/RPMS" -name '*.rpm')
+    if [[ ${#built[@]} -ne 1 ]]; then
+        echo "rpmbuild produced ${#built[@]} packages where one was expected: ${built[*]}" >&2
+        exit 1
+    fi
+    rpm_file="tobii-linux-${version}-1.${arch}.rpm"
+    cp "${built[0]}" "$dist/$rpm_file"
+    echo "  $rpm_file"
 else
     echo "  (no rpmbuild — skipping the .rpm)"
+fi
+
+# ------------------------------------------------- the prebuilt Arch package
+
+# tobii-linux-bin: the PKGBUILD the AUR gets, which repackages this tarball, so
+# nothing is compiled on the user's machine. Written to aur/, NOT dist/:
+# everything in dist/ is hashed into SHA256SUMS and uploaded as a release asset,
+# and a second file named PKGBUILD there would collide with the source one a
+# v0.3.0 hub downloads by name. release.yml's arch job turns it into the
+# .pkg.tar.zst that IS a release asset.
+if [[ "$arch" == x86_64 ]]; then
+    rm -rf "$root/aur/tobii-linux-bin"
+    scripts/aur-bin.sh "$version" "$tarball" "$root/aur/tobii-linux-bin" >/dev/null
+    echo "  aur/tobii-linux-bin/PKGBUILD (tobii-linux-bin ${version//-/}-1)"
+else
+    echo "  (no tobii-linux-bin for $arch — the release builds it for x86_64 only)"
 fi
 
 # ------------------------------------------------------------------- checksums

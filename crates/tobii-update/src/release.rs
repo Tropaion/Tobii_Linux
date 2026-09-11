@@ -49,6 +49,12 @@ impl Release {
     /// first, which is why the manager decides the file rather than the file
     /// deciding itself.
     ///
+    /// `pacman` has two formats, tried in order: the prebuilt `.pkg.tar.zst`
+    /// for this machine, which is one file and needs no toolchain; then the
+    /// `PKGBUILD` pair, which compiles the whole workspace. A release from
+    /// before the prebuilt package existed, or one that only built it for
+    /// another architecture, still has the pair.
+    ///
     /// Falls back to the archive when this release publishes no package for
     /// that manager *and* this machine: an archive is at least installable by
     /// hand, where a `.deb` built for another architecture is not.
@@ -63,7 +69,10 @@ impl Release {
         let (channel, files) = match manager {
             "dpkg" => (Channel::Deb, ending(format!("_{}.deb", deb_arch(arch)))),
             "rpm" => (Channel::Rpm, ending(format!(".{arch}.rpm"))),
-            "pacman" => (Channel::Pkgbuild, self.pkgbuild_pair()),
+            "pacman" => match self.pacman_package(arch) {
+                Some(p) => (Channel::Pacman, vec![p]),
+                None => (Channel::Pkgbuild, self.pkgbuild_pair()),
+            },
             _ => (Channel::Archive, Vec::new()),
         };
         if !files.is_empty() {
@@ -72,6 +81,26 @@ impl Release {
         self.archive_for(triple).map(|a| Offer {
             channel: Channel::Archive,
             files: vec![a],
+        })
+    }
+
+    /// The prebuilt Arch package for `arch`, if this release has one.
+    ///
+    /// makepkg names it `tobii-linux-bin-<pkgver>-<pkgrel>-<arch>.pkg.tar.zst`
+    /// (release.yml's `arch` job builds it from `scripts/aur-bin.sh`'s
+    /// PKGBUILD), so the architecture is the whole segment before the
+    /// extension. Never `tobii-linux-bin-debug-…`: makepkg splits detached
+    /// debug symbols into that package, and it installs no program. The job
+    /// builds with `!debug` and fails if one appears; this is the other half.
+    fn pacman_package(&self, arch: &str) -> Option<&Asset> {
+        if arch.is_empty() {
+            return None;
+        }
+        let ending = format!("-{arch}.pkg.tar.zst");
+        self.assets.iter().find(|a| {
+            a.name.starts_with(PACMAN_PREFIX)
+                && !a.name.starts_with(PACMAN_DEBUG_PREFIX)
+                && a.name.ends_with(&ending)
         })
     }
 
@@ -92,6 +121,11 @@ impl Release {
 /// The PKGBUILD `scripts/package.sh` publishes, and its install hook.
 const PKGBUILD: &str = "PKGBUILD";
 const PKGBUILD_INSTALL: &str = "tobii-linux.install";
+
+/// The prebuilt Arch package's file name starts with its package name, and
+/// makepkg's split debug package with that name plus `-debug`.
+const PACMAN_PREFIX: &str = "tobii-linux-bin-";
+const PACMAN_DEBUG_PREFIX: &str = "tobii-linux-bin-debug-";
 
 /// Debian's name for a machine architecture.
 ///
@@ -114,6 +148,9 @@ pub enum Channel {
     Deb,
     /// An `.rpm`, for `dnf` or `zypper`.
     Rpm,
+    /// A prebuilt `.pkg.tar.zst` (`tobii-linux-bin`), installed with
+    /// `pacman -U`.
+    Pacman,
     /// A `PKGBUILD` and its install hook, built with `makepkg`.
     Pkgbuild,
     /// The release archive, unpacked and installed by hand.
@@ -510,12 +547,30 @@ mod tests {
                     "tobii-linux-0.3.0-1.aarch64.rpm",
                     "https://github.com/a/b/r64",
                 ),
+                // aarch64 first, so a match on "any pkg.tar.zst" would pick
+                // the wrong one on the x86_64 machine the tests pretend to be.
+                (
+                    "tobii-linux-bin-0.3.0-1-aarch64.pkg.tar.zst",
+                    "https://github.com/a/b/z64",
+                ),
+                (
+                    "tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst",
+                    "https://github.com/a/b/z",
+                ),
                 ("PKGBUILD", "https://github.com/a/b/p"),
                 ("tobii-linux.install", "https://github.com/a/b/i"),
                 ("SHA256SUMS", "https://github.com/a/b/s"),
             ],
         )
     }
+
+    fn without(mut r: Release, gone: &[&str]) -> Release {
+        r.assets.retain(|a| !gone.contains(&a.name.as_str()));
+        r
+    }
+
+    const PKG_X86: &str = "tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst";
+    const PKG_ARM: &str = "tobii-linux-bin-0.3.0-1-aarch64.pkg.tar.zst";
 
     fn names<'a>(o: &Offer<'a>) -> Vec<&'a str> {
         o.files.iter().map(|a| a.name.as_str()).collect()
@@ -550,21 +605,97 @@ mod tests {
     }
 
     /// `makepkg` reads the install hook by name from beside the PKGBUILD, so
-    /// the pair travels together or not at all.
+    /// the pair travels together or not at all. (Without the prebuilt
+    /// packages, which would otherwise be offered first.)
     #[test]
     fn arch_gets_the_pkgbuild_and_its_install_hook_together() {
-        let all = packaged();
+        let all = without(packaged(), &[PKG_X86, PKG_ARM]);
         let o = all.offer_for("pacman", TRIPLE).expect("a PKGBUILD");
         assert_eq!(o.channel, Channel::Pkgbuild);
         assert_eq!(names(&o), ["PKGBUILD", "tobii-linux.install"]);
 
         // Half of it is not a smaller version of it: without the hook the
         // PKGBUILD does not build, so this falls back to the archive.
-        let mut half = packaged();
-        half.assets.retain(|a| a.name != "tobii-linux.install");
+        let half = without(all, &["tobii-linux.install"]);
         let o = half.offer_for("pacman", TRIPLE).expect("the archive");
         assert_eq!(o.channel, Channel::Archive);
         assert_eq!(names(&o), [format!("tobii-linux-0.3.0-{TRIPLE}.tar.gz")]);
+    }
+
+    /// The prebuilt package is one file and needs no Rust toolchain, so it is
+    /// what pacman is offered whenever there is one for this machine — and
+    /// only the one for this machine.
+    #[test]
+    fn arch_gets_the_prebuilt_package_for_its_own_machine() {
+        let r = packaged();
+
+        let o = r.offer_for("pacman", TRIPLE).expect("a package");
+        assert_eq!(o.channel, Channel::Pacman);
+        assert_eq!(names(&o), [PKG_X86]);
+
+        let o = r
+            .offer_for("pacman", "aarch64-unknown-linux-gnu")
+            .expect("a package");
+        assert_eq!(o.channel, Channel::Pacman);
+        assert_eq!(names(&o), [PKG_ARM]);
+    }
+
+    /// makepkg splits detached debug symbols into `tobii-linux-bin-debug-…`,
+    /// which installs no program. It is never the file handed over — not when
+    /// it is listed first, and not when it is the only one for this machine.
+    #[test]
+    fn a_debug_package_is_never_offered() {
+        let debug = "tobii-linux-bin-debug-0.3.0-1-x86_64.pkg.tar.zst";
+        let mut r = packaged();
+        r.assets.insert(
+            0,
+            Asset {
+                name: debug.into(),
+                url: "https://github.com/a/b/dbg".into(),
+            },
+        );
+        assert_eq!(names(&r.offer_for("pacman", TRIPLE).unwrap()), [PKG_X86]);
+
+        let only_debug = without(r, &[PKG_X86]);
+        let o = only_debug.offer_for("pacman", TRIPLE).unwrap();
+        assert_eq!(o.channel, Channel::Pkgbuild, "{:?}", names(&o));
+    }
+
+    /// A package built for another machine is not an answer. Without one for
+    /// this machine pacman gets the PKGBUILD pair, and without that the
+    /// archive — the same order as a release that never had a package.
+    #[test]
+    fn another_machines_package_falls_back_to_the_pkgbuild_then_the_archive() {
+        let arm_only = without(packaged(), &[PKG_X86]);
+        let o = arm_only.offer_for("pacman", TRIPLE).unwrap();
+        assert_eq!(o.channel, Channel::Pkgbuild);
+        assert_eq!(names(&o), ["PKGBUILD", "tobii-linux.install"]);
+
+        let no_pair = without(arm_only, &["PKGBUILD", "tobii-linux.install"]);
+        let o = no_pair.offer_for("pacman", TRIPLE).unwrap();
+        assert_eq!(o.channel, Channel::Archive);
+        assert_eq!(names(&o), [format!("tobii-linux-0.3.0-{TRIPLE}.tar.gz")]);
+    }
+
+    /// Only pacman is handed a `.pkg.tar.zst`: the deb, rpm and archive
+    /// matchers must not be satisfied by one, on either machine.
+    #[test]
+    fn no_other_channel_is_handed_an_arch_package() {
+        let r = packaged();
+        for triple in [TRIPLE, "aarch64-unknown-linux-gnu"] {
+            for manager in ["dpkg", "rpm", "nix", ""] {
+                if let Some(o) = r.offer_for(manager, triple) {
+                    assert!(
+                        o.files.iter().all(|a| !a.name.ends_with(".pkg.tar.zst")),
+                        "{manager} on {triple} was offered {:?}",
+                        names(&o)
+                    );
+                }
+            }
+            if let Some(a) = r.archive_for(triple) {
+                assert!(!a.name.ends_with(".pkg.tar.zst"), "{}", a.name);
+            }
+        }
     }
 
     /// A manager this project has never packaged for, and a release that

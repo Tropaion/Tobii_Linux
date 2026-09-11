@@ -1,0 +1,211 @@
+# Publish tobii-linux-bin to the AUR when a release is published.
+#
+# # What it pushes
+#
+# The PKGBUILD scripts/aur-bin.sh writes, its .SRCINFO, and the shared
+# tobii-linux.install, to ssh://aur@aur.archlinux.org/tobii-linux-bin.git. The
+# package repackages the release tarball's prebuilt binaries, so an AUR user
+# needs no Rust toolchain.
+#
+# # When
+#
+# - A release is PUBLISHED — which for this project is the maintainer pressing
+#   Publish on the draft release.yml made. Pre-releases are skipped: an AUR
+#   helper upgrades everybody who has the package, and a pre-release is not
+#   something to push at people who did not ask for one.
+# - By hand (Actions → AUR → Run workflow) with a tag, to publish an existing
+#   release, including the first push, which is what creates the AUR package.
+#   A manual run uses the scripts from the branch it is started on, so a fixed
+#   aur-bin.sh can re-publish a release without a new tag.
+#
+# # What the pin is — and is not
+#
+# The PKGBUILD pins the tarball's sha256, and that pin is taken from the
+# release's own SHA256SUMS: the tarball is checked against that file before
+# aur-bin.sh hashes it, and the PKGBUILD's value is compared with the file's
+# after. It is an integrity check from the SAME release — it proves an AUR
+# user's download matches what was published, and nothing about who published
+# it. It is not a signature. See the NOTE ON TRUST in scripts/release.sh and
+# "What installing an update trusts" in README.md, and do not write anything
+# here that implies more.
+#
+# # Without the secret
+#
+# Until the maintainer adds AUR_SSH_KEY (docs/wiki/Development.md, Releasing),
+# every step up to the push still runs, and the job prints what it would push
+# and ends green with a notice.
+
+name: AUR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release tag to publish to the AUR, e.g. v0.4.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One at a time, and never cancelled halfway: two releases published close
+# together must reach the AUR in order.
+concurrency:
+  group: aur
+  cancel-in-progress: false
+
+jobs:
+  aur:
+    name: Update tobii-linux-bin on the AUR
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # The tag reaches a shell, and a PKGBUILD that AUR helpers source on
+      # users' machines. The same pattern release.yml accepts, and passed
+      # through the environment, never interpolated into a script.
+      - name: Check the tag is a version
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z][A-Za-z0-9.]*)?$'; then
+            echo "::error::'$TAG' is not a release tag (vMAJOR.MINOR.PATCH, optionally -rc1-style)" >&2
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      # git and ssh for the push. base-devel has makepkg, binutils (objdump,
+      # for aur-bin.sh) and curl already. Mirrors flake, hence the retry.
+      - name: Install git and openssh
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            if pacman -Syu --noconfirm --needed git openssh; then exit 0; fi
+            echo "attempt $i of 5 failed" >&2
+            sleep $((i * 15))
+          done
+          exit 1
+
+      - uses: actions/checkout@v5
+
+      # From the URL the PKGBUILD itself downloads from, so this checks what
+      # AUR users will get. The pin must come from the release's own
+      # SHA256SUMS: the tarball is checked against it here, and the PKGBUILD's
+      # value is compared with it after aur-bin.sh has run.
+      - name: Fetch the release tarball and check it against the release's SHA256SUMS
+        run: |
+          set -euo pipefail
+          dir="tobii-linux-${VERSION}-x86_64-unknown-linux-gnu"
+          base="https://github.com/Tropaion/Tobii_Linux/releases/download/${TAG}"
+          mkdir -p fetched
+          cd fetched
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$dir.tar.gz" "$base/$dir.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+          count="$(awk -v n="$dir.tar.gz" '$2 == n { c++ } END { print c + 0 }' SHA256SUMS)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::SHA256SUMS lists $dir.tar.gz $count times, not once" >&2
+            exit 1
+          fi
+          awk -v n="$dir.tar.gz" '$2 == n' SHA256SUMS > tarball.sha256
+          sha256sum -c tarball.sha256
+          pin="$(cut -d' ' -f1 tarball.sha256)"
+          echo "PIN=$pin" >> "$GITHUB_ENV"
+          echo "pinned from the release's SHA256SUMS: $pin"
+
+      - name: Generate the PKGBUILD
+        run: |
+          set -euo pipefail
+          scripts/aur-bin.sh "$VERSION" "fetched/tobii-linux-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" out
+          if ! grep -Fxq "sha256sums_x86_64=('$PIN')" out/PKGBUILD; then
+            echo "::error::the PKGBUILD's pin is not the value the release's SHA256SUMS lists" >&2
+            exit 1
+          fi
+
+      # makepkg refuses to run as root. --verifysource downloads the source
+      # from the URL in the PKGBUILD — the published release, exactly what an
+      # AUR helper will fetch — and checks it against the pin. No tarball is
+      # copied in, so that download is a real one. It checks no dependencies.
+      - name: Verify the source and write .SRCINFO as an unprivileged user
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          install -d -o builder -g builder /home/builder/pkg
+          cp out/PKGBUILD out/tobii-linux.install /home/builder/pkg/
+          chown -R builder:builder /home/builder/pkg
+          su builder -c 'cd ~/pkg && makepkg --verifysource --noconfirm && makepkg --printsrcinfo > .SRCINFO'
+          cp /home/builder/pkg/.SRCINFO out/.SRCINFO
+          cat out/.SRCINFO
+
+      - name: Push to the AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          pkgver="$(awk '$1 == "pkgver" { print $3; exit }' out/.SRCINFO)"
+          pkgrel="$(awk '$1 == "pkgrel" { print $3; exit }' out/.SRCINFO)"
+          if [ -z "$pkgver" ] || [ -z "$pkgrel" ]; then
+            echo "::error::could not read pkgver/pkgrel from .SRCINFO" >&2
+            exit 1
+          fi
+
+          if [ -z "${AUR_SSH_KEY:-}" ]; then
+            echo "AUR_SSH_KEY is not set, so nothing is pushed. This is what would be:"
+            for f in PKGBUILD .SRCINFO tobii-linux.install; do
+              echo "==================== $f"
+              cat "out/$f"
+            done
+            echo "::notice::AUR_SSH_KEY is not set: tobii-linux-bin ${pkgver}-${pkgrel} was generated and verified but NOT pushed. docs/wiki/Development.md (Releasing) has the one-time setup."
+            exit 0
+          fi
+
+          ssh_dir="$(mktemp -d)"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$AUR_SSH_KEY" > "$ssh_dir/key"
+          chmod 600 "$ssh_dir/key"
+
+          # aur.archlinux.org's host keys, PINNED, so the push authenticates
+          # the server instead of trusting whatever answers first. Taken with
+          # ssh-keyscan on 2026-09-11 and checked against the fingerprints the
+          # AUR publishes on https://aur.archlinux.org (its home page):
+          #   Ed25519  SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+          #   ECDSA    SHA256:uTa/0PndEgPZTf76e1DFqXKJEXKsn7m9ivhLQtzGOCI
+          #   RSA      SHA256:5s5cIyReIfNNVGRFdDbe3hdYiI5OelHGpw2rOUud3Q8
+          # If the AUR rotates its keys, this fails closed ("host key
+          # verification failed"): compare the new fingerprints with that page
+          # before replacing these lines.
+          cat > "$ssh_dir/known_hosts" <<'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          aur.archlinux.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLMiLrP8pVi5BFX2i3vepSUnpedeiewE5XptnUnau+ZoeUOPkpoCgZZuYfpaIQfhhJJI5qgnjJmr4hyJbe/zxow=
+          aur.archlinux.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDKF9vAFWdgm9Bi8uc+tYRBmXASBb5cB5iZsB7LOWWFeBrLp3r14w0/9S2vozjgqY5sJLDPONWoTTaVTbhe3vwO8CBKZTEt1AcWxuXNlRnk9FliR1/eNB9uz/7y1R0+c1Md+P98AJJSJWKN12nqIDIhjl2S1vOUvm7FNY43fU2knIhEbHybhwWeg+0wxpKwcAd/JeL5i92Uv03MYftOToUijd1pqyVFdJvQFhqD4v3M157jxS5FTOBrccAEjT+zYmFyD8WvKUa9vUclRddNllmBJdy4NyLB8SvVZULUPrP3QOlmzemeKracTlVOUG1wsDbxknF1BwSCU7CmU6UFP90kpWIyz66bP0bl67QAvlIc52Yix7pKJPbw85+zykvnfl2mdROsaT8p8R9nwCdFsBc9IiD0NhPEHcyHRwB8fokXTajk2QnGhL+zP5KnkmXnyQYOCUYo3EKMXIlVOVbPDgRYYT/XqvBuzq5S9rrU70KoI/S5lDnFfx/+lPLdtcnnEPk=
+          EOF
+
+          # An explicit key and known_hosts file, because ssh reads ~/.ssh from
+          # the passwd entry, not $HOME — and in a container job $HOME is
+          # /github/home while root's passwd home is /root.
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes"
+
+          # The first push creates the package; cloning one that does not
+          # exist yet gives an empty repository, which is fine.
+          git clone ssh://aur@aur.archlinux.org/tobii-linux-bin.git aur-repo
+          cp out/PKGBUILD out/.SRCINFO out/tobii-linux.install aur-repo/
+          cd aur-repo
+          git add PKGBUILD .SRCINFO tobii-linux.install
+          if git diff --cached --quiet; then
+            echo "::notice::the AUR already has tobii-linux-bin ${pkgver}-${pkgrel}; nothing to push"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Update to ${pkgver}-${pkgrel}"
+          # The AUR only accepts master. HEAD:master covers both a fresh
+          # (empty) clone and an existing package.
+          git push origin HEAD:master
+          echo "::notice::pushed tobii-linux-bin ${pkgver}-${pkgrel} to the AUR"
