@@ -56,6 +56,8 @@ struct Seen {
     flow: &'static str,
     /// Whether the test itself kept a strong reference across the close.
     held: bool,
+    /// Sampled half a second after the click, with the flow on screen.
+    claims_while_open: Vec<&'static str>,
     claims_after_close: Vec<&'static str>,
     window_alive_after_close: bool,
 }
@@ -105,6 +107,12 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
             ];
             for (open, close, check, label, flow, held) in flows {
                 let weak: Rc<RefCell<Option<gtk::glib::WeakRef<gtk::Window>>>> = Rc::default();
+                let during: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+                let (d, du) = (demand.clone(), during.clone());
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(open + 500),
+                    move || *du.borrow_mut() = d.reasons(),
+                );
                 let (h, w) = (hub.clone(), weak.clone());
                 gtk::glib::timeout_add_local_once(
                     std::time::Duration::from_millis(open),
@@ -135,6 +143,7 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
                         s.borrow_mut().push(Seen {
                             flow,
                             held,
+                            claims_while_open: during.borrow().clone(),
                             claims_after_close: d.reasons(),
                             window_alive_after_close: w
                                 .borrow()
@@ -156,6 +165,14 @@ fn closing_a_flow_releases_its_tracker_claim_and_frees_its_window() {
     let seen = seen.borrow();
     assert_eq!(seen.len(), 3, "every run was exercised: {seen:?}");
     for s in seen.iter() {
+        // Held while the flow is on screen: a helper that released at once, or
+        // on some other window's removal, would pass every other assertion here.
+        assert!(
+            s.claims_while_open.contains(&s.flow),
+            "the {} flow was not holding the tracker while open: {:?}",
+            s.flow,
+            s.claims_while_open
+        );
         assert!(
             !s.claims_after_close.contains(&s.flow),
             "closing the {} flow left its claim on the tracker (held={}): {:?}",

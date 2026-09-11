@@ -187,9 +187,11 @@ const ICON_SVG: &[u8] = include_bytes!("../../../assets/com.tobiilinux.Configura
 /// `~/.local/share/icons/hicolor/scalable/` after Plasma has started, so the
 /// tray showed a placeholder until the next login — restarting plasmashell fixed
 /// it. `IconThemePath` makes the host look in a folder named by the item, and
-/// this writes the icon into it at every start, so the icon no longer depends
-/// on the install location, and a build run straight from the tree gets the
-/// real icon too.
+/// this writes the icon into it at every start, so the icon should no longer
+/// depend on the install location, and a build run straight from the tree gets
+/// the real icon too. Plasma was seen reading `IconThemePath`; that it then
+/// draws the icon after a first install has not been confirmed — see
+/// Quality-and-Risks 11.3c.
 ///
 /// Under the runtime directory the tracking socket already uses: per user, mode
 /// 0700, on tmpfs, gone at logout.
@@ -597,7 +599,23 @@ mod tests {
         }
         let index = std::fs::read_to_string(theme.join("hicolor/index.theme")).expect("index");
         assert!(index.contains("Directories=scalable/apps"), "{index}");
+        // A second start must leave the files as they are: a rename makes a new
+        // inode, and a host may be reading the old one at that moment.
+        use std::os::unix::fs::MetadataExt;
+        let files = [
+            theme.join(format!("hicolor/scalable/apps/{ICON_NAME}.svg")),
+            theme.join(format!("{ICON_NAME}.svg")),
+            theme.join("hicolor/index.theme"),
+        ];
+        let inodes = || -> Vec<u64> {
+            files
+                .iter()
+                .map(|f| std::fs::metadata(f).expect("written").ino())
+                .collect()
+        };
+        let before = inodes();
         assert_eq!(write_icon_theme(&base).expect("second start"), theme);
+        assert_eq!(inodes(), before, "a second start replaced the files");
         let _ = std::fs::remove_dir_all(&base);
     }
 

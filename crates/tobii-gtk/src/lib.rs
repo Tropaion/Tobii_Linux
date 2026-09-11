@@ -206,16 +206,7 @@ pub fn run() -> glib::ExitCode {
     // only way to stop a primary instance — which receives every launch of the
     // app for as long as it lives — was a signal, and a signal skips every step
     // of the teardown the close handler does.
-    {
-        let quit = gtk::gio::SimpleAction::new("quit", None);
-        let app_weak = app.downgrade();
-        quit.connect_activate(move |_, _| {
-            if let Some(app) = app_weak.upgrade() {
-                quit_everything(&app);
-            }
-        });
-        app.add_action(&quit);
-    }
+    install_quit_action(&app);
     // The stylesheet and the tray icon, both once the app starts.
     //
     // The tray is kept in a thread-local rather than passed down, because the
@@ -529,6 +520,20 @@ thread_local! {
     /// through the hub's own close handler, the ONE place the tracker claim,
     /// the overlay and the tick are released.
     static QUIT_HUB: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Install the `quit` action on `app` — see `run`, which is its one caller in
+/// the program. Public so the test that quits a hub hidden to the tray installs
+/// the same action, rather than a copy of it.
+pub fn install_quit_action(app: &Application) {
+    let quit = gtk::gio::SimpleAction::new("quit", None);
+    let app_weak = app.downgrade();
+    quit.connect_activate(move |_, _| {
+        if let Some(app) = app_weak.upgrade() {
+            quit_everything(&app);
+        }
+    });
+    app.add_action(&quit);
 }
 
 /// End the program, through the hub's own teardown when there is a hub.
