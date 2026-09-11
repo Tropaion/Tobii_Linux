@@ -69,6 +69,12 @@ jobs:
   aur:
     name: Update tobii-linux-bin on the AUR
     if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    # AUR_SSH_KEY lives in this Environment, not in the repository's secrets: a
+    # repository secret is readable by a workflow on any branch, and this key
+    # pushes a PKGBUILD every AUR helper sources on its users' machines. The
+    # Environment's deployment rules (main and v* tags, see Development.md) are
+    # what keep a branch from dispatching this job and printing it.
+    environment: aur
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     defaults:
@@ -213,12 +219,28 @@ jobs:
           # The first push creates the package; cloning one that does not
           # exist yet gives an empty repository, which is fine.
           git clone ssh://aur@aur.archlinux.org/tobii-linux-bin.git aur-repo
+          # Never backwards. Dispatching an older tag, or publishing an older
+          # draft after a newer one, would roll every AUR user back; the
+          # concurrency group orders runs by when they started, not by version.
+          old=""
+          if [ -f aur-repo/.SRCINFO ]; then
+            old="$(awk '$1 == "pkgver" { v = $3 } $1 == "pkgrel" { r = $3 } END { if (v != "") print v "-" r }' aur-repo/.SRCINFO)"
+          fi
+          if [ -n "$old" ] && [ "$(vercmp "${pkgver}-${pkgrel}" "$old")" -lt 0 ]; then
+            echo "::error::the AUR has tobii-linux-bin $old, and ${pkgver}-${pkgrel} is older. Not pushed." >&2
+            exit 1
+          fi
           cp out/PKGBUILD out/.SRCINFO out/tobii-linux.install aur-repo/
           cd aur-repo
           git add PKGBUILD .SRCINFO tobii-linux.install
           if git diff --cached --quiet; then
             echo "::notice::the AUR already has tobii-linux-bin ${pkgver}-${pkgrel}; nothing to push"
             exit 0
+          fi
+          # Changed, under the same version: no AUR helper would upgrade anyone.
+          if [ -n "$old" ] && [ "$(vercmp "${pkgver}-${pkgrel}" "$old")" -eq 0 ]; then
+            echo "::error::the PKGBUILD changed but ${pkgver}-${pkgrel} did not. Re-run with a higher pkgrel." >&2
+            exit 1
           fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \

@@ -2,10 +2,11 @@
 # Write the PKGBUILD for tobii-linux-bin: the release tarball's prebuilt
 # binaries, repackaged for pacman, so an Arch user needs no Rust toolchain.
 #
-#   scripts/aur-bin.sh <version> <tarball> <outdir>
+#   scripts/aur-bin.sh <version> <tarball> <outdir> [pkgrel]
 #   scripts/aur-bin.sh 0.3.0 dist/tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz aur/tobii-linux-bin
 #
-# Writes <outdir>/PKGBUILD and <outdir>/tobii-linux.install and nothing else.
+# Writes <outdir>/PKGBUILD and <outdir>/tobii-linux.install, removes a stale
+# <outdir>/.SRCINFO, and touches nothing else.
 # `.SRCINFO` is left to the caller (`makepkg --printsrcinfo > .SRCINFO`),
 # because that needs makepkg, and the Debian release container has none.
 #
@@ -204,6 +205,6 @@ package() {
 }
 EOF
 
-echo "aur-bin.sh: wrote $outdir/PKGBUILD (tobii-linux-bin ${version//-/}-1)"
+echo "aur-bin.sh: wrote $outdir/PKGBUILD (tobii-linux-bin ${version//-/}-${pkgrel})"
 echo "  depends: ${deps[*]}"
 echo "  sha256:  $sha"
