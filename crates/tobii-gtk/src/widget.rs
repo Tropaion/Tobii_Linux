@@ -217,6 +217,39 @@ pub fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64)
 /// Draw the latest NIR camera frame into a cairo context of size `w`×`h`,
 /// contrast-stretched (the raw frames are very dark) and letterboxed to preserve
 /// the square aspect. Mirrored horizontally so it reads like a mirror.
+/// Where an `iw`x`ih` image lands inside a `w`x`h` widget: letterboxed, centred.
+///
+/// Shared with the placeholder deliberately. The placeholder used to fill the
+/// whole widget while a frame filled only this rectangle, so the black area
+/// changed size the instant the tracker connected — a jump exactly as large as
+/// the letterboxing, in the one part of the window a user watches to see
+/// whether the tracker is working.
+pub fn camera_rect(w: i32, h: i32, iw: i32, ih: i32) -> (f64, f64, f64, f64) {
+    if iw <= 0 || ih <= 0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let scale = (f64::from(w) / f64::from(iw)).min(f64::from(h) / f64::from(ih));
+    let (dw, dh) = (f64::from(iw) * scale, f64::from(ih) * scale);
+    ((f64::from(w) - dw) / 2.0, (f64::from(h) - dh) / 2.0, dw, dh)
+}
+
+/// Fill the rectangle a frame WOULD occupy, in the colour it is drawn on.
+///
+/// `iw`/`ih` are the last frame's dimensions, so the placeholder is the shape
+/// this device actually sends rather than a shape assumed here.
+pub fn draw_camera_placeholder(cr: &cairo::Context, w: i32, h: i32, iw: i32, ih: i32) {
+    let (ox, oy, dw, dh) = camera_rect(w, h, iw, ih);
+    if dw <= 0.0 || dh <= 0.0 {
+        return;
+    }
+    cr.save().ok();
+    rounded_rect(cr, ox, oy, dw, dh, CAMERA_CORNER_RADIUS);
+    cr.clip();
+    cr.set_source_rgb(0.05, 0.05, 0.06);
+    let _ = cr.paint();
+    cr.restore().ok();
+}
+
 pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_protocol::CameraFrame) {
     let (iw, ih) = (frame.width as i32, frame.height as i32);
     if iw <= 0 || ih <= 0 || frame.pixels.len() < (iw * ih) as usize {
@@ -251,9 +284,8 @@ pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_proto
         return;
     };
 
-    let scale = (w as f64 / iw as f64).min(h as f64 / ih as f64);
-    let (dw, dh) = (iw as f64 * scale, ih as f64 * scale);
-    let (ox, oy) = ((w as f64 - dw) / 2.0, (h as f64 - dh) / 2.0);
+    let (ox, oy, dw, dh) = camera_rect(w, h, iw, ih);
+    let scale = dw / f64::from(iw);
     cr.save().ok();
     // Round the image's own corners to match the cards it sits among. Clipping
     // to the LETTERBOXED rect rather than the widget keeps the radius on the
@@ -274,6 +306,39 @@ pub fn draw_camera_view(cr: &cairo::Context, w: i32, h: i32, frame: &tobii_proto
 
 #[cfg(test)]
 mod tests {
+
+    /// The placeholder and a live frame must occupy the SAME rectangle, or the
+    /// black area jumps the instant the tracker connects — in the one part of
+    /// the window a user watches to tell whether it is working.
+    #[test]
+    fn the_placeholder_matches_where_a_frame_would_land() {
+        // A square sensor in a wider-than-tall widget: the letterboxing is what
+        // used to differ, so this is the case that matters.
+        let (ox, oy, dw, dh) = camera_rect(340, 268, 280, 280);
+        assert_eq!((dw, dh), (268.0, 268.0), "scaled to fit the short side");
+        assert_eq!(oy, 0.0, "no room to centre vertically");
+        assert_eq!(ox, 36.0, "centred horizontally");
+
+        // Taller than wide, and the non-square case a different sensor gives.
+        let (_, oy, dw, dh) = camera_rect(200, 400, 320, 240);
+        assert_eq!((dw, dh), (200.0, 150.0));
+        assert_eq!(oy, 125.0);
+
+        // Degenerate input must not produce a rectangle at all, rather than a
+        // NaN one that cairo would happily try to clip to.
+        assert_eq!(camera_rect(100, 100, 0, 0), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(camera_rect(100, 100, -1, 5), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    /// The whole point: a square frame in a non-square widget does NOT fill it.
+    /// If this ever became an equality, a placeholder that filled the widget
+    /// would look identical and the bug could come back unnoticed.
+    #[test]
+    fn a_square_frame_does_not_fill_a_wide_widget() {
+        let (ox, _, dw, _) = camera_rect(340, 268, 280, 280);
+        assert!(dw < 340.0, "premise: there IS letterboxing to match");
+        assert!(ox > 0.0);
+    }
     use super::*;
 
     /// A disconnected device must never leave the last pose on screen looking

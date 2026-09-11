@@ -771,12 +771,19 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     cam_area.set_vexpand(true);
     {
         let cam_frame = cam_frame.clone();
+        // The shape of the last frame this device sent, so the placeholder is
+        // the same rectangle a frame occupies. Seeded with the ET5's 280x280
+        // eye camera for the moment before the first one arrives, and corrected
+        // by the first frame — a device that sends something else is then
+        // matched rather than assumed about.
+        let last_shape = std::rc::Rc::new(Cell::new((280i32, 280i32)));
         cam_area.set_draw_func(move |_, cr, w, h| {
             if let Some(f) = cam_frame.borrow().as_ref() {
+                last_shape.set((f.width as i32, f.height as i32));
                 widget::draw_camera_view(cr, w, h, f);
             } else {
-                cr.set_source_rgb(0.05, 0.05, 0.06);
-                let _ = cr.paint();
+                let (iw, ih) = last_shape.get();
+                widget::draw_camera_placeholder(cr, w, h, iw, ih);
             }
         });
     }
