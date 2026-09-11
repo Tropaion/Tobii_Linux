@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::CmdResult;
 
 /// Where the artifacts are installed inside the prefix.
-const INSTALL_SUBDIR: &str = "drive_c/tobii-bridge";
+pub(crate) const INSTALL_SUBDIR: &str = "drive_c/tobii-bridge";
 
 /// The Windows spelling of the same directory.
 const INSTALL_WIN_DIR: &str = r"C:\tobii-bridge";

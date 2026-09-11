@@ -53,9 +53,7 @@ use std::time::{Duration, Instant};
 use tobii_config::{autostart, paths};
 use tobii_update::install::{is_build_tree, Ownership, BINARIES};
 
-use crate::bridge;
-
-type CmdResult = Result<(), Box<dyn std::error::Error>>;
+use crate::{bridge, CmdResult};
 
 pub const USAGE: &str =
     "usage: tobii uninstall [--dry-run] [--yes] [--purge] [--udev] [--system] [--bindir DIR]
@@ -67,12 +65,6 @@ pub const USAGE: &str =
   --udev       also remove the udev rule from /etc/udev/rules.d (uses sudo)
   --system     remove a `sudo ./install.sh --system` install (run with sudo)
   --bindir DIR also look in DIR for an install (absolute path; repeatable)";
-
-/// The directory `tobii bridge install` creates inside a Wine prefix.
-///
-/// A copy of `bridge.rs`'s private `INSTALL_SUBDIR`, because this change was
-/// kept out of the bridge's code. Keep the two equal.
-const BRIDGE_SUBDIR: &str = "drive_c/tobii-bridge";
 
 /// The rules `install-payload.sh` writes (60-) and used to write (99-).
 const UDEV_RULES: [&str; 2] = [
@@ -311,7 +303,8 @@ pub enum Verdict {
     /// program, but not writable by them. `chmod u+w` is the way, not sudo:
     /// root will not run what is in a directory that is not root's.
     NotWritable,
-    /// Present, but nothing there could be identified as this program.
+    /// Something may be there — present, or in a directory that cannot be
+    /// looked at — but nothing there could be identified as this program.
     Unidentified,
     /// A build tree or an unpacked archive: somewhere a copy runs from, not an
     /// install.
@@ -463,6 +456,22 @@ impl Plan {
             why: why.into(),
         });
     }
+
+    /// Carry out an [`entry_decision`] about the desktop entry `entry`, shown
+    /// as `label`. `true` when it stays.
+    fn settle_entry(&mut self, entry: PathBuf, label: &str, d: Decision) -> bool {
+        match d {
+            Decision::Absent => false,
+            Decision::Remove(why) => {
+                self.push_remove(entry, format!("{label} — {why}"), false);
+                false
+            }
+            Decision::Keep(why) => {
+                self.keep(entry, why);
+                true
+            }
+        }
+    }
 }
 
 /// Whether a path leads anywhere.
@@ -473,6 +482,13 @@ enum Presence {
     Gone,
     /// It cannot be told (no permission, a symlink loop): the error.
     Unknown(String),
+}
+
+/// Whether a failed lookup says the path is not there: it, or a directory on
+/// the way, does not exist. Any other error says nothing about what is there.
+fn is_gone(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
 
 /// Filesystem access under a root.
@@ -618,12 +634,9 @@ impl<'a> Fs<'a> {
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
     fn presence(&self, p: &Path) -> Presence {
-        use std::io::ErrorKind;
         match self.at(p).canonicalize() {
             Ok(_) => Presence::There,
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-                Presence::Gone
-            }
+            Err(e) if is_gone(&e) => Presence::Gone,
             Err(e) => Presence::Unknown(e.to_string()),
         }
     }
@@ -800,13 +813,6 @@ impl<'a> Fs<'a> {
         if let Some(r) = others(&m, &real, "a file others can change") {
             return Err(r);
         }
-        // Each directory a name on the way is in, and the file's own.
-        let mut dirs: Vec<&Path> = Vec::new();
-        for d in chain.iter().filter_map(|n| n.parent()).chain(real.parent()) {
-            if !dirs.contains(&d) {
-                dirs.push(d);
-            }
-        }
         let dir = "in a directory others can write";
         let look = |d: &Path| {
             std::fs::metadata(d).map_err(|e| {
@@ -826,29 +832,30 @@ impl<'a> Fs<'a> {
                 ),
             )
         };
-        for d in &dirs {
+        // Each directory a name on the way is in and the file's own, then
+        // every directory above them, whose owner may also be OVERFLOW_UID.
+        let near: Vec<&Path> = chain
+            .iter()
+            .filter_map(|n| n.parent())
+            .chain(real.parent())
+            .collect();
+        let above = near.iter().flat_map(|d| d.ancestors().skip(1));
+        let mut seen: Vec<&Path> = Vec::new();
+        for (d, is_near) in near
+            .iter()
+            .map(|d| (*d, true))
+            .chain(above.map(|a| (a, false)))
+        {
+            if seen.contains(&d) {
+                continue;
+            }
+            seen.push(d);
             let m = look(d)?;
             let uid = (self.owner)(d, &m);
-            if !ours(uid) {
+            if !ours(uid) && (is_near || uid != OVERFLOW_UID) {
                 return Err(belongs(d, uid));
             }
             if let Some(r) = others(&m, d, dir) {
-                return Err(r);
-            }
-        }
-        // And every directory above them.
-        let mut above: Vec<&Path> = Vec::new();
-        for a in dirs.iter().flat_map(|d| d.ancestors().skip(1)) {
-            if dirs.contains(&a) || above.contains(&a) {
-                continue;
-            }
-            above.push(a);
-            let m = look(a)?;
-            let uid = (self.owner)(a, &m);
-            if !ours(uid) && uid != OVERFLOW_UID {
-                return Err(belongs(a, uid));
-            }
-            if let Some(r) = others(&m, a, dir) {
                 return Err(r);
             }
         }
@@ -1056,7 +1063,7 @@ fn cargo_listed(
         return Vec::new();
     };
     let read = |name: &str| fs.read_regular(&root.join(name), RECORD_LIMIT);
-    let entries = read(".crates.toml")
+    let entries: Vec<_> = read(".crates.toml")
         .map(|t| crates_toml(&t))
         .unwrap_or_default()
         .into_iter()
@@ -1064,23 +1071,21 @@ fn cargo_listed(
             read(".crates2.json")
                 .map(|t| crates2_json(&t))
                 .unwrap_or_default(),
-        );
-    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
-    for (key, bins) in entries {
-        let ours = CARGO_PACKAGES
-            .iter()
-            .find(|p| key.strip_prefix(**p).is_some_and(|r| r.starts_with(' ')));
-        let Some(package) = ours else {
-            continue;
-        };
-        for b in present {
-            if bins.iter().any(|x| x == b) && !out.iter().any(|(x, _)| x == b) {
-                out.push((b, package));
-            }
-        }
-    }
-    out.sort_by_key(|(b, _)| present.iter().position(|x| x == b));
-    out
+        )
+        .collect();
+    // Each binary here with the package of the first of this program's
+    // entries that lists it.
+    present
+        .iter()
+        .filter_map(|b| {
+            entries.iter().find_map(|(key, bins)| {
+                let package = CARGO_PACKAGES
+                    .iter()
+                    .find(|p| key.strip_prefix(**p).is_some_and(|r| r.starts_with(' ')))?;
+                bins.iter().any(|x| x == b).then_some((*b, *package))
+            })
+        })
+        .collect()
 }
 
 /// A value in Cargo's record: just enough JSON — and TOML's quoted keys and
@@ -1297,18 +1302,16 @@ fn cargo_package_list(listed: &[(&str, &str)]) -> String {
     packages.join(" ")
 }
 
-/// `cargo uninstall` for `packages` installed in `dir`: with `--root` unless
-/// `dir` is `$CARGO_HOME/bin`, where it looks when given none.
-/// Always with `--root`. Cargo resolves its root from `--root`, then
-/// `CARGO_INSTALL_ROOT`, then `install.root` in its config, and only then
-/// `$CARGO_HOME` — so a command that leaves `--root` out for a copy in
-/// `$CARGO_HOME/bin` removes a different copy whenever either of the first two
-/// is set. With it, the command is right in every case.
+/// `cargo uninstall` for `packages` installed in `dir`, always with `--root`.
+/// Cargo resolves its root from `--root`, then `CARGO_INSTALL_ROOT`, then
+/// `install.root` in its config, and only then `$CARGO_HOME` — so a command
+/// that leaves `--root` out for a copy in `$CARGO_HOME/bin` removes a
+/// different copy whenever either of the first two is set. With it, the
+/// command is right in every case.
 fn cargo_uninstall(dir: &Path, packages: &str) -> String {
-    match dir.parent() {
-        Some(root) => format!("cargo uninstall --root {} {packages}", q(root)),
-        None => format!("cargo uninstall {packages}"),
-    }
+    // Only a `bin` with a parent can be Cargo's (cargo_listed), so `dir` has one.
+    let root = dir.parent().unwrap_or(dir);
+    format!("cargo uninstall --root {} {packages}", q(root))
 }
 
 fn cargo_hint(dir: &Path, listed: &[(&str, &str)]) -> String {
@@ -1591,7 +1594,7 @@ fn wine_prefixes(fs: &Fs, home: &Path, wineprefix: Option<&Path>) -> Vec<PathBuf
         };
         for e in entries.flatten() {
             let pfx = e.path().join("pfx");
-            if pfx.join(BRIDGE_SUBDIR).is_dir() {
+            if pfx.join(bridge::INSTALL_SUBDIR).is_dir() {
                 out.push(fs.logical(&pfx));
             }
         }
@@ -1602,7 +1605,7 @@ fn wine_prefixes(fs: &Fs, home: &Path, wineprefix: Option<&Path>) -> Vec<PathBuf
         .into_iter()
         .chain([home.join(".wine")]);
     for w in defaults {
-        if fs.is_real_dir(&w.join(BRIDGE_SUBDIR)) {
+        if fs.is_real_dir(&w.join(bridge::INSTALL_SUBDIR)) {
             out.push(fs.canon_or(&w));
         }
     }
@@ -1690,8 +1693,9 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
         }
     };
     let holds_ours = |d: &Path| BINARIES.iter().any(|b| fs.is_file_or_link(&d.join(b)));
-    for d in fs.manifest_bindirs(&manifest) {
-        add(&d, Via::Manifest);
+    let manifest_dirs = fs.manifest_bindirs(&manifest);
+    for d in &manifest_dirs {
+        add(d, Via::Manifest);
     }
     let system_listed: Vec<PathBuf> = if opts.system {
         Vec::new()
@@ -1779,11 +1783,43 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             .filter(|b| fs.is_file_or_link(&c.dir.join(b)))
             .collect();
         if present.is_empty() {
-            cleared.push(c.dir.clone());
+            // Neither name answered lstat. That means "gone" only when the
+            // error says so. A directory on the way that cannot be searched
+            // (no permission, a loop) says nothing about what is there, and
+            // dropping its manifest line on that guess would lose the only
+            // record of a --lean install.
+            let unknown =
+                BINARIES
+                    .iter()
+                    .find_map(|b| match fs.at(&c.dir.join(b)).symlink_metadata() {
+                        Err(e) if !is_gone(&e) => Some(e),
+                        _ => None,
+                    });
+            if let Some(e) = unknown {
+                p.keep(
+                    c.dir.clone(),
+                    format!(
+                        "it cannot be looked at ({e}), so whether this program is there cannot \
+                         be told — left as it is"
+                    ),
+                );
+                loc.verdict = Verdict::Unidentified;
+            } else {
+                cleared.push(c.dir.clone());
+            }
             p.locations.push(loc);
             continue;
         }
-        if !opts.system && system_listed.contains(&c.dir) {
+        // A system install is root's to remove — but only where root will:
+        // a listed directory root_may_run refuses (a user's own ~/bin, say)
+        // is refused by `sudo tobii uninstall --system` too, which sends its
+        // user here. So it is looked at like anywhere else.
+        let root_would = || {
+            present
+                .iter()
+                .all(|b| fs.root_may_run(&c.dir.join(b)).is_ok())
+        };
+        if !opts.system && system_listed.contains(&c.dir) && root_would() {
             loc.verdict = Verdict::SystemInstall;
             system_dirs.push(c.dir.clone());
             p.locations.push(loc);
@@ -1863,6 +1899,18 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
                 match listed_check(&fs, &path, env.euid) {
                     Ok(()) if is_me => (me_answer(), None),
                     Ok(()) => (Ident::Listed, None),
+                    // Root's refusal, said as for a directory found by
+                    // inference. That user's own run can remove it: it does
+                    // not call a directory root refuses a system install.
+                    Err((Ident::NotRun, why)) => {
+                        let why = format!(
+                            "{why}. If it is an install of this program, remove it as that \
+                             user: tobii uninstall --bindir {}",
+                            q(&c.dir)
+                        );
+                        not_run.get_or_insert_with(|| why.clone());
+                        (Ident::NotRun, Some(why))
+                    }
                     Err((ident, why)) => (ident, Some(why)),
                 }
             } else {
@@ -1968,24 +2016,19 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
     // without resolving the planned name's last component: a symlink to the
     // running program is only a link, removing it leaves the program where it
     // is, and so it goes with the others.
-    let mut binaries = Vec::new();
+    let mut binaries: Vec<Removal> = Vec::new();
     for b in &removing {
         if me.as_ref() == Some(b) {
             p.self_exe = Some(b.clone());
         } else {
-            binaries.push(b.clone());
+            binaries.push(Removal {
+                path: b.clone(),
+                what: "binary".into(),
+                tree: false,
+            });
         }
     }
-    let mut remove_first: Vec<Removal> = binaries
-        .into_iter()
-        .map(|path| Removal {
-            path,
-            what: "binary".into(),
-            tree: false,
-        })
-        .collect();
-    remove_first.append(&mut p.remove);
-    p.remove = remove_first;
+    p.remove.splice(0..0, binaries);
     for d in &system_dirs {
         p.hints
             .push(system_hint(d, &exe_display, p.self_exe.is_some()));
@@ -1999,17 +2042,8 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
 
     // ------------------------------------------------------------ data files
     let entry = paths::desktop_entry_in(&data);
-    let entry_kept = match entry_decision(&fs, &entry, &is_removed, &env.path, "the menu entry") {
-        Decision::Absent => false,
-        Decision::Remove(why) => {
-            p.push_remove(entry, format!("the menu entry — {why}"), false);
-            false
-        }
-        Decision::Keep(why) => {
-            p.keep(entry, why);
-            true
-        }
-    };
+    let d = entry_decision(&fs, &entry, &is_removed, &env.path, "the menu entry");
+    let entry_kept = p.settle_entry(entry, "the menu entry", d);
     let icon = paths::icon_in(&data);
     if fs.exists(&icon) {
         if entry_kept {
@@ -2026,23 +2060,14 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
         }
     }
     if !opts.system {
-        match entry_decision(
+        let d = entry_decision(
             &fs,
             &autostart_entry,
             &is_removed,
             &env.path,
             "start-at-login",
-        ) {
-            Decision::Absent => {}
-            Decision::Remove(why) => {
-                p.push_remove(
-                    autostart_entry.clone(),
-                    format!("the start-at-login entry — {why}"),
-                    false,
-                );
-            }
-            Decision::Keep(why) => p.keep(autostart_entry.clone(), why),
-        }
+        );
+        p.settle_entry(autostart_entry, "the start-at-login entry", d);
         let adir = autostart::dir_in(&config_home);
         for name in fs.list(&adir).unwrap_or_default() {
             if autostart::is_scratch_name(&name) {
@@ -2056,8 +2081,7 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
     }
 
     // --------------------------------------------------------------- manifest
-    let listed = fs.manifest_bindirs(&manifest);
-    let drop: Vec<PathBuf> = listed
+    let drop: Vec<PathBuf> = manifest_dirs
         .iter()
         .filter(|d| cleared.contains(&fs.canon_or(d)))
         .cloned()
@@ -2212,6 +2236,14 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
 /// without being run: the file it resolves to is a program, and that file
 /// and the name (`lstat`) are this user's or root's. `Err` is how it is
 /// shown, and why it stays.
+///
+/// As root, [`Fs::root_may_run`] is asked first, as for anything found by
+/// inference, and nothing is opened unless it passes. Being listed says an
+/// install was made there, not who can change it since: `sudo ./install.sh
+/// --system ~/bin` writes a line for a directory its user owns, and that
+/// user can swap it for a link to `/usr/bin` while root waits at the
+/// question — root's unlink of `~/bin/tobii` would then remove a package's
+/// copy. A directory only root can change cannot be swapped.
 fn listed_check(fs: &Fs, path: &Path, euid: u32) -> Result<(), (Ident, String)> {
     let listed_but = |why: String| {
         format!(
@@ -2219,10 +2251,20 @@ fn listed_check(fs: &Fs, path: &Path, euid: u32) -> Result<(), (Ident, String)> 
              where to look, and this is not a program that was installed there"
         )
     };
-    let real = fs.at(path).canonicalize().map_err(|e| {
-        let why = format!("it cannot be resolved ({e})");
-        (Ident::ListedNotProgram, listed_but(why))
-    })?;
+    let real = if euid == 0 {
+        fs.root_may_run(path).map_err(|why| {
+            let why = format!(
+                "its directory is listed in the install manifest, but nothing there is opened \
+                 or removed as root: {why}, so whoever that is chooses what is there"
+            );
+            (Ident::NotRun, why)
+        })?
+    } else {
+        fs.at(path).canonicalize().map_err(|e| {
+            let why = format!("it cannot be resolved ({e})");
+            (Ident::ListedNotProgram, listed_but(why))
+        })?
+    };
     fs.program_check(&real)
         .map_err(|why| (Ident::ListedNotProgram, listed_but(why)))?;
     let named = fs.at(&fs.unlinked_name(path));
@@ -2347,10 +2389,13 @@ fn apply_manifest(fs: &Fs, m: &ManifestEdit, self_going: Option<&Path>, out: &mu
     let Some(text) = fs.read(&m.file) else {
         return;
     };
+    // lstat, so a dangling link still counts as there; and a name that cannot
+    // be looked at counts as there too, since it may be.
+    let there = |f: &Path| !matches!(fs.at(f).symlink_metadata(), Err(e) if is_gone(&e));
     let remains = |d: &Path| {
         BINARIES.iter().any(|b| {
             let f = d.join(b);
-            fs.exists(&f) && self_going != Some(fs.unlinked_name(&f).as_path())
+            there(&f) && self_going != Some(fs.unlinked_name(&f).as_path())
         })
     };
     let emptied = |d: &Path| m.drop.iter().any(|x| x == d) && !remains(d);
@@ -2797,10 +2842,15 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
         "SIGTERM only if you agree"
     };
     if !plan.stop.is_empty() {
-        let _ = writeln!(
-            o,
-            "Running copies — stopped first (asked to quit, then {sigterm})"
-        );
+        // Only a hub can be asked, and only when no hub from a copy that
+        // stays could take the question instead (see stop_running). A running
+        // `tobii` is given five seconds to be quit by hand, then the question.
+        let asked = if plan.stop.iter().any(is_hub) && plan.other_hubs.is_empty() {
+            "the hub is asked to quit, then "
+        } else {
+            ""
+        };
+        let _ = writeln!(o, "Running copies — stopped first ({asked}{sigterm})");
         for p in &plan.stop {
             let _ = writeln!(o, "  {}", describe_proc(p));
         }
@@ -2887,7 +2937,7 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
 
     if opts.udev {
         let _ = writeln!(o, "The udev rule (--udev)");
-        for c in udev_commands(plan, plan.euid) {
+        for c in udev_commands(plan) {
             let _ = writeln!(o, "  {}", c.join(" "));
         }
         for n in &plan.udev_notes {
@@ -2964,11 +3014,11 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
 
 /// The udev commands, the same ones `install-payload.sh` runs. Without `sudo`
 /// when this is already root.
-fn udev_commands(plan: &Plan, euid: u32) -> Vec<Vec<String>> {
+fn udev_commands(plan: &Plan) -> Vec<Vec<String>> {
     if plan.udev.is_empty() {
         return Vec::new();
     }
-    let sudo: Vec<String> = if euid == 0 {
+    let sudo: Vec<String> = if plan.euid == 0 {
         Vec::new()
     } else {
         vec!["sudo".into()]
@@ -3035,6 +3085,19 @@ fn ask_hub_to_quit() -> Result<(), String> {
         let err = String::from_utf8_lossy(&out.stderr);
         Err(sanitize(err.lines().next().unwrap_or("it failed")))
     }
+}
+
+/// What is said when [`ask_hub_to_quit`] fails: the likely cause, and only
+/// the one that fits. `--system` runs only as root (`plan` refuses it
+/// otherwise), and root has no session bus that reaches a user's hub; in a
+/// user's own run, the hub may be one from before the quit action.
+fn quit_refused_note(e: &str, system: bool) -> String {
+    let why = if system {
+        "as root there is no session bus that reaches a user's hub"
+    } else {
+        "a hub from v0.3.0 or before has no quit action to ask"
+    };
+    format!("  the hub could not be asked to quit ({e}) — {why}")
 }
 
 /// Send `signal` to each process that is provably still the one listed, and
@@ -3110,10 +3173,7 @@ fn stop_running(plan: &Plan, opts: &Options, interactive: bool) -> Result<(), St
             Ok(()) => println!(
                 "  asked the hub to quit (over D-Bus, which reaches whichever hub owns the name)"
             ),
-            Err(e) => println!(
-                "  the hub could not be asked to quit ({e}) — hubs before v0.4 have no way \
-                 to be asked"
-            ),
+            Err(e) => println!("{}", quit_refused_note(&e, opts.system)),
         }
     }
     let left = wait_gone(&all, Duration::from_secs(5));
@@ -3171,8 +3231,8 @@ fn stop_running(plan: &Plan, opts: &Options, interactive: bool) -> Result<(), St
     Ok(())
 }
 
-fn run_udev(plan: &Plan, euid: u32, interactive: bool, yes: bool) {
-    let cmds = udev_commands(plan, euid);
+fn run_udev(plan: &Plan, interactive: bool, yes: bool) {
+    let cmds = udev_commands(plan);
     if cmds.is_empty() {
         for n in &plan.udev_notes {
             println!("  {n}");
@@ -3186,7 +3246,7 @@ fn run_udev(plan: &Plan, euid: u32, interactive: bool, yes: bool) {
         }
         return;
     }
-    let question = if euid == 0 {
+    let question = if plan.euid == 0 {
         "Remove the udev rule now?"
     } else {
         "Remove the udev rule now? This uses sudo."
@@ -3377,7 +3437,7 @@ pub fn run(args: &[String]) -> CmdResult {
         println!("Nothing to remove.");
         stop_running(&plan, &opts, interactive)?;
         if opts.udev {
-            run_udev(&plan, euid, interactive, opts.yes);
+            run_udev(&plan, interactive, opts.yes);
         }
         return Ok(());
     }
@@ -3406,7 +3466,7 @@ pub fn run(args: &[String]) -> CmdResult {
     stop_running(&plan, &opts, interactive)?;
     let out = execute(&plan);
     if opts.udev {
-        run_udev(&plan, euid, interactive, opts.yes);
+        run_udev(&plan, interactive, opts.yes);
     }
     print!("{}", summary(&plan, &out));
     if out.failed.is_empty() {

@@ -1,6 +1,6 @@
 //! `plan()` and `execute()` against temporary trees only. Nothing here runs a
 //! binary, asks a package manager or signals anything: ownership,
-//! identification and the process list are all injected. One test reads this
+//! identification and the process list are all injected. Two tests read this
 //! test process's own `/proc` entry, to check how a process is told apart from
 //! a later one with the same pid.
 
@@ -82,6 +82,44 @@ impl Tree {
     fn has(&self, p: &str) -> bool {
         self.real(p).symlink_metadata().is_ok()
     }
+    /// The tree as [`plan_with_fs`] sees it, with `owner` saying who owns what.
+    fn fs(&self, owner: Owner) -> Fs<'_> {
+        Fs {
+            root: &self.root,
+            owner,
+        }
+    }
+    /// What makes `dir` an unpacked release archive to [`not_an_install`]:
+    /// `install.sh` and `assets/install-payload.sh` beside the binaries.
+    fn archive(&self, dir: &str) {
+        self.put(&format!("{dir}/install.sh"), "#!/bin/sh\n");
+        self.put(&format!("{dir}/assets/install-payload.sh"), "#!/bin/sh\n");
+    }
+}
+
+/// Who owns a file, given its real path and metadata: what [`Fs`] asks.
+type Owner = fn(&Path, &std::fs::Metadata) -> u32;
+
+/// A tree [`Fs::root_may_run`] can pass, for a test of what root does: under
+/// target/, not /tmp, whose 1777 it refuses, and with an owner hook that says
+/// root owns it, no root is needed. `None`, after saying so, when a directory
+/// above target/ can be written by its group or others, which it refuses too.
+fn root_tree(tag: &str) -> Option<Tree> {
+    use std::os::unix::fs::MetadataExt;
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/uninstall-test");
+    mkdirs(&base);
+    let base = base.canonicalize().unwrap();
+    let open = base
+        .ancestors()
+        .find(|a| std::fs::metadata(a).is_ok_and(|m| m.mode() & 0o022 != 0));
+    if let Some(open) = open {
+        eprintln!(
+            "skipped: {} can be written by its group or others, which root_may_run refuses",
+            open.display()
+        );
+        return None;
+    }
+    Some(Tree::under(&base, tag))
 }
 
 impl Drop for Tree {
@@ -108,6 +146,15 @@ fn user() -> Env {
         pid: 4242,
         ppid: 4241,
         ..Env::default()
+    }
+}
+
+/// Root, in root's own home.
+fn root() -> Env {
+    Env {
+        euid: 0,
+        home: Some("/root".into()),
+        ..user()
     }
 }
 
@@ -168,25 +215,21 @@ fn plan_procs(
     owner: &dyn Fn(&Path) -> Ownership,
     procs: &[Proc],
 ) -> Plan {
-    plan_full(t, env, opts, owner, &|_| true, &by_content, procs)
+    let probes = Probes {
+        owner,
+        ..home_probes(&by_content)
+    };
+    plan(env, opts, &t.root, &probes, procs)
 }
 
-fn plan_full(
+/// A plan made with [`home_probes`] and no processes.
+fn plan_home(
     t: &Tree,
     env: &Env,
     opts: &Options,
-    owner: &dyn Fn(&Path) -> Ownership,
-    writable: &dyn Fn(&Path) -> bool,
     identify: &dyn Fn(&Path) -> Option<String>,
-    procs: &[Proc],
 ) -> Plan {
-    let probes = Probes {
-        owner,
-        identify,
-        writable,
-        private_group: &|_| false,
-    };
-    plan(env, opts, &t.root, &probes, procs)
+    plan(env, opts, &t.root, &home_probes(identify), &[])
 }
 
 /// Probes that answer as a plain home install would: no package, writable,
@@ -215,13 +258,18 @@ impl Runs {
         }
     }
     /// Whether anything whose real path ends with `p` was run.
-    fn ran(&self, t: &Tree, p: &str) -> bool {
-        let want = t.real(p);
-        self.0
-            .borrow()
-            .iter()
-            .any(|r| r == &want || r.ends_with(p.trim_start_matches('/')))
+    fn ran(&self, p: &str) -> bool {
+        let p = p.trim_start_matches('/');
+        self.0.borrow().iter().any(|r| r.ends_with(p))
     }
+}
+
+/// Plans for `t` as the user, with default options and [`home_probes`]:
+/// the plan, and every file it ran.
+fn plan_recording(t: &Tree) -> (Plan, Runs) {
+    let runs = Runs::new();
+    let p = plan_home(t, &user(), &Options::default(), &runs.identify());
+    (p, runs)
 }
 
 /// Every path the plan would delete, the running binary included.
@@ -271,6 +319,34 @@ fn proc(pid: u32, uid: u32, exe: &str, args: &[&str]) -> Proc {
         args: args.iter().map(|s| s.to_string()).collect(),
         start_time: None,
     }
+}
+
+/// This test process, as the process scan would list it.
+fn this_process() -> Proc {
+    let pid = std::process::id();
+    Proc {
+        pid,
+        uid: 0,
+        exe: std::fs::read_link("/proc/self/exe")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        args: Vec::new(),
+        start_time: start_time(pid),
+    }
+}
+
+/// A FIFO at `p`, made in-process: nothing here runs a program.
+fn mkfifo(p: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo only creates a node there.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+        0,
+        "{}",
+        p.display()
+    );
 }
 
 /// Every path `program_check` opened on this thread since the last call.
@@ -568,16 +644,11 @@ fn a_symlinked_binary_loses_only_the_link_and_what_it_points_at_stays() {
     v030_install(&t);
     t.symlink(&format!("{BIN}/tobii-gtk"), "/opt/links/tobii-gtk");
     t.put(AUTOSTART, &autostart::entry_text("/opt/links/tobii-gtk"));
-    let writable = |d: &Path| !d.ends_with("opt/links");
-    let p = plan_full(
-        &t,
-        &user(),
-        &Options::default(),
-        &unowned,
-        &writable,
-        &by_content,
-        &[],
-    );
+    let probes = Probes {
+        writable: &|d: &Path| !d.ends_with("opt/links"),
+        ..home_probes(&by_content)
+    };
+    let p = plan(&user(), &Options::default(), &t.root, &probes, &[]);
     assert!(!removals(&p).contains(&"/opt/links/tobii-gtk".to_string()));
     assert!(why_removed(&p, AUTOSTART).contains("being removed"));
 }
@@ -634,26 +705,38 @@ fn purge_removes_known_names_only_and_reports_the_rest() {
     let cfg = "/home/u/.config/tobii-linux";
     let state = "/home/u/.local/state/tobii-linux";
     populate_config_and_state(&t, cfg, state);
+    // Every name the program writes, and the `<name>.tmp` a crashed
+    // write_atomic leaves behind: taken from the lists, so a file added to
+    // them is covered here without editing this test.
+    for n in paths::CONFIG_FILES {
+        t.put(&format!("{cfg}/{n}"), "x");
+        t.put(&format!("{cfg}/{n}{}", paths::ATOMIC_TMP_SUFFIX), "x");
+    }
+    for n in tobii_headpose::model_store::file_names() {
+        t.put(&format!("{cfg}/models/{n}"), "m");
+    }
+    t.mkdir("/run/user/1000/tobii-linux");
+    let env = Env {
+        log_file: Some("/home/u/logs/mine.log".into()),
+        xdg_runtime_dir: Some("/run/user/1000".into()),
+        ..user()
+    };
     let opts = Options {
         purge: true,
         ..Options::default()
     };
 
-    let p = plan_in(&t, &user(), &opts, &unowned);
+    let p = plan_in(&t, &env, &opts, &unowned);
     let r = removals(&p);
-    for want in [
-        "calibration.bin",
-        "calibration.meta.toml",
-        "games.toml",
-        "config.toml",
-        "report_salt",
-        "accuracy.csv",
-        "models/head-pose-0.5-small.onnx",
-        "models/head-localizer.onnx.partial",
-    ] {
+    for n in paths::CONFIG_FILES {
+        for f in [n.to_string(), format!("{n}{}", paths::ATOMIC_TMP_SUFFIX)] {
+            assert!(r.contains(&format!("{cfg}/{f}")), "{f} missing: {r:#?}");
+        }
+    }
+    for n in tobii_headpose::model_store::file_names() {
         assert!(
-            r.contains(&format!("{cfg}/{want}")),
-            "{want} missing: {r:#?}"
+            r.contains(&format!("{cfg}/models/{n}")),
+            "models/{n} missing: {r:#?}"
         );
     }
     assert!(r.contains(&format!("{state}/tobii.log")));
@@ -686,12 +769,21 @@ fn purge_removes_known_names_only_and_reports_the_rest() {
     );
     // Told what it costs before it happens.
     assert!(p.warnings.iter().any(|w| w.contains("calibration.bin")));
+    // TOBII_LOG_FILE is a path the user chose: reported, never removed.
+    assert!(!r.contains(&"/home/u/logs/mine.log".to_string()));
+    assert!(why_kept(&p, "/home/u/logs/mine.log").contains("TOBII_LOG_FILE"));
+    // The hub's socket directory is on a tmpfs; it is reported and left alone.
+    assert!(kept(&p).contains(&"/run/user/1000/tobii-linux".to_string()));
 }
 
 #[test]
 fn a_package_managed_copy_is_left_to_its_package_manager() {
     let t = Tree::new("package");
     v030_install(&t);
+    // An updater temporary beside a package's copy is the package's
+    // directory's, and stays with it.
+    t.put(&format!("{BIN}/.tobii-update-123/archive.tar.gz"), "a");
+    t.put(&format!("{BIN}/.tobii.new-55"), "s");
     for (manager, command) in [
         ("pacman", "pacman -R tobii-linux"),
         ("dpkg", "apt remove tobii-linux"),
@@ -847,6 +939,13 @@ fn updater_scratch_goes_and_an_updated_binary_is_still_removed() {
         work.tree,
         "the updater's work dir is removed with its contents"
     );
+    // The binaries come first, then what was queued before them.
+    let at = |s: &str| p.remove.iter().position(|x| x.path == Path::new(s));
+    assert!(
+        at(&format!("{BIN}/tobii-gtk")) < at(&format!("{BIN}/.tobii-update-123")),
+        "{:#?}",
+        p.remove
+    );
     for s in [
         ".tobii-update-notes",
         ".tobii.new-",
@@ -887,15 +986,8 @@ fn a_manifest_listed_name_that_is_not_a_program_is_kept() {
     t.put(&format!("{BIN}/tobii"), "tobii 0.4.0\n"); // mode 644, text
     t.bin(&format!("{BIN}/tobii-gtk"), "tobii-gtk 0.4.0");
     let never = |p: &Path| -> Option<String> { panic!("{p:?} is listed and must not be run") };
-    let p = plan_full(
-        &t,
-        &user(),
-        &Options::default(),
-        &unowned,
-        &|_| true,
-        &never,
-        &[],
-    );
+    let probes = home_probes(&never);
+    let p = plan(&user(), &Options::default(), &t.root, &probes, &[]);
     let r = removals(&p);
     assert!(r.contains(&format!("{BIN}/tobii-gtk")), "{r:#?}");
     assert!(!r.contains(&format!("{BIN}/tobii")), "{r:#?}");
@@ -906,15 +998,7 @@ fn a_manifest_listed_name_that_is_not_a_program_is_kept() {
     // Executable, but a script rather than a program: kept too.
     t.put(&format!("{BIN}/tobii"), "#!/bin/sh\necho tobii 0.4.0\n");
     t.chmod(&format!("{BIN}/tobii"), 0o755);
-    let p = plan_full(
-        &t,
-        &user(),
-        &Options::default(),
-        &unowned,
-        &|_| true,
-        &never,
-        &[],
-    );
+    let p = plan(&user(), &Options::default(), &t.root, &probes, &[]);
     assert!(why_kept(&p, &format!("{BIN}/tobii")).contains("a script"));
     let text = render(&p, &Options::default());
     assert!(
@@ -928,10 +1012,8 @@ fn root_is_refused_and_roots_leftovers_are_only_ever_a_hint() {
     let t = Tree::new("root");
     v030_install(&t);
     let as_root = Env {
-        euid: 0,
-        home: Some("/root".into()),
         sudo_user: Some("u".into()),
-        ..user()
+        ..root()
     };
     let p = plan_in(&t, &as_root, &Options::default(), &unowned);
     let why = p.refusal.as_deref().expect("refused under sudo");
@@ -970,9 +1052,12 @@ fn root_is_refused_and_roots_leftovers_are_only_ever_a_hint() {
     );
 }
 
+/// Root acts only where root_may_run passes, so this is a [`root_tree`].
 #[test]
 fn a_system_install_is_planned_only_with_system_and_only_from_its_own_places() {
-    let t = Tree::new("system");
+    let Some(t) = root_tree("system") else {
+        return;
+    };
     v030_install(&t); // a home install that --system must not touch
     t.put(
         "/usr/local/share/tobii-linux/installs",
@@ -988,31 +1073,30 @@ fn a_system_install_is_planned_only_with_system_and_only_from_its_own_places() {
         "/usr/local/share/icons/hicolor/scalable/apps/com.tobiilinux.Configuration.svg",
         "<svg/>",
     );
+    // What `sudo ./install.sh --system` makes is root's. (A listed binary
+    // that is not root's is another user's, and is kept.)
+    let roots: Owner = |_, _| 0;
 
     // Seen from the user's own run: a hint, never a plan.
-    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    let probes = home_probes(&by_content);
+    let p = plan_with_fs(&user(), &Options::default(), t.fs(roots), &probes, &[]);
     assert!(removals(&p).iter().all(|r| !r.starts_with("/usr/local")));
     assert!(p
         .hints
         .iter()
         .any(|h| h.contains("uninstall --system --bindir /usr/local/bin")));
 
-    let root = Env {
-        euid: 0,
-        home: Some("/root".into()),
-        ..user()
-    };
     let sys = Options {
         system: true,
         ..Options::default()
     };
-    // What `sudo ./install.sh --system` makes is root's. (A listed binary
-    // that is not root's is another user's, and is kept.)
-    let fs = Fs {
-        root: &t.root,
-        owner: |_, _| 0,
-    };
-    let p = plan_with_fs(&root, &sys, fs, &home_probes(&by_content), &[]);
+    let procs = [
+        // Another user's hub, from the copy being removed: stopped first.
+        proc(40, 1001, "/usr/local/bin/tobii-gtk", &["tobii-gtk"]),
+        // Another user's hub whose package was removed: not this run's to stop.
+        proc(41, 1001, "/usr/bin/tobii-gtk (deleted)", &["tobii-gtk"]),
+    ];
+    let p = plan_with_fs(&root(), &sys, t.fs(roots), &probes, &procs);
     assert!(p.refusal.is_none(), "{:?}", p.refusal);
     let r = removals(&p);
     for want in [
@@ -1025,6 +1109,112 @@ fn a_system_install_is_planned_only_with_system_and_only_from_its_own_places() {
     }
     assert!(r.iter().all(|x| !x.starts_with("/home")), "{r:#?}");
     assert!(p.manifests[0].then_empty);
+    assert_eq!(p.stop.iter().map(|x| x.pid).collect::<Vec<_>>(), [40]);
+    assert!(
+        p.orphan_hubs.is_empty() && p.other_hubs.is_empty(),
+        "{p:#?}"
+    );
+
+    // Under sudo HOME can still be the user's (sudo -E, env_keep+=HOME).
+    // --system does not look there, judge their autostart entry, or scan
+    // their Wine prefixes, and it refuses --purge outright.
+    t.put(
+        AUTOSTART,
+        &autostart::entry_text("/usr/local/bin/tobii-gtk"),
+    );
+    t.mkdir("/home/u/.wine/drive_c/tobii-bridge");
+    let sudo_e = Env {
+        home: Some("/home/u".into()),
+        ..root()
+    };
+    let p = plan_with_fs(&sudo_e, &sys, t.fs(roots), &probes, &[]);
+    assert!(p.refusal.is_none(), "{:?}", p.refusal);
+    assert!(
+        p.locations.iter().all(|l| !l.dir.starts_with("/home")),
+        "{:#?}",
+        p.locations
+    );
+    // The program it runs is being removed, so only the guard keeps it.
+    assert!(removals(&p).contains(&"/usr/local/bin/tobii-gtk".to_string()));
+    assert!(
+        !removals(&p).contains(&AUTOSTART.to_string()),
+        "{:#?}",
+        removals(&p)
+    );
+    assert!(p.wine_prefixes.is_empty(), "{:?}", p.wine_prefixes);
+    let purge = Options {
+        purge: true,
+        ..sys.clone()
+    };
+    let why = plan_in(&t, &sudo_e, &purge, &unowned)
+        .refusal
+        .expect("--system --purge is refused");
+    assert!(why.contains("--purge"), "{why}");
+}
+
+/// `sudo ./install.sh --system ~/bin` lists a directory its user owns in
+/// root's manifest. Root's run neither opens nor removes anything there:
+/// that user could swap it for a link to /usr/bin while root waits at the
+/// question, and root's unlink of ~/bin/tobii would remove a package's copy.
+/// The line stays, and the user's own run — which root's refusal names —
+/// removes the install instead of sending them back to sudo.
+#[test]
+fn a_system_listed_directory_a_user_owns_is_left_by_root_and_removed_by_its_user() {
+    fn users_bin(p: &Path, _: &std::fs::Metadata) -> u32 {
+        if p.ends_with("home/u/bin") || p.ends_with("home/u") {
+            me()
+        } else {
+            0
+        }
+    }
+    let t = Tree::new("system-listed-users");
+    t.put(
+        "/usr/local/share/tobii-linux/installs",
+        "bindir=/home/u/bin\n",
+    );
+    t.bin("/home/u/bin/tobii", "tobii 0.4.0");
+    t.bin("/home/u/bin/tobii-gtk", "tobii-gtk 0.4.0");
+    t.bin("/usr/bin/tobii", "tobii 0.4.0"); // a package's copy
+
+    let never = |p: &Path| -> Option<String> { panic!("{p:?} was run as root") };
+    let sys = Options {
+        system: true,
+        ..Options::default()
+    };
+    checked();
+    let p = plan_with_fs(&root(), &sys, t.fs(users_bin), &home_probes(&never), &[]);
+    assert!(checked().is_empty(), "opened as root");
+    assert!(removals(&p).is_empty(), "{:#?}", removals(&p));
+    assert!(p.manifests.is_empty(), "the line stays: {:#?}", p.manifests);
+    let loc = location(&p, "/home/u/bin");
+    let Verdict::NotRunAsRoot(why) = &loc.verdict else {
+        panic!("{loc:?}");
+    };
+    assert!(
+        why.contains(&format!("/home/u/bin is owned by uid {}", me()))
+            && why.contains("remove it as that user: tobii uninstall --bindir /home/u/bin"),
+        "{why}"
+    );
+    assert!(
+        loc.binaries.iter().all(|b| b.ident == Ident::NotRun),
+        "{:?}",
+        loc.binaries
+    );
+
+    // The user's own run, as that refusal says.
+    let probes = home_probes(&by_content);
+    let p = plan_with_fs(&user(), &Options::default(), t.fs(users_bin), &probes, &[]);
+    let loc = location(&p, "/home/u/bin");
+    assert_eq!(loc.verdict, Verdict::Remove, "{loc:?}");
+    assert!(loc.via.contains(&Via::SystemManifest), "{:?}", loc.via);
+    for b in ["/home/u/bin/tobii", "/home/u/bin/tobii-gtk"] {
+        assert!(removals(&p).contains(&b.to_string()), "{b}");
+    }
+    assert!(
+        !p.hints.iter().any(|h| h.contains("--system")),
+        "{:?}",
+        p.hints
+    );
 }
 
 /// As root, identifying a binary means running it as root. A directory that
@@ -1037,37 +1227,55 @@ fn as_root_a_bindir_someone_else_can_write_to_is_never_run() {
     t.bin("/opt/t/tobii", "tobii 0.3.0");
     t.put("/opt/t/tobii-gtk", "#!/bin/sh\necho tobii-gtk 0.3.0\n");
     t.chmod("/opt/t/tobii-gtk", 0o755);
-    t.chmod("/opt/t", 0o777);
-    checked();
-    let root = Env {
-        euid: 0,
-        home: Some("/root".into()),
-        ..user()
-    };
     let opts = Options {
         system: true,
         bindirs: vec!["/opt/t".into()],
         ..Options::default()
     };
     let never = |p: &Path| -> Option<String> { panic!("{p:?} was run as root") };
-    let p = plan_full(&t, &root, &opts, &unowned, &|_| true, &never, &[]);
-    assert!(p.refusal.is_none(), "{:?}", p.refusal);
-    assert!(removals(&p).is_empty(), "{:#?}", removals(&p));
-    let loc = location(&p, "/opt/t");
-    let Verdict::NotRunAsRoot(why) = &loc.verdict else {
-        panic!("{loc:?}");
-    };
-    assert!(
-        why.contains("/opt/t") && why.contains("not run as root"),
-        "{why}"
-    );
-    assert!(kept(&p).contains(&"/opt/t/tobii".to_string()));
-    assert!(
-        loc.binaries.iter().all(|b| b.ident == Ident::NotRun),
-        "{:?}",
-        loc.binaries
-    );
-    assert!(checked().is_empty(), "opened as root");
+    // Root's own tree, so the one thing wrong with /opt/t is the row's. Owned
+    // by the test's user instead, root_may_run would refuse it for that first
+    // and never look at the write bits.
+    let roots: Owner = |_, _| 0;
+    let t_is_theirs: Owner = |p, _| if p.ends_with("opt/t") { 4321 } else { 0 };
+    for (mode, owner, says) in [
+        (
+            0o777,
+            roots,
+            "/opt/t can be written by its group or by anyone",
+        ),
+        (
+            0o775,
+            roots,
+            "/opt/t can be written by its group or by anyone",
+        ),
+        (
+            0o755,
+            t_is_theirs,
+            "/opt/t is owned by uid 4321, not by root",
+        ),
+    ] {
+        t.chmod("/opt/t", mode);
+        checked();
+        let p = plan_with_fs(&root(), &opts, t.fs(owner), &home_probes(&never), &[]);
+        assert!(p.refusal.is_none(), "{:?}", p.refusal);
+        assert!(removals(&p).is_empty(), "{mode:o}: {:#?}", removals(&p));
+        let loc = location(&p, "/opt/t");
+        let Verdict::NotRunAsRoot(why) = &loc.verdict else {
+            panic!("{loc:?}");
+        };
+        assert!(
+            why.contains(says) && why.contains("not run as root"),
+            "{mode:o}: {why}"
+        );
+        assert!(kept(&p).contains(&"/opt/t/tobii".to_string()));
+        assert!(
+            loc.binaries.iter().all(|b| b.ident == Ident::NotRun),
+            "{:?}",
+            loc.binaries
+        );
+        assert!(checked().is_empty(), "opened as root");
+    }
 }
 
 #[test]
@@ -1093,7 +1301,7 @@ fn the_udev_step_names_only_the_rules_in_etc() {
             PathBuf::from("/etc/udev/rules.d/99-tobii.rules"),
         ]
     );
-    let cmds = udev_commands(&p, 1000);
+    let cmds = udev_commands(&p);
     let all = cmds
         .iter()
         .map(|c| c.join(" "))
@@ -1111,24 +1319,57 @@ fn the_udev_step_names_only_the_rules_in_etc() {
     assert!(p.udev_notes.iter().any(|n| n.contains(PACKAGE_UDEV_RULE)));
     // Nothing in the removal list: the udev step is its own, separate step.
     assert!(removals(&p).iter().all(|r| !r.contains("udev")));
+
+    // Already root: the same commands, without sudo.
+    let as_root = Plan {
+        euid: 0,
+        udev: p.udev.clone(),
+        ..Plan::default()
+    };
+    assert_eq!(
+        udev_commands(&as_root)[0].join(" "),
+        "rm -f /etc/udev/rules.d/60-tobii.rules /etc/udev/rules.d/99-tobii.rules"
+    );
+
+    // No package here: without the rule, only root can open the tracker.
+    let t = Tree::new("udev-no-package");
+    t.put("/etc/udev/rules.d/60-tobii.rules", "rule");
+    let p = plan_in(&t, &user(), &opts, &unowned);
+    assert!(
+        p.udev_notes
+            .iter()
+            .any(|n| n.contains("can only be opened as root")),
+        "{:?}",
+        p.udev_notes
+    );
+    // No rule at all: said, and nothing to run.
+    let t = Tree::new("udev-none");
+    let p = plan_in(&t, &user(), &opts, &unowned);
+    assert!(udev_commands(&p).is_empty());
+    assert!(
+        p.udev_notes
+            .iter()
+            .any(|n| n.contains("there is no udev rule")),
+        "{:?}",
+        p.udev_notes
+    );
 }
 
 #[test]
 fn a_build_tree_or_an_unpacked_archive_is_not_an_install() {
-    for (tag, dir, extra) in [
-        ("build", "/home/u/src/TobiiLinux/target/release", None),
+    for (tag, dir, archive) in [
+        ("build", "/home/u/src/TobiiLinux/target/release", false),
         (
             "tarball",
             "/home/u/Downloads/tobii-linux-0.3.0-x86_64-unknown-linux-gnu",
-            Some("install.sh"),
+            true,
         ),
     ] {
         let t = Tree::new(tag);
         t.bin(&format!("{dir}/tobii"), "tobii 0.3.0");
         t.bin(&format!("{dir}/tobii-gtk"), "tobii-gtk 0.3.0");
-        if let Some(e) = extra {
-            t.put(&format!("{dir}/{e}"), "#!/bin/sh\n");
-            t.put(&format!("{dir}/assets/install-payload.sh"), "#!/bin/sh\n");
+        if archive {
+            t.archive(dir);
         }
         let env = Env {
             current_exe: Some(format!("{dir}/tobii").into()),
@@ -1137,9 +1378,7 @@ fn a_build_tree_or_an_unpacked_archive_is_not_an_install() {
         let p = plan_in(&t, &env, &Options::default(), &unowned);
         assert!(removals(&p).is_empty(), "{tag}: {:#?}", removals(&p));
         assert!(
-            p.locations
-                .iter()
-                .any(|l| matches!(l.verdict, Verdict::NotAnInstall(_))),
+            matches!(location(&p, dir).verdict, Verdict::NotAnInstall(_)),
             "{tag}: {:#?}",
             p.locations
         );
@@ -1155,12 +1394,8 @@ fn a_lean_install_is_found_from_an_unpacked_archive() {
     t.bin(&format!("{BIN}/tobii"), "tobii 0.3.0");
     let archive = "/home/u/Downloads/tobii-linux-0.4.0-x86_64-unknown-linux-gnu";
     t.bin(&format!("{archive}/tobii"), "tobii 0.4.0");
-    t.put(&format!("{archive}/install.sh"), "#!/bin/sh\n");
+    t.archive(archive);
     t.put(&format!("{archive}/uninstall.sh"), "#!/bin/sh\n");
-    t.put(
-        &format!("{archive}/assets/install-payload.sh"),
-        "#!/bin/sh\n",
-    );
     let env = Env {
         current_exe: Some(format!("{archive}/tobii").into()),
         ..user()
@@ -1192,16 +1427,23 @@ fn only_cargos_output_directories_count_as_a_build_tree() {
     for dir in built {
         t.bin(&format!("{dir}/tobii"), "tobii 0.3.0");
     }
+    // Three levels below the tag: deeper than Cargo puts its binaries.
+    let deep = "/work/target/a/b/bin";
+    t.bin(&format!("{deep}/tobii"), "tobii 0.3.0");
     let env = Env {
         home: Some(home.into()),
         ..user()
     };
     let opts = Options {
-        bindirs: built.iter().map(PathBuf::from).collect(),
+        bindirs: built.iter().chain([&deep]).map(PathBuf::from).collect(),
         ..Options::default()
     };
     let p = plan_in(&t, &env, &opts, &unowned);
-    assert_eq!(removals(&p), [format!("{home}/.local/bin/tobii")]);
+    assert_eq!(
+        removals(&p),
+        [format!("{home}/.local/bin/tobii"), format!("{deep}/tobii")]
+    );
+    assert_eq!(location(&p, deep).verdict, Verdict::Remove);
     for dir in built {
         assert_eq!(
             location(&p, dir).verdict,
@@ -1357,36 +1599,14 @@ fn a_process_is_told_apart_from_a_later_one_with_the_same_pid() {
     assert_eq!(parse_start_time(stat), Some(987654));
     assert_eq!(parse_start_time("1234 (x S 1"), None);
 
-    let pid = std::process::id();
-    let exe = std::fs::read_link("/proc/self/exe")
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let me = Proc {
-        pid,
-        uid: 0,
-        exe,
-        args: Vec::new(),
-        start_time: start_time(pid),
-    };
-    assert!(me.start_time.is_some());
-    assert!(safe_to_signal(&me));
+    let now = this_process();
+    assert!(now.start_time.is_some());
+    assert!(safe_to_signal(&now));
     let later = Proc {
-        start_time: me.start_time.map(|t| t + 1),
-        ..me.clone()
+        start_time: now.start_time.map(|t| t + 1),
+        ..now
     };
-    assert!(!still_running(&later) && !safe_to_signal(&later));
-    let other_program = Proc {
-        exe: "/usr/bin/something-else".into(),
-        ..me.clone()
-    };
-    assert!(!safe_to_signal(&other_program));
-    // No start time from the scan: cannot be proved the same, so no signal.
-    let unknown = Proc {
-        start_time: None,
-        ..me
-    };
-    assert!(!safe_to_signal(&unknown));
+    assert!(!still_running(&later));
 }
 
 #[test]
@@ -1450,11 +1670,7 @@ fn the_bridge_is_found_in_steam_prefixes_wineprefix_and_dot_wine() {
     t.mkdir("/home/u/.wine/drive_c/tobii-bridge");
     let archive = "/home/u/Downloads/tobii-linux-0.4.0-x86_64-unknown-linux-gnu";
     t.bin(&format!("{archive}/tobii"), "tobii 0.4.0");
-    t.put(&format!("{archive}/install.sh"), "#!/bin/sh\n");
-    t.put(
-        &format!("{archive}/assets/install-payload.sh"),
-        "#!/bin/sh\n",
-    );
+    t.archive(archive);
     let from_archive = Env {
         current_exe: Some(format!("{archive}/tobii").into()),
         ..user()
@@ -1502,6 +1718,11 @@ fn options_parse_and_a_relative_bindir_is_refused() {
     assert!(parse_options(&args(&["--bindir"])).is_err());
     assert!(parse_options(&args(&["--frobnicate"])).is_err());
     assert_eq!(parse_options(&args(&["--help"])), Ok(None));
+    // The short forms, and a relative --bindir= refused like a relative --bindir.
+    let o = parse_options(&args(&["-n", "-y"])).unwrap().unwrap();
+    assert!(o.dry_run && o.yes && !o.purge, "{o:?}");
+    assert_eq!(parse_options(&args(&["-h"])), Ok(None));
+    assert!(parse_options(&args(&["--bindir=rel"])).is_err());
 }
 
 #[test]
@@ -1604,12 +1825,17 @@ fn the_running_tobii_is_kept_with_its_line_when_anything_else_fails() {
         t.put(MANIFEST, "bindir=/home/u/.local/bin\n");
         t.bin(&format!("{BIN}/tobii"), "tobii 0.4.0");
         t.bin(&format!("{BIN}/tobii-gtk"), "tobii-gtk 0.4.0");
+        t.put(
+            AUTOSTART,
+            &autostart::entry_text(&format!("{BIN}/tobii-gtk")),
+        );
         let env = Env {
             current_exe: Some(format!("{BIN}/tobii").into()),
             ..user()
         };
         let p = plan_in(&t, &env, &Options::default(), &unowned);
         assert_eq!(p.self_exe, Some(PathBuf::from(format!("{BIN}/tobii"))));
+        assert!(removals(&p).contains(&AUTOSTART.to_string()));
         (t, p)
     };
 
@@ -1649,21 +1875,7 @@ fn the_running_tobii_is_kept_with_its_line_when_anything_else_fails() {
         eprintln!("skipped the read-only autostart case: root can write anywhere");
         return;
     }
-    let t = Tree::new("self-kept-outside");
-    t.put(MANIFEST, "bindir=/home/u/.local/bin\n");
-    t.bin(&format!("{BIN}/tobii"), "tobii 0.4.0");
-    t.bin(&format!("{BIN}/tobii-gtk"), "tobii-gtk 0.4.0");
-    t.put(
-        AUTOSTART,
-        &autostart::entry_text(&format!("{BIN}/tobii-gtk")),
-    );
-    let env = Env {
-        current_exe: Some(format!("{BIN}/tobii").into()),
-        ..user()
-    };
-    let p = plan_in(&t, &env, &Options::default(), &unowned);
-    assert_eq!(p.self_exe, Some(PathBuf::from(format!("{BIN}/tobii"))));
-    assert!(removals(&p).contains(&AUTOSTART.to_string()));
+    let (t, p) = setup("self-kept-outside");
     let autostart_dir = "/home/u/.config/autostart";
     t.chmod(autostart_dir, 0o555);
     let out = execute(&p);
@@ -1711,6 +1923,76 @@ fn an_entry_that_cannot_be_read_is_kept() {
     assert!(removals(&p).contains(&format!("{BIN}/tobii-gtk")));
 }
 
+/// The same when the program it runs cannot be looked at: not gone, only
+/// unknown.
+#[test]
+fn an_entry_whose_program_cannot_be_looked_at_is_kept() {
+    if real_uid() == 0 {
+        eprintln!("skipped: root searches a mode-000 directory");
+        return;
+    }
+    let t = Tree::new("entry-program-unknown");
+    t.bin("/home/u/locked/tobii-gtk", "tobii-gtk 0.3.0");
+    t.put(
+        AUTOSTART,
+        &autostart::entry_text("/home/u/locked/tobii-gtk"),
+    );
+    t.chmod("/home/u/locked", 0o000);
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    t.chmod("/home/u/locked", 0o755);
+    let why = why_kept(&p, AUTOSTART);
+    assert!(
+        why.contains("cannot be looked at") && why.contains("left as it is"),
+        "{why}"
+    );
+    assert!(!removals(&p).contains(&AUTOSTART.to_string()));
+}
+
+/// A manifest-listed directory that cannot be looked at is not an empty one:
+/// its line may be the only record of a `--lean` install, so it stays — when
+/// planned, and when the manifest is edited after a removal there failed.
+#[test]
+fn a_manifest_directory_that_cannot_be_looked_at_keeps_its_line() {
+    if real_uid() == 0 {
+        eprintln!("skipped: root searches a mode-000 directory");
+        return;
+    }
+    let t = Tree::new("unsearchable-bindir");
+    t.put(MANIFEST, "bindir=/home/u/apps/tobii\n");
+    t.bin("/home/u/apps/tobii/tobii", "tobii 0.4.0");
+    t.chmod("/home/u/apps", 0o000);
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    t.chmod("/home/u/apps", 0o755);
+    assert!(
+        p.manifests.is_empty(),
+        "the line must stay: {:#?}",
+        p.manifests
+    );
+    assert_eq!(
+        location(&p, "/home/u/apps/tobii").verdict,
+        Verdict::Unidentified
+    );
+    assert!(why_kept(&p, "/home/u/apps/tobii").contains("cannot be looked at"));
+    // Really gone is still gone: its line goes.
+    std::fs::remove_dir_all(t.real("/home/u/apps")).unwrap();
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    assert_eq!(p.manifests.len(), 1, "{:#?}", p.manifests);
+
+    // Planned while it could be looked at, and not by the time of the
+    // removal: that fails, and the line it would have taken stays.
+    t.bin("/home/u/apps/tobii/tobii", "tobii 0.4.0");
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    assert_eq!(p.manifests.len(), 1, "planned to go");
+    t.chmod("/home/u/apps", 0o000);
+    let out = execute(&p);
+    t.chmod("/home/u/apps", 0o755);
+    assert_eq!(out.failed.len(), 1, "{:?}", out.failed);
+    assert_eq!(
+        std::fs::read_to_string(t.real(MANIFEST)).unwrap(),
+        "bindir=/home/u/apps/tobii\n"
+    );
+}
+
 // ------------------------------------------------------- where it looks
 
 /// PATH is not a place to look. Scanning it reached users' own wrappers,
@@ -1727,16 +2009,10 @@ fn copies_found_only_on_path_are_not_looked_at() {
     };
     let runs = Runs::new();
     let identify = runs.identify();
-    let p = plan(
-        &env,
-        &Options::default(),
-        &t.root,
-        &home_probes(&identify),
-        &[],
-    );
+    let p = plan_home(&t, &env, &Options::default(), &identify);
     assert!(removals(&p).is_empty(), "{:#?}", removals(&p));
     assert!(p.locations.is_empty(), "{:#?}", p.locations);
-    assert!(!runs.ran(&t, "/home/u/opt/bin/tobii"));
+    assert!(!runs.ran("/home/u/opt/bin/tobii"));
 
     // An entry's bare-name Exec is judged by what PATH finds — here a copy
     // that stays, so the entry stays — but adds no place to look.
@@ -1745,13 +2021,7 @@ fn copies_found_only_on_path_are_not_looked_at() {
         path: vec!["/home/u/opt/bin".into()],
         ..user()
     };
-    let p = plan(
-        &only_opt,
-        &Options::default(),
-        &t.root,
-        &home_probes(&identify),
-        &[],
-    );
+    let p = plan_home(&t, &only_opt, &Options::default(), &identify);
     assert!(p.locations.is_empty(), "{:#?}", p.locations);
     assert!(runs.0.borrow().is_empty(), "{:?}", runs.0.borrow());
     assert!(why_kept(&p, AUTOSTART).contains("/home/u/opt/bin/tobii-gtk"));
@@ -1762,7 +2032,7 @@ fn copies_found_only_on_path_are_not_looked_at() {
         bindirs: vec!["/home/u/opt/bin".into()],
         ..Options::default()
     };
-    let p = plan(&env, &opts, &t.root, &home_probes(&identify), &[]);
+    let p = plan_home(&t, &env, &opts, &identify);
     assert_eq!(location(&p, "/home/u/opt/bin").via, [Via::Bindir]);
     assert_eq!(removals(&p).len(), 2, "{:#?}", removals(&p));
 }
@@ -1788,13 +2058,7 @@ fn a_wrapper_script_that_answers_as_the_hub_is_kept_and_never_run() {
         let name = p.file_name()?.to_str()?;
         Some(format!("{name} 0.3.0"))
     };
-    let p = plan(
-        &user(),
-        &Options::default(),
-        &t.root,
-        &home_probes(&answers_as_named),
-        &[],
-    );
+    let p = plan_home(&t, &user(), &Options::default(), &answers_as_named);
     assert!(
         !ran.borrow().iter().any(|r| r.ends_with("tobii-gtk")),
         "the wrapper was run: {:?}",
@@ -1858,10 +2122,7 @@ fn a_binary_someone_else_owns_is_neither_run_nor_removed() {
     };
     let runs = Runs::new();
     let identify = runs.identify();
-    let fs = Fs {
-        root: &t.root,
-        owner: someone_elses,
-    };
+    let fs = t.fs(someone_elses);
     let p = plan_with_fs(&user(), &opts, fs, &home_probes(&identify), &[]);
     for (d, owned) in [
         ("a", "/home/u/a/tobii"),
@@ -1891,11 +2152,32 @@ fn a_binary_someone_else_owns_is_neither_run_nor_removed() {
         "/home/u/c-real/tobii",
         "/home/u/e/tobii",
     ] {
-        assert!(!runs.ran(&t, r), "{r} was run");
+        assert!(!runs.ran(r), "{r} was run");
     }
     // The one that is all the user's own is run, and goes.
-    assert!(runs.ran(&t, "/home/u/d/tobii"));
+    assert!(runs.ran("/home/u/d/tobii"));
     assert_eq!(removals(&p), ["/home/u/d/tobii".to_string()]);
+}
+
+/// The v0.3.0 install with `chmod` applied, planned with `private` as the
+/// answer to "is this group the user's own" and `owner` as who owns each
+/// file: the plan, and whether the hub was run.
+fn vet_case(tag: &str, chmod: &[(&str, u32)], private: bool, owner: Owner) -> (Plan, bool) {
+    let t = Tree::new(tag);
+    v030_install(&t);
+    for (p, mode) in chmod {
+        t.chmod(p, *mode);
+    }
+    let runs = Runs::new();
+    let identify = runs.identify();
+    let private_group = move |_: u32| private;
+    let probes = Probes {
+        private_group: &private_group,
+        ..home_probes(&identify)
+    };
+    let p = plan_with_fs(&user(), &Options::default(), t.fs(owner), &probes, &[]);
+    let ran = runs.ran(&format!("{BIN}/tobii-gtk"));
+    (p, ran)
 }
 
 /// Somewhere others can write, what is there is not the user's alone to
@@ -1907,24 +2189,6 @@ fn a_binary_someone_else_owns_is_neither_run_nor_removed() {
 #[test]
 fn a_binary_somewhere_others_can_write_is_neither_run_nor_removed() {
     let gtk = format!("{BIN}/tobii-gtk");
-    let case = |tag: &str, chmod: &[(&str, u32)], private: bool| {
-        let t = Tree::new(tag);
-        v030_install(&t);
-        for (p, mode) in chmod {
-            t.chmod(p, *mode);
-        }
-        let runs = Runs::new();
-        let identify = runs.identify();
-        let private_group = move |_: u32| private;
-        let probes = Probes {
-            private_group: &private_group,
-            ..home_probes(&identify)
-        };
-        let p = plan(&user(), &Options::default(), &t.root, &probes, &[]);
-        let ran = runs.ran(&t, &gtk);
-        (p, ran)
-    };
-
     for (tag, chmod, private, says) in [
         ("dir-777", vec![(BIN, 0o777)], false, "anyone"),
         ("dir-775", vec![(BIN, 0o775)], false, "its group"),
@@ -1936,7 +2200,7 @@ fn a_binary_somewhere_others_can_write_is_neither_run_nor_removed() {
             "a file others can change",
         ),
     ] {
-        let (p, ran) = case(tag, &chmod, private);
+        let (p, ran) = vet_case(tag, &chmod, private, owner_of);
         assert!(!ran, "{tag}: it was run");
         assert!(!removals(&p).contains(&gtk), "{tag}");
         let why = why_kept(&p, &gtk);
@@ -1953,7 +2217,7 @@ fn a_binary_somewhere_others_can_write_is_neither_run_nor_removed() {
         ("dir-775-private", 0o775, true),
         ("dir-1777", 0o1777, false),
     ] {
-        let (p, ran) = case(tag, &[(BIN, mode)], private);
+        let (p, ran) = vet_case(tag, &[(BIN, mode)], private, owner_of);
         assert!(ran, "{tag}");
         assert!(removals(&p).contains(&gtk), "{tag}: {:#?}", p.kept);
     }
@@ -1964,16 +2228,8 @@ fn a_binary_somewhere_others_can_write_is_neither_run_nor_removed() {
     t.bin("/home/u/shared/tobii-gtk", "tobii-gtk 0.3.0");
     t.chmod("/home/u/shared", 0o777);
     t.symlink("/home/u/shared/tobii-gtk", &gtk);
-    let runs = Runs::new();
-    let identify = runs.identify();
-    let p = plan(
-        &user(),
-        &Options::default(),
-        &t.root,
-        &home_probes(&identify),
-        &[],
-    );
-    assert!(!runs.ran(&t, "/home/u/shared/tobii-gtk"));
+    let (p, runs) = plan_recording(&t);
+    assert!(!runs.ran("/home/u/shared/tobii-gtk"));
     let why = why_kept(&p, &gtk);
     assert!(
         why.contains("in a directory others can write") && why.contains("/home/u/shared can"),
@@ -1990,16 +2246,8 @@ fn a_binary_somewhere_others_can_write_is_neither_run_nor_removed() {
         t.bin("/home/u/opt/tobii-gtk", "tobii-gtk 0.3.0");
         t.symlink("/home/u/opt/tobii-gtk", &gtk);
         t.chmod(BIN, mode);
-        let runs = Runs::new();
-        let identify = runs.identify();
-        let p = plan(
-            &user(),
-            &Options::default(),
-            &t.root,
-            &home_probes(&identify),
-            &[],
-        );
-        assert!(!runs.ran(&t, "/home/u/opt/tobii-gtk"), "{tag}");
+        let (p, runs) = plan_recording(&t);
+        assert!(!runs.ran("/home/u/opt/tobii-gtk"), "{tag}");
         let why = why_kept(&p, &gtk);
         assert!(
             why.contains("in a directory others can write")
@@ -2015,16 +2263,8 @@ fn a_binary_somewhere_others_can_write_is_neither_run_nor_removed() {
     t.symlink("/home/u/opt/tobii-gtk", "/home/u/shared/tobii-gtk");
     t.chmod("/home/u/shared", 0o777);
     t.symlink("/home/u/shared/tobii-gtk", &gtk);
-    let runs = Runs::new();
-    let identify = runs.identify();
-    let p = plan(
-        &user(),
-        &Options::default(),
-        &t.root,
-        &home_probes(&identify),
-        &[],
-    );
-    assert!(!runs.ran(&t, "/home/u/opt/tobii-gtk"));
+    let (p, runs) = plan_recording(&t);
+    assert!(!runs.ran("/home/u/opt/tobii-gtk"));
     let why = why_kept(&p, &gtk);
     assert!(
         why.contains("in a directory others can write") && why.contains("/home/u/shared can"),
@@ -2164,7 +2404,8 @@ fn a_cargo_install_found_through_an_entry_is_left_to_cargo() {
         udev: true,
         ..Options::default()
     };
-    let p = plan_full(&t, &user(), &udev, &unowned, &|_| true, &never, &[]);
+    let probes = home_probes(&never);
+    let p = plan(&user(), &udev, &t.root, &probes, &[]);
     // cargo install ships no udev rule: nothing to say one takes over.
     assert!(
         !p.udev_notes
@@ -2190,9 +2431,7 @@ fn a_cargo_install_found_through_an_entry_is_left_to_cargo() {
     assert!(removals(&p).is_empty(), "{:#?}", removals(&p));
     assert!(kept(&p).contains(&ENTRY.to_string()));
 
-    // The older record, and only the hub there. Even for $CARGO_HOME/bin the
-    // command names --root: CARGO_INSTALL_ROOT or install.root could send a bare
-    // `cargo uninstall` to a different copy.
+    // The older record, .crates.toml, and only the hub there.
     let bin = "/home/u/cargo-x/bin";
     let t = Tree::new("cargo-home-toml");
     t.bin(&format!("{bin}/tobii-gtk"), "tobii-gtk 0.3.0");
@@ -2205,16 +2444,7 @@ fn a_cargo_install_found_through_an_entry_is_left_to_cargo() {
         AUTOSTART,
         &autostart::entry_text(&format!("{bin}/tobii-gtk")),
     );
-    let env = user();
-    let p = plan_full(
-        &t,
-        &env,
-        &Options::default(),
-        &unowned,
-        &|_| true,
-        &never,
-        &[],
-    );
+    let p = plan(&user(), &Options::default(), &t.root, &probes, &[]);
     assert!(
         p.hints
             .iter()
@@ -2257,7 +2487,7 @@ fn a_cargo_record_leaves_to_cargo_only_what_it_lists() {
     assert!(removals(&p).contains(&ENTRY.to_string()));
 
     // A record that lists tobii-cli: only tobii is Cargo's, and the command
-    // names this --root, since it is not $CARGO_HOME.
+    // names this --root.
     let t = Tree::new("cargo-record-cli");
     v030_install(&t);
     t.put(
@@ -2267,16 +2497,8 @@ fn a_cargo_record_leaves_to_cargo_only_what_it_lists() {
              tobii-cli)\" = [\"tobii\"]\n"
         ),
     );
-    let runs = Runs::new();
-    let identify = runs.identify();
-    let p = plan(
-        &user(),
-        &Options::default(),
-        &t.root,
-        &home_probes(&identify),
-        &[],
-    );
-    assert!(!runs.ran(&t, &format!("{BIN}/tobii")));
+    let (p, runs) = plan_recording(&t);
+    assert!(!runs.ran(&format!("{BIN}/tobii")));
     assert!(why_kept(&p, &format!("{BIN}/tobii")).contains("Cargo's record lists it"));
     assert!(removals(&p).contains(&format!("{BIN}/tobii-gtk")));
     assert!(!removals(&p).contains(&format!("{BIN}/tobii")));
@@ -2354,8 +2576,9 @@ fn a_directory_you_cannot_write_is_a_system_install_only_if_it_answers() {
     t.bin("/opt/other/tobii", "tobii-the-other-program 2.0");
     t.put("/opt/script/tobii", "#!/bin/sh\necho tobii 0.3.0\n");
     t.chmod("/opt/script/tobii", 0o755);
+    t.bin("/home/u/ro/tobii", "tobii 0.3.0");
     let opts = Options {
-        bindirs: ["/opt/sys", "/opt/other", "/opt/script"]
+        bindirs: ["/opt/sys", "/opt/other", "/opt/script", "/home/u/ro"]
             .iter()
             .map(PathBuf::from)
             .collect(),
@@ -2367,20 +2590,12 @@ fn a_directory_you_cannot_write_is_a_system_install_only_if_it_answers() {
         writable: &|_| false,
         ..home_probes(&identify)
     };
-    // /opt is root's; the home directory below is the user's own.
-    t.bin("/home/u/ro/tobii", "tobii 0.3.0");
-    let opts = Options {
-        bindirs: [opts.bindirs, vec!["/home/u/ro".into()]].concat(),
-        ..opts
-    };
-    let fs = Fs {
-        root: &t.root,
-        owner: opt_is_roots,
-    };
+    // /opt is root's; /home/u/ro is the user's own.
+    let fs = t.fs(opt_is_roots);
     let p = plan_with_fs(&user(), &opts, fs, &probes, &[]);
     assert!(removals(&p).is_empty(), "{:#?}", removals(&p));
 
-    assert!(runs.ran(&t, "/opt/sys/tobii"));
+    assert!(runs.ran("/opt/sys/tobii"));
     assert_eq!(location(&p, "/opt/sys").verdict, Verdict::SystemInstall);
     assert!(p
         .hints
@@ -2390,7 +2605,7 @@ fn a_directory_you_cannot_write_is_a_system_install_only_if_it_answers() {
     // The user's own directory, only not writable: chmod, not sudo — root
     // would refuse to run what is in a directory that is not root's, and
     // send them back here.
-    assert!(runs.ran(&t, "/home/u/ro/tobii"));
+    assert!(runs.ran("/home/u/ro/tobii"));
     assert_eq!(location(&p, "/home/u/ro").verdict, Verdict::NotWritable);
     let hint = p
         .hints
@@ -2418,7 +2633,7 @@ fn a_directory_you_cannot_write_is_a_system_install_only_if_it_answers() {
             "{dir}"
         );
     }
-    assert!(!runs.ran(&t, "/opt/script/tobii"));
+    assert!(!runs.ran("/opt/script/tobii"));
     let s = summary(&p, &Outcome::default());
     assert!(!s.contains("--bindir /opt/other"), "{s}");
 }
@@ -2434,16 +2649,8 @@ fn the_file_run_to_identify_a_binary_is_the_one_that_was_checked() {
     t.bin(real_gtk, "tobii-gtk 0.3.0");
     t.symlink(real_gtk, &format!("{BIN}/tobii-gtk"));
     t.bin(&format!("{BIN}/tobii"), "tobii 0.3.0");
-    let runs = Runs::new();
-    let identify = runs.identify();
     checked();
-    let p = plan(
-        &user(),
-        &Options::default(),
-        &t.root,
-        &home_probes(&identify),
-        &[],
-    );
+    let (p, runs) = plan_recording(&t);
     let canonical = |p: &str| t.real(p).canonicalize().unwrap();
     assert_eq!(
         *runs.0.borrow(),
@@ -2459,21 +2666,11 @@ fn the_file_run_to_identify_a_binary_is_the_one_that_was_checked() {
 
 /// The pid is checked again at the moment of the signal, not only when the
 /// list was made. A process whose start time differs is a later one that got
-/// the same pid, and is never signalled; nor is one whose start time was
-/// never known.
+/// the same pid, and is never signalled; nor is one now running a different
+/// program, nor one whose start time was never known.
 #[test]
 fn a_process_that_is_no_longer_the_one_listed_is_never_signalled() {
-    let pid = std::process::id();
-    let now = Proc {
-        pid,
-        uid: 0,
-        exe: std::fs::read_link("/proc/self/exe")
-            .unwrap()
-            .to_string_lossy()
-            .into_owned(),
-        args: Vec::new(),
-        start_time: start_time(pid),
-    };
+    let now = this_process();
     assert!(now.start_time.is_some());
     let later = Proc {
         start_time: now.start_time.map(|t| t + 1),
@@ -2483,8 +2680,12 @@ fn a_process_that_is_no_longer_the_one_listed_is_never_signalled() {
         start_time: None,
         ..now.clone()
     };
+    let other_program = Proc {
+        exe: "/usr/bin/something-else".into(),
+        ..now.clone()
+    };
     let mut sent: Vec<Option<u64>> = Vec::new();
-    let signalled = signal_each(&[later, unknown, now.clone()], &mut |p| {
+    let signalled = signal_each(&[later, unknown, other_program, now.clone()], &mut |p| {
         sent.push(p.start_time);
         Ok(())
     });
@@ -2521,11 +2722,7 @@ fn what_this_run_does_not_touch_has_its_own_heading_in_the_summary() {
         writable: &|d| !d.ends_with("opt/sys"),
         ..home_probes(&by_content)
     };
-    let fs = Fs {
-        root: &t.root,
-        owner: opt_is_roots,
-    };
-    let p = plan_with_fs(&user(), &opts, fs, &probes, &[]);
+    let p = plan_with_fs(&user(), &opts, t.fs(opt_is_roots), &probes, &[]);
     assert!(p.kept.is_empty() && p.is_empty(), "{p:#?}");
     let s = summary(&p, &execute(&p));
     let at = |needle: &str| {
@@ -2545,7 +2742,6 @@ fn what_this_run_does_not_touch_has_its_own_heading_in_the_summary() {
 /// only if it is a regular file.
 #[test]
 fn a_cachedir_tag_that_is_a_fifo_or_a_symlink_is_not_read() {
-    use std::os::unix::ffi::OsStringExt;
     let dir = "/home/u/build/out/release";
     let tag = "/home/u/build/out/CACHEDIR.TAG";
     let opts = Options {
@@ -2555,9 +2751,7 @@ fn a_cachedir_tag_that_is_a_fifo_or_a_symlink_is_not_read() {
 
     let t = Tree::new("tag-fifo");
     t.bin(&format!("{dir}/tobii-gtk"), "tobii-gtk 0.4.0");
-    let fifo = std::ffi::CString::new(t.real(tag).into_os_string().into_vec()).unwrap();
-    // SAFETY: a valid NUL-terminated path; mkfifo only creates a node there.
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    mkfifo(&t.real(tag));
     let (tx, rx) = std::sync::mpsc::channel();
     let (root, o) = (t.root.clone(), opts.clone());
     std::thread::spawn(move || {
@@ -2587,34 +2781,36 @@ fn a_cachedir_tag_that_is_a_fifo_or_a_symlink_is_not_read() {
 
 /// As root, nothing in a directory is opened until root_may_run has found
 /// that only root can change what is there: not the CACHEDIR.TAG above a
-/// user's build directory, not a Cargo record beside it, not the binary.
-/// It is left, and not run as root.
+/// user's build directory, not a Cargo record beside a `bin`, not the
+/// binary. It is left, and not run as root.
 #[test]
 fn as_root_nothing_in_a_directory_others_control_is_opened() {
     let t = Tree::new("root-tag");
     let dir = "/home/u/build/out/release";
+    let cargo_bin = "/home/u/cargo/bin";
     t.bin(&format!("{dir}/tobii-gtk"), "tobii-gtk 0.4.0");
     t.put("/home/u/build/out/CACHEDIR.TAG", CARGO_TAG);
+    t.bin(&format!("{cargo_bin}/tobii-gtk"), "tobii-gtk 0.4.0");
     t.put(
-        "/home/u/build/out/.crates.toml",
+        "/home/u/cargo/.crates.toml",
         "[v1]\n\"tobii-gtk 0.4.0 (x)\" = [\"tobii-gtk\"]\n",
     );
-    let root = Env {
-        euid: 0,
-        home: Some("/root".into()),
-        ..user()
-    };
     let opts = Options {
         system: true,
-        bindirs: vec![dir.into()],
+        bindirs: vec![dir.into(), cargo_bin.into()],
         ..Options::default()
     };
     let never = |p: &Path| -> Option<String> { panic!("{p:?} was run as root") };
     checked();
-    let p = plan_full(&t, &root, &opts, &unowned, &|_| true, &never, &[]);
-    let loc = location(&p, dir);
-    assert!(matches!(loc.verdict, Verdict::NotRunAsRoot(_)), "{loc:?}");
-    assert!(checked().is_empty(), "opened as root");
+    OPENED.take();
+    let p = plan(&root(), &opts, &t.root, &home_probes(&never), &[]);
+    for d in [dir, cargo_bin] {
+        let loc = location(&p, d);
+        assert!(matches!(loc.verdict, Verdict::NotRunAsRoot(_)), "{loc:?}");
+    }
+    assert!(checked().is_empty(), "a binary was opened as root");
+    let opened = OPENED.take();
+    assert!(opened.is_empty(), "opened as root: {opened:?}");
     assert!(
         !p.hints.iter().any(|h| h.contains("cargo")),
         "{:?}",
@@ -2625,34 +2821,16 @@ fn as_root_nothing_in_a_directory_others_control_is_opened() {
 /// D7 under --system: what root runs to identify a binary is exactly the
 /// path root_may_run approved, and the one program_check opened. Root's
 /// check needs every directory up to / to be root's and writable by no one
-/// else, so the tree is under target/ — not /tmp, whose 1777 it refuses —
-/// and the owner hook says root owns all of it. No root needed.
+/// else, so this is a [`root_tree`].
 #[test]
 fn as_root_the_file_run_is_the_one_root_may_run_approved() {
-    use std::os::unix::fs::MetadataExt;
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/uninstall-test");
-    mkdirs(&base);
-    let base = base.canonicalize().unwrap();
-    let open = base
-        .ancestors()
-        .find(|a| std::fs::metadata(a).is_ok_and(|m| m.mode() & 0o022 != 0));
-    if let Some(open) = open {
-        eprintln!(
-            "skipped: {} can be written by its group or others, which root_may_run refuses",
-            open.display()
-        );
+    let Some(t) = root_tree("root-d7") else {
         return;
-    }
-    let t = Tree::under(&base, "root-d7");
+    };
     let real_gtk = "/opt/tobii-linux/tobii-gtk";
     t.bin(real_gtk, "tobii-gtk 0.4.0");
     t.symlink(real_gtk, "/usr/local/bin/tobii-gtk");
     t.bin("/usr/local/bin/tobii", "tobii 0.4.0");
-    let root = Env {
-        euid: 0,
-        home: Some("/root".into()),
-        ..user()
-    };
     let opts = Options {
         system: true,
         bindirs: vec!["/usr/local/bin".into()],
@@ -2660,12 +2838,9 @@ fn as_root_the_file_run_is_the_one_root_may_run_approved() {
     };
     let runs = Runs::new();
     let identify = runs.identify();
-    let fs = Fs {
-        root: &t.root,
-        owner: |_, _| 0,
-    };
+    let fs = t.fs(|_, _| 0);
     checked();
-    let p = plan_with_fs(&root, &opts, fs, &home_probes(&identify), &[]);
+    let p = plan_with_fs(&root(), &opts, fs, &home_probes(&identify), &[]);
     let canonical = |p: &str| t.real(p).canonicalize().unwrap();
     assert_eq!(
         *runs.0.borrow(),
@@ -2678,8 +2853,6 @@ fn as_root_the_file_run_is_the_one_root_may_run_approved() {
     }
     assert!(!r.contains(&real_gtk.to_string()), "{r:#?}");
 }
-
-type Owner = fn(&Path, &std::fs::Metadata) -> u32;
 
 fn home_is_overflow(p: &Path, m: &std::fs::Metadata) -> u32 {
     if p.ends_with("home") {
@@ -2697,34 +2870,22 @@ fn home_is_theirs(p: &Path, m: &std::fs::Metadata) -> u32 {
     }
 }
 
+fn bin_is_overflow(p: &Path, m: &std::fs::Metadata) -> u32 {
+    if p.ends_with("home/u/.local/bin") {
+        OVERFLOW_UID
+    } else {
+        owner_of(p, m)
+    }
+}
+
 /// Above the directories that decide which file runs: whoever can write one
 /// can rename what is under it, so those count too — but for writers, and
 /// with the overflow uid as an owner, since inside a toolbox or `unshare -c`
-/// root's `/` and `/home` belong to it.
+/// root's `/` and `/home` belong to it. Only above them, never for the
+/// directory the install is in itself.
 #[test]
 fn a_directory_above_an_install_that_others_can_write_refuses_it() {
     let gtk = format!("{BIN}/tobii-gtk");
-    let case = |tag: &str, chmod: &[(&str, u32)], private: bool, owner: Owner| {
-        let t = Tree::new(tag);
-        v030_install(&t);
-        for (p, mode) in chmod {
-            t.chmod(p, *mode);
-        }
-        let runs = Runs::new();
-        let identify = runs.identify();
-        let private_group = move |_: u32| private;
-        let probes = Probes {
-            private_group: &private_group,
-            ..home_probes(&identify)
-        };
-        let fs = Fs {
-            root: &t.root,
-            owner,
-        };
-        let p = plan_with_fs(&user(), &Options::default(), fs, &probes, &[]);
-        let ran = runs.ran(&t, &gtk);
-        (p, ran)
-    };
     for (tag, chmod, owner, says) in [
         (
             "above-777",
@@ -2744,8 +2905,14 @@ fn a_directory_above_an_install_that_others_can_write_refuses_it() {
             home_is_theirs as Owner,
             "/home belongs to uid 4321",
         ),
+        (
+            "bin-overflow",
+            vec![],
+            bin_is_overflow as Owner,
+            "/home/u/.local/bin belongs to uid 65534",
+        ),
     ] {
-        let (p, ran) = case(tag, &chmod, false, owner);
+        let (p, ran) = vet_case(tag, &chmod, false, owner);
         assert!(!ran, "{tag}: it was run");
         assert!(!removals(&p).contains(&gtk), "{tag}");
         let why = why_kept(&p, &gtk);
@@ -2769,7 +2936,7 @@ fn a_directory_above_an_install_that_others_can_write_refuses_it() {
         ),
         ("above-overflow", vec![], false, home_is_overflow as Owner),
     ] {
-        let (p, ran) = case(tag, &chmod, private, owner);
+        let (p, ran) = vet_case(tag, &chmod, private, owner);
         assert!(ran, "{tag}");
         assert!(removals(&p).contains(&gtk), "{tag}: {:#?}", p.kept);
     }
@@ -2813,10 +2980,7 @@ fn a_manifest_listed_binary_someone_else_owns_is_kept() {
     };
 
     let t = setup("listed-theirs");
-    let fs = Fs {
-        root: &t.root,
-        owner: listed_but_theirs,
-    };
+    let fs = t.fs(listed_but_theirs);
     let p = plan_with_fs(&user(), &Options::default(), fs, &home_probes(&never), &[]);
     for b in [format!("{BIN}/tobii"), format!("{BIN}/tobii-gtk")] {
         let why = why_kept(&p, &b);
@@ -2835,10 +2999,7 @@ fn a_manifest_listed_binary_someone_else_owns_is_kept() {
         .all(|b| b.ident == Ident::Refused("owned by uid 4321".into())));
 
     let t = setup("listed-target-theirs");
-    let fs = Fs {
-        root: &t.root,
-        owner: listed_target_theirs,
-    };
+    let fs = t.fs(listed_target_theirs);
     let p = plan_with_fs(&user(), &Options::default(), fs, &home_probes(&never), &[]);
     let why = why_kept(&p, &format!("{BIN}/tobii-gtk"));
     assert!(
@@ -2874,11 +3035,7 @@ fn paths_in_printed_commands_are_quoted_for_the_shell() {
     );
     let archive = "/home/u/Down loads/tobii-linux-0.4.0";
     t.bin(&format!("{archive}/tobii"), "tobii 0.4.0");
-    t.put(&format!("{archive}/install.sh"), "#!/bin/sh\n");
-    t.put(
-        &format!("{archive}/assets/install-payload.sh"),
-        "#!/bin/sh\n",
-    );
+    t.archive(archive);
     let env = Env {
         wineprefix: Some(prefix.into()),
         current_exe: Some(format!("{archive}/tobii").into()),
@@ -2892,11 +3049,7 @@ fn paths_in_printed_commands_are_quoted_for_the_shell() {
         writable: &|d: &Path| !d.ends_with("Tobii's dir"),
         ..home_probes(&by_content)
     };
-    let fs = Fs {
-        root: &t.root,
-        owner: opt_is_roots,
-    };
-    let p = plan_with_fs(&env, &opts, fs, &probes, &[]);
+    let p = plan_with_fs(&env, &opts, t.fs(opt_is_roots), &probes, &[]);
     assert_eq!(location(&p, sys).verdict, Verdict::SystemInstall);
 
     let running = "'/home/u/Down loads/tobii-linux-0.4.0/tobii'";
@@ -2930,28 +3083,18 @@ fn open_regular_looks_before_it_opens() {
     let link = t.root.join("link-to-null");
     std::os::unix::fs::symlink("/dev/null", &link).unwrap();
     let fifo = t.root.join("a-fifo");
-    assert!(std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .is_ok_and(|s| s.success()));
-    super::OPENED.with(|o| o.borrow_mut().clear());
-    for p in [
-        std::path::Path::new("/dev/null"),
-        link.as_path(),
-        fifo.as_path(),
-    ] {
-        assert!(super::open_regular(p).is_err(), "{}", p.display());
+    mkfifo(&fifo);
+    OPENED.take();
+    for p in [Path::new("/dev/null"), link.as_path(), fifo.as_path()] {
+        assert!(open_regular(p).is_err(), "{}", p.display());
     }
-    assert!(
-        super::OPENED.with(|o| o.borrow().is_empty()),
-        "opened: {:?}",
-        super::OPENED.with(|o| o.borrow().clone())
-    );
+    let opened = OPENED.take();
+    assert!(opened.is_empty(), "opened: {opened:?}");
     // A regular file is still opened, once.
     let plain = t.root.join("plain");
     std::fs::write(&plain, b"x").unwrap();
-    assert!(super::open_regular(&plain).is_ok());
-    assert_eq!(super::OPENED.with(|o| o.borrow().clone()), vec![plain]);
+    assert!(open_regular(&plain).is_ok());
+    assert_eq!(OPENED.take(), [plain]);
 }
 
 /// Only a directory named `bin` can be Cargo's: it is the only one `cargo install`
@@ -2982,4 +3125,237 @@ fn only_a_bin_directory_can_be_cargos() {
         "{:?}",
         p.hints
     );
+}
+
+// ------------------------------------------------ stopping, and what is said
+
+/// Declined, or no terminal and no --yes: a copy of ours still running stops
+/// the run before anything is removed; a hub whose program is already gone
+/// does not. Not interactive, it asks nothing, and returns before anything is
+/// asked over D-Bus or signalled.
+#[test]
+fn a_running_copy_of_ours_that_was_not_stopped_stops_the_run() {
+    let t = Tree::new("stop-declined");
+    v030_install(&t);
+    let ours = proc(10, me(), &format!("{BIN}/tobii-gtk"), &["tobii-gtk"]);
+    let orphan = proc(30, me(), "/usr/bin/tobii-gtk (deleted)", &["tobii-gtk"]);
+    let opts = Options::default();
+    let p = plan_procs(&t, &user(), &opts, &unowned, &[ours, orphan.clone()]);
+    assert_eq!(p.stop.len(), 1, "{p:#?}");
+    let err = stop_running(&p, &opts, false).expect_err("ours still runs");
+    assert!(err.contains("Nothing was removed"), "{err}");
+
+    let p = plan_procs(&t, &user(), &opts, &unowned, &[orphan]);
+    assert!(p.stop.is_empty() && p.orphan_hubs.len() == 1, "{p:#?}");
+    assert_eq!(stop_running(&p, &opts, false), Ok(()));
+}
+
+/// The plan says who is asked to quit: a hub, over D-Bus — never a running
+/// `tobii`, which has nothing to ask it with, and no hub at all while a hub
+/// from a copy that stays could take the question instead.
+#[test]
+fn only_a_hub_is_said_to_be_asked_to_quit() {
+    let t = Tree::new("asked-to-quit");
+    v030_install(&t);
+    let game = proc(11, me(), &format!("{BIN}/tobii"), &["tobii", "game"]);
+    let hub = proc(10, me(), &format!("{BIN}/tobii-gtk"), &["tobii-gtk"]);
+    let opts = Options::default();
+    let heading = |procs: &[Proc]| {
+        let p = plan_procs(&t, &user(), &opts, &unowned, procs);
+        let text = render(&p, &opts);
+        let line = text.lines().find(|l| l.starts_with("Running copies"));
+        line.expect("a heading").to_string()
+    };
+    let h = heading(std::slice::from_ref(&game));
+    assert!(!h.contains("asked to quit"), "{h}");
+    let h = heading(&[game.clone(), hub.clone()]);
+    assert!(h.contains("the hub is asked to quit"), "{h}");
+    // A hub from a copy that stays: not asked, as the plan goes on to say.
+    t.bin("/usr/bin/tobii-gtk", "tobii-gtk 0.3.0");
+    let stays = proc(13, me(), "/usr/bin/tobii-gtk", &["tobii-gtk"]);
+    let h = heading(&[hub, stays]);
+    assert!(!h.contains("asked to quit"), "{h}");
+}
+
+/// What is said when the hub could not be asked names only the cause that
+/// fits: the quit action ships from v0.3.1, and root has no session bus.
+#[test]
+fn a_hub_that_could_not_be_asked_is_told_the_likely_reason() {
+    let user_run = quit_refused_note("no such method", false);
+    assert!(
+        user_run.contains("no such method") && user_run.contains("v0.3.0 or before"),
+        "{user_run}"
+    );
+    assert!(!user_run.contains("v0.4"), "{user_run}");
+    let root_run = quit_refused_note("no bus", true);
+    assert!(
+        root_run.contains("as root there is no session bus"),
+        "{root_run}"
+    );
+    assert!(!root_run.contains("v0.3.0"), "{root_run}");
+}
+
+// ------------------------------------------------------- more of execute
+
+/// The updater's work directory is the one thing removed as a tree. One that
+/// became a link to a directory of the user's is only unlinked.
+#[test]
+fn the_updaters_work_dir_goes_with_its_contents_and_a_link_in_its_place_only_as_a_link() {
+    let t = Tree::new("scratch-exec");
+    t.put(MANIFEST, "bindir=/home/u/.local/bin\n");
+    t.bin(&format!("{BIN}/tobii"), "tobii 0.4.0");
+    t.put(&format!("{BIN}/.tobii-update-123/archive.tar.gz"), "a");
+    t.put(&format!("{BIN}/.tobii-update-124/archive.tar.gz"), "a");
+    t.put("/home/u/keep/precious", "mine");
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    // Swapped for a link between the plan and the removal.
+    std::fs::remove_dir_all(t.real(&format!("{BIN}/.tobii-update-124"))).unwrap();
+    t.symlink("/home/u/keep", &format!("{BIN}/.tobii-update-124"));
+    let out = execute(&p);
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    assert!(!t.has(&format!("{BIN}/.tobii-update-123")));
+    assert!(!t.has(&format!("{BIN}/.tobii-update-124")));
+    assert!(
+        t.has("/home/u/keep/precious"),
+        "the link's target is the user's"
+    );
+}
+
+/// The running tobii's manifest line goes before it does, on the
+/// understanding that it will. When it then cannot remove itself, that is
+/// said: it is still found, being the program you run.
+#[test]
+fn a_tobii_that_could_not_remove_itself_says_so() {
+    let t = Tree::new("self-fails");
+    t.put(MANIFEST, "bindir=/home/u/.local/bin\n");
+    t.bin(&format!("{BIN}/tobii"), "tobii 0.4.0");
+    t.bin(&format!("{BIN}/tobii-gtk"), "tobii-gtk 0.4.0");
+    let env = Env {
+        current_exe: Some(format!("{BIN}/tobii").into()),
+        ..user()
+    };
+    let p = plan_in(&t, &env, &Options::default(), &unowned);
+    assert!(p.self_exe.is_some());
+    std::fs::remove_file(t.real(&format!("{BIN}/tobii"))).unwrap();
+    t.put(&format!("{BIN}/tobii/something"), "x");
+    let out = execute(&p);
+    assert_eq!(
+        out.failed
+            .iter()
+            .map(|(f, _)| f.clone())
+            .collect::<Vec<_>>(),
+        [PathBuf::from(format!("{BIN}/tobii"))]
+    );
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("could not remove itself")),
+        "{:?}",
+        out.notes
+    );
+    assert!(!t.has(MANIFEST), "its line went, as planned");
+}
+
+/// dir_writable, the probe `run` uses: entries in a directory can be created
+/// and removed only with both w and x for this user's class — the owner's
+/// bits for its owner, the group's for a member (the effective gid included).
+#[test]
+fn dir_writable_needs_write_and_search_for_this_user() {
+    use std::os::unix::fs::MetadataExt;
+    let t = Tree::new("dir-writable");
+    t.mkdir("/d");
+    let d = t.real("/d");
+    assert!(dir_writable(&d, 0), "root");
+    assert!(!dir_writable(&t.real("/missing"), real_uid()));
+    if real_uid() == 0 {
+        eprintln!("skipped the mode rows: root writes anywhere");
+        return;
+    }
+    for (mode, want) in [
+        (0o755, true),
+        (0o700, true),
+        (0o300, true),
+        (0o555, false),
+        (0o500, false),
+        (0o200, false),
+        (0o100, false),
+    ] {
+        t.chmod("/d", mode);
+        assert_eq!(dir_writable(&d, real_uid()), want, "owner {mode:o}");
+    }
+    // As another uid, the directory's group is this process's effective gid
+    // (unless a setgid parent gave it another), so the group bits decide.
+    let egid = std::fs::metadata("/proc/self").unwrap().gid();
+    if std::fs::metadata(&d).unwrap().gid() == egid {
+        for (mode, want) in [
+            (0o770, true),
+            (0o730, true),
+            (0o750, false),
+            (0o720, false),
+            (0o707, false),
+        ] {
+            t.chmod("/d", mode);
+            assert_eq!(dir_writable(&d, real_uid() + 1), want, "group {mode:o}");
+        }
+    } else {
+        eprintln!("skipped the group rows: the temp directory hands out another group");
+    }
+    t.chmod("/d", 0o755);
+}
+
+// ----------------------------------------------------- the smaller paths
+
+/// No HOME, or a relative one: there is no home install to look for, and
+/// guessing one would look somewhere else.
+#[test]
+fn no_home_refuses_the_plan() {
+    let t = Tree::new("no-home");
+    v030_install(&t);
+    for home in [None, Some(PathBuf::from("home/u"))] {
+        let env = Env { home, ..user() };
+        let p = plan_in(&t, &env, &Options::default(), &unowned);
+        let why = p.refusal.as_deref().expect("refused");
+        assert!(why.contains("HOME is not set"), "{why}");
+        assert!(p.is_empty());
+    }
+}
+
+/// /root that cannot be read says so, rather than claiming nothing is there.
+#[test]
+fn a_root_home_that_cannot_be_read_is_said_to_be_unknown() {
+    if real_uid() == 0 {
+        eprintln!("skipped: root reads a mode-000 directory");
+        return;
+    }
+    let t = Tree::new("root-denied");
+    v030_install(&t);
+    t.bin("/root/.local/bin/tobii", "tobii 0.3.0");
+    t.chmod("/root", 0o000);
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    t.chmod("/root", 0o755);
+    let hint = p
+        .hints
+        .iter()
+        .find(|h| h.contains("/root"))
+        .expect("a hint");
+    assert!(hint.contains("/root cannot be read from here"), "{hint}");
+    assert!(!hint.contains("sudo rm"), "{hint}");
+}
+
+/// A symlink loop ends the chain, and a chain longer than the kernel follows
+/// stops at its limit.
+#[test]
+fn a_link_chain_ends_at_a_loop_and_at_the_kernels_limit() {
+    let t = Tree::new("link-chain");
+    t.symlink("/l/b", "/l/a");
+    t.symlink("/l/a", "/l/b");
+    let fs = Fs::new(&t.root);
+    assert_eq!(
+        fs.link_chain(Path::new("/l/a")),
+        [PathBuf::from("/l/a"), PathBuf::from("/l/b")]
+    );
+    for i in 0..50 {
+        t.symlink(&format!("/m/{}", i + 1), &format!("/m/{i}"));
+    }
+    assert_eq!(fs.link_chain(Path::new("/m/0")).len(), 41);
 }
