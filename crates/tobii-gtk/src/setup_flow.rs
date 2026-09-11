@@ -1050,7 +1050,9 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
     {
         let setup = setup.clone();
         let chosen = chosen.clone();
-        let win = win.clone();
+        // Weak: this button lives inside the window, so a strong reference is
+        // a cycle that keeps the window alive after it closes.
+        let win = win.downgrade();
         let posture_warn = posture_warn.clone();
         posture_done.connect_clicked(move |_| {
             let s = *setup.borrow();
@@ -1074,14 +1076,21 @@ pub fn launch(app: &Application, cmd_tx: Sender<DeviceCommand>) -> gtk::Applicat
                 posture_warn.set_visible(true);
                 return;
             }
-            win.close();
+            if let Some(w) = win.upgrade() {
+                w.close();
+            }
         });
     }
 
-    // Cancel, on every page, all closing the whole wizard the same way.
+    // Cancel, on every page, all closing the whole wizard the same way. Weak
+    // for the same reason as Done above.
     for cancel_btn in [&align_cancel, &pick_cancel, &posture_cancel] {
-        let win = win.clone();
-        cancel_btn.connect_clicked(move |_| win.close());
+        let win = win.downgrade();
+        cancel_btn.connect_clicked(move |_| {
+            if let Some(w) = win.upgrade() {
+                w.close();
+            }
+        });
     }
 
     // Seed the form + readout from the initial setup.

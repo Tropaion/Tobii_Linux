@@ -336,16 +336,48 @@ pub fn status_text(status: &device::ConnStatus) -> &'static str {
     }
 }
 
-/// Keep the tracker running for as long as `win` exists.
+/// Keep the tracker running for as long as `win` is open.
 ///
 /// Every flow that needs live data runs in its own window, and the hub's own
 /// claim is released the moment it loses focus to one of them — so each flow
 /// has to ask for the tracker itself, for exactly as long as it is on screen.
+///
+/// Released when the window leaves its application, which `close()` does
+/// synchronously — NOT when the window is finalized. Finalization used to be
+/// the trigger (`connect_destroy`), and GTK4 emits `destroy` only once the last
+/// reference is gone: a flow whose own key controller and buttons held its
+/// window stayed alive for the life of the process, and so did its claim. After
+/// one calibration or display setup the tracker never went dark again, however
+/// the hub was minimised or unfocused. Measured: both flows' windows were still
+/// alive, and still claiming, six seconds after closing. `window-removed` fires
+/// on the close itself, whoever else still holds a reference.
 fn hold_while_open(demand: &device::Demand, win: &impl IsA<gtk::Window>, reason: &'static str) {
+    let win = win.as_ref();
     let guard = RefCell::new(Some(demand.hold(reason)));
-    win.as_ref().connect_destroy(move |_| {
-        *guard.borrow_mut() = None;
-    });
+    // Every caller passes a window built with `.application(app)`. One that is
+    // not gets the old trigger rather than a claim that is never released.
+    let Some(app) = win.application() else {
+        win.connect_destroy(move |_| {
+            guard.borrow_mut().take();
+        });
+        return;
+    };
+    let target = win.downgrade();
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+    let id = {
+        let handler = handler.clone();
+        app.connect_window_removed(move |app, removed| {
+            if target.upgrade().as_ref() != Some(removed) {
+                return;
+            }
+            guard.borrow_mut().take();
+            // One window, one release: nothing left for this handler to do.
+            if let Some(id) = handler.borrow_mut().take() {
+                app.disconnect(id);
+            }
+        })
+    };
+    *handler.borrow_mut() = Some(id);
 }
 
 /// Whether to run the gaze-accuracy diagnostic instead of the hub.
@@ -612,10 +644,16 @@ pub(crate) fn screen_height() -> i32 {
 /// session) — this only triggers it.
 pub(crate) fn add_escape_to_close(win: &ApplicationWindow) {
     let keys = gtk::EventControllerKey::new();
-    let win_for_key = win.clone();
+    // Weak, because the controller belongs to the window: a strong reference
+    // here is a cycle, and the window could never be freed. Both fullscreen
+    // flows use this, and a flow window that is never freed keeps everything it
+    // holds alive — see `hold_while_open`.
+    let win_for_key = win.downgrade();
     keys.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::Escape {
-            win_for_key.close();
+            if let Some(w) = win_for_key.upgrade() {
+                w.close();
+            }
             glib::Propagation::Stop
         } else {
             glib::Propagation::Proceed
