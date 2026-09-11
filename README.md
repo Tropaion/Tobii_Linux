@@ -277,15 +277,46 @@ tobii uninstall               # asks, then does it
 If that `tobii` is gone already, the release archive runs its own copy for you:
 `./uninstall.sh --dry-run`, then `./uninstall.sh`, from the unpacked folder.
 
-It looks for the install through the install manifest, the menu entry, the
-start-at-login entry, `~/.local/bin` and your `PATH`. A copy found any way but
-the manifest has to name itself when asked `--version` before it is removed. A
-Cargo build directory or an unpacked release archive is never taken for an
-install. It asks before stopping a hub that is still running, then removes the
-binaries, the menu entry, its icon and the start-at-login entry. A menu or
-start-at-login entry that runs a copy which stays — a package's, a build
-directory's — is left alone, and so is one whose program it cannot tell. It
-deletes only file names it knows, never a directory tree.
+It looks in these places, and only these: the install manifest the installer
+writes (`~/.local/share/tobii-linux/installs`), the directory named in the menu
+entry's `Exec=` and in the start-at-login entry's, `~/.local/bin`, the
+directory of the `tobii` you run it with, and any `--bindir DIR` you give it.
+It does not search your `PATH`. An install somewhere else that none of these
+lead to — one made into a directory of your choice by v0.3.0 or earlier, with
+no menu entry — is found with `--bindir DIR`.
+
+It asks before stopping a hub that is still running, then removes the
+binaries, the menu entry, its icon and the start-at-login entry. It deletes
+only file names it knows, never a directory tree.
+
+**What it will not touch, and why.** A copy found any way but the manifest is
+checked before it is run or removed. It is left where it is, never run, and
+listed with the reason, if:
+
+- it is not a program. A script called `tobii-gtk` in `~/.local/bin` is a
+  wrapper of yours, not a build of this program.
+- it belongs to another user. It is theirs to remove, with their own
+  `tobii uninstall`.
+- others can write where it is: the file, the directory it is in, or (for a
+  symlink) the directory of the file it leads to can be written by another
+  user, or by a group other than your own private group (the group of your own
+  that Fedora and others give each user is fine). Whoever can write there
+  chooses what would run.
+
+A copy that passes must still name itself when asked `--version`. It also
+leaves alone:
+
+- a Cargo build directory, recognised by the `CACHEDIR.TAG` Cargo writes
+  whatever the directory is called, and an unpacked release archive
+  (`install.sh` with `assets/install-payload.sh` beside it). Copies run from
+  there, but no install made them.
+- a copy `cargo install` put in `~/.cargo/bin`. It prints
+  `cargo uninstall tobii-cli` or `cargo uninstall tobii-gtk` instead, so
+  Cargo's record of what it installed stays right.
+- a directory you cannot write to. If what is there answers as this program,
+  it is a system-wide install, and the command for that is printed (see below).
+- a menu or start-at-login entry that runs a copy which stays — a package's, a
+  build directory's — and one whose program it cannot tell.
 
 `--yes` answers every question with yes. That includes stopping running copies
 with `SIGTERM` if they do not quit when asked — a `tobii game` wrapper among
@@ -307,10 +338,12 @@ It leaves:
 - **the udev rule.** Add `--udev`; that step uses `sudo`.
 - **the TrackIR/FreeTrack bridge in Wine prefixes.** It lists the prefixes it
   finds the bridge in — Steam's, `$WINEPREFIX` and `~/.wine` — with the command
-  for each. Removing the bridge needs `tobii`, so before it removes anything it
-  offers to stop and let you run those first. With `--yes` it goes on, and
-  repeats the commands at the end: the `tobii` in a release archive runs them
-  just as well.
+  for each. Removing the bridge needs a `tobii`. When the `tobii` you run is
+  one this removes, it offers, before removing anything, to stop and let you
+  run those first. With `--yes` it goes on, and repeats the commands at the
+  end: the `tobii` in a release archive runs them just as well. Run from the
+  archive's `./uninstall.sh`, that `tobii` stays, so it names it for the
+  commands, which work before or after, and does not stop.
 - **a copy your package manager installed.** It prints the command instead:
 
 ```sh
