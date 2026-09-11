@@ -636,13 +636,19 @@ pub fn download_release_files(
         }
     }
 }
-
-/// Remove what a failed download wrote, and the folder if that empties it.
+/// Undo a failed download: remove what this call wrote, and the directory if
+/// it is now empty.
 ///
-/// `remove_dir` and not `remove_dir_all`: it only ever succeeds on an empty
-/// directory, so a second attempt that fails after a first one succeeded cannot
-/// take the first download away with it, and neither can anything else the user
-/// put there.
+/// `remove_dir`, not `remove_dir_all`, so a folder the user chose cannot be
+/// emptied of anything this call did not put there.
+///
+/// It does NOT protect an earlier, completed download of the same release: a
+/// second attempt writes the same file names into the same
+/// `tobii-linux-<version>` directory, so a failure part-way through deletes the
+/// copies that were already there. Re-downloading is the only thing that
+/// triggers it, and re-downloading is what a user does when the first attempt
+/// looked wrong — so the honest statement is that this cleans up after itself,
+/// not that it is safe around your files.
 fn discard(written: &[PathBuf], dir: &Path) {
     for p in written {
         let _ = std::fs::remove_file(p);
@@ -1183,6 +1189,61 @@ fn set_executable(p: &Path) -> Result<(), InstallError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A release carrying just these assets; nothing else here reads the rest.
+    fn release_with(assets: Vec<crate::release::Asset>) -> crate::release::Release {
+        crate::release::Release {
+            tag: "v9.9.9".into(),
+            version: crate::version::Version::parse("v9.9.9").expect("a version"),
+            notes: String::new(),
+            assets,
+            html_url: String::new(),
+        }
+    }
+
+    /// The path-traversal guard runs before anything is fetched, and nothing
+    /// else tests it — `download_release_files` had no test at all, so the
+    /// check could be deleted with the whole suite still green.
+    ///
+    /// Offline by construction: the guard is ahead of `release.checksums()` and
+    /// ahead of the first `net::get`, so this needs no network and no seam.
+    #[test]
+    fn a_download_refuses_an_asset_whose_name_is_a_path() {
+        use crate::release::Asset;
+        let dir = std::env::temp_dir().join(format!("tobii-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        for bad in ["../evil", "a/b", "/etc/passwd", ".."] {
+            let asset = Asset {
+                name: bad.to_string(),
+                url: "https://example.invalid/x".to_string(),
+            };
+            let release = release_with(vec![asset.clone()]);
+            let err = download_release_files(&release, &[&asset], &dir, &|_| {})
+                .expect_err("a name that is a path must be refused");
+            assert!(
+                matches!(err, InstallError::UnsafeName(ref n) if n == bad),
+                "{bad:?} gave {err:?}"
+            );
+        }
+        assert!(
+            std::fs::read_dir(&dir).expect("dir").next().is_none(),
+            "nothing may be written before the name is checked"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nothing to download is its own answer, not an empty success — a caller
+    /// that got `Ok(vec![])` would report a finished download of no files.
+    #[test]
+    fn a_download_with_no_assets_says_there_is_no_build() {
+        let dir = std::env::temp_dir().join(format!("tobii-dl-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let err = download_release_files(&release_with(Vec::new()), &[], &dir, &|_| {})
+            .expect_err("an empty set must be refused");
+        assert!(matches!(err, InstallError::NoBuildForTarget(_)), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use super::*;
 
     /// A directory this test owns, removed on the way out.

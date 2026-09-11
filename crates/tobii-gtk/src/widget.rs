@@ -214,9 +214,6 @@ pub fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64)
     cr.close_path();
 }
 
-/// Draw the latest NIR camera frame into a cairo context of size `w`×`h`,
-/// contrast-stretched (the raw frames are very dark) and letterboxed to preserve
-/// the square aspect. Mirrored horizontally so it reads like a mirror.
 /// Where an `iw`x`ih` image lands inside a `w`x`h` widget: letterboxed, centred.
 ///
 /// Shared with the placeholder deliberately. The placeholder used to fill the

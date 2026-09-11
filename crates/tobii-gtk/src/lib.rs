@@ -453,7 +453,11 @@ thread_local! {
     static TRAY: RefCell<Option<tray::Tray>> = const { RefCell::new(None) };
 }
 
-/// Publish the tray icon, replacing any previous one.
+/// Publish the tray icon.
+///
+/// Called at startup, and once more five seconds later if that first attempt
+/// found no status-area host — never over an icon that is already up, which is
+/// why it does not have to take one down first.
 ///
 /// Clicking it goes through `activate`, which already knows how to either
 /// present the hub that exists or build one — doing it here instead would be a
@@ -491,9 +495,11 @@ const CARD_GAP: i32 = 16;
 
 /// How wide a control column is.
 ///
-/// Both control columns share it, so they read as one rack that happens to be
-/// split rather than as two panels that disagree — and the breakpoints below
-/// are arithmetic on this rather than three hand-tuned numbers that drift.
+/// All three share it, so they read as one rack that happens to be split
+/// rather than as panels that disagree. It is a floor, not the width they end
+/// up at: a card's padding and border sit outside it, and the columns stretch
+/// to fill the window — which is why the breakpoints below measure the layouts
+/// instead of doing arithmetic on this number.
 const COLUMN_WIDTH: i32 = 360;
 
 /// Install this app's stylesheet on the default display.
@@ -612,7 +618,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // The gaze-preview overlay window, while it is open.
     let overlay_win: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
     // Set by the Quit item, and only by it. See the close handler: pressing X
-    // minimises rather than exits, so something has to tell the two apart.
+    // hides or minimises rather than exiting, so something has to tell the two
+    // apart.
     let really_quitting = Rc::new(Cell::new(false));
     // "Select eyes to detect": guard against echoing our own seeding as a user
     // change, and seed the radios from the device once per connection.
@@ -1019,9 +1026,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     //
     // They pack from the top and every gap is `CARD_GAP`. Stretching the gaps
     // to level the bottoms — which is what this did while the columns were
-    // badly unbalanced — is no longer worth it: with 341/354/342 the levelling
-    // buys at most 13px, and it costs a gap inside a column that visibly
-    // differs from the gap between the rows.
+    // badly unbalanced — is no longer worth it: with 357/370/358 (the pairs
+    // above, plus the `CARD_GAP` between them) the levelling buys at most 13px,
+    // and it costs a gap inside a column that visibly differs from the gap
+    // between the rows.
     let col_calib = gtk::Box::new(Orientation::Vertical, CARD_GAP);
     col_calib.set_size_request(COLUMN_WIDTH, -1);
     col_calib.set_valign(Align::Start);
@@ -1147,23 +1155,81 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     split.set_valign(Align::Start);
     split.set_column_spacing(16);
     split.set_row_spacing(CARD_GAP as u32);
-    // Attached here in the widest layout, and re-placed by the breakpoint below
-    // if the window turns out to be narrower. Not left to the breakpoint alone:
-    // the window's opening height is MEASURED from this tree further down, and
-    // measuring an empty grid gave a window the height of its header with every
-    // card clipped off the bottom.
-    split.attach(&live, 0, 0, 3, 1);
-    split.attach(&col_calib, 0, 1, 1, 1);
-    split.attach(&col_display, 1, 1, 1, 1);
-    split.attach(&col_games, 2, 1, 1, 1);
+    // The three layouts. One function, so the arrangement a width selects and
+    // the arrangement it was measured against cannot drift apart.
+    let arrange: Rc<dyn Fn(i32)> = {
+        let split = split.clone();
+        let live = live.clone();
+        let col_calib = col_calib.clone();
+        let col_display = col_display.clone();
+        let col_games = col_games.clone();
+        Rc::new(move |columns: i32| {
+            // Only what is actually in the grid: the first call is the one that
+            // fills it, and removing an unattached child is a GTK-CRITICAL.
+            for card in [
+                live.upcast_ref::<gtk::Widget>(),
+                col_calib.upcast_ref(),
+                col_display.upcast_ref(),
+                col_games.upcast_ref(),
+            ] {
+                if card.parent().is_some() {
+                    split.remove(card);
+                }
+            }
+            // The live data always spans the full width, whatever that is: it
+            // is one card and splitting it across rows would put the two views
+            // in different places depending on the window size.
+            match columns {
+                3 => {
+                    split.attach(&live, 0, 0, 3, 1);
+                    split.attach(&col_calib, 0, 1, 1, 1);
+                    split.attach(&col_display, 1, 1, 1, 1);
+                    split.attach(&col_games, 2, 1, 1, 1);
+                }
+                // Games spans both columns rather than sitting under one of
+                // them: it is the widest card of the three, and a half-width
+                // hole beside it would read as something missing.
+                2 => {
+                    split.attach(&live, 0, 0, 2, 1);
+                    split.attach(&col_calib, 0, 1, 1, 1);
+                    split.attach(&col_display, 1, 1, 1, 1);
+                    split.attach(&col_games, 0, 2, 2, 1);
+                }
+                _ => {
+                    split.attach(&live, 0, 0, 1, 1);
+                    split.attach(&col_calib, 0, 1, 1, 1);
+                    split.attach(&col_display, 0, 2, 1, 1);
+                    split.attach(&col_games, 0, 3, 1, 1);
+                }
+            }
+            // Stacked, the two live views go one above the other — side by side
+            // in a narrow window each would be too small to read.
+            live.set_orientation(if columns == 1 {
+                Orientation::Vertical
+            } else {
+                Orientation::Horizontal
+            });
+        })
+    };
 
-    // What three columns ACTUALLY need, asked of the widgets rather than added
-    // up by hand. The hand-added version — instrument floor, two columns, two
-    // gutters — was 56px short of the truth, because a card's padding and
-    // border are not in any of those numbers. GTK then warned that it was being
-    // measured for less width than it needs, and the window opened one column
-    // short of what it had been sized for.
-    let (three_col_min, _, _, _) = split.measure(Orientation::Horizontal, -1);
+    // What each layout ACTUALLY needs, asked of the widgets rather than added
+    // up by hand. Two hand-added versions were wrong before this: the first was
+    // 56px short of three columns because a card's padding and border are in
+    // none of the numbers you would add up, and the second assumed dropping a
+    // column frees its width plus a gutter, which is 63px more than it frees —
+    // the columns are wider than `COLUMN_WIDTH` for the same padding reason,
+    // and the games card that spans the two remaining columns has a floor of
+    // its own. Both mistakes look the same from the outside: GTK warns that it
+    // is being measured for less width than it needs, and the cards clip.
+    //
+    // Measured widest-last so the grid is left in the layout the window opens
+    // in, which is also what the height below is measured from — measuring an
+    // empty grid once gave a window the height of its header with every card
+    // clipped off the bottom.
+    arrange(2);
+    let two_col_min = split.measure(Orientation::Horizontal, -1).0;
+    arrange(3);
+    let three_col_min = split.measure(Orientation::Horizontal, -1).0;
 
     // Re-fit the window to its content. Late-bound on purpose: the cogwheel is
     // built as part of the header, which is built before the window exists, so
@@ -1231,30 +1297,55 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         let win = window.clone();
         let root = root.clone();
         let window = win.clone();
-        let fit: Rc<dyn Fn()> = Rc::new(move || {
-            // Never on a window the user has sized themselves. Maximised or
-            // fullscreen, the height is not ours to choose; and re-fitting a
-            // window someone has deliberately made small would fight them.
-            if window.is_maximized() || window.is_fullscreen() {
-                return;
-            }
-            let width = window.width().max(window.default_width());
-            let (_, wanted, _, _) = root.measure(Orientation::Vertical, width);
-            if wanted != window.default_height() {
-                window.set_default_size(width, wanted);
-            }
-        });
+        // The last size this closure itself set. Anything else is the user.
+        //
+        // The comment here used to claim it never touched "a window the user
+        // has sized themselves", and checked only maximised and fullscreen —
+        // which are the two cases a user cannot produce by dragging an edge.
+        // Dragging is the ordinary one, and it was overridden: on GTK4
+        // `default_height` tracks the current size, so a window made smaller
+        // was silently grown back to its content the next time anything
+        // re-fitted.
+        let ours = std::rc::Rc::new(Cell::new((0i32, 0i32)));
+        let fit: Rc<dyn Fn()> = {
+            let ours = ours.clone();
+            Rc::new(move || {
+                // Maximised or fullscreen, the height is not ours to choose.
+                if window.is_maximized() || window.is_fullscreen() {
+                    return;
+                }
+                let (w, h) = (window.default_width(), window.default_height());
+                // Sized by hand since we last set it: leave it alone. The first
+                // call sees (0, 0) and proceeds, which is what opens the window
+                // at its content height.
+                if ours.get() != (0, 0) && ours.get() != (w, h) {
+                    return;
+                }
+                let width = window.width().max(w);
+                let (_, wanted, _, _) = root.measure(Orientation::Vertical, width);
+                if wanted != h {
+                    window.set_default_size(width, wanted);
+                    ours.set((width, wanted));
+                }
+            })
+        };
         *refit.borrow_mut() = Some(fit.clone());
 
-        // Once, when the window first appears. `natural_height` above is
-        // measured against a widget tree that has never been laid out, and it
-        // comes out a little short — the cards' padding is not all accounted
-        // for until they have been allocated once. Re-fitting on the first map
-        // costs one measurement and means the window opens at the height its
-        // content actually needs rather than a close guess.
+        // Once, and latched — because `map` is not a first-appearance signal.
+        // It fires on every show, so closing to the tray and coming back used to
+        // re-measure and resize the window each time, which is how a window the
+        // user had made smaller grew back. `natural_height` above is measured
+        // against a widget tree that has never been laid out and comes out a
+        // little short — the cards' padding is not all accounted for until they
+        // have been allocated once — so one re-fit is worth it and the rest are
+        // not.
         {
             let fit = fit.clone();
+            let first = Cell::new(true);
             win.connect_map(move |_| {
+                if !first.replace(false) {
+                    return;
+                }
                 // One idle later, not inline: `map` runs BEFORE the first
                 // allocation, so measuring here returns the same slightly-short
                 // answer `natural_height` already got. After one turn of the
@@ -1273,12 +1364,16 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             b.connect_visible_notify(move |_| fit());
         }
     }
-    // A floor, kept deliberately low. Width is the constraint that carries
-    // meaning — the breakpoints below drop from three columns to two to one as
-    // it shrinks — while height only decides how much scrolling there is, so
-    // there is no reason to stop the user shrinking it. 760 is just above where
-    // even one control column stops fitting beside the instrument.
-    window.set_size_request(760, 340);
+    // A height floor, kept deliberately low: height only decides how much
+    // scrolling there is, so there is no reason to stop the user shrinking it
+    // past the point where the content fits.
+    //
+    // Width is left out on purpose. Whatever is asked for here, GTK enforces
+    // the larger of it and what the content measures, and the content measures
+    // 1152px in the widest layout even at the smallest text — so any floor
+    // below that is inert, and any floor above it would fight the breakpoints
+    // below, which exist precisely so the window CAN be made narrow.
+    window.set_size_request(-1, 340);
 
     // The breakpoints. Three layouts, chosen by width alone.
     //
@@ -1287,18 +1382,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // and the 20px page margins either side. Tuned constants drift the moment
     // any of those changes; these do not.
     let breakpoint: Rc<dyn Fn(i32)> = {
-        const GUTTER: i32 = 16;
-        // Measured above, plus the page margins either side. Dropping a column
-        // frees exactly its width and the gutter beside it, which is the one
-        // part of this that IS simple arithmetic.
+        // Measured above, plus the page margins either side.
         let three_below = three_col_min + PAGE_MARGIN * 2;
-        let two_below = three_below - GUTTER - COLUMN_WIDTH;
+        let two_below = two_col_min + PAGE_MARGIN * 2;
 
-        let split = split.clone();
-        let live_bp = live.clone();
-        let calib_bp = col_calib.clone();
-        let display_bp = col_display.clone();
-        let games_bp = col_games.clone();
+        let arrange = arrange.clone();
         // Three, because that is how the children were attached above — so a
         // window that opens wide enough is not needlessly torn down and rebuilt
         // before it is first drawn.
@@ -1315,43 +1403,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 return;
             }
             columns_now.set(columns);
-            split.remove(&live_bp);
-            split.remove(&calib_bp);
-            split.remove(&display_bp);
-            split.remove(&games_bp);
-            // The live data always spans the full width, whatever that is: it
-            // is one card and splitting it across rows would put the two views
-            // in different places depending on the window size.
-            match columns {
-                3 => {
-                    split.attach(&live_bp, 0, 0, 3, 1);
-                    split.attach(&calib_bp, 0, 1, 1, 1);
-                    split.attach(&display_bp, 1, 1, 1, 1);
-                    split.attach(&games_bp, 2, 1, 1, 1);
-                }
-                // Games spans both columns rather than sitting under one of
-                // them: it is the widest card of the three, and a half-width
-                // hole beside it would read as something missing.
-                2 => {
-                    split.attach(&live_bp, 0, 0, 2, 1);
-                    split.attach(&calib_bp, 0, 1, 1, 1);
-                    split.attach(&display_bp, 1, 1, 1, 1);
-                    split.attach(&games_bp, 0, 2, 2, 1);
-                }
-                _ => {
-                    split.attach(&live_bp, 0, 0, 1, 1);
-                    split.attach(&calib_bp, 0, 1, 1, 1);
-                    split.attach(&display_bp, 0, 2, 1, 1);
-                    split.attach(&games_bp, 0, 3, 1, 1);
-                }
-            }
-            // Stacked, the two live views go one above the other — side by side
-            // in a narrow window each would be too small to read.
-            live_bp.set_orientation(if columns == 1 {
-                Orientation::Vertical
-            } else {
-                Orientation::Horizontal
-            });
+            arrange(columns);
         };
         // Shared, because one signal is not enough to be sure. `default-width`
         // does not fire for every way a window can change size (tiling and
@@ -1420,14 +1472,32 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             // reason the surface is not visible to the user — minimised, fully
             // occluded, on another workspace — which is exactly the set of
             // states where redrawing a readout is wasted work.
-            if tick_window.is_suspended() {
+            //
+            // `is_mapped` as well, and it is not redundant: a HIDDEN window —
+            // which is what closing to the tray produces — reports
+            // `is_suspended() == false`. Measured, on this window: hidden gives
+            // `mapped=false suspended=false`, minimised gives `suspended=true`.
+            // So the guard that exists to stop this body running while nobody
+            // is looking was inert in precisely the state the tray made the
+            // default, and the full 30 Hz tick ran for as long as the hub sat
+            // in the tray.
+            if tick_window.is_suspended() || !tick_window.is_mapped() {
                 return glib::ControlFlow::Continue;
             }
 
             // Re-check the layout breakpoint. `notify::default-width` misses some
             // ways a window changes size (tiling, maximising), and this costs one
             // integer compare — `apply` returns immediately when nothing changed.
-            breakpoint(tick_window.width());
+            //
+            // Guarded, because `width()` is 0 before the first allocation — and
+            // 0 is below every breakpoint, so it collapsed the grid to the
+            // one-column layout. That is not only a startup race: it also
+            // happened for the whole time the window was hidden, and the re-fit
+            // on the next show then measured the stacked tree and sized the
+            // window for it. Measured: natural height 803 -> 1736, window left
+            // 420px too tall for the rest of the run. `fit` already guards the
+            // same way.
+            breakpoint(tick_window.width().max(tick_window.default_width()));
             // Move the camera frame out (no 78 KB clone) and clone the rest cheaply,
             // under one lock. `new_cam` is None on the ticks between device frames.
             let (snap, new_cam) = {
@@ -1653,6 +1723,20 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             if let Some(id) = tick_id.borrow_mut().take() {
                 id.remove();
             }
+
+            // 4. The tray icon, and then the application.
+            //
+            //    Neither is optional. `--background` holds a `GApplication`
+            //    hold for the life of the process precisely so that having no
+            //    window does not end it — which means destroying the last
+            //    window does not end it either, and Quit left the process
+            //    running with its tray icon still live and still able to open
+            //    a new hub. Dropping the tray first keeps the icon from
+            //    outliving the program that owns it by even a moment.
+            TRAY.with(|c| *c.borrow_mut() = None);
+            if let Some(app) = w.application() {
+                app.quit();
+            }
             glib::Propagation::Proceed
         });
     }
@@ -1807,7 +1891,13 @@ fn settings_button(quitting: &Rc<Cell<bool>>, refit: Refit) -> gtk::MenuButton {
     btn
 }
 
-/// The contents of that popover.
+/// One press of the text-size control, clamped to what the UI can render.
+///
+/// Free so the two ends of the range can be tested without a GTK widget.
+fn stepped(current: f64, by: f64) -> f64 {
+    (current + by).clamp(tobii_config::TEXT_SCALE_MIN, tobii_config::TEXT_SCALE_MAX)
+}
+
 /// The text-size control: minus, the current percentage, plus.
 ///
 /// Buttons rather than a slider. The range that is useful is small and the
@@ -1849,11 +1939,20 @@ fn text_size_row(refit: Refit) -> gtk::Box {
     };
     refresh(tobii_config::text_scale());
 
+    // The live value, held here rather than re-read from disk on every press.
+    //
+    // Reading it back meant the buttons only moved if the previous press had
+    // been SAVED: with a read-only config directory the save fails, the next
+    // press re-reads the old value, and the control appears stuck at one step
+    // from where it started — while the text on screen had actually changed.
+    // The save is best-effort; the setting is not.
+    let current = std::rc::Rc::new(Cell::new(tobii_config::text_scale()));
     let bump = {
         let refresh = refresh.clone();
+        let current = current.clone();
         move |by: f64| {
-            let next = (tobii_config::text_scale() + by)
-                .clamp(tobii_config::TEXT_SCALE_MIN, tobii_config::TEXT_SCALE_MAX);
+            let next = stepped(current.get(), by);
+            current.set(next);
             // Applied before it is saved: the change is visible instantly, and
             // a read-only config directory costs the user the persistence
             // rather than the feature.
@@ -1935,7 +2034,7 @@ fn settings_list(quitting: &Rc<Cell<bool>>, refit: Refit) -> gtk::Box {
 ///
 /// A program that keeps running after you close its window has to say where
 /// its exit went, and this is where somebody looks for it. The description is
-/// not decoration: without it, the only way to discover that X minimises is to
+/// not decoration: without it, the only way to discover that X does not quit is to
 /// press X.
 fn quit_row(quitting: &Rc<Cell<bool>>) -> gtk::Box {
     let btn = crate::widget::button("Quit");
@@ -1959,8 +2058,9 @@ fn quit_row(quitting: &Rc<Cell<bool>>) -> gtk::Box {
     });
     settings_row(
         "Quit",
-        "Closing the window only minimises it, so games keep getting head \
-         tracking while you play. This exits for real.",
+        "Closing the window leaves it running, so games keep getting head \
+         tracking while you play — it goes to the tray icon if your desktop has \
+         one, and minimises if it does not. This exits for real.",
         &btn,
     )
 }
@@ -2241,8 +2341,6 @@ fn update_check_switch() -> Switch {
     sw
 }
 
-/// A settings section: bold title, wrapped description (original wording), and
-/// a control widget beneath — the right-column building block.
 /// One setting, as a card: what it is, what it does, and its control.
 ///
 /// A card rather than a bare stack because the hub holds five co-equal
@@ -2311,21 +2409,64 @@ mod tests {
                 "the 2:1 ratio must survive scale {scale}: {title} vs {eyebrow}"
             );
 
-            // The whole real sheet, at the smallest scale, must still state
-            // sizes a person can see.
-            let out = super::scaled_css(super::CSS, scale);
-            let mut sizes = out.match_indices("font-size: ").map(|(i, k)| {
-                out[i + k.len()..]
-                    .split("px")
-                    .next()
-                    .and_then(|n| n.parse::<i64>().ok())
-                    .unwrap_or(0)
-            });
-            assert!(
-                sizes.all(|s| s >= 1),
-                "a size rounded away at scale {scale}"
-            );
+            // And the real sheet, size by size, against what each one should
+            // become. Asserting only that the results are positive passed just
+            // as well when nothing had been scaled at all.
+            let sizes = |css: &str| -> Vec<i64> {
+                css.match_indices("font-size: ")
+                    .filter_map(|(i, k)| {
+                        let t = &css[i + k.len()..];
+                        let d: String = t.chars().take_while(char::is_ascii_digit).collect();
+                        t[d.len()..].starts_with("px").then(|| d.parse().ok())?
+                    })
+                    .collect()
+            };
+            let before = sizes(super::CSS);
+            let after = sizes(&super::scaled_css(super::CSS, scale));
+            assert_eq!(before.len(), after.len(), "a rule went missing at {scale}");
+            assert!(!before.is_empty(), "the sheet states px sizes");
+            for (b, a) in before.iter().zip(&after) {
+                assert_eq!(
+                    *a,
+                    ((*b as f64 * scale).round() as i64).max(1),
+                    "{b}px at {scale}"
+                );
+            }
         }
+    }
+
+    /// The floor is for sheets this one is not: every size the hub states is
+    /// 10px or more, so even `TEXT_SCALE_MIN` leaves 8px and the clamp never
+    /// fires. It is here so a 1px rule added later degrades to invisible-but-
+    /// present rather than to `font-size: 0px`, which GTK rejects — taking the
+    /// whole stylesheet, not just that rule, with it.
+    #[test]
+    fn a_size_never_scales_away_to_nothing() {
+        assert_eq!(
+            super::scaled_css(".a { font-size: 1px; }", 0.1),
+            ".a { font-size: 1px; }"
+        );
+        assert!(super::CSS.match_indices("font-size: ").all(|(i, k)| {
+            let t = &super::CSS[i + k.len()..];
+            let d: String = t.chars().take_while(char::is_ascii_digit).collect();
+            d.parse::<f64>()
+                .is_ok_and(|px| px * tobii_config::TEXT_SCALE_MIN >= 8.0)
+        }));
+    }
+
+    /// The ends of the text-size range, without a GTK widget — which is the
+    /// reason `stepped` is a free function rather than a closure in the popover.
+    #[test]
+    fn the_text_size_steps_stop_at_both_ends() {
+        use tobii_config::{TEXT_SCALE_MAX, TEXT_SCALE_MIN};
+        const STEP: f64 = 0.1;
+        assert_eq!(super::stepped(1.0, STEP), 1.1);
+        assert_eq!(super::stepped(TEXT_SCALE_MAX, STEP), TEXT_SCALE_MAX);
+        assert_eq!(super::stepped(TEXT_SCALE_MIN, -STEP), TEXT_SCALE_MIN);
+        // Pressed from an out-of-range value — a hand-edited preference file —
+        // the next press is in range rather than one step further out.
+        assert_eq!(super::stepped(9.0, STEP), TEXT_SCALE_MAX);
+        assert_eq!(super::stepped(0.0, -STEP), TEXT_SCALE_MIN);
     }
 
     /// A size in a unit this does not understand is copied through, not guessed

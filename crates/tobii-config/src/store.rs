@@ -310,11 +310,13 @@ pub fn text_scale_path() -> PathBuf {
 
 /// The smallest and largest text scale the UI will apply.
 ///
-/// Not a matter of taste. Below the floor the 10px eyebrow labels stop being
-/// legible at all; above the ceiling the control column no longer fits beside
-/// the instrument at the window's minimum width, so the layout stacks and the
-/// user has traded readable text for a window they must scroll. Both ends are
-/// reachable from the buttons, so neither is a wall the user hits by accident.
+/// Both ends are where the hub stops working rather than where taste runs out,
+/// and both were measured. Below the floor the smallest thing the stylesheet
+/// states — the 10px eyebrow labels — rounds to 8px and stops being readable.
+/// Above the ceiling the hub's own minimum grows past the screens it has to fit
+/// on: 1395x857 at 1.6, already more than a 1366x768 laptop can show, so the
+/// window opens clipped rather than merely large. Both ends are reachable from
+/// the buttons, so neither is a wall the user hits by accident.
 pub const TEXT_SCALE_MIN: f64 = 0.8;
 pub const TEXT_SCALE_MAX: f64 = 1.6;
 
