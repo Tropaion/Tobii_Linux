@@ -420,7 +420,7 @@ because the reasoning is worth more than the tidiness.
   by the install-script tests with an entry, an icon and an applications folder
   the user cannot write (skipped as root, whom chmod does not bind).
 
-### 11.3d The one-eye fallback, the filter's gate and the calibration re-show (new since v0.3.1)
+### 11.3d The one-eye fallback, the filter's gate, the calibration re-show and the rotation recentre (new since v0.3.1)
 
 - **No committed recording in this repository contains a tracked eye**, so
   neither head-pose number below is fitted to real motion. Decoded rather than
@@ -475,12 +475,49 @@ because the reasoning is worth more than the tidiness.
   reads it. So a reconstructed pose currently reaches opentrack, the joystick
   and the Wine bridge looking exactly like a measured one — the failure mode the
   `PoseSource`/`SourcedPose` distinction exists to prevent.
-- **None of the three has been run against a tracker.** All are unit-tested,
-  each new test negative-controlled by undoing the change it covers, and the
-  hardware halves are untestable here: that a one-eye frame's surviving origin
-  behaves as the rigid-offset model assumes, that holding a sample is the right
-  answer to a real glitch, and that the device refuses a point the way the
-  re-show assumes and then collects it on a second showing.
+- **The rotation recentre's two thresholds are chosen, not fitted.** Both come
+  from the same shortage as the numbers above — no recording here contains a
+  tracked eye, so there is no distribution of what a head *holding still*
+  actually does over a second:
+  - `RECENTRE_MAX_SPREAD_DEG = 8.0` is **borrowed, not measured for this
+    purpose**: it is the spread at which `--calibrate-pitch` already tells a user
+    their head moved. Same shape of measurement, different axes, and a different
+    consequence — the pitch run reports a spread it dislikes and still hands over
+    the number, while this one **refuses** and leaves the old reference standing.
+    The nearest thing to evidence that the bar is passable is §10.1's pitch-zero
+    run on real hardware: 10–90% spread **2.57°** while sitting still, a third of
+    the limit — but that is one person, one setup, one axis, and not this code.
+    If an ordinary user's yaw/roll spread is in fact larger, the failure mode is
+    a button that refuses over and over with nothing to tune, since the limit is
+    a constant and not a `games.toml` key.
+  - `RECENTRE_MIN_POSES = 10` in the 1000 ms window is anchored to the
+    2026-08-09 session's per-eye dropout rates (34% left, 18% right of 400
+    frames), which are **not** a distribution of how many poses a one-second
+    window yields — the arithmetic from one to the other was never done against a
+    recording. `RECENTRE_WINDOW = 1000 ms` is this page's own original figure,
+    and how long a user actually holds a pose after clicking is unmeasured.
+  - `REQUEST_MAX_AGE = 2 s` and the hub's 6 s outcome message are chosen bounds
+    around a consumption latency of one gaze frame; nothing measures either.
+- **What a recentre is *for* has never been checked end to end.** The 17.4°
+  off-axis session that motivates it was measured before this existed, and
+  nothing since has confirmed that taking a reference from such a posture removes
+  the in-game bias — that needs a tracker, a game and the same head. Nor is the
+  reference shown anywhere once applied: the pipeline holds two degrees that no
+  readout prints, so a wrong reference presents as "head tracking is turned a bit"
+  with nothing to inspect.
+- **One reference, two rotation sources.** `rot_ref` is subtracted from the head
+  term whatever produced it, so a reference measured while the neural model was
+  supplying rotation is still applied when the model drops out and the geometric
+  `pose_from_eyes` takes over. §10.1 measured the two as closely correlated
+  (yaw r = 0.998, roll r = 0.990) but a constant offset between them would ride
+  straight through this, and no test or measurement rules one out.
+- **None of the four has been run against a tracker.** All are unit-tested, each
+  new test negative-controlled by undoing the change it covers, and the hardware
+  halves are untestable here: that a one-eye frame's surviving origin behaves as
+  the rigid-offset model assumes, that holding a sample is the right answer to a
+  real glitch, that the device refuses a point the way the re-show assumes and
+  then collects it on a second showing, and that a settle window of real head
+  data passes its own spread test.
 
 ### 11.4 Environmental
 

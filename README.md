@@ -205,10 +205,12 @@ band and per eye, with a diagnosis.
 <summary><b>Closing the window does not quit — and where the window goes</b></summary>
 
 Pressing **X** puts the hub in the background and leaves it running. That is
-deliberate: only one process can claim the tracker over USB, so the program that
-owns the device has to be the same one that feeds a game — and configuring it
-means opening this window. A hub that died when you dismissed it would take the
-game's head tracking with it.
+deliberate: only one process can claim the tracker over USB, so whatever owns
+the device is also what feeds a game — and when that is the hub (the route that
+feeds the joystick, the Wine bridge and opentrack at once), it has to outlive
+the window you configured it in. A hub that died when you dismissed it would
+take the game's head tracking with it. Nothing needs it for the
+`tobii headpose` route, which owns the device itself.
 
 **Where it goes depends on your desktop.** If something on your session bus owns
 `org.kde.StatusNotifierWatcher` — KDE Plasma, and the panels and bars that
@@ -307,6 +309,8 @@ tobii headpose                    # stream to opentrack on :4242
 
 Point opentrack's **UDP over network** input at `127.0.0.1:4242`. Without the
 model this still works — you get position, yaw and roll, and pitch reads zero.
+That command is the whole route: it opens the tracker itself and sends the
+datagram itself, with no hub running and nothing wrapping your game.
 
 **5 DOF with no extra download**: position in millimetres plus yaw and roll,
 derived from the two eye origins. **6 DOF with the optional model**: it adds
@@ -321,25 +325,48 @@ The model reports pitch in its own frame, offset by how your tracker is mounted;
 model's yaw and roll beside the geometry's, which is how the sign conventions
 were confirmed on hardware.
 
-### In a game
+### In a game — two routes, and only one of them needs a wrapper
 
-The tracker is only on while something asks for it, and a game cannot ask — it
-speaks opentrack or TrackIR, not this program's socket. So wrap the game:
+**Just opentrack: run `tobii headpose` and play.** It is a complete path on its
+own — it opens the tracker over USB, composes the pose and sends the 48-byte
+opentrack datagram to `127.0.0.1:4242` until you stop it. Anything that reads
+that datagram is served by it: opentrack itself, and **X-Plane 11/12**, which
+binds the port natively through the `headtrack` plugin and needs no opentrack at
+all (see [`docs/wiki/Game-Output.md`](docs/wiki/Game-Output.md)). No hub, no
+`tobii game`, no launch options. Start it before the game, Ctrl-C afterwards —
+the tracker is lit for exactly as long as the command runs.
+
+**Everything at once: let the hub own the device.** Only one process can claim
+the ET5 over USB, so if you want the virtual joystick, the Wine bridge and
+opentrack fed from one place, that place is the hub: it holds the connection and
+fans the same composed frame out to every sink you have turned on.
+
+The price of that is a signal the hub cannot get by itself. It keeps the
+infrared illuminators dark unless something is asking for the tracker, and a
+game cannot ask — it speaks opentrack or TrackIR, not this program's socket.
+**Turning "Head tracking for games" on is not itself a request**: that switch
+decides where frames go, not whether the tracker runs. So something has to ask
+on the game's behalf, and that is the entire job of the wrapper:
 
 ```sh
 tobii game -- %command%        # Steam: paste this into Launch Options
 tobii game -- ./MyGame.x86_64  # or anywhere else
 ```
 
-The hub must be running (it is, if you closed its window rather than quitting).
-The tracker comes on when the game starts and goes dark a few seconds after it
-exits — measured on the wrapper above: **0 USB file descriptors held before, 1
-while the game runs, 0 again afterwards.**
+It carries no tracking data at all. It connects to the hub's socket, subscribes
+to pose for as long as the child process lives, and lets go when it exits — so
+the hub lights the tracker while the game runs and drops it afterwards. Measured
+on the wrapper above: **0 USB file descriptors held before, 1 while the game
+runs, 0 again afterwards.** Any program that connects to that socket and asks
+for pose does the same; the wrapper is simply the one that knows exactly how
+long a game lives.
 
-`tobii game` is transparent to whatever launched it: it exits with the game's own
-exit code, reports a killed game as 128 + the signal rather than as success, and
-**never stops the game starting**. With no hub running it prints a note and runs
-the game anyway — head tracking is worth less than the game launching.
+The hub must be running for it (it is, if you closed its window rather than
+quitting). `tobii game` is transparent to whatever launched it: it exits with
+the game's own exit code, reports a killed game as 128 + the signal rather than
+as success, and **never stops the game starting**. With no hub running it prints
+a note and runs the game anyway — head tracking is worth less than the game
+launching.
 
 Steam's `%command%`, Lutris's and Heroic's wrapper fields, and a plain shell
 script all work with no further support, which is why this is a wrapper rather
@@ -452,7 +479,7 @@ this program keeps one open only while something actually wants data:
 | The hub window | while it has **focus** |
 | Preview my gaze | while the overlay is shown |
 | Calibration, display setup, the accuracy diagnostic | while the flow is running |
-| A game started with `tobii game` | while the game runs |
+| Any program connected to the hub's socket asking for pose, gaze or camera — a game started with `tobii game` is one | while it stays connected |
 | A queued setting (e.g. select eyes) | until it has been applied |
 
 Three seconds after the last of those lets go, the session closes and the LEDs
@@ -460,8 +487,18 @@ go out. The linger is not arbitrary: closing the session makes the ET5 reboot,
 and the next connect has to re-apply the display area, the eye selection and the
 calibration blob, so alt-tabbing away and back should not pay for that twice.
 
+That table is the whole list, and **turning game output on is not on it**: the
+"Head tracking for games" switch decides where frames go, not whether the
+tracker runs. A hub with the switch on and nothing playing sits dark on purpose
+— which is why the hub route needs `tobii game` (or another socket client) and
+the `tobii headpose` route does not.
+
 A useful consequence: while the hub is unfocused it holds no USB session, so
 `tobii headpose` can claim the device for a game without closing the hub first.
+That is what makes the standalone route work with the hub open — but only one
+process can have the device at a time, so focusing the hub while
+`tobii headpose` runs gets "already claimed by another process" rather than a
+live view.
 
 ## Configuration
 

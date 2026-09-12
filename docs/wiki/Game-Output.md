@@ -14,10 +14,47 @@ All four are fed from the same [`FramePipeline`](../../crates/tobii-output/src/p
 and fanned out by the same `Router`, so no two of them can disagree about what a
 blink does or when Extended View contributes.
 
+## Two processes can feed those routes, and only one of them needs a wrapper
+
+The pipeline and the `Router` are a library, and **two front ends drive them**:
+the hub, and `tobii headpose`. Which one is running decides whether anything has
+to wrap the game.
+
+**`tobii headpose` is self-contained.** `crates/tobii-cli/src/main.rs` opens the
+device itself (`UsbTransport::open`, then `Connection::connect`), builds a
+`Router` with the opentrack sink — and the bridge sink and joystick, where
+`games.toml` asks for them — and streams until it is stopped. The tracker is lit
+for exactly as long as the command runs, because that process holds the USB
+session. For the **opentrack UDP** route this is the whole story: opentrack's
+"UDP over network" input, or a direct listener like X-Plane (below), receives
+the datagram with no hub running and nothing wrapping the game.
+
+**The hub is how the other three routes are fed, and how all four are fed at
+once.** Only one process can claim the ET5 over USB, so a joystick, a Wine
+bridge and an opentrack stream cannot be three programs; they are one, and the
+hub is the one that also owns the calibration, the display area and the
+settings.
+
+What the hub cannot work out by itself is *when*. The USB session is
+reference-counted (`Demand`, see [[Runtime-View]] §6.2), and the things that
+take a count are the hub window while it has focus, the gaze overlay, a
+calibration or setup flow, and **a socket client**
+(`crates/tobii-gtk/src/outputs.rs`: `Holds::hello` takes a `DemandGuard` for a
+client subscribed to pose, gaze or camera). **Game output is not on that list**
+— `GameOutput::from_config` opens sinks and takes no guard — so the switch
+decides where frames go and never whether the tracker runs. A game cannot take a
+count either: it speaks opentrack or TrackIR, not this program's socket.
+
+That gap is the whole reason `tobii game` exists. It transports nothing: it
+connects to the hub's socket, subscribes to pose for the lifetime of the child
+process, and drops the connection when the child exits — the wrapper is a
+`DemandGuard` with a launcher's sense of timing. Any program that holds that
+subscription does the same job.
+
 ## The composition order is load-bearing
 
-Two orderings inside the pipeline are not obvious and are the difference between
-tracking that feels right and tracking that feels broken:
+These orderings inside the pipeline are not obvious and are the difference
+between tracking that feels right and tracking that feels broken:
 
 * **Compose, then filter once.** Smoothing the head pose and the gaze
   contribution separately leaves the two out of phase, so a fast look arrives
@@ -32,7 +69,18 @@ tracking that feels right and tracking that feels broken:
   not a lunge. Position only — the pose reaching the filter already carries the
   Extended View term, which moves at saccade speed, so any angular gate tight
   enough to catch a rotation glitch would reject a legitimate look across the
-  screen.
+  screen. The 150 mm is the default of the `filter_max_step_mm` key, not a
+  constant.
+* **Recentre rotation *before* `compose`, translation *after* it.** The two
+  references are taken at opposite ends of the pipeline on purpose. Translation's
+  neutral goes out after Extended View, because Extended View measures gaze
+  against the screen's corners in the tracker's frame and moving the head to the
+  origin first collapses that angle to nothing. A rotation reference
+  (`--recenter`, the hub's button, `Msg::Recentre`) is taken before, because
+  after `compose` the angle also carries the gaze-driven Extended View term — and
+  a reference caught during a glance at a screen edge would be permanent, since
+  nothing decays it. Pitch is in neither: it has its own measured zero from
+  `tobii headpose --calibrate-pitch`.
 
 Tracking loss longer than a second discards the smoothing state entirely:
 resuming from a second-old pose swings the camera across the room.
@@ -250,13 +298,28 @@ receiver". It binds UDP `0.0.0.0:4242` and reads a 48-byte payload of six
 and `pilots_head_{psi,the,phi}` in **degrees**.
 
 That is byte-for-byte what our opentrack sink already emits, on the port we
-already default to. So:
+already default to. So install the plugin and run:
+
+```sh
+tobii headpose                    # sends to 127.0.0.1:4242 until you stop it
+```
+
+and it works — no opentrack, no bridge, no hub, no new code. The plugin binds
+the port and this command sends to it; nothing else is in the path.
+
+Through the hub instead — worth it when the same session should also drive a
+joystick or the Wine bridge — the sink is on by default and only has to be
+switched on:
 
 ```sh
 tobii games set enabled true      # opentrack sink is on by default at 127.0.0.1:4242
 ```
 
-install the plugin, and it works — no opentrack, no bridge, no new code.
+with the caveat from the section above: the hub sends nothing while nothing is
+asking for the tracker, so X-Plane started on its own gets a dark tracker until
+`tobii game -- <the X-Plane launcher>`, or another socket client, holds the
+demand. That is the asymmetry worth knowing before choosing a route — the
+standalone command needs no such holder, because it *is* one.
 
 This matters because the virtual joystick genuinely *cannot* reach X-Plane:
 Laminar's own developer documentation is explicit that a joystick axis cannot be

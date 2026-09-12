@@ -140,7 +140,13 @@ A tick-driven state machine in `calibrate_flow.rs` over the device thread:
 ### 6.4 `tobii headpose` to a game
 
 Its own process, its own connection — which is only possible because the hub
-releases the device when unfocused.
+releases the device when unfocused. Nothing below goes through the hub or its
+socket: this path holds the USB session itself, so the tracker is lit for
+exactly as long as the command runs, and the `tobii game` wrapper has nothing to
+do here. That wrapper is a socket client and nothing else — it exists for the
+hub's route, where game output itself takes no `DemandGuard` and so cannot light
+the tracker for a game that never connects (§6.2, and
+[[Game-Output]]).
 
 1. Resolve `--udp` (default `127.0.0.1:4242`) and `--rate` (default 60 Hz).
 2. Bind an ephemeral local socket; opentrack only ever receives.

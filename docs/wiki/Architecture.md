@@ -197,7 +197,11 @@ a backlog of stale frames is worse than a skipped one.
 
 `Demand` is the reference count on the USB session. Consumers take a
 `DemandGuard`: the hub while its window has focus, the gaze overlay while shown,
-a calibration or setup flow while it runs. A queued command is the one thing
+a calibration or setup flow while it runs, and a **socket client** for as long as
+it stays subscribed to pose, gaze or camera (`outputs::Holds::hello`) — which is
+all `tobii game` is, and the only reason a game lights the tracker. Game output
+itself takes no guard: the switch routes frames, it does not ask for the device.
+A queued command is the one thing
 that opens a session WITHOUT taking a guard — the device thread's wait is
 `!demand.active() && pending.is_empty()`, so "select left eye only" typed into
 an idle hub still takes effect. Three seconds after the last guard drops, the

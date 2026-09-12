@@ -102,7 +102,10 @@ illuminators are lit for as long as a session is open. The linger is not
 arbitrary: closing makes the device reboot, so the next connect must re-apply
 everything in decision 5. Unplanned and now load-bearing benefit: while the hub
 wants nothing the device is free, so `tobii headpose` can claim it for a game
-without closing the hub. Commit `39c1547`.
+without closing the hub — a complete route that needs neither the hub nor a
+wrapper. A socket client subscribed to pose is itself one of the references, and
+that is the whole of `tobii game`: it transports nothing, it only tells the hub
+that something wants data for as long as the game runs. Commit `39c1547`.
 
 **7. `Idle` is not an error state.** The hub renders it "Tracker off", not
 "Disconnected" — a user who sees a fault where there is none goes looking for

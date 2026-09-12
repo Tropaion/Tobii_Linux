@@ -8,11 +8,12 @@ Each item says what to change, where, what it costs, and how it could go wrong.
 Where a number appears, it is one this project measured — not one read from
 another project.
 
-**Three of the four numbered items have since been built** — 1, 2 and 4 — and
-each keeps its original reasoning here with what actually shipped, what was
-deliberately left out, and where the shipped behaviour differs from what this
-page proposed. Item 3 is the one still open. None of the three has been run
-against a tracker; what that leaves untested is listed in
+**All four numbered items have since been built**, and each keeps its original
+reasoning here with what actually shipped, what was deliberately left out, and
+where the shipped behaviour differs from what this page proposed. What is still
+queued is under [Smaller candidates](#smaller-candidates) and
+[In progress](#in-progress) below. None of the four has been run against a
+tracker; what that leaves untested is listed in
 [Quality-and-Risks](Quality-and-Risks.md) §11.3d.
 
 ## How this list came about
@@ -141,35 +142,105 @@ file, listed by `tobii games`, and read by nothing. `with_max_step_mm()` exists
 so that wiring is a one-line change when it is wanted; nothing outside the
 crate's own tests calls it today.
 
-## 3. A rotation recentre — the one item on this page still open
+## 3. A rotation recentre — shipped in `f25a2ea`
 
-**What.** There is none. `crates/tobii-output/src/pipeline.rs` says "Rotation is
-never recentred: it is already referenced to facing the screen". Translation gets
-an automatic neutral; rotation gets nothing.
+**Was.** There was none. `crates/tobii-output/src/pipeline.rs` said "Rotation is
+never recentred: it is already referenced to facing the screen" — true of the
+Extended View term, which is built against the screen's own corners, and not of
+the head term, which is an `atan2` on the interocular vector (`pose_from_eyes`)
+and so absolute in the *tracker's* frame. It is referenced to the screen only by
+assuming the tracker is mounted square and the user sits on its axis. This
+project has a measured session with a head sitting **17.4° off-axis**; that user
+had a permanent in-game bias and no control that removed it.
 
-**Why.** That reasoning holds for the Extended View term, which is measured
-against screen centre, but head yaw and roll come from `pose_from_eyes` — an
-`atan2` on the interocular vector, absolute in the tracker's frame. It is
-referenced to the screen only by assuming the tracker is mounted square and the
-user sits on axis. This project has a measured session with a head sitting
-**17.4° off-axis**; such a user has a permanent in-game bias and no control that
-removes it.
+**Shipped.** `rot_ref: Option<[f64; 2]>` beside `neutral` in `pipeline.rs`, two
+degrees subtracted from the head term, and a settle window that decides what
+they are. `begin_recentre` opens one; `RECENTRE_WINDOW` is **1000 ms**, about 33
+frames at the 30.208 ms cadence measured in `session.tobiicap`, and short enough
+that the user is still holding the pose they pressed the button in. The window
+is reduced the way `tobii_headpose::pitch_offset_from` already reduces the other
+measured zero in this project — **median and 10–90% spread**, so the frames
+before the user settled cannot move the answer. Non-finite angles are dropped
+rather than sorted (a degenerate model quaternion normalises to NaN, and
+`partial_cmp` answers `None` for it), which costs the run those frames and so
+shows up as a window with too few poses, which is the truth.
 
-**Touches.** A `rot_ref` beside `neutral` in `crates/tobii-output/src/pipeline.rs`,
-a `Recenter` action over `crates/tobii-ipc`, a button in `crates/tobii-gtk`, and
-`tobii headpose --recenter`.
+**Two ways a window is refused, and both leave the old reference standing.**
+`RECENTRE_MIN_POSES = 10` of the ~33 frames a second holds: a chosen floor
+bounded by measurement in both directions — the 2026-08-09 session lost its left
+eye in 34% of 400 frames and its right in 18%, so demanding most of the window
+would refuse an ordinary session, while a window that yielded fewer than ten
+poses means the tracker was mostly not seeing the user.
+`RECENTRE_MAX_SPREAD_DEG = 8.0` is not a new number either: it is the spread at
+which `--calibrate-pitch` already tells the user their head moved during the
+measurement — the same shape of measurement, so the same figure. It is **the worse of yaw and roll, not their
+average** — a head that held its yaw while swinging in roll was still moving —
+and it refuses rather than merely flagging, because a pitch run prints the number
+it measured while a rotation reference is invisible once applied. The bias this
+exists to remove is twice the bar (17.4° against 8°), so an off-axis user is
+refused for *moving*, never for being off-axis. Both refusals are reported:
+`RecentreOutcome` names what went wrong, because a recentre that quietly did not
+take is indistinguishable from nothing happening.
 
-**Effort.** A day, most of it the IPC and GUI surface.
+**Before `compose`, never after.** The exact opposite of the rule for
+translation, for the opposite reason: after `compose` the angle also carries the
+gaze-driven Extended View term, so a reference taken while the user glanced at a
+screen edge would write that glance in permanently — and unlike the neutral,
+nothing decays it. A window that completes on a frame is applied to *that* frame,
+so the recentre takes effect on the first frame it possibly can.
 
-**Risks.** Three, each avoidable:
-- A reference captured mid-turn is worse than none — average over a settle window
-  of about a second rather than grabbing one frame.
-- **Keep pitch out of it.** Pitch already has a measured zero from
-  `tobii headpose --calibrate-pitch`; a second reference would fight it.
-- Recentre the head term only, never after `fusion::compose` — recentring while
-  the user looks at a screen edge would bake the Extended View offset into the
-  reference. The same trap for translation is already documented in
-  `pipeline.rs`; this one is worse, because nothing decays it.
+**Pitch is untouched**, as this item asked: it already has a measured zero from
+`tobii headpose --calibrate-pitch`, saved to disk and applied inside the model,
+and the geometric path has no pitch to reference at all. The reference also
+**survives a tracking loss**, unlike the neutral beside it — walking away is not
+a request to undo something the user asked for — though a settle window *in
+flight* when the head is gone for a second is abandoned and reported rather than
+averaged across the gap.
+
+**Three ways in, one place they are decided.** The hub's "Recentre view" button
+in the games row, `tobii headpose --recenter` (`--recentre` is accepted too,
+because every line of prose here spells it that way), and `Msg::Recentre` over
+the socket, answered with `RecentreReply`. The message kind is additive, which is
+what the codec's `Unknown` arm exists to make safe for an older client. Only the
+`FramePipeline` on the device thread can perform one, so a request is *left* in
+`Recentring` (`crates/tobii-gtk/src/outputs.rs`) and taken by whichever pipeline
+is composing frames — it is not a `DeviceCommand`, because a recentre changes
+nothing on the tracker.
+
+**Refused before it is taken, in the two states the asker cannot see.**
+`recentre_decision` refuses while a flow holds the device exclusively
+(`EXCLUSIVE = ["calibration", "display setup"]`) — a calibration has the user
+following a stimulus dot into the corners, so the "posture" a window would
+average is whichever corner the dot was in — and when nothing is tracking, which
+would otherwise be a control that appears to do nothing. The hub's button is
+insensitive exactly when that function would refuse. A request nobody consumes
+goes stale after `REQUEST_MAX_AGE = 2 s`: game output takes one on its next gaze
+frame, 30.208 ms away, so anything still waiting two seconds later was asked for
+while nothing was composing frames, and performing it when a game finally starts
+would take a reference from a posture nobody was holding. Two presses before
+either is taken collapse into one, which is what they mean.
+
+**Two things rode along**, because they need files this change already owns:
+
+- **`filter_max_step_mm`** — item 2's "left out" is no longer left out. The
+  filter's jump limit is a `games.toml` key, read at both places a pipeline is
+  built (`FramePipeline::new` and `reconfigure`), so the constant that shipped
+  with the gate is tunable without a rebuild.
+- **The one-eye fallback is visible.** `fallback_note` appends
+  `, one eye N%` to the rates that `tobii headpose` and `--check` already print,
+  with `(now)` while the current pose is a reconstruction — so a tracker that
+  cannot see one eye at all reads differently from one that blinked twenty
+  minutes ago. Item 1's "left out" is half closed: the hub and `tobii debug`
+  still show nothing.
+
+**Different from what this item proposed.** This page said "average over a settle
+window of about a second". What shipped takes a **median**, and can **refuse** —
+an average always produces a number, and a number produced from a head that was
+moving is exactly the permanent bad reference this item was written to avoid.
+The refusal states (a flow that owns the device, nothing tracking, a request gone
+stale) are not on this page at all; they came out of the three entry points
+existing at once. The spelling is the other difference: this page said
+`--recenter`, the code accepts it and spells everything else "recentre".
 
 ## 4. Per-group retry in the calibration flow — shipped in `161198e`
 
@@ -214,6 +285,46 @@ group's own points and does not depend on how many are already captured, while
 for a lone survivor `focus::zone_radius` returns `f64::MAX` — the whole screen
 counts as "on" that point, which is the class of bug the per-group radius was
 introduced to fix. The re-show reuses the radius `launch()` computed.
+
+## In progress
+
+### The hub lights the tracker for a listener on the opentrack port
+
+**Status: being built now**, not shipped. Written down here because it changes
+the answer to a question the README used to answer badly.
+
+**What.** The hub reads `/proc/net/udp` (and `/proc/net/udp6`), looks for a
+socket bound to the configured opentrack destination — `127.0.0.1:4242` by
+default — and, while one exists, holds a `DemandGuard` for it, exactly as a
+socket client does today. opentrack running, or X-Plane with the `headtrack`
+plugin loaded, then lights the tracker by itself.
+
+**Why.** Because the wrapper is a workaround for a signal the hub could not
+otherwise get. `tobii game` transports nothing: it exists only to tell the hub
+that something wants data (see [Game-Output](Game-Output.md)). For the opentrack
+route, the receiver is already announcing itself — it has bound the port, and the
+kernel will say so — so the hub can hold its own demand and the launch option is
+no longer needed. The joystick and the Wine bridge keep needing the wrapper,
+because neither receiver binds anything the hub can see.
+
+**The trade, stated plainly.** A bound socket is not a request:
+
+- **An idle listener keeps the illuminators lit.** opentrack left open on a
+  second monitor is indistinguishable, through `/proc/net/udp`, from opentrack
+  feeding a game — same socket, same state. The tracker would be on all
+  afternoon, which is exactly what the reference-counted session exists to
+  prevent. The wrapper is precise about when a game starts and stops; this is
+  not, and cannot be made so from this interface.
+- **It only sees this machine.** `/proc/net/udp` lists this host's sockets in
+  this network namespace. Sending to another machine's opentrack — a
+  configuration `tobii games set opentrack HOST:PORT` allows — finds nothing to
+  detect, and so must keep working through a wrapper or through a hub window
+  that has focus. A receiver in a network namespace of its own is the same case.
+
+**Consequently the detection cannot be the only way in**, and cannot be silent:
+whatever ships has to say in the hub *why* the tracker is on ("a program is
+listening on 127.0.0.1:4242"), the way every other reason already names itself,
+and the wrapper stays for the routes and the machines this cannot reach.
 
 ## Smaller candidates
 
