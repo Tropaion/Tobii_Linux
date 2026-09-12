@@ -361,6 +361,18 @@ runs, 0 again afterwards.** Any program that connects to that socket and asks
 for pose does the same; the wrapper is simply the one that knows exactly how
 long a game lives.
 
+**For opentrack, the hub can see the request without being told.** A program
+that binds the address the opentrack sink sends to — opentrack's "UDP over
+network" input, or X-Plane — is visible to the hub, which treats it as the ask,
+lights the tracker while the socket is open, and drops it when it closes.
+Measured on a hub with no window open: **0** USB file descriptors with nothing
+listening, **1** within four seconds of a socket binding `127.0.0.1:4242`, **0**
+again after it closed. So for opentrack through the hub there is no launch
+option either — open opentrack and play. The joystick and the Wine bridge still
+need the wrapper, because neither receiver binds anything the hub can see, and
+an opentrack left open with no game keeps the tracker lit, which the wrapper
+never does: `tobii games set wake_for_opentrack false` turns the watch off.
+
 The hub must be running for it (it is, if you closed its window rather than
 quitting). `tobii game` is transparent to whatever launched it: it exits with
 the game's own exit code, reports a killed game as 128 + the signal rather than

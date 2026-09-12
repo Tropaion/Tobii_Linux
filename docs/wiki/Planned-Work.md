@@ -10,11 +10,11 @@ another project.
 
 **All four numbered items have since been built**, and each keeps its original
 reasoning here with what actually shipped, what was deliberately left out, and
-where the shipped behaviour differs from what this page proposed. What is still
-queued is under [Smaller candidates](#smaller-candidates) and
-[In progress](#in-progress) below. None of the four has been run against a
-tracker; what that leaves untested is listed in
-[Quality-and-Risks](Quality-and-Risks.md) §11.3d.
+where the shipped behaviour differs from what this page proposed. A fifth item,
+the opentrack port watch, has shipped since. What is still queued is under
+[Smaller candidates](#smaller-candidates). None of the four numbered items has
+been run against a tracker — the port watch has, end to end — and what that
+leaves untested is listed in [Quality-and-Risks](Quality-and-Risks.md) §11.3d.
 
 ## How this list came about
 
@@ -286,12 +286,10 @@ for a lone survivor `focus::zone_radius` returns `f64::MAX` — the whole screen
 counts as "on" that point, which is the class of bug the per-group radius was
 introduced to fix. The re-show reuses the radius `launch()` computed.
 
-## In progress
+## 5. The hub lights the tracker for a listener on the opentrack port — shipped in `8c2537f`
 
-### The hub lights the tracker for a listener on the opentrack port
-
-**Status: being built now**, not shipped. Written down here because it changes
-the answer to a question the README used to answer badly.
+Written down here because it changes the answer to a question the README used to
+answer badly: the wrapper was never needed for the opentrack route.
 
 **What.** The hub reads `/proc/net/udp` (and `/proc/net/udp6`), looks for a
 socket bound to the configured opentrack destination — `127.0.0.1:4242` by
@@ -321,10 +319,27 @@ because neither receiver binds anything the hub can see.
   detect, and so must keep working through a wrapper or through a hub window
   that has focus. A receiver in a network namespace of its own is the same case.
 
-**Consequently the detection cannot be the only way in**, and cannot be silent:
-whatever ships has to say in the hub *why* the tracker is on ("a program is
-listening on 127.0.0.1:4242"), the way every other reason already names itself,
-and the wrapper stays for the routes and the machines this cannot reach.
+**Consequently the detection is not the only way in**, and it is not silent: the
+hub names this cause like any other ("a program listening on the opentrack
+port"), and the wrapper stays for the routes and the machines this cannot reach.
+
+**Shipped.** `tobii_output::listener::probe` answers `Yes` / `No` /
+`Unknown(why)`; `Unknown` never takes a hold, so a configured address this host
+cannot see keeps the old behaviour rather than guessing. The /proc path is
+behind `cfg(target_os = "linux")` because this crate cross-compiles to
+`x86_64-pc-windows-gnu` for the Wine bridge. The hub polls once a second, not at
+the socket loop's 50 ms. The key is `wake_for_opentrack`, default **on**, and it
+does nothing until game output is `enabled` (off out of the box) and an
+opentrack address is set — so a fresh install behaves as it always did, and the
+watch only runs for somebody who already turned game output on.
+
+**Measured, not inferred.** A hub started with `--background` (no window, so
+nothing else could be holding the device) against a config with game output on:
+**0** USB file descriptors with nothing listening, **1** within four seconds of
+a socket binding `127.0.0.1:4242`, and **0** again after it closed and the three
+second linger elapsed. Its IPC socket was already owned by another hub at the
+time, which the log said — so the watch does not depend on the socket server
+binding.
 
 ## Smaller candidates
 

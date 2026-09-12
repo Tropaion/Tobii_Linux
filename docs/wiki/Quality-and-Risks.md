@@ -519,6 +519,28 @@ because the reasoning is worth more than the tidiness.
   then collects it on a second showing, and that a settle window of real head
   data passes its own spread test.
 
+### 11.3e The opentrack port watch (new since v0.3.1)
+
+- **A bound socket is not a request, and this cannot tell the difference.**
+  opentrack left open on a second monitor looks exactly like opentrack feeding a
+  game, so the illuminators stay lit for as long as it is open. `tobii games set
+  wake_for_opentrack false` turns the watch off; the wrapper remains exact about
+  when a game starts and stops.
+- **It sees only this host, in this network namespace.** A configured opentrack
+  address that is not local answers `Unknown`, never `No`, and `Unknown` takes no
+  hold — so sending to another machine, or to a receiver in its own namespace,
+  behaves exactly as it did before and still needs a wrapper or a focused hub.
+- **The decode assumes a little-endian host.** `/proc/net/udp` prints the address
+  as a `__be32` in host order; on a big-endian machine the addresses would come
+  out byte-swapped and simply never match, so the watch would be inert rather
+  than wrong. Untested there — no such machine was available.
+- **What is measured:** a background hub held 0 USB file descriptors with nothing
+  listening, 1 within four seconds of a socket binding the configured address,
+  and 0 again after it closed. The parser is tested against captured
+  `/proc/net/udp` and `udp6` text, and one test binds a real socket on an
+  OS-assigned port. What is **not** measured is a real opentrack or X-Plane doing
+  the binding — both were inferred from the port they document.
+
 ### 11.4 Environmental
 
 - **Glyph clipping at fractional display scale.** Tops of tall glyphs appear

@@ -51,6 +51,20 @@ process, and drops the connection when the child exits — the wrapper is a
 `DemandGuard` with a launcher's sense of timing. Any program that holds that
 subscription does the same job.
 
+**One receiver announces itself, and the hub listens for that.** A socket bound
+to the opentrack destination appears in `/proc/net/udp` (and `udp6`), so
+`tobii_output::listener::probe` looks for one and `PortWatch` in
+`crates/tobii-gtk/src/outputs.rs` holds a `DemandGuard` while it is there,
+polling once a second rather than at the socket loop's 50 ms. `probe` answers
+`Yes`, `No` or `Unknown(why)`, and `Unknown` — a configured address this host
+cannot see, or a platform without `/proc` — never takes a hold, so it degrades
+to the old behaviour instead of guessing. The key is `wake_for_opentrack`,
+default on, and it does nothing until game output is `enabled` and an opentrack
+address is set. This closes the gap for one route only: the joystick and the
+bridge receivers bind nothing the hub can see. The trade is that a bound socket
+is not a request — opentrack left open on a second monitor is indistinguishable
+from opentrack feeding a game, so the illuminators stay lit until it is closed.
+
 ## The composition order is load-bearing
 
 These orderings inside the pipeline are not obvious and are the difference
