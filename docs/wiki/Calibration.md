@@ -117,6 +117,32 @@ evidence of device-side blocking. See `crates/tobii-gtk/src/calibrate_flow.rs`'s
 > A later revision then assumed a fixed host-side dwell was sufficient in its
 > place — that too was superseded, by the gaze-verified mechanism described here.
 
+## A weak group comes back; it no longer ends the run
+
+A point the device refused, or a group whose deadline elapsed, used to fail the
+whole 7-point run — on a 49" panel one bad corner cost every point already
+collected. Since `161198e` the group is re-shown instead:
+`MAX_GROUP_ATTEMPTS = 3` in `calibrate_flow.rs`, the first showing plus two
+re-shows, and only the last attempt still fails with the message it always gave.
+The failure screen's "Try again" is unchanged and still restarts from the first
+point.
+
+A re-show keeps the points that group already captured, keeps `focused` so a
+late ack still has a point to land on, sends `discard_point` (`0x438`) for
+whatever collect was in flight, and takes a fresh deadline. Only two things
+count as "too weak", because the device offers nothing else: `add_point` answers
+with an ack or an error and no per-point sample count has ever been decoded out
+of it, so the signals are the error (read as an edge, charged to the tick that
+was waiting for that ack) and the group's own timeout. The mid-collect discard
+on lost focus is deliberately *not* one — it already recovers by itself.
+
+Three attempts is a judgement bounded by arithmetic, not a measured or
+decompiled figure: ~33 s per member caps a three-point group's attempt at ~99 s,
+so a group at ~5 minutes and a whole run at ~11.5 minutes of worst case. **Never
+run against hardware** — that the device refuses a point this way, and collects
+it on a second showing, both need a tracker and a screen; and `0x438` itself is
+[CODE-VERIFIED] only. See [[Quality-and-Risks]] §11.3d.
+
 ## Session / realm
 
 No special realm: all calibration ops ride the handshake's already-open no-auth

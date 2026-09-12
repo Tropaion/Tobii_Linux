@@ -25,9 +25,25 @@ tracking that feels right and tracking that feels broken:
 * **Hold through a blink.** Gaze vanishes for 100–400 ms every few seconds.
   Treating that as "look straight ahead" makes the camera lurch on every blink,
   so the last Extended View offset is held and decayed instead.
+* **Hold a sample that teleports.** The filter is no longer a plain EMA: a
+  finite sample whose *position* has moved more than **150 mm** from the last
+  accepted raw sample is refused, at most three frames in a row. 150 mm at the
+  measured 30.208 ms frame interval is 4.97 m/s, so it catches a teleport and
+  not a lunge. Position only — the pose reaching the filter already carries the
+  Extended View term, which moves at saccade speed, so any angular gate tight
+  enough to catch a rotation glitch would reject a legitimate look across the
+  screen.
 
 Tracking loss longer than a second discards the smoothing state entirely:
 resuming from a second-old pose swings the camera across the room.
+
+Where the pipeline is the one deriving the pose — the 5-DOF path, with no fresh
+neural pose — a frame carrying only **one** tracked eye still produces one: the
+missing eye is placed at the last measured interocular offset, for up to 300 ms.
+Rotation is *held* at its last measurement there; only translation follows the
+surviving eye. `FramePipeline::fallback_stats` counts how many poses a session
+owes to that, though nothing displays it yet. See [[Head-Pose]] and
+[[Quality-and-Risks]] §11.3d — none of this has been run against a tracker.
 
 ## Virtual joystick
 

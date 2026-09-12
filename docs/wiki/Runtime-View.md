@@ -131,7 +131,10 @@ A tick-driven state machine in `calibrate_flow.rs` over the device thread:
    (~990 ms) with `GAZE_GAP_TOLERANCE_TICKS = 8` of blink tolerance. A lost
    streak mid-collect sends a discard. Each completed group is computed and
    applied so the next is collected against a partially fitted model, exactly as
-   the original does.
+   the original does. A group whose point the device refuses, or whose deadline
+   elapses, is **re-shown** rather than ending the run — three attempts in all,
+   captured points staying captured — and only the third failure reaches the
+   failure screen, whose "Try again" still restarts from the first point.
 5. **Computing** → compute → retrieve → persist to `calibration.bin`.
 
 ### 6.4 `tobii headpose` to a game
@@ -149,7 +152,11 @@ releases the device when unfocused.
 6. Per frame: **position from the eye origins, rotation from the model.** The
    fusion is the point — two eye origins cannot express pitch, because nodding
    rotates the head about the line through them and leaves both origins where
-   they were.
+   they were. Without a fresh model pose, a frame with only one tracked eye
+   still yields one: the pipeline places the missing eye at the last measured
+   interocular offset for up to 300 ms, holding rotation at its last
+   measurement. With a model pose that path is bypassed — `onnx::fuse` takes the
+   model's own position when the eye geometry is missing.
 7. Encode six `f64` little-endian into the opentrack datagram and send — x, y, z,
    yaw, pitch, roll, which is 48 bytes, as `datagram_is_exactly_48_bytes` pins.
    `TRANSLATION_SCALE = 0.1` converts millimetres to the centimetres opentrack's

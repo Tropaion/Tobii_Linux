@@ -186,7 +186,8 @@ gate rejects: across 400 live frames there were **0** frames in which `0x07`/
 value. Every candidate gate (`0x1e`/`0x1f`, `0x26`/`0x28`, non-zero trackbox,
 non-zero display trackbox) admits the same 91% of frames. If a dot is missing,
 the fix is upstream of the wire — aim, lighting, occlusion — or reconstruction
-from the *other* eye (`eyeview::PairOffset`), never a looser gate.
+from the *other* eye (`eyeview::PairOffset` for the dots,
+`tobii-headpose::PairOffset` for the pose), never a looser gate.
 **[CONFIRMED]** live.
 
 ## No head pose here

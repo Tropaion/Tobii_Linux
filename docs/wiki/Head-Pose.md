@@ -90,7 +90,9 @@ Gating is strict: **both** eyes must report `validity == 0` *and* have origin
 columns present (`pose_from_sample`) — the present bit alone is not enough (the
 device sends zeroed origins with `validity == 4` when no eye is detected; see
 [[Gaze-Stream]]). Streamed to opentrack over UDP by `tobii headpose`.
-**[CONFIRMED]** — `tobii-headpose/src/lib.rs` and its tests.
+**[CONFIRMED]** — `tobii-headpose/src/lib.rs` and its tests. That gate is still
+the whole of the *stateless* function; a one-eye frame is now handled beside it,
+see below.
 
 **Unverified in the fallback [HYPOTHESIS]:** the yaw/roll **sign conventions**
 (yaw>0 = turn to user's right; roll>0 = tilt to user's right) and the
@@ -100,6 +102,38 @@ each sign is decided.
 
 The 5-DOF eye-origin fallback remains useful as a no-model, always-available
 baseline (position + yaw + roll); the neural path adds the pitch it cannot give.
+
+### One eye is enough — for 300 ms, and only for translation
+
+Since `a804686` a dropped eye no longer costs the frame its pose.
+`tobii-headpose::PairOffset` is the stateful counterpart of `pose_from_sample`:
+it re-measures the right-minus-left offset on every two-eye frame and, when
+exactly one eye is tracked, places the missing one at the surviving one plus
+that offset. The reason it exists is measured — roughly **five per-eye dropouts
+per second**, with one eye lost far more often than both, because a head off the
+tracker's optical axis loses the two independently.
+
+- **Rotation is held, not extrapolated.** `pose_from_eyes` reads yaw and roll
+  off the interocular vector, and during an outage that vector *is* the stored
+  offset — so a reconstructed frame repeats the last measured rotation and only
+  translation follows the eye that is really there.
+- **Bounds.** `RECONSTRUCTION_MAX_AGE = 300 ms` (~10 frames at the measured
+  30.208 ms cadence, and inside `tobii-output`'s 1 s `TRACKING_LOSS_RESET`);
+  `ONE_EYE_DEBOUNCE = 2`, one-directional, so one isolated invalid frame never
+  switches paths while two measured eyes are answered with the two-eye pose at
+  once. With both eyes tracked the output is bit for bit what it was.
+- **Not the same code as the eye-position screen's.** `eyeview::PairOffset`
+  carries normalized trackbox positions for a drawing; this one carries
+  tracker-space millimetres and ages in wall-clock time, so a stalled stream
+  cannot make an old offset look fresh by not arriving.
+- **Where it applies.** The pipeline uses it only when the stateless path
+  returned nothing *and* there is no fresh model pose — with one, `onnx::fuse`
+  takes the model's own position. The hub readout and `--check`'s `eyes` line
+  are stateless and still blank on a one-eye frame.
+
+**[HYPOTHESIS]** — unit-tested only; never run against a tracker, and the 300 ms
+bound is a judgement anchored to session notes rather than a fitted
+distribution. See [[Quality-and-Risks]] §11.3d.
 
 ## What we ship: the neural 6-DOF path
 

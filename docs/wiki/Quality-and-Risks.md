@@ -420,6 +420,68 @@ because the reasoning is worth more than the tidiness.
   by the install-script tests with an entry, an icon and an applications folder
   the user cannot write (skipped as root, whom chmod does not bind).
 
+### 11.3d The one-eye fallback, the filter's gate and the calibration re-show (new since v0.3.1)
+
+- **No committed recording in this repository contains a tracked eye**, so
+  neither head-pose number below is fitted to real motion. Decoded rather than
+  assumed: `crates/tobii-usb/tests/captures/session.tobiicap` holds exactly 40
+  gaze records, and every one is byte-identical to `tobii-protocol`'s committed
+  no-eyes fixture (`gaze.rs::real_frame_payload()`) apart from its timestamp and
+  frame counter — so all 40 carry validity `(4, 4)` with both eye-origin columns
+  zeroed, which is the state that fixture's own test asserts.
+  `calibration.tobiicap` carries no gaze records at all, and `tobii record
+  --calibration` records zero frames by construction. What the session *does*
+  give is the cadence: its 39 timestamp deltas are **30208 µs** (30211 max),
+  i.e. 33.1 Hz, matching the ~33 Hz documented elsewhere. What follows from
+  having the cadence and not the motion:
+  - The filter's `DEFAULT_MAX_STEP_MM = 150.0` is **geometry, not a
+    distribution** — 150 mm at 30.208 ms is **4.97 m/s**, picked to sit several
+    times above a seated head's translation and clear of the synthetic 100 mm
+    lean `tobii-output`'s and `tobii-gtk`'s existing tests assert on.
+  - `RECONSTRUCTION_MAX_AGE = 300 ms` is a judgement anchored to the 2026-08-09
+    session's notes — ordinary outages of ~95 ms (left eye) and ~120 ms (right),
+    with two extremes at 480 ms and 1260 ms — and the distribution between them
+    was never recorded.
+  - `MAX_HELD_FRAMES = 3` (91 ms at that cadence) is a chosen bound as well;
+    nothing recorded here says how long a glitch lasts.
+  Closing this needs one `tobii record` with a head in the trackbox and the
+  per-frame step distribution read off it.
+- **A reconstructed pose holds rotation; it never extrapolates it.** Yaw and
+  roll are read off the interocular vector, and during an outage that vector
+  *is* the stored offset — so a one-eye frame reports the rotation the last
+  two-eye frame measured, and only translation follows the eye that is really
+  there. That is what the age bound is for, and it also means a user who turns
+  their head during a dropout is reported as not having turned, for up to
+  300 ms.
+- **Where the fallback takes effect is narrower than it reads.** Both front ends
+  derive their pose with the *stateless* `pose_from_sample` and hand it to the
+  pipeline, which reconstructs only when that returned nothing and no fresh
+  neural pose exists — with one, `onnx::fuse` supplies the model's own position
+  instead, and the reconstruction is neither used nor counted. The hub's
+  head-pose readout and `tobii headpose --check`'s `eyes` line still show
+  nothing on a one-eye frame, so the feature is invisible in both places a user
+  would look to confirm it.
+- **The calibration re-show rests on `discard_calibration_point`**, which
+  `tobii-usb`'s own doc marks as reverse-engineered from native disassembly and
+  **unverified on real hardware** (`0x438` is [CODE-VERIFIED] in
+  [[Op-Catalog]] — disassembly, never a hardware round trip). Every re-show
+  sends one for the point that was in flight, and the call is best-effort: a
+  failure is logged and the flow continues. If the device does not in fact
+  discard, a re-shown point is collected on top of a partial sample rather than
+  in place of it, and nothing here can detect that.
+- **The fallback is counted, and displayed nowhere.**
+  `FramePipeline::fallback_stats` reports the both-eye and reconstructed frame
+  counts and whether the last pose was reconstructed; no crate in the workspace
+  reads it. So a reconstructed pose currently reaches opentrack, the joystick
+  and the Wine bridge looking exactly like a measured one — the failure mode the
+  `PoseSource`/`SourcedPose` distinction exists to prevent.
+- **None of the three has been run against a tracker.** All are unit-tested,
+  each new test negative-controlled by undoing the change it covers, and the
+  hardware halves are untestable here: that a one-eye frame's surviving origin
+  behaves as the rigid-offset model assumes, that holding a sample is the right
+  answer to a real glitch, and that the device refuses a point the way the
+  re-show assumes and then collects it on a second showing.
+
 ### 11.4 Environmental
 
 - **Glyph clipping at fractional display scale.** Tops of tall glyphs appear

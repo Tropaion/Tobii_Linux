@@ -8,6 +8,13 @@ Each item says what to change, where, what it costs, and how it could go wrong.
 Where a number appears, it is one this project measured — not one read from
 another project.
 
+**Three of the four numbered items have since been built** — 1, 2 and 4 — and
+each keeps its original reasoning here with what actually shipped, what was
+deliberately left out, and where the shipped behaviour differs from what this
+page proposed. Item 3 is the one still open. None of the three has been run
+against a tracker; what that leaves untested is listed in
+[Quality-and-Risks](Quality-and-Risks.md) §11.3d.
+
 ## How this list came about
 
 Most of it came from comparing this project against
@@ -37,56 +44,104 @@ Those extract firmware from Tobii's own Windows service binary and replay a
 signed DFU header captured from a vendor update. That is a provenance this
 project does not touch, and this project never flashes firmware at all.
 
-## 1. A one-eye fallback in the head-pose path
+## 1. A one-eye fallback in the head-pose path — shipped in `a804686`
 
-**What.** `pose_from_sample` (`crates/tobii-headpose/src/lib.rs`) requires both
-eye validities to be 0 and returns `None` otherwise, so one dropped eye produces
-no pose for that frame.
+**Was.** `pose_from_sample` (`crates/tobii-headpose/src/lib.rs`) required both
+eye validities to be 0 and returned `None` otherwise, so one dropped eye
+produced no pose for that frame. This project measured roughly **five per-eye
+dropouts per second** as the residual "lag" in head tracking — not latency, and
+not the algorithm — so that was not a corner case.
 
-**Why.** This project measured roughly **five per-eye dropouts per second** as
-the residual "lag" in head tracking — not latency, and not the algorithm. A
-fallback that keeps producing a pose from the surviving eye is the structural fix.
+**Shipped.** `tobii-headpose::PairOffset`, a stateful path beside the stateless
+one. It re-measures the right-minus-left offset on every two-eye frame and
+places the missing eye at the surviving one plus that offset.
+`RECONSTRUCTION_MAX_AGE` is **300 ms**, about ten frames at the measured
+30.208 ms cadence and well inside the pipeline's 1 s `TRACKING_LOSS_RESET`;
+`ONE_EYE_DEBOUNCE` is **2**, and one-directional, so an isolated invalid frame
+never switches paths while a frame carrying two measured eyes is answered with
+the two-eye pose at once. With both eyes tracked the result is bit for bit the
+geometry that shipped before. `tobii-output`'s `FramePipeline` owns the state
+beside `neutral` — per-session tracking state that must survive a settings
+change — and drops it with the rest at `TRACKING_LOSS_RESET`.
 
-**The algorithm is already here.** `crates/tobii-gtk/src/eyeview.rs`'s
-`PairOffset` re-measures the right-minus-left delta while both eyes are real,
-reconstructs the missing one when exactly one is, and ages the offset out so it
-never draws a ghost. It is not wired into `tobii-headpose`.
+**What a reconstructed pose actually claims.** Yaw and roll are read off the
+interocular vector, and during an outage that vector *is* the stored offset. So
+rotation is **held** at its last measurement and never extrapolated; only
+translation keeps following the eye that is really there. `PoseSource` and
+`SourcedPose` carry that distinction out of the crate, because the whole risk of
+this path is a guess that reads exactly like a measurement.
 
-**Touches.** `crates/tobii-headpose/src/lib.rs` for a variant of
-`pose_from_sample` that carries reconstruction state, and
-`crates/tobii-output/src/pipeline.rs` to own that state beside `neutral`.
+**Left out.** The visibility this item asked for. The fallback is **counted, not
+shown**: `FramePipeline::fallback_stats` reports the both-eye and reconstructed
+frame counts and whether the last pose was reconstructed, and nothing reads it
+yet — `tobii debug`, the hub and `tobii headpose --check` live in crates that
+commit did not own. `tobii-headpose` has no logger of its own (it cross-compiles
+for the Wine bridge), so counting was the only in-crate option.
 
-**Effort.** Half a day with tests. Pure logic, unit-testable with recorded frames.
+**Different from what this item proposed.** This page read as "wire
+`eyeview::PairOffset` in". What shipped is a second implementation rather than a
+shared one: the eyeview version carries normalized trackbox positions for a
+drawing, this one tracker-space millimetres for a pose, and this one ages in
+**wall-clock** time so a stalled stream cannot make an old offset look fresh by
+simply not arriving.
 
-**Risks.** A reconstructed pose is a guess: keep `PairOffset`'s aging discipline
-so a stale offset cannot confidently report a head that is not there, and make
-the fallback visible in `tobii debug`. Note the present cost is a stutter, not a
-yank — `pipeline.rs` only recentres after `TRACKING_LOSS_RESET`, and the
-opentrack sink drops pose-less frames rather than sending zeros, so the receiver
-holds its last value.
+**Where it changes the output, and where it does not.** Only on frames where
+nothing else produced a pose — in practice the 5-DOF path. Both front ends
+compute their pose with the *stateless* `pose_from_sample` first
+(`tobii-cli`'s headpose loop, `tobii-gtk`'s `device.rs`), and the pipeline uses
+the reconstruction only when that comes up empty and no fresh model pose exists;
+with one, `onnx::fuse` already falls back to the model's own position, so the
+reconstruction is bypassed and not counted. The hub's own head-pose readout and
+`--check`'s `eyes` line still show nothing on a one-eye frame.
 
-## 2. Reject-and-hold for glitches in the pose filter
+## 2. Reject-and-hold for glitches in the pose filter — shipped in `2ea22cd`
 
-**What.** `crates/tobii-headpose/src/filter.rs` is a plain EMA and says so; it
-rejects only non-finite input. A sample that jumps implausibly far in one frame
-is blended in over the following frames.
+**Was.** `crates/tobii-headpose/src/filter.rs` was a plain EMA that rejected
+only non-finite input, so a sample jumping further in one frame than a head can
+move was blended in over the following frames — a swing across the view rather
+than a discarded sample. It is the pairing for item 1: when an eye drops and
+returns, the eye-origin midpoint steps.
 
-**Why.** This is the pairing for item 1: when an eye drops and returns, the
-eye-origin midpoint steps, and an EMA turns that step into a visible swing. A
-per-frame jump limit that holds the last accepted value instead is a handful of
-lines.
+**Shipped.** A plausibility gate in front of the average. A finite sample whose
+**position** has moved more than `DEFAULT_MAX_STEP_MM = 150.0` from the last
+accepted **raw** sample is held, and the raw reference is held with it —
+measuring against the smoothed output instead would let a glitch drag the
+reference after it one blend at a time, until the view had swept there anyway.
+The hold is bounded at `MAX_HELD_FRAMES = 3` (91 ms at the measured interval), a
+chosen bound: unbounded, it locks up, because once the head really is elsewhere
+every later sample is just as far from the held value. `reset()` drops the
+reference with the state, so whoever comes back after a tracking loss is allowed
+to be somewhere else. Non-finite handling is unchanged and stays ahead of the
+gate, deliberately not charged to the hold budget.
 
-**Touches.** `crates/tobii-headpose/src/filter.rs`, and one key in
-`crates/tobii-output/src/games.rs::keys()` if it should be tunable.
+**Where 150 mm comes from, and what it is not.** Not a recorded distribution:
+**no committed recording in this repository contains a tracked eye**, which was
+decoded rather than assumed (see [Quality-and-Risks](Quality-and-Risks.md)
+§11.3d). What `session.tobiicap` does give is the frame interval, **30.208 ms**,
+which turns a speed into a per-frame step: 150 mm is **4.97 m/s**, several times
+the fastest a seated head translates. It rejects a teleport, not the few
+millimetres a stale one-eye reconstruction contributes — a limit tight enough
+for that would reject a genuine lunge, which is the risk this item named. It
+also cannot go below 100 mm without changing `pipeline.rs` and `tobii-gtk`'s
+`outputs.rs`, which each move a synthetic 100 mm between two consecutive frames
+and assert the axis moves.
 
-**Effort.** A few hours.
+**Position only, and no angular limit at all.** The pose reaching the filter is
+the composed one, so yaw and pitch already carry the gaze-driven Extended View
+term. Measured on the panel the defaults were tuned for: gaze at the left edge
+gives `ev_yaw −45.00°` and the right edge `+45.00°`, so a one-frame look across
+the screen legitimately swings composed yaw by 90°. Any angular gate tight
+enough to catch a rotation glitch would reject that. A bad frame that moves
+position is still rejected whole, angles included.
 
-**Risks.** Too tight a threshold rejects a genuine fast turn. The limit is
-per frame precisely so a real turn spans many frames and each stays under it.
-**Derive the threshold from recorded sessions here, not from another project's
-constant** — theirs ships with an open high-severity corner overshoot.
+**Left out.** The `games.toml` key this item offered. The only path from that
+file to the filter is `PoseFilter::new(cfg.filter_alpha)` in `pipeline.rs`, a
+crate that commit did not own, so an advertised key would be written into the
+file, listed by `tobii games`, and read by nothing. `with_max_step_mm()` exists
+so that wiring is a one-line change when it is wanted; nothing outside the
+crate's own tests calls it today.
 
-## 3. A rotation recentre
+## 3. A rotation recentre — the one item on this page still open
 
 **What.** There is none. `crates/tobii-output/src/pipeline.rs` says "Rotation is
 never recentred: it is already referenced to facing the screen". Translation gets
@@ -116,21 +171,49 @@ a `Recenter` action over `crates/tobii-ipc`, a button in `crates/tobii-gtk`, and
   reference. The same trap for translation is already documented in
   `pipeline.rs`; this one is worse, because nothing decays it.
 
-## 4. Per-group retry in the calibration flow
+## 4. Per-group retry in the calibration flow — shipped in `161198e`
 
-**What.** A weak point fails the whole run: `crates/tobii-gtk/src/calibrate_flow.rs`
-offers "Try again", which restarts from the first point.
+**Was.** A point the device refused, or a group whose deadline ran out, ended
+the whole 7-point run and offered "Try again", which restarts from the first
+point. On a 49" panel one bad corner therefore cost every point already
+collected, and nothing on the device side required it: this flow sends per-point
+`CalCollect`/`CalDiscard` and already discards and re-dwells mid-collect.
 
-**Why.** On a 49" panel one bad corner costs the entire run. The device side
-already supports the narrower operation — this flow sends per-point
-`CalCollect`/`CalDiscard` and already discards and retries mid-collect.
+**Shipped.** `MAX_GROUP_ATTEMPTS = 3` in `calibrate_flow.rs` — the first showing
+plus two re-shows; only the last attempt still fails, with the same message it
+always gave. "Try again" is untouched and still restarts a genuinely failed run
+from the first point. A re-show keeps the points the group already captured
+(`calibrated` is monotonic, and clearing a captured bit would panic the
+`expect()` that reads `collected` against it), keeps `focused` so a collect that
+acks late still has a point to be attributed to, sends `CalDiscard` for whatever
+was in flight, and takes a fresh deadline and fade-in. The instruction line
+reads "Let's try those dots again", because the progress count does not move
+when a group comes back and the run would otherwise look stalled.
 
-**Effort.** Half a day. No protocol change.
+**"Too weak" is two signals, because there are only two.** The device answers
+`add_calibration_point` with an ack or an error and nothing else — `tobii-usb`
+drops the reply payload, and no per-point sample count has ever been decoded out
+of it — so a weak group means the device refused a point (`CalPhase::last_error`,
+read as an *edge* by gating on `requested`, or one error would empty the budget
+on consecutive ticks) or the group's own deadline elapsed. The mid-collect
+discard on lost focus is deliberately **not** one: it already recovers on its
+own, and charging it an attempt would spend the budget on the one failure mode
+this flow handles well.
 
-**Risks.** The flow shows three points per group and lets gaze choose which is
-focused, so "retry this point" is not well defined: it has to be "retry this
-group". The group's hit-zone radius is computed from that group's own points, so
-a partial re-show needs the radius recomputed, or the whole group re-shown.
+**Three is a judgement bounded by arithmetic**, not a measured or decompiled
+figure: an attempt is capped at `COLLECT_TIMEOUT_TICKS` per member (~33 s), so
+~99 s for a three-point group — three attempts cap one group at ~5 minutes and a
+whole run at ~11.5 minutes of worst case before the failure screen appears. What
+is measured is only that a dropped eye is usually transient (item 1's five
+per-eye dropouts a second), which is why a first failure is not treated as final.
+
+**Different from what this item proposed.** This page said a partial re-show
+needs the group's hit-zone radius recomputed. It does not, and recomputing would
+be actively wrong: `group_zone_radii` derives one radius per group from that
+group's own points and does not depend on how many are already captured, while
+for a lone survivor `focus::zone_radius` returns `f64::MAX` — the whole screen
+counts as "on" that point, which is the class of bug the per-group radius was
+introduced to fix. The re-show reuses the radius `launch()` computed.
 
 ## Smaller candidates
 
