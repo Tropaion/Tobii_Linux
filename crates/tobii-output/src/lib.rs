@@ -17,6 +17,7 @@ pub mod frame;
 pub mod freetrack;
 pub mod fusion;
 pub mod games;
+pub mod listener;
 pub mod pipeline;
 pub mod sinks;
 pub mod trackir;

@@ -44,6 +44,16 @@ const STRENGTHS: [(&str, f64, f64); 3] = [
     ("Strong", 70.0, 40.0),
 ];
 
+/// Whether simply starting opentrack is enough to switch the tracker on.
+///
+/// Asks [`crate::outputs::watch_target`] rather than reading the two settings
+/// again: this line and the thing it describes have to agree, and the way they
+/// stop agreeing is somebody adding a third condition in one place. There is
+/// one predicate, and the status line is a reader of it.
+fn watching_opentrack(cfg: &OutputConfig) -> bool {
+    crate::outputs::watch_target(cfg).is_some()
+}
+
 /// Which preset a config's values correspond to, if any.
 ///
 /// Matched on yaw alone: it is the axis the presets differ most on, and a
@@ -107,7 +117,19 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStat
         // Not a fault. The tracker is off because nothing is asking for it,
         // which is the whole standby behaviour — so the line says what to do
         // rather than implying something is broken.
-        format!("Ready to send to {to}. Starts when a game asks: tobii game -- <command>")
+        //
+        // What to do depends on whether the port watch is on, and the honest
+        // answer changed when it arrived: with an opentrack address configured
+        // and the watch on, simply starting opentrack is enough, and this line
+        // used to send those users off to wrap something in `tobii game` for no
+        // reason. The wrapper is still named, because it is the answer for
+        // everything that is not an opentrack listener.
+        let starter = if watching_opentrack(cfg) {
+            "Starts when opentrack opens the port, or a game asks: tobii game -- <command>"
+        } else {
+            "Starts when a game asks: tobii game -- <command>"
+        };
+        format!("Ready to send to {to}. {starter}")
     };
     match trouble {
         Some(t) => format!("{base} {t}."),
@@ -476,6 +498,36 @@ mod tests {
                 assert_ne!(a, b, "two states read identically");
             }
         }
+    }
+
+    /// The wrapper is not the only way in any more, and the line that tells a
+    /// waiting user what starts the tracker has to say so — that sentence is
+    /// where the "you must wrap opentrack in `tobii game`" folklore came from.
+    #[test]
+    fn a_ready_line_names_opentrack_itself_as_a_way_to_start_it() {
+        let ready = text(&cfg_with(true, Some("127.0.0.1:4242"), None), false);
+        assert!(
+            ready.contains("opentrack opens the port"),
+            "starting opentrack is enough by itself: {ready}"
+        );
+        assert!(
+            ready.contains("tobii game"),
+            "and the wrapper is still the answer for everything else: {ready}"
+        );
+
+        // With the watch off, the wrapper really is the only way, and claiming
+        // otherwise would send the user to wait for something that never comes.
+        let no_watch = OutputConfig {
+            wake_for_opentrack: false,
+            ..cfg_with(true, Some("127.0.0.1:4242"), None)
+        };
+        let s = text(&no_watch, false);
+        assert!(!s.contains("opentrack opens the port"), "{s}");
+        assert!(s.contains("tobii game"), "{s}");
+
+        // Same when there is no opentrack sink at all: only the joystick.
+        let joy = text(&joystick_only(), false);
+        assert!(!joy.contains("opentrack opens the port"), "{joy}");
     }
 
     /// "Ready" is not a fault. With game output configured and nothing playing,

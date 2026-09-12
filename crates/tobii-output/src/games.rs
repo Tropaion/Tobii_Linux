@@ -73,6 +73,26 @@ pub struct OutputConfig {
     pub filter_max_step_mm: f64,
     /// opentrack endpoint, or `None` to not send there.
     pub opentrack: Option<String>,
+    /// Whether a program bound to [`opentrack`](Self::opentrack) is itself a
+    /// reason to switch the tracker on.
+    ///
+    /// # Why the default is on
+    ///
+    /// The project's rule is that the tracker runs only while something asks
+    /// for data, and this key is the answer to "does a bound socket count as
+    /// asking". It does. Binding UDP 4242 is not something a machine does by
+    /// accident: it is opentrack's *UDP over network* input, which a person
+    /// switched on, or X-Plane, which binds it natively. Before this, that
+    /// person had to also run `tobii game -- …` around something — a wrapper
+    /// that transports nothing and exists only to raise the demand count — or
+    /// sit in front of a dark tracker wondering what was broken.
+    ///
+    /// It cannot light the tracker on its own: the watch only runs with
+    /// [`enabled`](Self::enabled) on (off by default) and an opentrack address
+    /// configured, so a fresh install behaves exactly as it did. What it can do
+    /// is light the tracker for some *other* program that happens to hold that
+    /// port, which is what turning this off is for.
+    pub wake_for_opentrack: bool,
     /// Loopback port for the Wine bridge, or `None` to not send there.
     pub bridge_port: Option<u16>,
     /// The composed head angle, in degrees, that drives each joystick axis to
@@ -118,6 +138,7 @@ impl Default for OutputConfig {
             filter_alpha: tobii_headpose::filter::DEFAULT_ALPHA,
             filter_max_step_mm: tobii_headpose::filter::DEFAULT_MAX_STEP_MM,
             opentrack: Some(DEFAULT_OPENTRACK_ADDR.to_string()),
+            wake_for_opentrack: true,
             bridge_port: Some(DEFAULT_BRIDGE_PORT),
             joystick_full_deg: [70.0, 35.0, 20.0],
             joystick: true,
@@ -157,6 +178,8 @@ impl OutputConfig {
              #\n\
              # opentrack = \"\"  disables the opentrack sink\n\
              # bridge_port = 0 disables the Wine-bridge sink\n\
+             # wake_for_opentrack = false stops a program bound to the opentrack\n\
+             #                 address from switching the tracker on by itself\n\
              [games]\n",
         );
         s.push_str(&format!("enabled = {}\n", self.enabled));
@@ -169,6 +192,10 @@ impl OutputConfig {
         s.push_str(&format!(
             "opentrack = \"{}\"\n",
             self.opentrack.as_deref().unwrap_or("")
+        ));
+        s.push_str(&format!(
+            "wake_for_opentrack = {}\n",
+            self.wake_for_opentrack
         ));
         s.push_str(&format!(
             "bridge_port = {}\n",
@@ -279,6 +306,10 @@ impl OutputConfig {
                 }
                 self.opentrack = (!value.is_empty()).then(|| value.to_string());
             }
+            "wake_for_opentrack" => match value.parse::<bool>() {
+                Ok(b) => self.wake_for_opentrack = b,
+                Err(_) => return false,
+            },
             // Port 0 is never a real destination, so it doubles as "disabled".
             "bridge_port" => match value.parse::<u16>() {
                 Ok(0) => self.bridge_port = None,
@@ -362,6 +393,7 @@ impl OutputConfig {
             "filter_alpha",
             "filter_max_step_mm",
             "opentrack",
+            "wake_for_opentrack",
             "bridge_port",
             "joystick",
             "joystick_yaw_full_deg",
@@ -429,6 +461,8 @@ mod tests {
             filter_alpha: 0.4,
             filter_max_step_mm: 220.0,
             opentrack: Some("192.168.1.7:4242".to_string()),
+            // Off, because the default is on — see the note above `joystick`.
+            wake_for_opentrack: false,
             bridge_port: Some(5000),
             // Off, because the default is on: the round-trip tests below only
             // mean anything if every field differs from its default.
@@ -480,6 +514,33 @@ mod tests {
         let back = OutputConfig::from_toml(&c.to_toml());
         assert_eq!(back.opentrack, None);
         assert_eq!(back.bridge_port, None);
+    }
+
+    /// The deliberate default, and the two facts that keep it from being a
+    /// surprise: it is on, but it does nothing at all until game output itself
+    /// is switched on, which is off out of the box.
+    #[test]
+    fn watching_the_opentrack_port_is_on_but_useless_until_game_output_is() {
+        let d = OutputConfig::default();
+        assert!(
+            d.wake_for_opentrack,
+            "a program bound to the opentrack port is asking for tracking"
+        );
+        assert!(!d.enabled, "and it is still gated behind game output");
+    }
+
+    /// Turning it off has to survive the file, or the switch is decorative.
+    #[test]
+    fn the_opentrack_watch_can_be_turned_off_and_stays_off() {
+        let mut c = OutputConfig::default();
+        assert!(c.apply_key("wake_for_opentrack", "false"));
+        assert!(!c.wake_for_opentrack);
+        assert!(!OutputConfig::from_toml(&c.to_toml()).wake_for_opentrack);
+        assert!(
+            !c.apply_key("wake_for_opentrack", "sometimes"),
+            "a value that is not a boolean is refused rather than guessed"
+        );
+        assert!(!c.wake_for_opentrack, "and leaves the setting as it was");
     }
 
     #[test]
@@ -619,7 +680,7 @@ mod tests {
         let mut c = OutputConfig::default();
         for key in OutputConfig::keys() {
             let value = match *key {
-                "enabled" | "extended_view" | "joystick" => "true",
+                "enabled" | "extended_view" | "joystick" | "wake_for_opentrack" => "true",
                 k if k.starts_with("joystick_") => "45",
                 "opentrack" => "127.0.0.1:9999",
                 "bridge_port" => "4243",

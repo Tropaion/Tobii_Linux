@@ -20,6 +20,19 @@
 //! in one file, `device.rs`'s `while !thread_demand.active()`, and this module
 //! did not have to change it.
 //!
+//! # The other way something can ask
+//!
+//! Not everything that wants head tracking can connect to that socket.
+//! opentrack's *UDP over network* input is a plain UDP listener that knows
+//! nothing about us, and X-Plane is the same. Wrapping a game in `tobii game`
+//! was the workaround — it carries no data at all, it subscribes so that the
+//! count goes above zero — and telling everyone to wrap opentrack in it was
+//! never anything but a way to spell "please turn the tracker on".
+//!
+//! So [`PortWatch`] asks the kernel instead: is a socket bound where we send?
+//! The answer becomes an ordinary [`DemandGuard`], which is the point — the
+//! second way of asking did not need a second notion of who wants the device.
+//!
 //! # What this does not do yet
 //!
 //! Nothing is published. No frames, no lease, no game output — this is the
@@ -28,10 +41,13 @@
 //! is a line in the log when the socket was already taken.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tobii_ipc::{subs, ClientId, LeaseAction, Server, StatusCode};
+use tobii_output::games::OutputConfig;
+use tobii_output::listener::Listening;
 use tobii_output::sinks::JoystickHandle;
 
 use crate::device::{ConnStatus, Demand, DemandGuard, DeviceState, Lease};
@@ -63,6 +79,118 @@ fn reason_for(bits: u32) -> Option<&'static str> {
         Some("another program watching the eye camera")
     } else {
         None
+    }
+}
+
+/// Why the tracker is on when a program holds the opentrack port.
+///
+/// Named as its own cause rather than folded into the socket-client reason
+/// above, because the two are answers to different questions when something
+/// goes wrong: one is "a program connected to the hub and asked", the other is
+/// "a program is sitting on the address we send to and never spoke to us at
+/// all". A user staring at lit illuminators with no game running needs to be
+/// able to tell those apart — and if it says the wrong one, the thing they go
+/// looking for does not exist.
+const LISTENER_REASON: &str = "a program listening on the opentrack port";
+
+/// How often the opentrack address is checked for a listener.
+///
+/// Deliberately not [`POLL`]. The socket loop runs at 50 ms because it is
+/// draining a socket and a client's disconnect should not sit unnoticed; this
+/// is a scan of `/proc/net/udp`, which walks every UDP socket on the machine,
+/// and the thing it is watching for is a human starting a program. Twenty scans
+/// a second, forever, to notice that half a second sooner is not a trade worth
+/// making — and the cost of the slower rate is bounded the same way in both
+/// directions: up to a second before the tracker lights, up to a second before
+/// it goes dark again.
+const LISTENER_POLL: Duration = Duration::from_secs(1);
+
+/// The address to watch, or `None` if nothing should be watched.
+///
+/// Three conditions, all of them settings the user set themselves: game output
+/// is on, the watch is on, and there is an address to watch. The first is what
+/// keeps this from being a surprise — with game output off, the hub is not
+/// sending anywhere, and lighting the tracker for a socket it would ignore
+/// would be lighting it for nothing.
+pub(crate) fn watch_target(cfg: &OutputConfig) -> Option<SocketAddr> {
+    if !cfg.enabled || !cfg.wake_for_opentrack {
+        return None;
+    }
+    cfg.opentrack.as_deref()?.parse().ok()
+}
+
+/// A [`DemandGuard`] held for as long as something is bound at the opentrack
+/// address.
+///
+/// This is the whole of "you do not need a wrapper for opentrack". `tobii game`
+/// transports nothing — it subscribes over the hub's socket so that the demand
+/// count goes above zero — and opentrack, which speaks plain UDP and knows
+/// nothing about the hub, had no way to do the same. So the hub looks at the
+/// place it would be sending instead: a socket bound there is a program that
+/// asked for head tracking, in the only vocabulary it has.
+///
+/// Same machinery as every other consumer, on purpose. A second notion of who
+/// wants the device — a flag, a timeout, a "game mode" — would be a second
+/// place for the standby rule to be wrong.
+#[derive(Default)]
+pub(crate) struct PortWatch {
+    held: Option<DemandGuard>,
+    last_looked: Option<Instant>,
+}
+
+impl PortWatch {
+    /// Look, at most once per [`LISTENER_POLL`], and hold or release.
+    ///
+    /// `target` and `look` are passed in rather than called directly for two
+    /// reasons: a test can then drive every transition without a config file or
+    /// a socket, and the throttle genuinely saves the work — on a tick that is
+    /// not due, neither the file read nor the `/proc` scan happens.
+    fn poll(
+        &mut self,
+        demand: &Demand,
+        now: Instant,
+        target: impl FnOnce() -> Option<SocketAddr>,
+        look: impl FnOnce(SocketAddr) -> Listening,
+    ) {
+        if self
+            .last_looked
+            .is_some_and(|t| now.saturating_duration_since(t) < LISTENER_POLL)
+        {
+            return;
+        }
+        self.last_looked = Some(now);
+        // Switched off, or nothing to watch: give the hold back. Read every
+        // time rather than once at startup, because these are settings the user
+        // can change while the hub runs — the same mistake `GameOutput` records
+        // having made by freezing its config for the life of a session.
+        let Some(addr) = target() else {
+            self.held = None;
+            return;
+        };
+        match look(addr) {
+            // One listener is one guard, kept rather than re-taken. Assigning a
+            // fresh `hold` every second would behave the same — but only
+            // because assignment drops the old guard *after* taking the new
+            // one, so the count never touches zero. That is a subtlety to not
+            // depend on: the version of it that does the drop first closes and
+            // reopens the USB session once a second, which on this device means
+            // rebooting the tracker once a second.
+            Listening::Yes => {
+                self.held
+                    .get_or_insert_with(|| demand.hold(LISTENER_REASON));
+            }
+            // `Unknown` releases too. It means the question could not be
+            // answered — an address on another machine, no `/proc` — and a hold
+            // taken on an answer we no longer have is a tracker that stays lit
+            // for a reason nobody can check.
+            Listening::No | Listening::Unknown(_) => self.held = None,
+        }
+    }
+
+    /// Whether the tracker is currently being held on for a listener.
+    #[cfg(test)]
+    fn holding(&self) -> bool {
+        self.held.is_some()
     }
 }
 
@@ -522,6 +650,10 @@ pub(crate) fn spawn(
         // actually let go. See `Lease`.
         let mut awaiting: Vec<ClientId> = Vec::new();
         let mut last_sent: Option<StatusCode> = None;
+        // Riding this thread rather than one of its own: it already wakes on a
+        // timer and already owns a `Demand`, and the watch's own rate limit is
+        // what keeps the two cadences apart.
+        let mut watch = PortWatch::default();
         loop {
             tick(
                 &server,
@@ -532,6 +664,12 @@ pub(crate) fn spawn(
                 &mut awaiting,
                 &mut last_sent,
                 &recentring,
+            );
+            watch.poll(
+                &demand,
+                Instant::now(),
+                || watch_target(&tobii_output::games::load_output_config()),
+                tobii_output::listener::probe,
             );
             std::thread::sleep(POLL);
         }
@@ -1264,6 +1402,249 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("no recentre reply arrived");
+    }
+    /// A config with game output on, watching one address.
+    fn watching(addr: &str) -> OutputConfig {
+        OutputConfig {
+            enabled: true,
+            opentrack: Some(addr.to_string()),
+            ..OutputConfig::default()
+        }
+    }
+
+    /// The claim the feature rests on, with the probe stubbed: a socket bound
+    /// where we send is a `DemandGuard`, and it goes away with the socket.
+    #[test]
+    fn a_bound_socket_lights_the_tracker_and_closing_it_puts_it_out() {
+        let demand = Demand::new();
+        let mut watch = PortWatch::default();
+        let t0 = Instant::now();
+        let target = || watch_target(&watching("127.0.0.1:4242"));
+
+        watch.poll(&demand, t0, target, |_| Listening::No);
+        assert!(!demand.active(), "nothing bound there yet");
+
+        watch.poll(&demand, t0 + LISTENER_POLL, target, |_| Listening::Yes);
+        assert!(demand.active(), "opentrack started; the tracker comes on");
+        assert_eq!(
+            demand.reasons(),
+            vec![LISTENER_REASON],
+            "and says which cause it is"
+        );
+
+        watch.poll(&demand, t0 + 2 * LISTENER_POLL, target, |_| Listening::No);
+        assert!(!demand.active(), "opentrack closed; the tracker goes dark");
+        assert!(!watch.holding());
+    }
+
+    /// A listener that stays put is one hold that stays put — polling it does
+    /// not accumulate anything that has to be released one at a time.
+    ///
+    /// An invariant pin rather than a behaviour gate, and worth saying so: the
+    /// obvious alternative spelling (assign a fresh `hold` each poll) passes
+    /// this too, because assignment drops the old guard after taking the new
+    /// one. What it would catch is a version that keeps a guard per poll.
+    #[test]
+    fn a_listener_that_stays_is_still_only_one_hold() {
+        let demand = Demand::new();
+        let mut watch = PortWatch::default();
+        let t0 = Instant::now();
+        let target = || watch_target(&watching("127.0.0.1:4242"));
+
+        for i in 0..10u32 {
+            watch.poll(&demand, t0 + i * LISTENER_POLL, target, |_| Listening::Yes);
+        }
+        assert_eq!(demand.reasons().len(), 1);
+
+        watch.poll(&demand, t0 + 10 * LISTENER_POLL, target, |_| Listening::No);
+        assert!(
+            !demand.active(),
+            "ten polls must not need ten releases to go dark"
+        );
+    }
+
+    /// `Unknown` is not `No`, and it is certainly not `Yes`: an address on
+    /// another machine cannot be seen from here, so nothing may be claimed
+    /// about it in either direction.
+    #[test]
+    fn an_unanswerable_probe_never_holds_the_tracker() {
+        let demand = Demand::new();
+        let mut watch = PortWatch::default();
+        let t0 = Instant::now();
+        let target = || watch_target(&watching("192.168.1.7:4242"));
+
+        watch.poll(&demand, t0, target, |_| {
+            Listening::Unknown(tobii_output::listener::NOT_LOCAL)
+        });
+        assert!(!demand.active());
+
+        // And a real probe of a remote address answers exactly that, so the
+        // stub above is the case that actually occurs.
+        assert!(matches!(
+            tobii_output::listener::probe("192.168.1.7:4242".parse().unwrap()),
+            Listening::Unknown(_)
+        ));
+    }
+
+    /// Nothing is watched that the user did not ask for. In particular game
+    /// output being off means the hub is not sending anywhere, and lighting an
+    /// infrared lamp for a socket we would ignore is the exact thing the
+    /// standby rule forbids.
+    #[test]
+    fn nothing_is_watched_unless_the_user_asked_for_it() {
+        assert_eq!(
+            watch_target(&OutputConfig::default()),
+            None,
+            "game output is off out of the box, so a fresh install watches nothing"
+        );
+        assert_eq!(
+            watch_target(&OutputConfig {
+                wake_for_opentrack: false,
+                ..watching("127.0.0.1:4242")
+            }),
+            None,
+            "and the user can turn the watch itself off"
+        );
+        assert_eq!(
+            watch_target(&OutputConfig {
+                opentrack: None,
+                ..watching("127.0.0.1:4242")
+            }),
+            None,
+            "no destination, nothing to watch"
+        );
+        assert_eq!(
+            watch_target(&watching("not an address")),
+            None,
+            "an unparseable address is watched as nothing, not panicked on"
+        );
+        assert_eq!(
+            watch_target(&watching("127.0.0.1:4242")),
+            Some("127.0.0.1:4242".parse().unwrap())
+        );
+    }
+
+    /// Turning the watch off while a listener is up gives the tracker back,
+    /// rather than holding it until the other program happens to close.
+    #[test]
+    fn switching_the_watch_off_releases_a_hold_it_is_already_holding() {
+        let demand = Demand::new();
+        let mut watch = PortWatch::default();
+        let t0 = Instant::now();
+
+        watch.poll(
+            &demand,
+            t0,
+            || watch_target(&watching("127.0.0.1:4242")),
+            |_| Listening::Yes,
+        );
+        assert!(demand.active());
+
+        watch.poll(&demand, t0 + LISTENER_POLL, || None, |_| Listening::Yes);
+        assert!(!demand.active(), "switched off means switched off");
+    }
+
+    /// The scan walks every UDP socket on the machine, so it runs at its own
+    /// rate rather than the socket loop's 50 ms — and the config file is not
+    /// read on the ticks in between either.
+    #[test]
+    fn the_port_is_checked_about_once_a_second_not_at_the_socket_cadence() {
+        assert!(
+            LISTENER_POLL >= 20 * POLL,
+            "a /proc scan per socket tick would be 20 a second"
+        );
+
+        let demand = Demand::new();
+        let mut watch = PortWatch::default();
+        let t0 = Instant::now();
+        let looked = std::cell::Cell::new(0);
+        let asked = std::cell::Cell::new(0);
+
+        // One second of the socket loop's ticks.
+        for i in 0..20u32 {
+            watch.poll(
+                &demand,
+                t0 + POLL * i,
+                || {
+                    asked.set(asked.get() + 1);
+                    watch_target(&watching("127.0.0.1:4242"))
+                },
+                |_| {
+                    looked.set(looked.get() + 1);
+                    Listening::No
+                },
+            );
+        }
+        assert_eq!(looked.get(), 1, "one scan in a second, not twenty");
+        assert_eq!(asked.get(), 1, "and one config read, not twenty");
+
+        watch.poll(
+            &demand,
+            t0 + LISTENER_POLL,
+            || {
+                asked.set(asked.get() + 1);
+                watch_target(&watching("127.0.0.1:4242"))
+            },
+            |_| {
+                looked.set(looked.get() + 1);
+                Listening::No
+            },
+        );
+        assert_eq!(looked.get(), 2, "and it does look again once it is due");
+    }
+
+    /// Through the real kernel, with no wrapper anywhere in it: something binds
+    /// the address the hub sends to, and the tracker comes on.
+    ///
+    /// This is the whole point of the feature, so it is worth one test that
+    /// stubs nothing — the port is OS-assigned rather than 4242 so it neither
+    /// collides with a real opentrack nor depends on the uid of whoever runs it.
+    #[test]
+    fn a_real_socket_on_the_opentrack_address_is_enough_to_light_the_tracker() {
+        use std::net::UdpSocket;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let addr = sock.local_addr().expect("local addr");
+        let cfg = watching(&addr.to_string());
+
+        let demand = Demand::new();
+        let mut watch = PortWatch::default();
+        let t0 = Instant::now();
+        watch.poll(
+            &demand,
+            t0,
+            || watch_target(&cfg),
+            tobii_output::listener::probe,
+        );
+        assert!(
+            demand.active(),
+            "a socket bound at {addr} should have lit the tracker"
+        );
+
+        drop(sock);
+        watch.poll(
+            &demand,
+            t0 + LISTENER_POLL,
+            || watch_target(&cfg),
+            tobii_output::listener::probe,
+        );
+        assert!(!demand.active(), "and closing it should put it out");
+    }
+
+    /// Two different causes must read as two different sentences, or the user
+    /// who asks why the tracker is on is sent looking for the wrong program.
+    #[test]
+    fn the_listener_reason_is_its_own_cause_and_reads_as_a_phrase() {
+        assert_ne!(Some(LISTENER_REASON), reason_for(subs::POSE));
+        assert!(LISTENER_REASON.contains("opentrack"));
+        assert!(LISTENER_REASON
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_lowercase()));
+        assert!(
+            !crate::device::wants_exclusive(&[LISTENER_REASON]),
+            "a listener is watching, not a stateful conversation with the device"
+        );
     }
 
     /// The reason text is a literal, never the client's own name — that name
