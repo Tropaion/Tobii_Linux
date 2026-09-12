@@ -9,7 +9,7 @@ in Rust, with no Tobii software installed.
 [![Linux · Wayland](https://img.shields.io/badge/Linux-Wayland-informational)](#requirements)
 
 <!-- image: the hub, tracker connected, both eyes visible as dots in the trackbox, the head drawn around them, the readout showing position/distance/yaw/pitch/roll, the setting cards beneath -->
-<img src="docs/images/hub.png" alt="The TobiiLinux hub: the trackbox and infrared sensor view across the top, with the calibration, display, eye-selection, head-tracking and gaze-preview cards beneath" width="900">
+<img src="docs/images/hub.png" alt="The TobiiLinux hub with a tracker connected: both eyes as dots in the trackbox with the head drawn around them, a readout of position, distance, yaw, pitch and roll, the infrared sensor view, and the tracking setting cards beneath" width="900">
 
 Tobii ships no software for Linux: the device will not stream gaze, and it
 cannot be calibrated or told where your screen is. This project is the missing
