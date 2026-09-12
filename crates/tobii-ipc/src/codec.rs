@@ -44,6 +44,27 @@ pub enum Msg {
     Lease(LeaseAction),
     /// Server → client: whether the lease was granted, and why not.
     LeaseReply { ok: bool, text: String },
+    /// Client → server: call the user's current head rotation straight ahead.
+    ///
+    /// No payload, because there is nothing for the client to say. The head
+    /// being re-referenced is the one the server is tracking, the reference is
+    /// averaged over a settle window on the server's own clock, and whether it
+    /// is allowed at all is the server's business — it refuses while a
+    /// calibration or a display setup owns the device, since a reference taken
+    /// mid-calibration is a reference taken while the user was looking at a
+    /// stimulus dot.
+    ///
+    /// Unlike [`Msg::Lease`] this asks for nothing exclusive and returns
+    /// nothing: it is a request that the *composition* of the pose change, so a
+    /// client that sends it and a client that receives poses need not be the
+    /// same program.
+    Recentre,
+    /// Server → client: whether the recentre was accepted, and why not.
+    ///
+    /// `ok` is "the request was taken", not "the reference moved": the settle
+    /// window has not finished when this is sent, and it can still refuse for a
+    /// head that would not hold still. Whoever reports that is the server.
+    RecentreReply { ok: bool, text: String },
     /// A kind this build does not know.
     ///
     /// Forward compatibility: an older client talking to a newer daemon skips
@@ -150,6 +171,13 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             p.extend_from_slice(text.as_bytes());
             framed(kind::LEASE_REPLY, p)
         }
+        Msg::Recentre => framed(kind::RECENTRE, Vec::new()),
+        Msg::RecentreReply { ok, text } => {
+            let mut p = Vec::with_capacity(1 + text.len());
+            p.push(u8::from(*ok));
+            p.extend_from_slice(text.as_bytes());
+            framed(kind::RECENTRE_REPLY, p)
+        }
         Msg::Unknown { kind, payload } => framed(*kind, payload.clone()),
     }
 }
@@ -238,6 +266,20 @@ pub fn decode(buf: &[u8]) -> Result<Decoded, CodecError> {
                 text: text(&p[1..], "lease reply text")?,
             }
         }
+        // Any payload at all is accepted and ignored, rather than rejected for
+        // being non-empty: this kind carries no arguments today, and refusing
+        // whatever a later version adds would make that addition breaking in
+        // the one direction the protocol promises it is not.
+        kind::RECENTRE => Msg::Recentre,
+        kind::RECENTRE_REPLY => {
+            if p.is_empty() {
+                return Err(CodecError::Malformed("recentre reply"));
+            }
+            Msg::RecentreReply {
+                ok: p[0] != 0,
+                text: text(&p[1..], "recentre reply text")?,
+            }
+        }
         other => Msg::Unknown {
             kind: other,
             payload: p.to_vec(),
@@ -275,6 +317,11 @@ mod tests {
             Msg::LeaseReply {
                 ok: false,
                 text: "the tracker is leased by tobii-gtk".to_string(),
+            },
+            Msg::Recentre,
+            Msg::RecentreReply {
+                ok: false,
+                text: "the hub is busy with calibration".to_string(),
             },
             Msg::Unknown {
                 kind: 0x7FFF,
@@ -436,13 +483,14 @@ mod tests {
     #[test]
     fn payloads_too_short_for_their_kind_are_rejected() {
         type Case = (&'static str, u16, Vec<u8>);
-        let cases: [Case; 6] = [
+        let cases: [Case; 7] = [
             ("hello header", kind::HELLO, vec![0; 9]),
             ("welcome", kind::WELCOME, vec![0; 11]),
             ("status code", kind::STATUS, vec![]),
             ("notify op", kind::NOTIFY, vec![0; 3]),
             ("lease action", kind::LEASE, vec![]),
             ("lease reply", kind::LEASE_REPLY, vec![]),
+            ("recentre reply", kind::RECENTRE_REPLY, vec![]),
         ];
         for (what, k, payload) in cases {
             let bytes = framed(k, payload);

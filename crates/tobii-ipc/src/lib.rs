@@ -86,6 +86,16 @@ pub mod kind {
     pub const LEASE: u16 = 0x0030;
     /// Server → client: whether the lease was granted.
     pub const LEASE_REPLY: u16 = 0x0031;
+
+    /// Client → server: call the user's current head rotation straight ahead.
+    ///
+    /// Appended, never renumbered — the same rule [`crate::StatusCode::Idle`]
+    /// follows. An older build decodes an unknown kind as
+    /// [`Msg::Unknown`](crate::codec::Msg::Unknown) and skips it, which is what
+    /// makes adding one a non-breaking change.
+    pub const RECENTRE: u16 = 0x0032;
+    /// Server → client: whether the recentre was accepted, and why not.
+    pub const RECENTRE_REPLY: u16 = 0x0033;
 }
 
 /// Bits a client sets in `Hello.subs` to say what it wants.
@@ -248,6 +258,8 @@ mod tests {
             kind::CMD_REPLY,
             kind::LEASE,
             kind::LEASE_REPLY,
+            kind::RECENTRE,
+            kind::RECENTRE_REPLY,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

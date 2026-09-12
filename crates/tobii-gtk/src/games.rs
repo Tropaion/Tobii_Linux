@@ -21,11 +21,15 @@
 use gtk::prelude::*;
 use gtk::{glib, Align, CheckButton, Label, Orientation, Switch};
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tobii_output::games::{load_output_config, save_output_config, OutputConfig};
 
-use crate::device::JoystickStatus;
+use crate::device::{Demand, JoystickStatus};
+use crate::outputs::{recentre_decision, Recentring};
 
 /// Extended View strength presets, as `(yaw output_max, pitch output_max)` in
 /// degrees.
@@ -111,6 +115,21 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStat
     }
 }
 
+/// The same sentence, starting with a capital.
+///
+/// The wording of a recentre's outcome lives on
+/// [`tobii_output::pipeline::RecentreOutcome`] so that this window and `tobii
+/// headpose` cannot explain the same refusal differently. It is written for a
+/// log line, which is where the CLI puts it; here it is a sentence in a
+/// paragraph of other sentences, and the only difference is the first letter.
+fn sentence(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 /// A checkbox with its label beside it, as one row.
 ///
 /// Separate labels rather than a `CheckButton`'s built-in one: the tops of tall
@@ -159,6 +178,21 @@ pub struct GamesRow {
     joy: CheckButton,
     strength: Vec<CheckButton>,
     joystick: Arc<Mutex<JoystickStatus>>,
+    /// The recentre button, so [`GamesRow::refresh`] can make it insensitive
+    /// exactly when [`recentre_decision`] would refuse it. A control that is
+    /// pressable and then declines is worse than one that is plainly not
+    /// available yet.
+    recentre: gtk::Button,
+    /// Where the request is left and the outcome comes back from.
+    recentring: Recentring,
+    demand: Demand,
+    /// What `refresh` last knew about the tracker, for the click handler.
+    ///
+    /// The button's sensitivity is set from the same fact, but sensitivity is a
+    /// 33 ms-old snapshot: the honest thing for the click to test is the value
+    /// itself, and then the decision is made by the one function the socket
+    /// path also uses.
+    tracker_on: Rc<Cell<bool>>,
 }
 
 impl GamesRow {
@@ -168,7 +202,11 @@ impl GamesRow {
     /// constructs widgets; a `Default` impl — which clippy asks for on a `new()`
     /// taking no arguments — would advertise a cheap, side-effect-free
     /// constructor that this is not.
-    pub fn build(joystick: Arc<Mutex<JoystickStatus>>) -> GamesRow {
+    pub fn build(
+        joystick: Arc<Mutex<JoystickStatus>>,
+        recentring: Recentring,
+        demand: Demand,
+    ) -> GamesRow {
         let cfg = load_output_config();
 
         let sw = Switch::new();
@@ -206,9 +244,17 @@ impl GamesRow {
         let refresh = {
             let status = status.clone();
             let joystick = Arc::clone(&joystick);
+            let recentring = recentring.clone();
             move || {
                 let js = joystick.lock().unwrap().clone();
-                status.set_text(&status_text(&load_output_config(), false, &js));
+                // What a recentre just said outranks the standing status for a
+                // few seconds: it is the answer to something the user did, and
+                // it is the only place the answer appears.
+                let text = match recentring.message(Instant::now()) {
+                    Some(m) => sentence(&m),
+                    None => status_text(&load_output_config(), false, &js),
+                };
+                status.set_text(&text);
             }
         };
 
@@ -255,12 +301,53 @@ impl GamesRow {
             });
         }
 
+        // A button, not a setting: it acts on the pose being sent right now,
+        // and it is the only control in this window that does.
+        let tracker_on = Rc::new(Cell::new(false));
+        let recentre = crate::widget::button("Recentre view");
+        recentre.set_tooltip_text(Some(
+            "Sit the way you play, look at the centre of the screen, and press this: \
+             the head angle you are holding becomes straight ahead in the game. Hold \
+             still for a second while it measures. Games with their own centring key \
+             still have it; this fixes a tracker that is not quite square to you.",
+        ));
+        {
+            let recentring = recentring.clone();
+            let demand = demand.clone();
+            let refresh = refresh.clone();
+            let tracker_on = tracker_on.clone();
+            recentre.connect_clicked(move |_| {
+                let now = Instant::now();
+                // The same decision the socket path makes, from the same
+                // function: a recentre refused for another program and taken
+                // silently for the hub would be two rules for one action.
+                match recentre_decision(&demand.reasons(), tracker_on.get()) {
+                    Ok(()) => {
+                        recentring.request(now);
+                        // Said here rather than left to the outcome a second
+                        // later, because holding still is the part the user has
+                        // to do and they have to be told while it matters.
+                        recentring.report(
+                            "measuring — hold still and look at the centre of the screen"
+                                .to_string(),
+                            now,
+                        );
+                    }
+                    Err(why) => recentring.report(why, now),
+                }
+                refresh();
+            });
+        }
+
         let controls = gtk::Box::new(Orientation::Vertical, 8);
         let top = gtk::Box::new(Orientation::Horizontal, 16);
         top.append(&sw);
         top.append(&strength_ctl);
         controls.append(&top);
         controls.append(&joy_row);
+        let recentre_row = gtk::Box::new(Orientation::Horizontal, 8);
+        recentre_row.append(&recentre);
+        controls.append(&recentre_row);
         controls.append(&status);
 
         let row = GamesRow {
@@ -270,6 +357,10 @@ impl GamesRow {
             joy,
             strength: buttons,
             joystick,
+            recentre,
+            recentring,
+            demand,
+            tracker_on,
         };
         row.refresh(false);
         row
@@ -302,8 +393,19 @@ impl GamesRow {
             }
         }
 
+        // A recentre needs a head to measure and a user who is not looking at a
+        // calibration dot, so the button says so by being unavailable rather
+        // than by refusing after the press.
+        self.tracker_on.set(tracker_on);
+        self.recentre
+            .set_sensitive(recentre_decision(&self.demand.reasons(), tracker_on).is_ok());
+
         let js = self.joystick.lock().unwrap().clone();
-        self.status.set_text(&status_text(&cfg, tracker_on, &js));
+        let text = match self.recentring.message(Instant::now()) {
+            Some(m) => sentence(&m),
+            None => status_text(&cfg, tracker_on, &js),
+        };
+        self.status.set_text(&text);
     }
 }
 
@@ -448,6 +550,24 @@ mod tests {
         let s = status_text(&joystick_only(), false, &JoystickStatus::Off);
         assert!(!s.contains("no destination"), "{s}");
         assert!(s.contains("starting"), "{s}");
+    }
+
+    /// The outcome sentences are shared with `tobii headpose`, which wants them
+    /// lowercase for a log line; this window wants a sentence. Only the first
+    /// letter may differ, or the two front ends have started wording the same
+    /// answer differently.
+    #[test]
+    fn an_outcome_reads_as_a_sentence_without_being_reworded() {
+        let applied = tobii_output::pipeline::RecentreOutcome::Applied {
+            yaw_deg: 17.4,
+            roll_deg: -0.2,
+            spread_deg: 0.3,
+        }
+        .to_string();
+        let shown = sentence(&applied);
+        assert!(shown.starts_with('R'), "{shown}");
+        assert_eq!(shown[1..], applied[1..], "the wording must not diverge");
+        assert_eq!(sentence(""), "");
     }
 
     #[test]

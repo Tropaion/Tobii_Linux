@@ -742,7 +742,7 @@ pub(crate) fn close_on_click(btn: &gtk::Button) {
 /// rather than a probe-only twin means there is nothing here that only test
 /// scaffolding calls.
 pub fn build_hub(app: &Application, session: device::Session) -> Option<ApplicationWindow> {
-    let (state, cmd_tx, demand, joystick_status) = session;
+    let (state, cmd_tx, demand, joystick_status, recentring) = session;
     // `--accuracy` runs the gaze-accuracy diagnostic instead of the hub. It
     // needs the device thread, so it branches here rather than in `run`.
     if accuracy_mode() {
@@ -1252,7 +1252,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     ));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
     // tracker does, not about how this program behaves.
-    let games_row = crate::games::GamesRow::build(joystick_status);
+    let games_row = crate::games::GamesRow::build(joystick_status, recentring, demand.clone());
     col_games.append(&section(
         "Head tracking for games",
         "Sends head tracking and gaze to a game. Wrap the game with \

@@ -57,6 +57,20 @@ pub struct OutputConfig {
     pub rate_hz: f64,
     /// Smoothing strength, `0.0`–`1.0`; higher follows the head more closely.
     pub filter_alpha: f64,
+    /// How far the head's position may move between two frames and still be
+    /// believed, in millimetres.
+    ///
+    /// The filter holds a sample that steps further than this instead of
+    /// blending it in, which is what keeps a decode fault or a reacquisition
+    /// onto somebody else from sweeping the view. It is a key rather than a
+    /// constant for one reason: `tobii_headpose::filter::DEFAULT_MAX_STEP_MM`
+    /// says in its own documentation that it is **not** measured against real
+    /// head motion, because no recording in this repository has a head in it.
+    /// Until one does, the person who can tell a rejected lunge from a rejected
+    /// glitch is the person it happened to, and this is what they turn the gate
+    /// off with (a very large value) or tighten it with. See that constant for
+    /// what the 150 mm default is derived from.
+    pub filter_max_step_mm: f64,
     /// opentrack endpoint, or `None` to not send there.
     pub opentrack: Option<String>,
     /// Loopback port for the Wine bridge, or `None` to not send there.
@@ -102,6 +116,7 @@ impl Default for OutputConfig {
             enabled: false,
             rate_hz: DEFAULT_RATE_HZ,
             filter_alpha: tobii_headpose::filter::DEFAULT_ALPHA,
+            filter_max_step_mm: tobii_headpose::filter::DEFAULT_MAX_STEP_MM,
             opentrack: Some(DEFAULT_OPENTRACK_ADDR.to_string()),
             bridge_port: Some(DEFAULT_BRIDGE_PORT),
             joystick_full_deg: [70.0, 35.0, 20.0],
@@ -147,6 +162,10 @@ impl OutputConfig {
         s.push_str(&format!("enabled = {}\n", self.enabled));
         s.push_str(&format!("rate_hz = {}\n", self.rate_hz));
         s.push_str(&format!("filter_alpha = {}\n", self.filter_alpha));
+        s.push_str(&format!(
+            "filter_max_step_mm = {}\n",
+            self.filter_max_step_mm
+        ));
         s.push_str(&format!(
             "opentrack = \"{}\"\n",
             self.opentrack.as_deref().unwrap_or("")
@@ -230,6 +249,17 @@ impl OutputConfig {
             },
             "filter_alpha" => match f(value).filter(|v| (0.0..=1.0).contains(v)) {
                 Some(v) => self.filter_alpha = v,
+                None => return false,
+            },
+            // Positive and finite is the whole rule, and there is deliberately
+            // no upper bound: a very large value is how somebody turns the gate
+            // off to find out whether it is what is holding their pose. A zero
+            // or negative limit would refuse every sample, so it is refused
+            // here rather than silently repaired — `PoseFilter::with_max_step_mm`
+            // falls back to the default for one, and a key that quietly did
+            // something other than what it says is worse than a rejection.
+            "filter_max_step_mm" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.filter_max_step_mm = v,
                 None => return false,
             },
             // An empty address is how the file spells "do not send there".
@@ -330,6 +360,7 @@ impl OutputConfig {
             "enabled",
             "rate_hz",
             "filter_alpha",
+            "filter_max_step_mm",
             "opentrack",
             "bridge_port",
             "joystick",
@@ -396,6 +427,7 @@ mod tests {
             enabled: true,
             rate_hz: 120.0,
             filter_alpha: 0.4,
+            filter_max_step_mm: 220.0,
             opentrack: Some("192.168.1.7:4242".to_string()),
             bridge_port: Some(5000),
             // Off, because the default is on: the round-trip tests below only
@@ -486,6 +518,12 @@ mod tests {
             ("rate_hz", "nan"),
             ("filter_alpha", "1.5"),
             ("filter_alpha", "-0.1"),
+            // A limit of zero or less would refuse every sample, and the
+            // filter would answer with a default-constructed pose for three
+            // frames at a time.
+            ("filter_max_step_mm", "0"),
+            ("filter_max_step_mm", "-1"),
+            ("filter_max_step_mm", "nan"),
             ("ev_yaw_input_max_deg", "0"),
             ("ev_yaw_deadzone_deg", "-1"),
         ] {
@@ -589,6 +627,7 @@ mod tests {
                 // Alpha is a fraction, so the generic numeric value below would
                 // be legitimately out of range.
                 "filter_alpha" => "0.3",
+                "filter_max_step_mm" => "200",
                 k if k.ends_with("_curve") => "linear",
                 _ => "3",
             };

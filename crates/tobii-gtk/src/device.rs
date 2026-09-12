@@ -911,6 +911,9 @@ pub fn spawn() -> Session {
     let lease: Arc<Mutex<Lease>> = Arc::new(Mutex::new(Lease::Free));
     let joystick_status = Arc::new(Mutex::new(JoystickStatus::Off));
     let thread_joystick_status = Arc::clone(&joystick_status);
+    // Shared with the socket thread and with the hub: all three can ask for a
+    // rotation recentre, and only game output can perform one.
+    let recentring = crate::outputs::Recentring::default();
     let thread_state = Arc::clone(&state);
     let thread_demand = demand.clone();
     let thread_lease = Arc::clone(&lease);
@@ -919,7 +922,13 @@ pub fn spawn() -> Session {
     // than from the GUI because this is where the `Demand` is constructed, and
     // a connected client IS a demand — see `crate::outputs`. Nothing published
     // yet; this is the seam alone.
-    crate::outputs::spawn(demand.clone(), Arc::clone(&state), Arc::clone(&lease));
+    crate::outputs::spawn(
+        demand.clone(),
+        Arc::clone(&state),
+        Arc::clone(&lease),
+        recentring.clone(),
+    );
+    let thread_recentring = recentring.clone();
     std::thread::spawn(move || {
         // Commands that arrived while the tracker was off. They are not
         // dropped: "select left eye only" typed into an idle hub has to take
@@ -927,7 +936,7 @@ pub fn spawn() -> Session {
         let mut pending: Vec<DeviceCommand> = Vec::new();
         // Game output's settings, polled rather than read once — see
         // `GameSide`.
-        let mut game_side = GameSide::new(thread_joystick_status);
+        let mut game_side = GameSide::new(thread_joystick_status, thread_recentring);
         loop {
             game_side.poll();
             // Nothing wants the tracker: do not open it. This is the whole
@@ -969,7 +978,7 @@ pub fn spawn() -> Session {
             );
         }
     });
-    (state, tx, demand, joystick_status)
+    (state, tx, demand, joystick_status, recentring)
 }
 
 /// The device thread and the handles onto it.
@@ -988,6 +997,7 @@ pub type Session = (
     Sender<DeviceCommand>,
     Demand,
     Arc<Mutex<JoystickStatus>>,
+    crate::outputs::Recentring,
 );
 
 /// What the virtual joystick is actually doing, for the hub to report.
@@ -1046,6 +1056,10 @@ struct GameSide {
     joystick: Option<JoystickHandle>,
     /// Published for the hub's games row to report.
     status: Arc<Mutex<JoystickStatus>>,
+    /// Handed to every output this builds, so a recentre asked for while the
+    /// settings happened to change is still picked up by the router that
+    /// replaces the one it was asked of.
+    recentring: crate::outputs::Recentring,
     /// The settings the current router was built from, to notice a change.
     last_cfg: Option<tobii_output::games::OutputConfig>,
     checked: Option<Instant>,
@@ -1066,10 +1080,11 @@ fn wants_joystick(cfg: &tobii_output::games::OutputConfig) -> bool {
 const GAMES_POLL: Duration = Duration::from_secs(1);
 
 impl GameSide {
-    fn new(status: Arc<Mutex<JoystickStatus>>) -> GameSide {
+    fn new(status: Arc<Mutex<JoystickStatus>>, recentring: crate::outputs::Recentring) -> GameSide {
         GameSide {
             joystick: None,
             status,
+            recentring,
             last_cfg: None,
             checked: None,
             warned: false,
@@ -1108,7 +1123,7 @@ impl GameSide {
     /// outlives every router built from it, which is the whole reason it is
     /// owned by the thread rather than by a session.
     fn output(&self) -> Option<crate::outputs::GameOutput> {
-        crate::outputs::GameOutput::for_session(self.joystick.clone())
+        crate::outputs::GameOutput::for_session(self.joystick.clone(), self.recentring.clone())
     }
 
     /// Create or destroy the device to match the setting.

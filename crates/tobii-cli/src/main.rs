@@ -78,7 +78,7 @@ fn main() -> ExitCode {
                  tobii games [set KEY VALUE]\n  \
                  tobii bridge install --prefix PATH\n  \
                  tobii bridge run --prefix PATH\n  \
-                 tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE]\n  \
+                 tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE] [--recenter]\n  \
                  tobii headpose --check [--calibrate-pitch [SECS]]\n  \
                  tobii headpose --model-status\n  \
                  tobii headpose --fetch-model [--agree]\n  \
@@ -1913,6 +1913,44 @@ fn apply_games_opt_in(cfg: &mut tobii_output::games::OutputConfig, args: &[Strin
     }
 }
 
+/// Whether this run should take a rotation reference.
+///
+/// Both spellings are accepted. `--recenter` is the documented one, because it
+/// is the spelling in `docs/wiki/Planned-Work.md` and the one an English
+/// keyboard produces by habit; every line of prose in this repository spells it
+/// "recentre", and somebody typing what they just read should not be answered
+/// with a usage message.
+fn wants_recentre(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--recenter" || a == "--recentre")
+}
+
+/// How much of this session's head pose is a reconstruction, and whether the
+/// pose right now is one.
+///
+/// A dropped eye used to cost the frame its pose outright; `PairOffset` now
+/// rebuilds the missing eye from the last measured offset — a guess, which must
+/// not be able to travel as a measurement. This is where it says so, and it is
+/// a fragment appended to the status line rather than a line of its own because
+/// that line is read while a game is running.
+///
+/// Empty while every pose came from two measured eyes, which is the ordinary
+/// case and needs no word. `(now)` marks a pose that is a reconstruction at this
+/// instant, so a tracker that cannot see one eye at all reads differently from
+/// one that blinked twenty minutes ago.
+fn fallback_note(stats: tobii_output::pipeline::FallbackStats) -> String {
+    let total = stats.both_eyes + stats.reconstructed;
+    if stats.reconstructed == 0 || total == 0 {
+        return String::new();
+    }
+    // A whole percent: this is a proportion read at a glance beside three
+    // rates, not a number anybody computes with.
+    let pct = stats.reconstructed as f64 * 100.0 / total as f64;
+    format!(
+        ", one eye {pct:.0}%{}",
+        if stats.active { " (now)" } else { "" }
+    )
+}
+
 /// Apply one `KEY VALUE` to a config, or say why it was refused.
 ///
 /// Split from [`games_cmd`] so the decision can be tested without touching the
@@ -2008,6 +2046,11 @@ fn headpose(args: &[String]) -> CmdResult {
     // conventions: turn your head one axis at a time and the two must move
     // TOGETHER. If one is inverted, that sign is wrong.
     let check = args.iter().any(|a| a == "--check");
+    // `--recenter` takes a rotation reference for this run: the head angle the
+    // user is holding becomes straight ahead. It is the same settle window the
+    // hub's button and the socket's `Recentre` message ask for, because all
+    // three ask the same `FramePipeline`.
+    let recentre = wants_recentre(args);
     // `--calibrate-pitch [SECS]` measures the pitch zero instead of streaming:
     // sit square-on to the screen and hold still.
     let calibrate_pitch = args.iter().position(|a| a == "--calibrate-pitch").map(|i| {
@@ -2102,6 +2145,13 @@ fn headpose(args: &[String]) -> CmdResult {
              `tobii headpose --fetch-model` adds the model that can."
         );
     }
+    if recentre {
+        eprintln!(
+            "recentring: sit the way you play, look at the centre of the screen and hold \
+             still for a second — the head angle you are holding becomes straight ahead. \
+             Pitch is not part of it; it has its own zero from `--calibrate-pitch`."
+        );
+    }
 
     // The compose sequence lives in tobii-output now, so this command and the
     // hub cannot disagree about when Extended View contributes, what a blink
@@ -2114,6 +2164,9 @@ fn headpose(args: &[String]) -> CmdResult {
     // the filter's internal state: what the status should report is what was
     // actually sent, which is the frame, not the smoother.
     let mut last_frame: Option<tobii_output::TrackingFrame> = None;
+    // Whether the settle window has been started. Once only: the reference is
+    // taken at the start of the run, and a second one would fight the first.
+    let mut recentre_started = false;
     let mut samples_since_status = 0u32;
     let mut sends_since_status = 0u32;
     let mut frames_since_status = 0u32;
@@ -2144,7 +2197,24 @@ fn headpose(args: &[String]) -> CmdResult {
                     // because opentrack holding its last value is far less
                     // jarring in game than a snap to zero.
                     let at = Instant::now();
+                    // Started on the first frame that actually produced a pose,
+                    // not at startup: the window would otherwise spend part of
+                    // its second on frames from before the tracker had found
+                    // the user, and be refused for having too few poses in it.
+                    if recentre
+                        && !recentre_started
+                        && last_frame.as_ref().is_some_and(|f| f.pose.is_some())
+                    {
+                        pipeline.begin_recentre(at);
+                        recentre_started = true;
+                    }
                     let frame = pipeline.offer(&sample, fuse_pose(eyes, fresh), &cfg, corners, at);
+                    // A second later, when the window closes — including when
+                    // it refuses, which is the answer somebody sitting still is
+                    // waiting for.
+                    if let Some(outcome) = pipeline.take_recentre() {
+                        eprintln!("{outcome}");
+                    }
                     if matches!(router.offer(&frame, at), tobii_output::Emitted::Sent) {
                         sends_since_status += 1;
                     }
@@ -2160,11 +2230,15 @@ fn headpose(args: &[String]) -> CmdResult {
 
         if last_status.elapsed() >= STATUS_INTERVAL {
             let elapsed = last_status.elapsed().as_secs_f64();
+            // The one-eye fallback rides on the end of the rates, so both this
+            // command's status line and `--check`'s two-line form report it
+            // without either growing a line. See `fallback_note`.
             let rates = format!(
-                "{:.0} samples/s, {:.0} frames/s, {:.0} sent/s",
+                "{:.0} samples/s, {:.0} frames/s, {:.0} sent/s{}",
                 f64::from(samples_since_status) / elapsed,
                 f64::from(frames_since_status) / elapsed,
                 f64::from(sends_since_status) / elapsed,
+                fallback_note(pipeline.fallback_stats()),
             );
             if check {
                 print_check_line(
@@ -2498,6 +2572,66 @@ mod tests {
         assert!(!sanitize_notes("a\u{9b}31m").contains('\u{9b}'));
         // Bidi overrides can reorder a line into a different sentence.
         assert!(!sanitize_notes("a\u{202e}b").contains('\u{202e}'));
+    }
+
+    /// A reconstructed pose is a guess, and the whole risk of the one-eye
+    /// fallback is that it reads exactly like a measurement. This is the line
+    /// that says otherwise, so it has to say it while it is happening and it
+    /// has to stay short enough to sit beside three rates.
+    #[test]
+    fn the_status_line_says_when_a_pose_is_a_reconstruction() {
+        use tobii_output::pipeline::FallbackStats;
+
+        assert_eq!(
+            fallback_note(FallbackStats::default()),
+            "",
+            "before any frame there is nothing to report"
+        );
+        assert_eq!(
+            fallback_note(FallbackStats {
+                both_eyes: 100,
+                reconstructed: 0,
+                active: false,
+            }),
+            "",
+            "a session with two eyes throughout says nothing at all"
+        );
+
+        let live = fallback_note(FallbackStats {
+            both_eyes: 75,
+            reconstructed: 25,
+            active: true,
+        });
+        assert!(live.contains("25%"), "the share of the session: {live}");
+        assert!(
+            live.contains("now"),
+            "a pose that IS a reconstruction must be visible as one: {live}"
+        );
+        assert!(live.len() < 32, "it shares a line with the rates: {live:?}");
+
+        let past = fallback_note(FallbackStats {
+            both_eyes: 75,
+            reconstructed: 25,
+            active: false,
+        });
+        assert!(past.contains("25%"), "{past}");
+        assert!(
+            !past.contains("now"),
+            "a pose measured from two eyes must not be marked as a guess: {past}"
+        );
+    }
+
+    /// The flag is documented `--recenter`; the prose everywhere in this
+    /// repository says "recentre". Both have to work.
+    #[test]
+    fn the_recentre_flag_is_accepted_in_either_spelling() {
+        assert!(wants_recentre(&args(&["tobii", "headpose", "--recenter"])));
+        assert!(wants_recentre(&args(&["tobii", "headpose", "--recentre"])));
+        assert!(!wants_recentre(&args(&["tobii", "headpose"])));
+        assert!(
+            !wants_recentre(&args(&["tobii", "headpose", "--check"])),
+            "an unrelated flag must not start a settle window"
+        );
     }
 
     #[test]
