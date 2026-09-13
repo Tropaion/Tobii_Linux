@@ -1582,10 +1582,16 @@ fn stream(json: bool, eyes: bool) -> CmdResult {
 use tobii_output::games::DEFAULT_OPENTRACK_ADDR as DEFAULT_UDP_ADDR;
 /// How often the human-readable status line is printed to stderr.
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
-/// How long tracking must stay lost before the smoothing filter is reset. A
-/// blink drops a handful of frames and should not cause a visible snap when the
-/// eyes come back; a genuine absence should not drag a stale pose back in.
-const TRACKING_LOSS_RESET: Duration = Duration::from_millis(1000);
+/// How stale a measured (model) rotation may be before the command stops
+/// handing it to `fuse_pose`.
+///
+/// The camera and the gaze stream both run at ~33 Hz but are not in lockstep,
+/// so holding the last model pose bridges the gaps rather than dropping pitch
+/// to zero on every gaze sample that arrived without an image. After a second
+/// the hold is a guess, and the geometric pose — which tracks the eyes that are
+/// really there — is the honest answer. Same rule and same value as the hub's
+/// `outputs::HEAD_POSE_MAX_AGE`.
+const HEAD_POSE_MAX_AGE: Duration = Duration::from_millis(1000);
 
 /// Value of a `--flag VALUE` style option, if present.
 fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -1938,10 +1944,13 @@ fn wants_recentre(args: &[String]) -> bool {
 /// instant, so a tracker that cannot see one eye at all reads differently from
 /// one that blinked twenty minutes ago.
 fn fallback_note(stats: tobii_output::pipeline::FallbackStats) -> String {
-    let total = stats.both_eyes + stats.reconstructed;
-    if stats.reconstructed == 0 || total == 0 {
+    // Nothing to say until a frame has actually been reconstructed — which also
+    // means `total` below is at least one, so the percentage cannot divide by
+    // zero.
+    if stats.reconstructed == 0 {
         return String::new();
     }
+    let total = stats.both_eyes + stats.reconstructed;
     // A whole percent: this is a proportion read at a glance beside three
     // rates, not a number anybody computes with.
     let pct = stats.reconstructed as f64 * 100.0 / total as f64;
@@ -2173,7 +2182,7 @@ fn headpose(args: &[String]) -> CmdResult {
     // The model's pose is held between camera frames: the camera runs at ~33 Hz
     // and gaze at ~33 Hz, but they are not in lockstep, and dropping pitch to
     // zero on every gaze sample that arrived without a matching image would
-    // shake the head in game. Held for at most `TRACKING_LOSS_RESET`.
+    // shake the head in game. Held for at most `HEAD_POSE_MAX_AGE`.
     let mut last_model: Option<(ModelPose, Instant)> = None;
 
     loop {
@@ -2188,7 +2197,7 @@ fn headpose(args: &[String]) -> CmdResult {
                     let eyes = pose_from_sample(&sample);
                     let fresh = last_model
                         .as_ref()
-                        .filter(|(_, at)| at.elapsed() < TRACKING_LOSS_RESET)
+                        .filter(|(_, at)| at.elapsed() < HEAD_POSE_MAX_AGE)
                         .map(|(m, _)| m);
                     // The model's pose wins where there is one; the pipeline
                     // falls back to the geometric pose otherwise. Tracking loss
@@ -2247,11 +2256,8 @@ fn headpose(args: &[String]) -> CmdResult {
                     &rates,
                 );
             } else {
-                match (
-                    last_frame.as_ref().is_some_and(|f| f.pose.is_some()),
-                    last_frame.as_ref().and_then(|f| f.pose),
-                ) {
-                    (true, Some(p)) => {
+                match last_frame.as_ref().and_then(|f| f.pose) {
+                    Some(p) => {
                         let pitch = match last_model {
                             Some(_) => format!("{:>6.1}°", p.pitch_deg),
                             None => "   n/a".to_string(),
@@ -2262,7 +2268,7 @@ fn headpose(args: &[String]) -> CmdResult {
                             p.x_mm, p.y_mm, p.z_mm, p.yaw_deg, p.roll_deg,
                         )
                     }
-                    _ => eprintln!(
+                    None => eprintln!(
                         "NO HEAD DETECTED — both eyes must be in the trackbox  ({rates}, \
                          not sending)"
                     ),

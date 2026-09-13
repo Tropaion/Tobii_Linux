@@ -125,6 +125,17 @@ fn framed(kind: u16, payload: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// A one-byte tag — a status code, or an `ok` flag — then a UTF-8 tail.
+///
+/// Three kinds share this payload shape, and the next reply kind will be a
+/// fourth.
+fn tagged(tag: u8, text: &str) -> Vec<u8> {
+    let mut p = Vec::with_capacity(1 + text.len());
+    p.push(tag);
+    p.extend_from_slice(text.as_bytes());
+    p
+}
+
 /// Encode a message, header included.
 ///
 /// A `Msg::Unknown` re-encodes to exactly the bytes it was decoded from, so a
@@ -151,12 +162,7 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             p.extend_from_slice(&caps.to_le_bytes());
             framed(kind::WELCOME, p)
         }
-        Msg::Status { code, text } => {
-            let mut p = Vec::with_capacity(1 + text.len());
-            p.push(code.to_wire());
-            p.extend_from_slice(text.as_bytes());
-            framed(kind::STATUS, p)
-        }
+        Msg::Status { code, text } => framed(kind::STATUS, tagged(code.to_wire(), text)),
         Msg::Notify { op, payload } => {
             let mut p = Vec::with_capacity(4 + payload.len());
             p.extend_from_slice(&op.to_le_bytes());
@@ -165,18 +171,10 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
         }
         Msg::Pose(frame) => framed(kind::POSE, frame.clone()),
         Msg::Lease(action) => framed(kind::LEASE, vec![action.to_wire()]),
-        Msg::LeaseReply { ok, text } => {
-            let mut p = Vec::with_capacity(1 + text.len());
-            p.push(u8::from(*ok));
-            p.extend_from_slice(text.as_bytes());
-            framed(kind::LEASE_REPLY, p)
-        }
+        Msg::LeaseReply { ok, text } => framed(kind::LEASE_REPLY, tagged(u8::from(*ok), text)),
         Msg::Recentre => framed(kind::RECENTRE, Vec::new()),
         Msg::RecentreReply { ok, text } => {
-            let mut p = Vec::with_capacity(1 + text.len());
-            p.push(u8::from(*ok));
-            p.extend_from_slice(text.as_bytes());
-            framed(kind::RECENTRE_REPLY, p)
+            framed(kind::RECENTRE_REPLY, tagged(u8::from(*ok), text))
         }
         Msg::Unknown { kind, payload } => framed(*kind, payload.clone()),
     }
@@ -448,6 +446,29 @@ mod tests {
             }
         );
         // Skipping it leaves the stream aligned on the next message.
+        assert_eq!(decode_one(&buf[n..]).0, known);
+    }
+
+    /// A kind with no arguments today must still decode once a later version has
+    /// given it some. That is the whole of the forward-compatibility promise, and
+    /// `RECENTRE` is the one arm in this file that keeps it — every other
+    /// length-checked kind is pinned the other way by
+    /// `payloads_too_short_for_their_kind_are_rejected`, and the reply arm two
+    /// lines below it is the symmetry a later reader would be tempted to copy.
+    #[test]
+    fn a_recentre_with_a_payload_from_a_newer_client_still_decodes() {
+        let mut buf = framed(kind::RECENTRE, vec![1, 2, 3]);
+        let known = Msg::Lease(LeaseAction::Release);
+        buf.extend_from_slice(&encode(&known));
+
+        let (got, n) = decode_one(&buf);
+        assert_eq!(
+            got,
+            Msg::Recentre,
+            "a payload must be ignored, not rejected"
+        );
+        // Ignored is not skipped: the next message has to still be reachable, or a
+        // client that sent one would have desynchronised the stream.
         assert_eq!(decode_one(&buf[n..]).0, known);
     }
 

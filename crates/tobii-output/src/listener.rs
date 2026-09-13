@@ -44,6 +44,30 @@
 //! the machine regardless of who asks, which is also why the tests below can
 //! run as root in CI without changing meaning.
 //!
+//! # Which of those sockets count
+//!
+//! Two kinds are skipped, both because they cannot receive what we send:
+//!
+//! * **A socket that has `connect`ed.** Its `rem_address` column is non-zero,
+//!   and the kernel delivers it only datagrams from that one peer — so it is
+//!   not a listener *for us*, whatever port it holds. This is most of the
+//!   outbound UDP on a desktop (DNS stubs, QUIC), and every one of them draws
+//!   an ephemeral port that could otherwise collide with a configured one.
+//! * **One of our own sinks.** `OpentrackUdp` and `BridgeUdp` bind `0.0.0.0:0`
+//!   and send with `send_to`, so each is an unconnected wildcard socket on an
+//!   ephemeral port — exactly the shape the wildcard arm below reports as a
+//!   listener. The kernel draws that port from `ip_local_port_range`, and it is
+//!   free to draw the configured opentrack port precisely when nothing is bound
+//!   to it, which is the case this whole module is asked about. Counting our own
+//!   sink would then latch: the answer takes a hold, the hold keeps the session,
+//!   the session keeps the sink bound, and the sink is what the answer was
+//!   reading — the tracker would never return to standby, which is the one rule
+//!   this subsystem exists to enforce. A socket is ours when its `inode` column
+//!   matches one of the `socket:[N]` links in `/proc/self/fd`; it is a *sender*
+//!   when it is also bound to a wildcard, which is a fact about this project
+//!   rather than about the kernel — those two sinks are the only wildcard binds
+//!   in the tree, and every receiver we write names a loopback address.
+//!
 //! # What this deliberately cannot see
 //!
 //! * **A listener on another machine.** Nothing in `/proc` knows about other
@@ -74,13 +98,6 @@ pub enum Listening {
     /// The question cannot be answered here, for the reason given. Callers must
     /// treat this as "do not claim a listener", never as `No`.
     Unknown(&'static str),
-}
-
-impl Listening {
-    /// Whether a listener was actually found.
-    pub fn found(self) -> bool {
-        self == Listening::Yes
-    }
 }
 
 /// The reason `Unknown` is returned for an address on some other machine.
@@ -138,6 +155,10 @@ mod proc_net {
     /// the Linux default but can be turned on. Over-matching there costs a lit
     /// illuminator for a program that is not ours; under-matching would cost the
     /// whole feature for every dual-stack listener, which is most of them.
+    ///
+    /// This asks only where a socket is bound. Whether it is one that would take
+    /// our datagrams at all — unconnected, and not one of ours — is decided by
+    /// [`bound_sockets`], because that question is answered by other columns.
     fn would_receive(bound: SocketAddr, want: SocketAddr) -> bool {
         if bound.port() != want.port() {
             return false;
@@ -161,13 +182,10 @@ mod proc_net {
             }
             // Four of them, in order.
             32 => {
-                let mut words = [0u32; 4];
-                for (i, word) in words.iter_mut().enumerate() {
-                    *word = u32::from_str_radix(addr.get(i * 8..i * 8 + 8)?, 16).ok()?;
-                }
                 let mut bytes = [0u8; 16];
-                for (i, word) in words.iter().enumerate() {
-                    bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                for (i, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let word = u32::from_str_radix(addr.get(i * 8..i * 8 + 8)?, 16).ok()?;
+                    *chunk = word.to_le_bytes();
                 }
                 IpAddr::from(bytes)
             }
@@ -176,21 +194,62 @@ mod proc_net {
         Some(SocketAddr::new(ip, port))
     }
 
-    /// Every local address in one `/proc/net/udp` or `/proc/net/udp6` document.
-    fn local_addresses(text: &str) -> impl Iterator<Item = SocketAddr> + '_ {
-        text.lines()
-            .filter_map(|line| parse_local(line.split_whitespace().nth(1)?))
+    /// One UDP socket, as far as this module reads it.
+    struct Bound {
+        /// Where it is bound — the only address in the line that matters.
+        local: SocketAddr,
+        /// Whether it has a peer, i.e. somebody called `connect` on it.
+        connected: bool,
+        /// The socket's inode, which is what `/proc/self/fd` reports it as.
+        inode: u64,
+    }
+
+    /// Every UDP socket in one `/proc/net/udp` or `/proc/net/udp6` document.
+    ///
+    /// Lines whose local address does not decode are dropped, which is how the
+    /// header is skipped rather than by counting lines. The other two fields only
+    /// ever narrow the answer, so an unreadable one is read as the permissive
+    /// value: a column we cannot parse must not cost us a real listener.
+    fn bound_sockets(text: &str) -> impl Iterator<Item = Bound> + '_ {
+        text.lines().filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let local = parse_local(fields.nth(1)?)?;
+            let connected = fields
+                .next()
+                .and_then(parse_local)
+                .is_some_and(|peer| peer.port() != 0);
+            let inode = fields.nth(6).and_then(|f| f.parse().ok()).unwrap_or(0);
+            Some(Bound {
+                local,
+                connected,
+                inode,
+            })
+        })
+    }
+
+    /// Whether a socket is one of ours, sending.
+    ///
+    /// A wildcard bind is what makes it a sender rather than a receiver, and
+    /// that is a fact about this project rather than about the kernel: the two
+    /// sinks are the only `0.0.0.0` binds in the tree, and every receiver we
+    /// write — the test sockets here, the hub's, the Wine bridge's — names a
+    /// loopback address. So "ours and bound to a wildcard" is our own sink, and
+    /// the narrow rule leaves an in-process socket on a real address counting
+    /// as the listener it is standing in for.
+    fn is_our_sender(s: &Bound, ours: &[u64]) -> bool {
+        s.local.ip().is_unspecified() && ours.contains(&s.inode)
     }
 
     /// Answer the question against two documents already read.
     ///
     /// Pure, so the fixtures below can be real captured files: the interesting
     /// mistakes are all in the decoding and the matching, and neither needs a
-    /// socket to get wrong.
-    fn scan(udp: &str, udp6: &str, want: SocketAddr) -> Listening {
-        let found = local_addresses(udp)
-            .chain(local_addresses(udp6))
-            .any(|bound| would_receive(bound, want));
+    /// socket to get wrong. `ours` is the inode list from [`own_socket_inodes`],
+    /// empty when the caller wants the machine's answer without that filter.
+    fn scan(udp: &str, udp6: &str, want: SocketAddr, ours: &[u64]) -> Listening {
+        let found = bound_sockets(udp)
+            .chain(bound_sockets(udp6))
+            .any(|s| !s.connected && !is_our_sender(&s, ours) && would_receive(s.local, want));
         if found {
             Listening::Yes
         } else {
@@ -198,8 +257,36 @@ mod proc_net {
         }
     }
 
-    /// Whether something on this machine is bound where `want` would arrive.
-    pub fn probe(want: SocketAddr) -> Listening {
+    /// The inode of every socket this process holds open.
+    ///
+    /// `/proc/self/fd/N` links to `socket:[INODE]` for a socket, and that number
+    /// is the inode column of `/proc/net/udp`. Unreadable — a hardened `/proc`,
+    /// or a target where the link is not spelled that way — answers "none of
+    /// them are ours", which is the behaviour of not looking at all rather than a
+    /// new failure mode.
+    fn own_socket_inodes() -> Vec<u64> {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let target = std::fs::read_link(entry.path()).ok()?;
+                let link = target.to_str()?;
+                link.strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// Whether something is bound where `want` would arrive, `ours` aside.
+    ///
+    /// Split from [`probe`] so that a test can ask the real kernel the
+    /// unfiltered question — the premise "this socket would otherwise have been
+    /// counted" is half of what the exclusion's test has to say.
+    fn look(want: SocketAddr, ours: &[u64]) -> Listening {
         if !is_visible_here(want.ip()) {
             return Listening::Unknown(NOT_LOCAL);
         }
@@ -215,7 +302,13 @@ mod proc_net {
             udp.as_deref().unwrap_or(""),
             udp6.as_deref().unwrap_or(""),
             want,
+            ours,
         )
+    }
+
+    /// Whether somebody else on this machine is bound where `want` would arrive.
+    pub fn probe(want: SocketAddr) -> Listening {
+        look(want, &own_socket_inodes())
     }
 
     #[cfg(test)]
@@ -251,7 +344,7 @@ mod proc_net {
         /// the capture above was taken.
         #[test]
         fn the_hex_columns_decode_to_the_addresses_that_were_bound() {
-            let v4: Vec<SocketAddr> = local_addresses(UDP).collect();
+            let v4: Vec<SocketAddr> = bound_sockets(UDP).map(|s| s.local).collect();
             assert_eq!(
                 v4,
                 vec![
@@ -262,42 +355,49 @@ mod proc_net {
                 "the header line must be skipped and the rest byte-reversed"
             );
 
-            let v6: Vec<SocketAddr> = local_addresses(UDP6).collect();
+            let v6: Vec<SocketAddr> = bound_sockets(UDP6).map(|s| s.local).collect();
             assert_eq!(v6, vec![addr("[::1]:4343"), addr("[::]:5353")]);
+
+            let inodes: Vec<u64> = bound_sockets(UDP).map(|s| s.inode).collect();
+            assert_eq!(
+                inodes,
+                vec![18491, 45013, 45015],
+                "the inode column is what says whose socket it is"
+            );
         }
 
         #[test]
         fn a_socket_bound_to_the_exact_address_is_a_listener() {
-            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:4242")), Listening::Yes);
+            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:4242"), &[]), Listening::Yes);
         }
 
         /// What X-Plane does: bind the wildcard. A datagram to 127.0.0.1 arrives
         /// there, so it counts.
         #[test]
         fn a_wildcard_bind_counts_as_listening_on_loopback() {
-            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:4444")), Listening::Yes);
-            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:5353")), Listening::Yes);
+            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:4444"), &[]), Listening::Yes);
+            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:5353"), &[]), Listening::Yes);
         }
 
         /// The port is the whole question. Matching the address and ignoring the
         /// port would report every loopback socket on the machine as opentrack.
         #[test]
         fn a_different_port_is_not_a_listener() {
-            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:4243")), Listening::No);
-            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:1")), Listening::No);
+            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:4243"), &[]), Listening::No);
+            assert_eq!(scan(UDP, UDP6, addr("127.0.0.1:1"), &[]), Listening::No);
         }
 
         /// v4 and v6 loopback are different addresses, and a datagram to one does
         /// not reach a socket bound to the other.
         #[test]
         fn the_two_loopbacks_are_not_interchangeable() {
-            assert_eq!(scan(UDP, UDP6, addr("[::1]:4343")), Listening::Yes);
+            assert_eq!(scan(UDP, UDP6, addr("[::1]:4343"), &[]), Listening::Yes);
             assert_eq!(
-                scan(UDP, UDP6, addr("127.0.0.1:4343")),
+                scan(UDP, UDP6, addr("127.0.0.1:4343"), &[]),
                 Listening::No,
                 "a v6-only listener does not receive v4 loopback traffic"
             );
-            assert_eq!(scan(UDP, UDP6, addr("[::1]:4242")), Listening::No);
+            assert_eq!(scan(UDP, UDP6, addr("[::1]:4242"), &[]), Listening::No);
         }
 
         /// A dual-stack `[::]` socket does receive IPv4 loopback traffic, and a
@@ -329,7 +429,7 @@ mod proc_net {
                 "1: 0100007F0100:1092 0:0\n",
                 "1:\n",
             ] {
-                assert_eq!(local_addresses(junk).count(), 0, "{junk:?} parsed");
+                assert_eq!(bound_sockets(junk).count(), 0, "{junk:?} parsed");
             }
         }
 
@@ -343,9 +443,11 @@ mod proc_net {
             assert!(is_visible_here("::1".parse().unwrap()));
             assert!(is_visible_here("0.0.0.0".parse().unwrap()));
 
-            let remote = probe(addr("192.168.1.7:4242"));
-            assert_eq!(remote, Listening::Unknown(NOT_LOCAL));
-            assert!(!remote.found(), "Unknown must never read as a listener");
+            assert_eq!(
+                probe(addr("192.168.1.7:4242")),
+                Listening::Unknown(NOT_LOCAL),
+                "a remote address is Unknown, and Unknown must never read as a listener"
+            );
         }
 
         /// The whole mechanism through the real kernel: bind a socket, it is seen;
@@ -354,7 +456,9 @@ mod proc_net {
         /// The port is whatever the OS hands out rather than 4242, so the test does
         /// not fight an opentrack the developer happens to have running — and
         /// nothing here reads the socket's owner, so it means the same run as root
-        /// in CI as it does on a desktop.
+        /// in CI as it does on a desktop. A real address rather than a wildcard,
+        /// which is what a socket this process holds has to be to stand in for
+        /// somebody else's listener.
         #[test]
         fn a_real_socket_is_seen_while_it_is_open_and_not_after() {
             let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -375,11 +479,13 @@ mod proc_net {
         }
 
         /// Our own opentrack sink must never be mistaken for the thing it is
-        /// sending to. It binds `0.0.0.0:0` — an ephemeral port — and never the
-        /// destination, so it appears in the file under a port nobody configured.
-        /// Checked rather than assumed, because if it were wrong the hub would hold
-        /// the tracker on for its own sink, forever, and the standby rule would be
-        /// quietly dead.
+        /// sending to. It binds `0.0.0.0:0`, so the kernel hands it a port out of
+        /// `ip_local_port_range` — and the port we are watching is eligible for
+        /// that draw whenever nothing is bound to it, which is exactly when the
+        /// question is being asked. So the guarantee cannot be "the draw misses";
+        /// it is "the socket is ours". Forced here rather than waited for, because
+        /// if it were wrong the hub would hold the tracker on for its own sink,
+        /// forever, and the standby rule would be quietly dead.
         #[test]
         fn our_own_sender_is_not_mistaken_for_a_listener() {
             // A port that was free a moment ago: bound to learn the number, then
@@ -388,6 +494,21 @@ mod proc_net {
             let target = probe_sock.local_addr().expect("local addr");
             drop(probe_sock);
             assert_eq!(probe(target), Listening::No, "premise: {target} is free");
+
+            // The collision the kernel is free to hand us: a wildcard sender of
+            // ours holding the very port the hub watches.
+            let collided = UdpSocket::bind(("0.0.0.0", target.port())).expect("bind");
+            assert_eq!(
+                probe(target),
+                Listening::No,
+                "a sender of ours on {target} must not read as a listener on it"
+            );
+            assert_eq!(
+                look(target, &[]),
+                Listening::Yes,
+                "premise: without the exclusion that same socket does read as one"
+            );
+            drop(collided);
 
             let mut sink = crate::sinks::OpentrackUdp::new(target).expect("sink");
             sink.emit(&crate::TrackingFrame::from_pose(
@@ -399,7 +520,32 @@ mod proc_net {
             assert_eq!(
                 probe(target),
                 Listening::No,
-                "a sender that has sent to {target} must not look like a listener on it"
+                "and nor must the real sink after it has sent to {target}"
+            );
+        }
+
+        /// A socket with a peer receives only that peer's datagrams, so whatever
+        /// port it holds it is not a listener for ours. Most outbound UDP on a
+        /// desktop is this shape, and all of it sits on ephemeral ports that a
+        /// configured opentrack port can collide with.
+        #[test]
+        fn a_connected_socket_is_not_a_listener_for_us() {
+            let elsewhere = UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let peer = elsewhere.local_addr().expect("local addr");
+
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let addr = sock.local_addr().expect("local addr");
+            assert_eq!(
+                probe(addr),
+                Listening::Yes,
+                "premise: unconnected, {addr} is a listener"
+            );
+
+            sock.connect(peer).expect("connect");
+            assert_eq!(
+                probe(addr),
+                Listening::No,
+                "connected to {peer}, it can no longer receive ours"
             );
         }
     }
