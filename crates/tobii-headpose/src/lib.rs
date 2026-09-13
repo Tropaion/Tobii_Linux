@@ -20,8 +20,8 @@
 //! models plug in behind that trait; [`preprocess`] holds the shared face-crop
 //! and tensor conversion.
 //!
-//! This function is the **geometric fallback** used when no model is configured:
-//! it reconstructs what the two eye origins alone can support —
+//! [`pose_from_eyes`] is the **geometric fallback** used when no model is
+//! configured: it reconstructs what the two eye origins alone can support —
 //!
 //! * **position** — the midpoint of the two eye origins.
 //! * **yaw** — the interocular vector's angle in the horizontal (x–z) plane.
@@ -97,11 +97,44 @@ pub fn pitch_offset_from(samples: &mut Vec<f64>) -> Option<(f64, f64)> {
     if samples.len() < 20 {
         return None;
     }
+    let (median, spread) = median_and_spread(samples);
+    Some((-median, spread))
+}
+
+/// The middle of a set of samples and how far they spread: the median, and the
+/// 10-90% range. Sorted in place.
+///
+/// One function rather than one per measurement, because this project takes the
+/// same reduction twice — the pitch zero above, and the rotation recentre in
+/// `tobii-output`'s pipeline — and both justify their thresholds by being the
+/// same measurement as the other. A comment cannot hold two copies of
+/// arithmetic together; a shared function can.
+///
+/// Median rather than mean for both: the first frames of a run are the ones
+/// before the user has settled, and a handful of them must not be able to move
+/// the answer.
+///
+/// **Non-finite samples must be removed and the length checked first.**
+/// `partial_cmp` answers `None` for a NaN, so a sort containing one is not a
+/// sort, and the indices assume a non-empty slice. Both callers already do:
+/// `pitch_offset_from` with `retain` and its 20-sample floor, the pipeline by
+/// dropping non-finite angles as they arrive and gating on its own floor.
+pub fn median_and_spread(samples: &mut [f64]) -> (f64, f64) {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = samples[samples.len() / 2];
     let spread = samples[samples.len() * 9 / 10] - samples[samples.len() / 10];
-    Some((-median, spread))
+    (median, spread)
 }
+
+/// 10-90% spread, in degrees, above which a "sit still and hold it" run is
+/// treated as a head that moved rather than a posture.
+///
+/// Shared by the two such runs in this project — the pitch zero
+/// ([`pitch_offset_from`], whose callers warn and save anyway) and the rotation
+/// recentre in `tobii-output`'s pipeline (which refuses) — because they are the
+/// same measurement reduced the same way. What each one *does* past the bar is
+/// its own decision, documented at its own call site.
+pub const MOVED_SPREAD_DEG: f64 = 8.0;
 
 /// Validity value meaning "this eye is tracked". Anything else (in practice 4,
 /// "not detected") means the eye's origin column is meaningless.
@@ -258,6 +291,24 @@ pub const ONE_EYE_DEBOUNCE: u32 = 2;
 /// What was **not** measured is the distribution between those numbers — the
 /// session recorded the rate and the two maxima, not a histogram — so 300 ms
 /// is a conservative choice inside them, not a fitted one.
+///
+/// # Measured against two clocks, because neither bounds the other
+///
+/// The host's clock is what refuses a **stalled** stream: a stream that stops
+/// arriving must not be able to make an old offset look fresh by producing no
+/// frames to age it.
+///
+/// The device's own `timestamp_us` is what refuses a **backlog**.
+/// `tobii-usb`'s transport soaks incoming transfers while a large frame is
+/// going out and hands the queue over in one drain afterwards, which
+/// `tobii-usb`'s connection module describes from the user's side as "a freeze
+/// followed by a jump when the queued samples all arrive at once". Both
+/// callers take `Instant::now()` per sample inside that drain, so an entire
+/// burst is stamped within microseconds of itself and the host bound cannot
+/// fire inside it however far apart the frames were really recorded. Ageing
+/// only against the host clock would therefore hand out a held rotation across
+/// an arbitrary span of device time — the one thing this constant exists to
+/// put a number on.
 pub const RECONSTRUCTION_MAX_AGE: Duration = Duration::from_millis(300);
 
 /// The last measured offset between the two eyes, used to keep producing a
@@ -275,10 +326,10 @@ pub const RECONSTRUCTION_MAX_AGE: Duration = Duration::from_millis(300);
 /// reconstruct the missing one from it when exactly one is, age it out so it
 /// can never draw a ghost. This is a second implementation rather than a shared
 /// one because the two work in different spaces: that one carries normalized
-/// trackbox positions for a drawing, this one carries tracker-space
-/// millimetres for a pose, and ages in wall-clock time because its consumer
-/// already has a clock and a stalled stream must not be able to make an old
-/// offset look fresh by simply not arriving.
+/// trackbox positions for a drawing and ages by counting frames, this one
+/// carries tracker-space millimetres for a pose and ages against the host and
+/// device clocks together — see [`RECONSTRUCTION_MAX_AGE`] for what each of
+/// the two refuses that the other cannot.
 ///
 /// **Reconstructing beats dropping the frame, but it is not free.** Feeding the
 /// surviving eye's origin straight into [`pose_from_eyes`] as if it were the
@@ -287,14 +338,31 @@ pub const RECONSTRUCTION_MAX_AGE: Duration = Duration::from_millis(300);
 /// only a stutter. The stored offset is what keeps the centre still.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PairOffset {
-    /// Right eye minus left eye, in tracker-space mm, from the most recent
-    /// frame that carried both.
-    delta_mm: Option<[f64; 3]>,
-    /// When that measurement was taken. Only a two-eye frame moves it, so the
-    /// age keeps growing for as long as an outage lasts.
-    measured_at: Option<Instant>,
+    /// The most recent two-eye frame's offset, and when it arrived.
+    ///
+    /// One field, because the offset and its age are a single measurement:
+    /// only a two-eye frame writes them, so the age keeps growing for as long
+    /// as an outage lasts. Splitting them would let the type express a state
+    /// (an offset with no timestamp) that the code cannot reach, and cost
+    /// [`PairOffset::reconstruct`] a second fallible read to rule out.
+    measured: Option<Measured>,
     /// Consecutive samples so far with exactly one usable eye.
     one_eye_run: u32,
+}
+
+/// The last offset between the eyes, with both clocks that can age it.
+#[derive(Debug, Clone, Copy)]
+struct Measured {
+    /// Right eye minus left eye, in tracker-space mm.
+    delta_mm: [f64; 3],
+    /// When the frame reached the host.
+    at: Instant,
+    /// The device's own clock for that frame, where it carried one.
+    ///
+    /// `None` for a frame without the timestamp column, which is the only
+    /// reason the device bound can be absent — the age is then the host's
+    /// alone, exactly as it was before the second bound existed.
+    timestamp_us: Option<i64>,
 }
 
 impl PairOffset {
@@ -334,16 +402,19 @@ impl PairOffset {
         match (left, right) {
             (true, true) => {
                 let (l, r) = (s.eye_origin_l_mm, s.eye_origin_r_mm);
-                self.delta_mm = Some([r[0] - l[0], r[1] - l[1], r[2] - l[2]]);
-                self.measured_at = Some(now);
+                self.measured = Some(Measured {
+                    delta_mm: [r[0] - l[0], r[1] - l[1], r[2] - l[2]],
+                    at: now,
+                    timestamp_us: device_clock(s),
+                });
                 self.one_eye_run = 0;
                 Some(SourcedPose {
                     pose: pose_from_eyes(l, r),
                     source: PoseSource::BothEyes,
                 })
             }
-            (true, false) => self.reconstruct(s.eye_origin_l_mm, Seen::Left, now),
-            (false, true) => self.reconstruct(s.eye_origin_r_mm, Seen::Right, now),
+            (true, false) => self.reconstruct(s, s.eye_origin_l_mm, Seen::Left, now),
+            (false, true) => self.reconstruct(s, s.eye_origin_r_mm, Seen::Right, now),
             (false, false) => {
                 // Nobody there. Not a one-eye outage, so the debounce starts
                 // again rather than counting this towards one.
@@ -355,19 +426,47 @@ impl PairOffset {
 
     /// Place the eye the tracker cannot see at the one it can, plus the stored
     /// offset, and take the pose from the completed pair.
-    fn reconstruct(&mut self, seen_mm: [f64; 3], seen: Seen, now: Instant) -> Option<SourcedPose> {
+    fn reconstruct(
+        &mut self,
+        s: &GazeSample,
+        seen_mm: [f64; 3],
+        seen: Seen,
+        now: Instant,
+    ) -> Option<SourcedPose> {
         self.one_eye_run = self.one_eye_run.saturating_add(1);
         if self.one_eye_run < ONE_EYE_DEBOUNCE {
             return None;
         }
-        // `?` on both: nothing is reconstructed before both eyes have ever
-        // been seen together, and a stale offset yields no pose rather than a
-        // confident one.
-        let measured_at = self.measured_at?;
-        if now.saturating_duration_since(measured_at) > RECONSTRUCTION_MAX_AGE {
+        // Nothing is reconstructed before both eyes have ever been seen
+        // together...
+        let m = self.measured?;
+        // ...and a stale offset yields no pose rather than a confident one.
+        // Stale on EITHER clock, because neither bounds what the other does.
+        //
+        // The host clock is the one that answers a stalled stream: a stream
+        // that stops arriving must not be able to make an old offset look
+        // fresh by simply not producing frames to age it.
+        //
+        // The device clock is the one that answers a backlog. `tobii-usb`'s
+        // transport soaks incoming transfers while a large frame is being sent
+        // and hands them over in one drain afterwards, and both callers stamp
+        // `Instant::now()` per sample inside that drain — so a whole burst is
+        // stamped within microseconds and the host bound never fires inside
+        // it, however far apart the frames were actually recorded. The device
+        // clock says how far apart they really were.
+        //
+        // Only a positive delta refuses: a timestamp that went backwards is a
+        // device clock this code has no model for, and the host bound is still
+        // standing over it.
+        if now.saturating_duration_since(m.at) > RECONSTRUCTION_MAX_AGE {
             return None;
         }
-        let d = self.delta_mm?;
+        if let (Some(then), Some(now_us)) = (m.timestamp_us, device_clock(s)) {
+            if now_us.saturating_sub(then) > RECONSTRUCTION_MAX_AGE.as_micros() as i64 {
+                return None;
+            }
+        }
+        let d = m.delta_mm;
         let shifted = |sign: f64| {
             [
                 seen_mm[0] + sign * d[0],
@@ -384,6 +483,11 @@ impl PairOffset {
             source: PoseSource::Reconstructed,
         })
     }
+}
+
+/// The device's own clock for a frame, in microseconds, where it sent one.
+fn device_clock(s: &GazeSample) -> Option<i64> {
+    s.has(present::TIMESTAMP).then_some(s.timestamp_us)
 }
 
 /// Which eye the tracker still has, so the offset is applied in the right
@@ -803,45 +907,67 @@ mod tests {
     /// still see is" would move the reported head half an interocular distance
     /// sideways the instant an eye blinked out — a yank, where today's
     /// behaviour is merely a missing frame.
+    ///
+    /// Both directions, because the offset is applied by sign
+    /// (`Seen::Left => seen + d`, `Seen::Right => seen - d`) and the tracker
+    /// loses either eye: a copy-paste between the two arms moves the centre a
+    /// whole interocular distance and changes no rotation, so rotation
+    /// assertions cannot catch it. At 17°/-9° the stored offset has all three
+    /// components, so a swapped or dropped component is caught too.
     #[test]
     fn a_lost_eye_does_not_move_the_head_centre() {
-        let mut pair = PairOffset::new();
         let now = Instant::now();
-        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
-        let before = pair.pose_from_sample(&both, now).expect("both eyes").pose;
+        let both = pair_sample(OFF_AXIS_CENTRE, 17.0, -9.0);
+        for drop_right in [true, false] {
+            let mut pair = PairOffset::new();
+            let before = pair.pose_from_sample(&both, now).expect("both eyes").pose;
 
-        let one_eye = without_eye(&both, true);
-        let after = after_debounce(&mut pair, &one_eye, now);
-        assert_eq!(after.source, PoseSource::Reconstructed);
-        assert_close(after.pose.x_mm, before.x_mm, "x");
-        assert_close(after.pose.y_mm, before.y_mm, "y");
-        assert_close(after.pose.z_mm, before.z_mm, "z");
+            let one_eye = without_eye(&both, drop_right);
+            let after = after_debounce(&mut pair, &one_eye, now);
+            assert_eq!(after.source, PoseSource::Reconstructed);
+            assert_close(after.pose.x_mm, before.x_mm, "x");
+            assert_close(after.pose.y_mm, before.y_mm, "y");
+            assert_close(after.pose.z_mm, before.z_mm, "z");
 
-        // And the naive answer really would have been a long way off: the
-        // surviving left eye sits half an interocular distance from centre.
-        assert!(
-            (one_eye.eye_origin_l_mm[0] - before.x_mm).abs() > HALF_IPD - 1.0,
-            "the test is not measuring anything: the surviving eye is already \
-             at the centre"
-        );
+            // And the naive answer really would have been a long way off: the
+            // surviving eye sits half an interocular distance from centre.
+            let surviving = if drop_right {
+                one_eye.eye_origin_l_mm
+            } else {
+                one_eye.eye_origin_r_mm
+            };
+            assert!(
+                (surviving[0] - before.x_mm).abs() > HALF_IPD - 1.0,
+                "the test is not measuring anything: the surviving eye is \
+                 already at the centre"
+            );
+        }
     }
 
     /// A head that moves while one eye is out still moves: the reconstruction
-    /// follows the eye the tracker can see, one for one.
+    /// follows the eye the tracker can see, one for one. Both directions, for
+    /// the reason above.
     #[test]
     fn a_reconstructed_pose_follows_the_eye_that_is_still_there() {
-        let mut pair = PairOffset::new();
         let now = Instant::now();
-        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
-        let start = pair.pose_from_sample(&both, now).expect("both eyes").pose;
+        let both = pair_sample(OFF_AXIS_CENTRE, 17.0, -9.0);
+        for drop_right in [true, false] {
+            let mut pair = PairOffset::new();
+            let start = pair.pose_from_sample(&both, now).expect("both eyes").pose;
 
-        // The right eye drops out and the head slides 10 mm left and 5 mm up.
-        let mut moved = without_eye(&both, true);
-        moved.eye_origin_l_mm[0] -= 10.0;
-        moved.eye_origin_l_mm[1] += 5.0;
-        let after = after_debounce(&mut pair, &moved, now);
-        assert_close(after.pose.x_mm, start.x_mm - 10.0, "x follows the eye");
-        assert_close(after.pose.y_mm, start.y_mm + 5.0, "y follows the eye");
+            // One eye drops out and the head slides 10 mm left and 5 mm up.
+            let mut moved = without_eye(&both, drop_right);
+            let surviving = if drop_right {
+                &mut moved.eye_origin_l_mm
+            } else {
+                &mut moved.eye_origin_r_mm
+            };
+            surviving[0] -= 10.0;
+            surviving[1] += 5.0;
+            let after = after_debounce(&mut pair, &moved, now);
+            assert_close(after.pose.x_mm, start.x_mm - 10.0, "x follows the eye");
+            assert_close(after.pose.y_mm, start.y_mm + 5.0, "y follows the eye");
+        }
     }
 
     /// What a reconstructed frame is really claiming. Yaw and roll come from
@@ -865,6 +991,49 @@ mod tests {
             "yaw must be the held measurement, not a new guess"
         );
         assert_eq!(after.pose.roll_deg, measured.roll_deg, "roll likewise");
+    }
+
+    /// The other half of the bound: a burst of frames the transport queued up
+    /// and released together ages by the device's clock, not the host's.
+    ///
+    /// `tobii-usb`'s transport soaks incoming transfers while a large frame is
+    /// going out and drains them afterwards in one pass, and both callers take
+    /// `Instant::now()` per sample inside that pass — so a whole burst carries
+    /// one host timestamp, give or take microseconds. Aged against that alone
+    /// the offset never goes stale inside a burst, and a held rotation is
+    /// handed out across however much device time the queue happened to hold.
+    #[test]
+    fn a_drained_backlog_ages_by_the_devices_clock_rather_than_the_hosts() {
+        // The whole burst arrives at one host instant, the way a drain does.
+        let now = Instant::now();
+        let stamped = |s: &GazeSample, us: i64| GazeSample {
+            present_mask: s.present_mask | present::TIMESTAMP,
+            timestamp_us: us,
+            ..s.clone()
+        };
+        let both = pair_sample(OFF_AXIS_CENTRE, 0.0, 0.0);
+        let one_eye = without_eye(&both, true);
+
+        let mut pair = PairOffset::new();
+        pair.pose_from_sample(&stamped(&both, 0), now);
+
+        // Inside the bound on the device's clock, the reconstruction stands.
+        pair.pose_from_sample(&stamped(&one_eye, 30_208), now); // the debounce
+        let at_limit = RECONSTRUCTION_MAX_AGE.as_micros() as i64;
+        assert!(
+            pair.pose_from_sample(&stamped(&one_eye, at_limit), now)
+                .is_some(),
+            "an offset still inside its age must reconstruct"
+        );
+
+        // One frame further on the device's clock and it is stale, even though
+        // the host has not moved at all.
+        assert!(
+            pair.pose_from_sample(&stamped(&one_eye, at_limit + 1), now)
+                .is_none(),
+            "a held rotation was handed out across more than \
+             RECONSTRUCTION_MAX_AGE of device time"
+        );
     }
 
     /// The bound, from both sides. A pose at the limit, none past it: past

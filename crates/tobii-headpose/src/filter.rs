@@ -121,12 +121,28 @@ fn step_mm(a: HeadPose, b: HeadPose) -> f64 {
 pub struct PoseFilter {
     alpha: f64,
     max_step_mm: f64,
-    state: Option<HeadPose>,
-    /// The last sample *accepted*, before smoothing. The gate measures against
-    /// this rather than against `state`, which lags it by design.
-    last_raw: Option<HeadPose>,
+    /// The last accepted sample and what it produced, or `None` before the
+    /// first one.
+    last: Option<Accepted>,
     /// Consecutive samples refused by the gate, reset by every acceptance.
     held: u32,
+}
+
+/// The last accepted sample and the output it produced.
+///
+/// Both or neither: an accepted sample always produces an output, and `reset`
+/// drops the pair. Two separate `Option`s would let the gate's hold arm read
+/// as though it might have a reference with no output to return, which is a
+/// state nothing can reach.
+#[derive(Debug, Clone, Copy)]
+struct Accepted {
+    /// As it arrived. The gate measures against this rather than against
+    /// `out`, which lags it by design — comparing against the smoothed output
+    /// would let a glitch drag the reference after it, one blend at a time.
+    raw: HeadPose,
+    /// What the blend produced from it, and what the gate repeats while it
+    /// holds.
+    out: HeadPose,
 }
 
 impl Default for PoseFilter {
@@ -162,8 +178,7 @@ impl PoseFilter {
         Self {
             alpha,
             max_step_mm,
-            state: None,
-            last_raw: None,
+            last: None,
             held: 0,
         }
     }
@@ -186,7 +201,7 @@ impl PoseFilter {
 
     /// The most recent output, or `None` before the first update.
     pub fn current(&self) -> Option<HeadPose> {
-        self.state
+        self.last.map(|a| a.out)
     }
 
     /// Forget the running state, so the next update seeds the filter afresh.
@@ -198,8 +213,7 @@ impl PoseFilter {
     /// so measuring their first sample against where the last person sat would
     /// refuse the reacquisition for no reason.
     pub fn reset(&mut self) {
-        self.state = None;
-        self.last_raw = None;
+        self.last = None;
         self.held = 0;
     }
 
@@ -215,34 +229,32 @@ impl PoseFilter {
             // rejection: a NaN carries no position to measure a step from, and
             // spending the hold budget on one would let a run of them open the
             // gate for whatever arrived next.
-            return self.state.unwrap_or_default();
+            return self.last.map_or_else(HeadPose::default, |a| a.out);
         }
-        // The gate. There is nothing to measure against before the first
-        // accepted sample, so it seeds the filter unconditionally.
-        if let Some(last) = self.last_raw {
-            if step_mm(p, last) > self.max_step_mm && self.held < MAX_HELD_FRAMES {
-                self.held += 1;
-                return self.state.unwrap_or_default();
-            }
-        }
-        self.held = 0;
-        self.last_raw = Some(p);
-        let out = match self.state {
+        let out = match self.last {
+            // There is nothing to measure against before the first accepted
+            // sample, so it seeds the filter unconditionally.
             None => p,
-            Some(prev) => {
+            Some(last) => {
+                // The gate.
+                if step_mm(p, last.raw) > self.max_step_mm && self.held < MAX_HELD_FRAMES {
+                    self.held += 1;
+                    return last.out;
+                }
                 let a = self.alpha;
                 let mix = |new: f64, old: f64| a * new + (1.0 - a) * old;
                 HeadPose {
-                    x_mm: mix(p.x_mm, prev.x_mm),
-                    y_mm: mix(p.y_mm, prev.y_mm),
-                    z_mm: mix(p.z_mm, prev.z_mm),
-                    yaw_deg: mix(p.yaw_deg, prev.yaw_deg),
-                    pitch_deg: mix(p.pitch_deg, prev.pitch_deg),
-                    roll_deg: mix(p.roll_deg, prev.roll_deg),
+                    x_mm: mix(p.x_mm, last.out.x_mm),
+                    y_mm: mix(p.y_mm, last.out.y_mm),
+                    z_mm: mix(p.z_mm, last.out.z_mm),
+                    yaw_deg: mix(p.yaw_deg, last.out.yaw_deg),
+                    pitch_deg: mix(p.pitch_deg, last.out.pitch_deg),
+                    roll_deg: mix(p.roll_deg, last.out.roll_deg),
                 }
             }
         };
-        self.state = Some(out);
+        self.held = 0;
+        self.last = Some(Accepted { raw: p, out });
         out
     }
 }
@@ -371,9 +383,9 @@ mod tests {
         assert_pose_close(f.update(good), good);
     }
 
-    /// Also the gate's reset: `reset` has to drop `last_raw`, or this 500 mm
-    /// reacquisition is measured against where the previous user sat and
-    /// refused, and the filter answers with a default-constructed pose.
+    /// Also the gate's reset: `reset` has to drop the accepted sample, or this
+    /// 500 mm reacquisition is measured against where the previous user sat
+    /// and refused, and the filter answers with a default-constructed pose.
     #[test]
     fn reset_makes_the_next_sample_seed_the_filter_again() {
         let mut f = PoseFilter::new(0.1);
@@ -465,6 +477,49 @@ mod tests {
         // And the filter is actually following it, rather than passing the
         // test by having stopped.
         assert!(f.current().expect("state").yaw_deg > 60.0);
+    }
+
+    /// The gate measures against the last accepted **raw** sample, never
+    /// against the smoothed output — which lags it by design, so using the
+    /// output would make the effective limit `max_step_mm - lag`: the faster
+    /// the head was already moving, the tighter the gate, which is exactly the
+    /// genuine-fast-motion rejection [`DEFAULT_MAX_STEP_MM`] is written to
+    /// avoid.
+    ///
+    /// The lag here is built out of motion this crate already calls plausible —
+    /// the same 30 mm/frame (1.0 m/s) ramp as
+    /// `a_fast_head_turn_ramps_through_without_a_rejection` — rather than out
+    /// of a step no head can make, so the test measures the reference and not
+    /// an absurdity.
+    #[test]
+    fn a_lagging_output_does_not_tighten_the_gate() {
+        let mut f = PoseFilter::new(0.25);
+        // A sustained ramp leaves the average step * (1 - alpha) / alpha behind
+        // the raw samples: 90 mm at 30 mm/frame and alpha 0.25.
+        for i in 0..20 {
+            f.update(pose(i as f64 * 30.0, 0.0));
+        }
+        let last_raw_x = 19.0 * 30.0;
+        let state_x = f.current().expect("state").x_mm;
+        assert!(
+            last_raw_x - state_x > 80.0,
+            "premise: the average lags the raw samples, by {}",
+            last_raw_x - state_x
+        );
+
+        // One honest 100 mm lean on top of the ramp: 100 mm from the last
+        // accepted raw sample, but ~190 mm from the smoothed output.
+        let out = f.update(pose(last_raw_x + 100.0, 0.0));
+        assert_eq!(
+            f.held_frames(),
+            0,
+            "an honest 100 mm step must not be refused"
+        );
+        assert!(
+            out.x_mm > state_x,
+            "and the average must follow it: {}",
+            out.x_mm
+        );
     }
 
     /// The hold has to end. Once the head really is somewhere else, every
