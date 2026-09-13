@@ -215,6 +215,12 @@ pub struct GamesRow {
     /// itself, and then the decision is made by the one function the socket
     /// path also uses.
     tracker_on: Rc<Cell<bool>>,
+    /// And whether anything is composing a pose to recentre, from the same
+    /// 33 ms refresh. Carried rather than read in the handler for the same
+    /// reason the config is read once per refresh here: a click handler that
+    /// reads `games.toml` itself is a second reader of the same file with its
+    /// own idea of what it says.
+    composing: Rc<Cell<bool>>,
 }
 
 impl GamesRow {
@@ -326,6 +332,7 @@ impl GamesRow {
         // A button, not a setting: it acts on the pose being sent right now,
         // and it is the only control in this window that does.
         let tracker_on = Rc::new(Cell::new(false));
+        let composing = Rc::new(Cell::new(crate::outputs::composing(&cfg)));
         let recentre = crate::widget::button("Recentre view");
         recentre.set_tooltip_text(Some(
             "Sit the way you play, look at the centre of the screen, and press this: \
@@ -338,12 +345,13 @@ impl GamesRow {
             let demand = demand.clone();
             let refresh = refresh.clone();
             let tracker_on = tracker_on.clone();
+            let composing = composing.clone();
             recentre.connect_clicked(move |_| {
                 let now = Instant::now();
                 // The same decision the socket path makes, from the same
                 // function: a recentre refused for another program and taken
                 // silently for the hub would be two rules for one action.
-                match recentre_decision(&demand.reasons(), tracker_on.get()) {
+                match recentre_decision(&demand.reasons(), tracker_on.get(), composing.get()) {
                     Ok(()) => {
                         recentring.request(now);
                         // Said here rather than left to the outcome a second
@@ -383,6 +391,7 @@ impl GamesRow {
             recentring,
             demand,
             tracker_on,
+            composing,
         };
         row.refresh(false);
         row
@@ -415,12 +424,14 @@ impl GamesRow {
             }
         }
 
-        // A recentre needs a head to measure and a user who is not looking at a
-        // calibration dot, so the button says so by being unavailable rather
-        // than by refusing after the press.
+        // A recentre needs a head to measure, something composing a pose out of
+        // it, and a user who is not looking at a calibration dot — so the button
+        // says so by being unavailable rather than by refusing after the press.
         self.tracker_on.set(tracker_on);
-        self.recentre
-            .set_sensitive(recentre_decision(&self.demand.reasons(), tracker_on).is_ok());
+        self.composing.set(crate::outputs::composing(&cfg));
+        self.recentre.set_sensitive(
+            recentre_decision(&self.demand.reasons(), tracker_on, self.composing.get()).is_ok(),
+        );
 
         let js = self.joystick.lock().unwrap().clone();
         let text = match self.recentring.message(Instant::now()) {

@@ -33,12 +33,13 @@
 //! The answer becomes an ordinary [`DemandGuard`], which is the point — the
 //! second way of asking did not need a second notion of who wants the device.
 //!
-//! # What this does not do yet
+//! # What is in here
 //!
-//! Nothing is published. No frames, no lease, no game output — this is the
-//! demand seam alone. A shipped build behaves exactly as it does today, because
-//! nothing in the tree connects to the socket; the only user-visible difference
-//! is a line in the log when the socket was already taken.
+//! Four answers to "who wants the device, and what do they get": the demand
+//! seam ([`Holds`], [`PortWatch`]), the lease hand-over (`handle_lease`), the
+//! recentre request left for whoever is composing frames ([`Recentring`]), and
+//! the hub's own game output ([`GameOutput`]) — the only thing that can perform
+//! a recentre, because the `FramePipeline` lives inside it.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -141,31 +142,39 @@ pub(crate) struct PortWatch {
 impl PortWatch {
     /// Look, at most once per [`LISTENER_POLL`], and hold or release.
     ///
-    /// `target` and `look` are passed in rather than called directly for two
+    /// `settings` and `look` are passed in rather than called directly for two
     /// reasons: a test can then drive every transition without a config file or
     /// a socket, and the throttle genuinely saves the work — on a tick that is
     /// not due, neither the file read nor the `/proc` scan happens.
+    ///
+    /// The settings are handed back on the ticks where they were actually read,
+    /// because this is the only thing on the socket thread that reads them and
+    /// it is not the only thing that needs them: see [`Serving::composing`]. A
+    /// second reader with its own rate would be a second answer to "what do the
+    /// settings say" on one thread.
     fn poll(
         &mut self,
         demand: &Demand,
         now: Instant,
-        target: impl FnOnce() -> Option<SocketAddr>,
+        settings: impl FnOnce() -> OutputConfig,
         look: impl FnOnce(SocketAddr) -> Listening,
-    ) {
+    ) -> Option<OutputConfig> {
         if self
             .last_looked
             .is_some_and(|t| now.saturating_duration_since(t) < LISTENER_POLL)
         {
-            return;
+            return None;
         }
         self.last_looked = Some(now);
-        // Switched off, or nothing to watch: give the hold back. Read every
-        // time rather than once at startup, because these are settings the user
-        // can change while the hub runs — the same mistake `GameOutput` records
-        // having made by freezing its config for the life of a session.
-        let Some(addr) = target() else {
+        // Read every time rather than once at startup, because these are
+        // settings the user can change while the hub runs — the same mistake
+        // `GameOutput` records having made by freezing its config for the life
+        // of a session.
+        let cfg = settings();
+        // Switched off, or nothing to watch: give the hold back.
+        let Some(addr) = watch_target(&cfg) else {
             self.held = None;
-            return;
+            return Some(cfg);
         };
         match look(addr) {
             // One listener is one guard, kept rather than re-taken. Assigning a
@@ -185,6 +194,7 @@ impl PortWatch {
             // for a reason nobody can check.
             Listening::No | Listening::Unknown(_) => self.held = None,
         }
+        Some(cfg)
     }
 
     /// Whether the tracker is currently being held on for a listener.
@@ -254,6 +264,21 @@ impl Holds {
     }
 }
 
+/// The refusal for anything the hub will not do while an exclusive flow owns
+/// the device.
+///
+/// One sentence, two askers: `handle_lease` refuses a lease for these reasons
+/// and [`recentre_decision`] refuses a recentre for the same ones. A user who
+/// hits both must not be told two different things, and the way that starts is
+/// one of two copies being reworded — the reason the recentre outcomes already
+/// live in one place (see `games::sentence`).
+fn busy_with(reasons: &[&'static str]) -> String {
+    format!(
+        "the hub is busy with {} — try again when it has finished",
+        reasons.join(" and ")
+    )
+}
+
 /// Decide and act on one lease request.
 ///
 /// The reply for a granted acquire is deliberately NOT sent here. See
@@ -287,10 +312,7 @@ fn handle_lease(
                     from,
                     &tobii_ipc::codec::Msg::LeaseReply {
                         ok: false,
-                        text: format!(
-                            "the hub is busy with {} — try again when it has finished",
-                            reasons.join(" and ")
-                        ),
+                        text: busy_with(&reasons),
                     },
                 );
                 return;
@@ -332,12 +354,16 @@ fn handle_lease(
 
 /// A recentre asked for from anywhere, and what came of it.
 ///
-/// Three things can ask the hub for one — the button in the games row, a socket
-/// client sending [`tobii_ipc::codec::Msg::Recentre`], and the hub's own tick —
-/// while the only thing that can perform one is the `FramePipeline` inside
-/// [`GameOutput`], which lives on the device thread and is rebuilt whenever the
-/// settings change under it. So a request is *left here* rather than delivered,
-/// and taken by whichever pipeline is composing frames when it next runs.
+/// Two things can ask the hub for one — the button in the games row and a
+/// socket client sending [`tobii_ipc::codec::Msg::Recentre`] — while the only
+/// thing that can perform one is the `FramePipeline` inside [`GameOutput`],
+/// which lives on the device thread and is rebuilt whenever the settings change
+/// under it. So a request is *left here* rather than delivered, and taken by
+/// whichever pipeline is composing frames when it next runs.
+///
+/// `tobii headpose --recenter` is the third way a user reaches a recentre and
+/// does not pass through here at all: it leases the device and drives its own
+/// `FramePipeline`, calling `begin_recentre` on it directly.
 ///
 /// Shared exactly the way `JoystickStatus` is, and for the same reason: it is
 /// state two threads have to agree about. Deliberately not a `DeviceCommand` —
@@ -409,9 +435,27 @@ impl Recentring {
     }
 }
 
+/// Whether anything would be composing a pose for these settings.
+///
+/// The same question [`GameOutput::for_session`] answers by returning `None`:
+/// the switch is on AND there is somewhere to send to. It is asked before a
+/// recentre because the pipeline that performs one lives inside a
+/// [`GameOutput`], so with no output there is nothing to take the request and
+/// nothing to answer it.
+///
+/// Settings, not outcomes, so it can be asked from the hub tick and from the
+/// socket thread without either of them having to see the device thread. It
+/// therefore still says yes for a joystick `/dev/uinput` refused, or an
+/// opentrack address whose socket would not open — cases the status line
+/// already names, and the standing status line is what a refused recentre falls
+/// back to.
+pub(crate) fn composing(cfg: &OutputConfig) -> bool {
+    cfg.enabled && (cfg.joystick || cfg.opentrack.is_some() || cfg.bridge_port.is_some())
+}
+
 /// Whether a recentre can be taken right now, and what to tell the asker if not.
 ///
-/// Both refusals are for things the asker cannot see:
+/// All three refusals are for things the asker cannot see:
 ///
 /// * **A flow that wants the device exclusively.** `handle_lease` refuses a
 ///   lease for exactly these reasons, and this refuses for the same ones —
@@ -424,17 +468,33 @@ impl Recentring {
 ///   precisely the failure worth refusing for.
 /// * **Nothing is tracking.** There is no head to measure, so the request would
 ///   sit unclaimed until it expired — a button that appeared to do nothing.
-pub(crate) fn recentre_decision(reasons: &[&'static str], tracking: bool) -> Result<(), String> {
+/// * **Nothing is composing frames.** A recentre is performed by the
+///   `FramePipeline` inside a [`GameOutput`], and there is no [`GameOutput`]
+///   with game output switched off or with no destination set — the state a
+///   fresh install is in. The request would expire exactly the same way, which
+///   is why this refusal exists rather than a hope that somebody notices.
+pub(crate) fn recentre_decision(
+    reasons: &[&'static str],
+    tracking: bool,
+    composing: bool,
+) -> Result<(), String> {
+    // First, because it is about what the user's eyes are doing rather than
+    // about how anything is configured: during a calibration the answer is "not
+    // now" whatever the settings say.
     if crate::device::wants_exclusive(reasons) {
-        return Err(format!(
-            "the hub is busy with {} — try again when it has finished",
-            reasons.join(" and ")
-        ));
+        return Err(busy_with(reasons));
     }
     if !tracking {
         return Err(
             "the tracker is not running, so there is no head pose to recentre — start what \
              you are recentring first"
+                .to_string(),
+        );
+    }
+    if !composing {
+        return Err(
+            "nothing is composing a head pose to recentre — turn on head tracking for games, \
+             and give it somewhere to send to"
                 .to_string(),
         );
     }
@@ -645,133 +705,217 @@ pub(crate) fn spawn(
         }
     };
     std::thread::spawn(move || {
-        let mut holds = Holds::default();
-        // Clients told "yes, in a moment" — answered once the device thread has
-        // actually let go. See `Lease`.
-        let mut awaiting: Vec<ClientId> = Vec::new();
-        let mut last_sent: Option<StatusCode> = None;
+        let mut serving = Serving::new(server, demand, state, lease, recentring);
         // Riding this thread rather than one of its own: it already wakes on a
         // timer and already owns a `Demand`, and the watch's own rate limit is
         // what keeps the two cadences apart.
         let mut watch = PortWatch::default();
         loop {
-            tick(
-                &server,
-                &demand,
-                &state,
-                &lease,
-                &mut holds,
-                &mut awaiting,
-                &mut last_sent,
-                &recentring,
-            );
-            watch.poll(
-                &demand,
+            serving.tick();
+            if let Some(cfg) = watch.poll(
+                &serving.demand,
                 Instant::now(),
-                || watch_target(&tobii_output::games::load_output_config()),
+                tobii_output::games::load_output_config,
                 tobii_output::listener::probe,
-            );
+            ) {
+                serving.composing = composing(&cfg);
+            }
             std::thread::sleep(POLL);
         }
     });
 }
 
-/// One pass: drain the socket, reconcile the holds, publish a status change.
+/// Everything one pass of the socket loop reads or updates.
 ///
-/// Split from the loop so a test can drive it against a real `Server` on a
-/// temporary path. The pure `Holds` tests below cover the decisions; this is
-/// what proves the decisions are reached from an actual client connecting.
-#[allow(clippy::too_many_arguments)]
-fn tick(
-    server: &Server,
-    demand: &Demand,
-    state: &Arc<Mutex<DeviceState>>,
-    lease: &Arc<Mutex<Lease>>,
-    holds: &mut Holds,
-    awaiting: &mut Vec<ClientId>,
-    last_sent: &mut Option<StatusCode>,
-    recentring: &Recentring,
-) {
-    for msg in server.poll() {
-        match msg.msg {
-            tobii_ipc::codec::Msg::Hello { subs: bits, .. } => {
-                holds.hello(demand, msg.from, bits);
+/// One bundle rather than eight threaded parameters, the way `device::GameSide`
+/// already holds the device thread's loop state: every one of these is owned by
+/// the loop and touched by the same pass, and the argument lists were the only
+/// thing that grew when the loop gained something to do.
+struct Serving {
+    server: Server,
+    demand: Demand,
+    state: Arc<Mutex<DeviceState>>,
+    lease: Arc<Mutex<Lease>>,
+    recentring: Recentring,
+    holds: Holds,
+    /// Clients told "yes, in a moment" — answered once the device thread has
+    /// actually let go. See `Lease`.
+    awaiting: Vec<ClientId>,
+    last_sent: Option<StatusCode>,
+    /// Whether anything would be composing a pose, as of the last time the
+    /// settings were read — see [`composing`]. Kept rather than read per
+    /// request because the one reader of the settings on this thread is the
+    /// port watch, at its own rate; a recentre arriving in the second after the
+    /// switch was flipped is answered from the second before it, which is the
+    /// same staleness the hub's own button has between two refreshes.
+    composing: bool,
+}
+
+impl Serving {
+    fn new(
+        server: Server,
+        demand: Demand,
+        state: Arc<Mutex<DeviceState>>,
+        lease: Arc<Mutex<Lease>>,
+        recentring: Recentring,
+    ) -> Serving {
+        Serving {
+            server,
+            demand,
+            state,
+            lease,
+            recentring,
+            holds: Holds::default(),
+            awaiting: Vec::new(),
+            last_sent: None,
+            composing: composing(&tobii_output::games::load_output_config()),
+        }
+    }
+
+    /// One pass: drain the socket, reconcile the holds, publish a status change.
+    ///
+    /// Split from the loop so a test can drive it against a real `Server` on a
+    /// temporary path. The pure `Holds` tests below cover the decisions; this is
+    /// what proves the decisions are reached from an actual client connecting.
+    fn tick(&mut self) {
+        // Named once so the borrows below are of disjoint fields rather than of
+        // the whole struct: `handle_lease` takes several of them at a time.
+        let Serving {
+            server,
+            demand,
+            state,
+            lease,
+            recentring,
+            holds,
+            awaiting,
+            last_sent,
+            composing: sending,
+        } = self;
+        for msg in server.poll() {
+            match msg.msg {
+                tobii_ipc::codec::Msg::Hello { subs: bits, .. } => {
+                    holds.hello(demand, msg.from, bits);
+                }
+                // Answered immediately, unlike a lease: there is nothing to wait
+                // for, because nothing is being handed over. `ok` says the request
+                // was taken, not that the reference moved — the settle window has
+                // not run yet, and it can still refuse a head that will not hold
+                // still. The hub reports that part through its own status line.
+                tobii_ipc::codec::Msg::Recentre => {
+                    let tracking = matches!(state.lock().unwrap().status, ConnStatus::Connected);
+                    let reply = match recentre_decision(&demand.reasons(), tracking, *sending) {
+                        Ok(()) => {
+                            recentring.request(Instant::now());
+                            tobii_ipc::codec::Msg::RecentreReply {
+                                ok: true,
+                                text: String::new(),
+                            }
+                        }
+                        Err(why) => tobii_ipc::codec::Msg::RecentreReply {
+                            ok: false,
+                            text: why,
+                        },
+                    };
+                    server.send_to(msg.from, &reply);
+                }
+                tobii_ipc::codec::Msg::Lease(action) => {
+                    let name = server
+                        .clients()
+                        .into_iter()
+                        .find(|c| c.id == msg.from)
+                        .map(|c| c.name)
+                        .unwrap_or_default();
+                    handle_lease(server, demand, lease, awaiting, msg.from, &name, action);
+                }
+                _ => {}
             }
-            // Answered immediately, unlike a lease: there is nothing to wait
-            // for, because nothing is being handed over. `ok` says the request
-            // was taken, not that the reference moved — the settle window has
-            // not run yet, and it can still refuse a head that will not hold
-            // still. The hub reports that part through its own status line.
-            tobii_ipc::codec::Msg::Recentre => {
-                let tracking = matches!(state.lock().unwrap().status, ConnStatus::Connected);
-                let reply = match recentre_decision(&demand.reasons(), tracking) {
-                    Ok(()) => {
-                        recentring.request(Instant::now());
-                        tobii_ipc::codec::Msg::RecentreReply {
+        }
+        let live: Vec<ClientId> = server.clients().into_iter().map(|c| c.id).collect();
+        holds.reap(&live);
+
+        // A client that died holding the lease gets it taken back. This is the same
+        // reasoning as reaping a hold: a socket that is gone is the truth, and it
+        // needs no timeout.
+        {
+            let mut l = lease.lock().unwrap();
+            if l.client().is_some_and(|id| !live.contains(&id)) {
+                *l = Lease::Free;
+            }
+        }
+
+        // `awaiting` is reconciled like the holds and the lease, and for the same
+        // reason. An entry means "this client is being let go of"; a client that
+        // released inside that window, or died in it, leaves one behind, and the
+        // answer below would hand it somebody else's lease — the `DeviceBusy` the
+        // Requested/Held split exists to prevent, arriving at the client that did
+        // everything right.
+        {
+            let l = lease.lock().unwrap();
+            awaiting.retain(|id| live.contains(id) && l.client() == Some(*id));
+        }
+
+        // The device thread has let go: answer the client it let go FOR.
+        let holder = lease.lock().unwrap().clone();
+        if let Lease::Held { by, .. } = holder {
+            awaiting.retain(|id| {
+                if *id == by {
+                    server.send_to(
+                        *id,
+                        &tobii_ipc::codec::Msg::LeaseReply {
                             ok: true,
                             text: String::new(),
-                        }
-                    }
-                    Err(why) => tobii_ipc::codec::Msg::RecentreReply {
-                        ok: false,
-                        text: why,
-                    },
-                };
-                server.send_to(msg.from, &reply);
-            }
-            tobii_ipc::codec::Msg::Lease(action) => {
-                let name = server
-                    .clients()
-                    .into_iter()
-                    .find(|c| c.id == msg.from)
-                    .map(|c| c.name)
-                    .unwrap_or_default();
-                handle_lease(server, demand, lease, awaiting, msg.from, &name, action);
-            }
-            _ => {}
+                        },
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
         }
-    }
-    let live: Vec<ClientId> = server.clients().into_iter().map(|c| c.id).collect();
-    holds.reap(&live);
 
-    // A client that died holding the lease gets it taken back. This is the same
-    // reasoning as reaping a hold: a socket that is gone is the truth, and it
-    // needs no timeout.
-    {
-        let mut l = lease.lock().unwrap();
-        if l.client().is_some_and(|id| !live.contains(&id)) {
-            *l = Lease::Free;
+        // Only on a change. A status broadcast every 50 ms would be a wake-up per
+        // client per tick for information that changes a few times a minute.
+        let (code, text) = {
+            let s = state.lock().unwrap();
+            status_of(&s)
+        };
+        if *last_sent != Some(code) {
+            server.broadcast(0, &tobii_ipc::codec::Msg::Status { code, text });
+            *last_sent = Some(code);
         }
-    }
-
-    // The device thread has let go: answer everyone who was told to wait.
-    if matches!(*lease.lock().unwrap(), Lease::Held { .. }) {
-        for id in awaiting.drain(..) {
-            server.send_to(
-                id,
-                &tobii_ipc::codec::Msg::LeaseReply {
-                    ok: true,
-                    text: String::new(),
-                },
-            );
-        }
-    }
-
-    // Only on a change. A status broadcast every 50 ms would be a wake-up per
-    // client per tick for information that changes a few times a minute.
-    let (code, text) = {
-        let s = state.lock().unwrap();
-        status_of(&s)
-    };
-    if *last_sent != Some(code) {
-        server.broadcast(0, &tobii_ipc::codec::Msg::Status { code, text });
-        *last_sent = Some(code);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hub serving a socket of its own, with everything [`Serving::tick`]
+    /// needs, and the path a test client connects to.
+    ///
+    /// `tag` keeps each test on its own path; the socket file is removed by
+    /// `Server`'s own `Drop`, so nothing here has to clean up after it.
+    ///
+    /// `composing` is set rather than left as `Serving::new` read it: that
+    /// constructor reads `games.toml`, and a test whose answer depends on
+    /// whether the machine running it happens to have game output switched on
+    /// is not a test. Every case below says which of the two it means.
+    fn serving(tag: &str, status: ConnStatus) -> (Serving, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("tobii-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut hub = Serving::new(
+            Server::bind_at(&path).expect("bind"),
+            Demand::new(),
+            Arc::new(Mutex::new(DeviceState {
+                status,
+                ..DeviceState::default()
+            })),
+            Arc::new(Mutex::new(Lease::Free)),
+            Recentring::default(),
+        );
+        hub.composing = true;
+        (hub, path)
+    }
 
     /// The claim the whole design rests on: a subscriber is a `DemandGuard`,
     /// so the standby gate in `device.rs` needs no second notion of who wants
@@ -894,44 +1038,17 @@ mod tests {
     fn a_real_client_connecting_is_what_lights_the_tracker() {
         use tobii_ipc::Client;
 
-        let path = std::env::temp_dir().join(format!("tobii-seam-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let server = Server::bind_at(&path).expect("bind");
-        let demand = Demand::new();
-        let state = Arc::new(Mutex::new(DeviceState::default()));
-        let mut holds = Holds::default();
-        let lease = Arc::new(Mutex::new(Lease::Free));
-        let mut awaiting = Vec::new();
-        let mut last = None;
-        let recentring = Recentring::default();
+        let (mut hub, path) = serving("seam", ConnStatus::Idle);
 
-        tick(
-            &server,
-            &demand,
-            &state,
-            &lease,
-            &mut holds,
-            &mut awaiting,
-            &mut last,
-            &recentring,
-        );
-        assert!(!demand.active(), "no clients, no reason");
+        hub.tick();
+        assert!(!hub.demand.active(), "no clients, no reason");
 
         let client = Client::connect_at(&path, subs::POSE, "a game").expect("connect");
         // The hello arrives on the server's accept thread, so give it a moment
         // rather than assuming it is there on the first tick.
         let lit = (0..100).any(|_| {
-            tick(
-                &server,
-                &demand,
-                &state,
-                &lease,
-                &mut holds,
-                &mut awaiting,
-                &mut last,
-                &recentring,
-            );
-            if demand.active() {
+            hub.tick();
+            if hub.demand.active() {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -939,31 +1056,24 @@ mod tests {
         });
         assert!(lit, "a connected subscriber should light the tracker");
         assert!(
-            demand.reasons().iter().any(|r| r.contains("head tracking")),
+            hub.demand
+                .reasons()
+                .iter()
+                .any(|r| r.contains("head tracking")),
             "{:?}",
-            demand.reasons()
+            hub.demand.reasons()
         );
 
         drop(client);
         let dark = (0..100).any(|_| {
-            tick(
-                &server,
-                &demand,
-                &state,
-                &lease,
-                &mut holds,
-                &mut awaiting,
-                &mut last,
-                &recentring,
-            );
-            if !demand.active() {
+            hub.tick();
+            if !hub.demand.active() {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
             false
         });
         assert!(dark, "the tracker must go out when the client goes away");
-        let _ = std::fs::remove_file(&path);
     }
 
     /// A rotation the model has merely been HOLDING must not reach a game.
@@ -1002,14 +1112,7 @@ mod tests {
         use tobii_ipc::codec::Msg;
         use tobii_ipc::Client;
 
-        let path = std::env::temp_dir().join(format!("tobii-lease-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let server = Server::bind_at(&path).expect("bind");
-        let demand = Demand::new();
-        let state = Arc::new(Mutex::new(DeviceState::default()));
-        let lease = Arc::new(Mutex::new(Lease::Free));
-        let (mut holds, mut awaiting, mut last) = (Holds::default(), Vec::new(), None);
-        let recentring = Recentring::default();
+        let (mut hub, path) = serving("lease", ConnStatus::Idle);
 
         let mut client = Client::connect_at(&path, subs::POSE, "a game").expect("connect");
         client
@@ -1018,95 +1121,140 @@ mod tests {
 
         // Pump until the request has been seen.
         let asked = (0..100).any(|_| {
-            tick(
-                &server,
-                &demand,
-                &state,
-                &lease,
-                &mut holds,
-                &mut awaiting,
-                &mut last,
-                &recentring,
-            );
-            if matches!(*lease.lock().unwrap(), Lease::Requested { .. }) {
+            hub.tick();
+            if matches!(*hub.lease.lock().unwrap(), Lease::Requested { .. }) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
             false
         });
         assert!(asked, "the acquire should have been recorded");
-        assert_eq!(awaiting.len(), 1, "and the reply deferred, not sent");
+        assert_eq!(hub.awaiting.len(), 1, "and the reply deferred, not sent");
 
         // The hub is still letting go, so no confirmation yet, however many
         // times the loop runs.
         for _ in 0..5 {
-            tick(
-                &server,
-                &demand,
-                &state,
-                &lease,
-                &mut holds,
-                &mut awaiting,
-                &mut last,
-                &recentring,
-            );
+            hub.tick();
         }
-        assert_eq!(awaiting.len(), 1, "still not confirmed while Requested");
+        assert_eq!(hub.awaiting.len(), 1, "still not confirmed while Requested");
 
         // The device thread announces the release.
-        *lease.lock().unwrap() = Lease::Held {
-            by: awaiting[0],
+        *hub.lease.lock().unwrap() = Lease::Held {
+            by: hub.awaiting[0],
             name: "a game".into(),
         };
-        tick(
-            &server,
-            &demand,
-            &state,
-            &lease,
-            &mut holds,
-            &mut awaiting,
-            &mut last,
-            &recentring,
-        );
-        assert!(awaiting.is_empty(), "now it is answered");
-
-        let _ = std::fs::remove_file(&path);
+        hub.tick();
+        assert!(hub.awaiting.is_empty(), "now it is answered");
     }
 
     /// A client that dies holding the lease must not keep the device forever.
     /// Same reasoning as reaping a hold: a socket that is gone is the truth.
     #[test]
     fn a_lease_held_by_a_dead_client_is_taken_back() {
-        let path = std::env::temp_dir().join(format!("tobii-lease2-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let server = Server::bind_at(&path).expect("bind");
-        let demand = Demand::new();
-        let state = Arc::new(Mutex::new(DeviceState::default()));
+        let (mut hub, _path) = serving("lease2", ConnStatus::Idle);
         // A holder that never existed on this server stands in for one that
         // has gone: either way it is not in `clients()`.
-        let lease = Arc::new(Mutex::new(Lease::Held {
+        *hub.lease.lock().unwrap() = Lease::Held {
             by: 4242,
             name: "a departed game".into(),
-        }));
-        let (mut holds, mut awaiting, mut last) = (Holds::default(), Vec::new(), None);
-        let recentring = Recentring::default();
+        };
 
-        tick(
-            &server,
-            &demand,
-            &state,
-            &lease,
-            &mut holds,
-            &mut awaiting,
-            &mut last,
-            &recentring,
-        );
+        hub.tick();
         assert_eq!(
-            *lease.lock().unwrap(),
+            *hub.lease.lock().unwrap(),
             Lease::Free,
             "the device must come back when its holder is gone"
         );
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A client that asked and changed its mind must not be answered with
+    /// somebody else's lease.
+    ///
+    /// The window is real and the sequence is legal: a client is told "yes, in
+    /// a moment" while the device thread lets go, which takes up to a full
+    /// `read_notifications`, and a release sent inside it is answered by
+    /// `lease_decision` as `Released`. The entry left behind would then be
+    /// answered `ok: true` the moment the NEXT client's lease was granted —
+    /// sending a client that did everything right to open an interface somebody
+    /// else owns, which is the `DeviceBusy` the Requested/Held split exists to
+    /// prevent.
+    #[test]
+    fn a_client_that_changed_its_mind_is_not_answered_with_somebody_elses_lease() {
+        use tobii_ipc::codec::Msg;
+        use tobii_ipc::Client;
+
+        let (mut hub, path) = serving("lease3", ConnStatus::Idle);
+        let mut a = Client::connect_at(&path, subs::POSE, "the first game").expect("connect");
+
+        // Pump until `want` is true of the hub and of everything that has
+        // arrived for `a` so far, which is also what drains its mailbox: a
+        // reply is queued by `tick` and delivered on the client's own thread,
+        // so neither half is true on the same pass every time.
+        fn pump(
+            hub: &mut Serving,
+            a: &Client,
+            want: impl Fn(&Serving, &[tobii_ipc::codec::Msg]) -> bool,
+        ) -> Vec<tobii_ipc::codec::Msg> {
+            let mut seen = Vec::new();
+            for _ in 0..200 {
+                hub.tick();
+                seen.extend(a.poll());
+                if want(hub, &seen) {
+                    return seen;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the lease never reached the state the test was waiting for");
+        }
+
+        a.send(&Msg::Lease(LeaseAction::Acquire))
+            .expect("the acquire is sent");
+        pump(&mut hub, &a, |h, _| {
+            matches!(*h.lease.lock().unwrap(), Lease::Requested { .. })
+        });
+        assert_eq!(hub.awaiting.len(), 1, "told to wait, not answered");
+
+        // It changes its mind before the device thread has let go, and is
+        // answered for its own release.
+        a.send(&Msg::Lease(LeaseAction::Release))
+            .expect("the release is sent");
+        pump(&mut hub, &a, |h, seen| {
+            matches!(*h.lease.lock().unwrap(), Lease::Free)
+                && seen.iter().any(|m| matches!(m, Msg::LeaseReply { .. }))
+        });
+
+        // A second client now takes the device, and the device thread lets go
+        // for IT.
+        let mut b = Client::connect_at(&path, subs::POSE, "the second game").expect("connect");
+        b.send(&Msg::Lease(LeaseAction::Acquire))
+            .expect("the acquire is sent");
+        let quiet = pump(&mut hub, &a, |h, _| {
+            matches!(*h.lease.lock().unwrap(), Lease::Requested { .. })
+        });
+        let holder = hub.lease.lock().unwrap().client().expect("a holder");
+        *hub.lease.lock().unwrap() = Lease::Held {
+            by: holder,
+            name: "the second game".into(),
+        };
+        // Long enough for a reply that was sent to have arrived: a message is
+        // queued by `tick` and delivered on the client's own thread, so one
+        // poll would prove nothing.
+        let mut late = Vec::new();
+        for _ in 0..20 {
+            hub.tick();
+            late.extend(a.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let for_a: Vec<_> = quiet
+            .into_iter()
+            .chain(late)
+            .filter(|m| matches!(m, Msg::LeaseReply { .. }))
+            .collect();
+        assert!(
+            for_a.is_empty(),
+            "the first client was told it owns a device the second one owns: {for_a:?}"
+        );
     }
 
     /// A datagram actually leaves.
@@ -1188,6 +1336,84 @@ mod tests {
         );
     }
 
+    /// The last link in the recentre: a request left in [`Recentring`] — by the
+    /// hub's button or by a socket client — has to reach the pipeline that
+    /// composes frames, and the answer has to come back to whoever asked.
+    ///
+    /// Nothing else drives either half of [`GameOutput::offer`]'s recentre
+    /// glue: every other test stops at `Recentring` itself, and with both lines
+    /// deleted the button and the socket would go on saying "measuring" and
+    /// never say anything else.
+    #[test]
+    fn a_request_left_for_game_output_is_performed_and_answered() {
+        use std::net::UdpSocket;
+        use tobii_output::games::OutputConfig;
+
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind a listener");
+        let addr = listener.local_addr().unwrap();
+        // Extended View off so the run depends on nothing but the samples: it
+        // reads the display corners saved on whichever machine is running this,
+        // and the recentre is not about them.
+        let mut cfg = OutputConfig {
+            enabled: true,
+            opentrack: Some(addr.to_string()),
+            bridge_port: None,
+            joystick: false,
+            ..OutputConfig::default()
+        };
+        cfg.extended_view.enabled = false;
+        let recentring = Recentring::default();
+        let mut out =
+            GameOutput::from_config(cfg, None, recentring.clone()).expect("a router with one sink");
+
+        let sample = tobii_protocol::GazeSample {
+            timestamp_us: 1,
+            validity_l: 0,
+            validity_r: 0,
+            eye_origin_l_mm: [-32.0, 0.0, 600.0],
+            eye_origin_r_mm: [32.0, 0.0, 600.0],
+            present_mask: tobii_protocol::gaze::present::EYE_ORIGIN_L
+                | tobii_protocol::gaze::present::EYE_ORIGIN_R
+                | tobii_protocol::gaze::present::VALIDITY_L
+                | tobii_protocol::gaze::present::VALIDITY_R,
+            ..Default::default()
+        };
+        // A head held 17.4° off the tracker's axis — the bias measured on this
+        // hardware, and the whole reason the button exists.
+        let pose = tobii_headpose::HeadPose {
+            x_mm: 0.0,
+            y_mm: 0.0,
+            z_mm: 600.0,
+            yaw_deg: 17.4,
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
+        };
+
+        let t0 = Instant::now();
+        recentring.request(t0);
+        // One pose per 100 ms for the settle window and one frame past it, so
+        // the window closes on a run with more than the poses it asks for.
+        for i in 0..=11u32 {
+            out.offer(
+                &sample,
+                Some(pose),
+                t0 + Duration::from_millis(100 * i as u64),
+            );
+        }
+
+        let said = recentring
+            .message(t0 + Duration::from_millis(1100))
+            .expect("the outcome has to come back to whoever asked");
+        assert!(
+            said.contains("recentred") && said.contains("17.4"),
+            "the answer must say what was taken as straight ahead: {said}"
+        );
+        assert!(
+            !recentring.take(t0 + Duration::from_millis(1100)),
+            "and the request was consumed, not left for the next pipeline"
+        );
+    }
+
     /// Game output is off unless it has been turned on. A hub that started
     /// steering games the moment it was installed would be a surprise, and the
     /// illuminator rule says nothing about who may consume the data.
@@ -1209,25 +1435,79 @@ mod tests {
     #[test]
     fn a_recentre_is_refused_while_a_flow_owns_the_device() {
         for flow in ["calibration", "display setup"] {
-            let why = recentre_decision(&[flow], true)
+            let why = recentre_decision(&[flow], true, true)
                 .expect_err("a recentre during an exclusive flow must be refused");
             assert!(why.contains(flow), "the refusal must name the flow: {why}");
         }
         // Watching is not a reason to refuse: the hub having focus, or the gaze
         // preview being open, says nothing about where the user is looking.
-        assert!(recentre_decision(&["the hub window"], true).is_ok());
-        assert!(recentre_decision(&[], true).is_ok());
+        assert!(recentre_decision(&["the hub window"], true, true).is_ok());
+        assert!(recentre_decision(&[], true, true).is_ok());
     }
 
     /// With nothing tracking there is no head to measure, so the request would
     /// sit unclaimed until it expired — a control that appears to do nothing.
     #[test]
     fn a_recentre_with_the_tracker_dark_is_refused_rather_than_queued() {
-        let why = recentre_decision(&[], false).expect_err("refused");
+        let why = recentre_decision(&[], false, true).expect_err("refused");
         assert!(
             why.contains("not running"),
             "the refusal must say why it did nothing: {why}"
         );
+    }
+
+    /// And the same for the other end of the chain, which is the state a fresh
+    /// install is in: the tracker can be streaming for the hub's own window
+    /// while nothing is composing a pose out of it, and then there is no
+    /// `GameOutput` to take the request. It expires two seconds later with no
+    /// outcome anywhere — the "button that appeared to do nothing" the other
+    /// two refusals exist to prevent, reached by a third route.
+    #[test]
+    fn a_recentre_with_nothing_composing_a_pose_is_refused_rather_than_queued() {
+        let why = recentre_decision(&[], true, false).expect_err("refused");
+        assert!(
+            why.contains("head tracking for games"),
+            "the refusal must say what to turn on: {why}"
+        );
+    }
+
+    /// The refusal has to be asked of the same question `for_session` answers,
+    /// or the hub refuses a recentre it could have performed — or, worse,
+    /// accepts one nothing will take.
+    #[test]
+    fn what_can_perform_a_recentre_is_what_would_open_a_sink() {
+        let off = OutputConfig::default();
+        assert!(!off.enabled, "premise: game output is off out of the box");
+        assert!(!composing(&off), "nothing composes with the switch off");
+
+        let no_destination = OutputConfig {
+            enabled: true,
+            opentrack: None,
+            bridge_port: None,
+            joystick: false,
+            ..OutputConfig::default()
+        };
+        assert!(
+            !composing(&no_destination),
+            "on with nowhere to send is `for_session` returning None, not an output"
+        );
+
+        for cfg in [
+            OutputConfig {
+                opentrack: Some("127.0.0.1:4242".to_string()),
+                ..no_destination.clone()
+            },
+            OutputConfig {
+                bridge_port: Some(4243),
+                ..no_destination.clone()
+            },
+            OutputConfig {
+                joystick: true,
+                ..no_destination.clone()
+            },
+        ] {
+            assert!(composing(&cfg), "one destination is enough: {cfg:?}");
+        }
     }
 
     /// A request is for the posture the user is holding *now*. One left behind
@@ -1284,35 +1564,14 @@ mod tests {
         use tobii_ipc::codec::Msg;
         use tobii_ipc::Client;
 
-        let path = std::env::temp_dir().join(format!("tobii-recentre-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let server = Server::bind_at(&path).expect("bind");
-        let demand = Demand::new();
-        let state = Arc::new(Mutex::new(DeviceState {
-            status: ConnStatus::Connected,
-            ..DeviceState::default()
-        }));
-        let lease = Arc::new(Mutex::new(Lease::Free));
-        let (mut holds, mut awaiting, mut last) = (Holds::default(), Vec::new(), None);
-        let recentring = Recentring::default();
+        let (mut hub, path) = serving("recentre", ConnStatus::Connected);
         // A calibration running in the hub, exactly as the flow takes it.
-        let _calibrating = demand.hold("calibration");
+        let _calibrating = hub.demand.hold("calibration");
 
         let mut client = Client::connect_at(&path, subs::POSE, "a game").expect("connect");
         client.send(&Msg::Recentre).expect("the request is sent");
 
-        let reply = wait_for_reply(
-            &server,
-            &demand,
-            &state,
-            &lease,
-            &mut holds,
-            &mut awaiting,
-            &mut last,
-            &recentring,
-            &client,
-        );
-        match reply {
+        match wait_for_reply(&mut hub, &client) {
             Msg::RecentreReply { ok, text } => {
                 assert!(!ok, "a recentre mid-calibration must be refused");
                 assert!(text.contains("calibration"), "{text}");
@@ -1320,10 +1579,9 @@ mod tests {
             other => panic!("expected a recentre reply, got {other:?}"),
         }
         assert!(
-            !recentring.take(Instant::now()),
+            !hub.recentring.take(Instant::now()),
             "a refused request must not still be waiting for the pipeline"
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     /// And the accepting half: with nothing exclusive running and the tracker
@@ -1333,42 +1591,54 @@ mod tests {
         use tobii_ipc::codec::Msg;
         use tobii_ipc::Client;
 
-        let path =
-            std::env::temp_dir().join(format!("tobii-recentre-ok-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let server = Server::bind_at(&path).expect("bind");
-        let demand = Demand::new();
-        let state = Arc::new(Mutex::new(DeviceState {
-            status: ConnStatus::Connected,
-            ..DeviceState::default()
-        }));
-        let lease = Arc::new(Mutex::new(Lease::Free));
-        let (mut holds, mut awaiting, mut last) = (Holds::default(), Vec::new(), None);
-        let recentring = Recentring::default();
+        let (mut hub, path) = serving("recentre-ok", ConnStatus::Connected);
 
         let mut client = Client::connect_at(&path, subs::POSE, "a game").expect("connect");
         client.send(&Msg::Recentre).expect("the request is sent");
 
-        let reply = wait_for_reply(
-            &server,
-            &demand,
-            &state,
-            &lease,
-            &mut holds,
-            &mut awaiting,
-            &mut last,
-            &recentring,
-            &client,
-        );
+        let reply = wait_for_reply(&mut hub, &client);
         assert!(
             matches!(reply, Msg::RecentreReply { ok: true, .. }),
             "expected the request to be taken, got {reply:?}"
         );
         assert!(
-            recentring.take(Instant::now()),
+            hub.recentring.take(Instant::now()),
             "the request must be waiting for whichever pipeline runs next"
         );
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// And a socket client is refused for the third reason too, rather than
+    /// being told `ok: true` for a request nothing exists to take.
+    ///
+    /// It is answered and then forgotten: a request left behind would be
+    /// performed by whichever pipeline started next, from a posture the user
+    /// was holding minutes earlier.
+    #[test]
+    fn a_recentre_over_the_socket_with_nothing_composing_is_refused() {
+        use tobii_ipc::codec::Msg;
+        use tobii_ipc::Client;
+
+        let (mut hub, path) = serving("recentre-off", ConnStatus::Connected);
+        // Game output switched off, which is what a fresh install is.
+        hub.composing = false;
+
+        let mut client = Client::connect_at(&path, subs::POSE, "a game").expect("connect");
+        client.send(&Msg::Recentre).expect("the request is sent");
+
+        match wait_for_reply(&mut hub, &client) {
+            Msg::RecentreReply { ok, text } => {
+                assert!(!ok, "nothing can perform it, so it must not be taken");
+                assert!(
+                    text.contains("head tracking for games"),
+                    "the refusal must say what to turn on: {text}"
+                );
+            }
+            other => panic!("expected a recentre reply, got {other:?}"),
+        }
+        assert!(
+            !hub.recentring.take(Instant::now()),
+            "a refused request must not still be waiting for the pipeline"
+        );
     }
 
     /// Pump `tick` until the client has an answer.
@@ -1376,22 +1646,9 @@ mod tests {
     /// The hello and the request arrive on the server's accept thread, so a
     /// single tick proves nothing about timing on a loaded machine — the same
     /// reason the lease tests above poll rather than sleep.
-    #[allow(clippy::too_many_arguments)]
-    fn wait_for_reply(
-        server: &Server,
-        demand: &Demand,
-        state: &Arc<Mutex<DeviceState>>,
-        lease: &Arc<Mutex<Lease>>,
-        holds: &mut Holds,
-        awaiting: &mut Vec<ClientId>,
-        last: &mut Option<StatusCode>,
-        recentring: &Recentring,
-        client: &tobii_ipc::Client,
-    ) -> tobii_ipc::codec::Msg {
+    fn wait_for_reply(hub: &mut Serving, client: &tobii_ipc::Client) -> tobii_ipc::codec::Msg {
         for _ in 0..200 {
-            tick(
-                server, demand, state, lease, holds, awaiting, last, recentring,
-            );
+            hub.tick();
             if let Some(m) = client
                 .poll()
                 .into_iter()
@@ -1419,7 +1676,7 @@ mod tests {
         let demand = Demand::new();
         let mut watch = PortWatch::default();
         let t0 = Instant::now();
-        let target = || watch_target(&watching("127.0.0.1:4242"));
+        let target = || watching("127.0.0.1:4242");
 
         watch.poll(&demand, t0, target, |_| Listening::No);
         assert!(!demand.active(), "nothing bound there yet");
@@ -1449,7 +1706,7 @@ mod tests {
         let demand = Demand::new();
         let mut watch = PortWatch::default();
         let t0 = Instant::now();
-        let target = || watch_target(&watching("127.0.0.1:4242"));
+        let target = || watching("127.0.0.1:4242");
 
         for i in 0..10u32 {
             watch.poll(&demand, t0 + i * LISTENER_POLL, target, |_| Listening::Yes);
@@ -1471,7 +1728,7 @@ mod tests {
         let demand = Demand::new();
         let mut watch = PortWatch::default();
         let t0 = Instant::now();
-        let target = || watch_target(&watching("192.168.1.7:4242"));
+        let target = || watching("192.168.1.7:4242");
 
         watch.poll(&demand, t0, target, |_| {
             Listening::Unknown(tobii_output::listener::NOT_LOCAL)
@@ -1484,6 +1741,43 @@ mod tests {
             tobii_output::listener::probe("192.168.1.7:4242".parse().unwrap()),
             Listening::Unknown(_)
         ));
+    }
+
+    /// And it gives back one it is already holding. "I cannot look" is not "it
+    /// is still there": `/proc` may have gone away, or the address may have
+    /// been retyped as a remote one, and a hold nobody can re-check is a
+    /// tracker that stays lit for a reason nobody can check.
+    #[test]
+    fn an_unanswerable_probe_gives_back_a_hold_it_was_already_holding() {
+        let demand = Demand::new();
+        let mut watch = PortWatch::default();
+        let t0 = Instant::now();
+        let local = || watching("127.0.0.1:4242");
+
+        watch.poll(&demand, t0, local, |_| Listening::Yes);
+        assert!(demand.active(), "premise: a listener was found");
+
+        // The same address, and the question stopped being answerable.
+        watch.poll(&demand, t0 + LISTENER_POLL, local, |_| {
+            Listening::Unknown(tobii_output::listener::NO_PROC)
+        });
+        assert!(
+            !demand.active(),
+            "a hold on an answer we no longer have must be released"
+        );
+        assert!(!watch.holding());
+
+        // And the same the other way round, through the real probe: the
+        // destination is retyped as a remote one, which no `/proc` scan can see.
+        watch.poll(&demand, t0 + 2 * LISTENER_POLL, local, |_| Listening::Yes);
+        assert!(demand.active());
+        watch.poll(
+            &demand,
+            t0 + 3 * LISTENER_POLL,
+            || watching("192.168.1.7:4242"),
+            tobii_output::listener::probe,
+        );
+        assert!(!demand.active(), "a remote destination holds nothing");
     }
 
     /// Nothing is watched that the user did not ask for. In particular game
@@ -1535,12 +1829,20 @@ mod tests {
         watch.poll(
             &demand,
             t0,
-            || watch_target(&watching("127.0.0.1:4242")),
+            || watching("127.0.0.1:4242"),
             |_| Listening::Yes,
         );
         assert!(demand.active());
 
-        watch.poll(&demand, t0 + LISTENER_POLL, || None, |_| Listening::Yes);
+        watch.poll(
+            &demand,
+            t0 + LISTENER_POLL,
+            || OutputConfig {
+                wake_for_opentrack: false,
+                ..watching("127.0.0.1:4242")
+            },
+            |_| Listening::Yes,
+        );
         assert!(!demand.active(), "switched off means switched off");
     }
 
@@ -1567,7 +1869,7 @@ mod tests {
                 t0 + POLL * i,
                 || {
                     asked.set(asked.get() + 1);
-                    watch_target(&watching("127.0.0.1:4242"))
+                    watching("127.0.0.1:4242")
                 },
                 |_| {
                     looked.set(looked.get() + 1);
@@ -1583,7 +1885,7 @@ mod tests {
             t0 + LISTENER_POLL,
             || {
                 asked.set(asked.get() + 1);
-                watch_target(&watching("127.0.0.1:4242"))
+                watching("127.0.0.1:4242")
             },
             |_| {
                 looked.set(looked.get() + 1);
@@ -1610,12 +1912,7 @@ mod tests {
         let demand = Demand::new();
         let mut watch = PortWatch::default();
         let t0 = Instant::now();
-        watch.poll(
-            &demand,
-            t0,
-            || watch_target(&cfg),
-            tobii_output::listener::probe,
-        );
+        watch.poll(&demand, t0, || cfg.clone(), tobii_output::listener::probe);
         assert!(
             demand.active(),
             "a socket bound at {addr} should have lit the tracker"
@@ -1625,7 +1922,7 @@ mod tests {
         watch.poll(
             &demand,
             t0 + LISTENER_POLL,
-            || watch_target(&cfg),
+            || cfg.clone(),
             tobii_output::listener::probe,
         );
         assert!(!demand.active(), "and closing it should put it out");

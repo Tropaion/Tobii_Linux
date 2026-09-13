@@ -1255,8 +1255,15 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let games_row = crate::games::GamesRow::build(joystick_status, recentring, demand.clone());
     col_games.append(&section(
         "Head tracking for games",
-        "Sends head tracking and gaze to a game. Wrap the game with \
-         `tobii game -- <command>` — in Steam, put that in Launch Options.",
+        // Two routes, not one. The status line under these controls says which
+        // of them this configuration uses; this sentence must not contradict it
+        // by naming the wrapper as the requirement — that phrasing is where the
+        // "you must wrap opentrack in `tobii game`" folklore came from. It does
+        // not promise the opentrack route either, because it cannot see whether
+        // the port watch is on.
+        "Sends head tracking and gaze to a game. With opentrack, starting it is \
+         usually enough; anything else is wrapped with `tobii game -- <command>` \
+         — in Steam, put that in Launch Options.",
         &games_row.controls,
     ));
 
