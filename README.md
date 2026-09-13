@@ -307,9 +307,11 @@ tobii headpose                    # stream to opentrack on :4242
 
 Point opentrack's **UDP over network** input at `127.0.0.1:4242` and play. That
 command is the whole route: it opens the tracker, composes the pose and sends
-the datagram, with no hub running and nothing wrapping your game. **X-Plane
-11/12** binds that port natively and needs no opentrack at all. The tracker is
-lit for exactly as long as the command runs. (From a build tree, that is
+the 48-byte datagram, with no hub running and nothing wrapping your game.
+**X-Plane 11/12** reads that datagram through the `headtrack` plugin and needs
+no opentrack at all (see
+[`docs/wiki/Game-Output.md`](docs/wiki/Game-Output.md)). The tracker is lit for
+exactly as long as the command runs. (From a build tree, that is
 `./target/release/tobii`.)
 
 **The hub is the other route**, and the one to use if you want the virtual
@@ -349,30 +351,34 @@ The hub keeps the infrared illuminators dark unless something is asking for the
 tracker, and **turning "Head tracking for games" on is not itself a request**:
 that switch decides where frames go, not whether the tracker runs.
 
-For **opentrack**, the receiver asks by binding the port, and the hub watches for
-that — open opentrack and play, with no launch option at all. Measured on a hub
-with no window open: **0** USB file descriptors with nothing listening, **1**
-within four seconds of a socket binding `127.0.0.1:4242`, **0** again once it
-closed. The catch is that an opentrack left open with no game keeps the tracker
-lit; `tobii games set wake_for_opentrack false` turns the watch off.
+For **opentrack**, the receiver asks by binding the port, and the hub watches
+for that whenever game output is on — open opentrack and play, with no launch
+option at all. Measured on a hub with no window open: **0** USB file
+descriptors with nothing listening, **1** within four seconds of a socket
+binding `127.0.0.1:4242`, **0** again once it closed. The catch is that an
+opentrack left open with no game keeps the tracker lit; `tobii games set
+wake_for_opentrack false` turns the watch off.
 
-For the **virtual joystick and the Wine bridge** nothing binds a port the hub
-can see, so wrap the game instead:
+The hub watches the opentrack address and nothing else, so for the **virtual
+joystick and the Wine bridge** you wrap the game instead:
 
 ```sh
 tobii game -- %command%        # Steam: paste this into Launch Options
 tobii game -- ./MyGame.x86_64  # or anywhere else
 ```
 
-The wrapper carries no tracking data. It holds a subscription to the hub's
-socket for as long as the child process lives — measured: **0** USB file
-descriptors before, **1** while the game runs, **0** again afterwards — so the
-hub knows exactly how long a game lasts. It is transparent to whatever launched
-it, exiting with the game's own code and reporting a killed game as 128 + the
-signal, and it **never stops the game starting**: with no hub running it prints
-a note and launches anyway. Steam's `%command%`, Lutris's and Heroic's wrapper
-fields and a plain shell script all work, which is why this is a wrapper rather
-than a setting.
+The hub has to be running for this — it is, if you closed its window rather
+than quitting. The wrapper itself carries no tracking data: it holds a
+subscription to the hub's socket for as long as the child process lives —
+measured: **0** USB file descriptors before, **1** while the game runs, **0**
+again afterwards — so the hub knows exactly how long a game lasts. It is
+transparent to whatever launched it, exiting with the game's own code and
+reporting a killed game as 128 + the signal, and it **never stops the game
+starting**: with no hub running it prints a note and launches anyway. Any
+program that connects to that socket and asks for pose does the same job; the
+wrapper is just the one that knows exactly how long a game lasts. Steam's
+`%command%`, Lutris's and Heroic's wrapper fields and a plain shell script all
+work, which is why this is a wrapper rather than a setting.
 
 <details>
 <summary><b>Games that have never heard of head tracking (the virtual joystick)</b></summary>
