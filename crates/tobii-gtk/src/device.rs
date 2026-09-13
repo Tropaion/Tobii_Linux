@@ -8,6 +8,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tobii_output::pipeline::SuppliedPose;
 use tobii_output::sinks::{uinput_joystick::Response, JoystickHandle, UinputJoystick};
 use tobii_protocol::camera::decode_camera_frame;
 use tobii_protocol::frame::OP_GAZE_NOTIFY;
@@ -643,8 +644,16 @@ pub fn device_tick<T: Transport>(
                     let now = Instant::now();
                     // The pose game output should act on, decided while the
                     // lock is held and used after it is dropped. A rotation the
-                    // model has merely been HOLDING is not offered: see
-                    // `outputs::pose_is_fresh`.
+                    // model has been HOLDING for over a second is not offered
+                    // at all: see `outputs::pose_is_fresh`.
+                    //
+                    // A younger hold still goes out — dropping pitch to zero
+                    // between camera frames would shake the head in game — but
+                    // it goes out with `head_pose_at` attached, which is
+                    // refreshed only where the model was confident. That is
+                    // what lets the settle window behind a recentre count one
+                    // model measurement once, however many gaze frames it was
+                    // held across: see `pipeline::SuppliedPose`.
                     let for_games = {
                         let mut s = state.lock().unwrap();
                         s.eye_view = Some(s.eye_history.update(&g));
@@ -656,8 +665,9 @@ pub fn device_tick<T: Transport>(
                             s.head_sigma = None;
                         }
                         crate::outputs::pose_is_fresh(s.head_pose_at, now)
-                            .then_some(s.head_pose)
+                            .then(|| s.head_pose.zip(s.head_pose_at))
                             .flatten()
+                            .map(|(pose, rotation_at)| SuppliedPose { pose, rotation_at })
                     };
                     // Routed from HERE, on the sample that produced it, rather
                     // than from a timer re-reading the state mutex: a poll

@@ -111,7 +111,7 @@ pub enum RecentreOutcome {
     },
     /// The head kept moving through the window, so the old reference stands.
     Moved { spread_deg: f64 },
-    /// The tracker did not see the user for enough of the window.
+    /// Too few of the window's frames measured a head angle to average.
     NoHead { poses: usize },
     /// The user left while the window was still measuring, so it never ran its
     /// second.
@@ -123,8 +123,8 @@ pub enum RecentreOutcome {
     /// recentre, then lose both eyes for a second, and the run holds twenty
     /// perfectly good poses it is not allowed to average, because the rest of
     /// the window would have been measured after the user came back. Reporting
-    /// that as `NoHead` prints "found you in only 20 frames", which contradicts
-    /// the floor it is quoting and sends the user looking at their tracker
+    /// that as `NoHead` prints "only 20 frames measured your head angle"
+    /// against a floor of ten, which sends the user looking at their tracker
     /// instead of at the measurement they walked out of.
     Interrupted { poses: usize },
 }
@@ -148,8 +148,8 @@ impl std::fmt::Display for RecentreOutcome {
             ),
             RecentreOutcome::NoHead { poses } => write!(
                 f,
-                "not recentred: the tracker found you in only {poses} frames of the second it \
-                 was measuring"
+                "not recentred: only {poses} frames of that second measured your head angle \
+                 — sit square to the tracker and ask again"
             ),
             RecentreOutcome::Interrupted { poses } => write!(
                 f,
@@ -158,6 +158,35 @@ impl std::fmt::Display for RecentreOutcome {
             ),
         }
     }
+}
+
+/// A pose composed outside this crate, and when the rotation in it was
+/// measured.
+///
+/// The instant is not decoration, and it is not a freshness bound — the caller
+/// has already applied one by the time it calls. Both front ends hold the
+/// neural model's last rotation across the gaze frames that arrive between
+/// camera frames: the two streams both run at ~33 Hz and are not in lockstep,
+/// so dropping pitch to zero on every gaze sample that came without an image
+/// would shake the head in game. They keep holding it for up to a second after
+/// the model stops being confident, which is a whole settle window.
+///
+/// A held rotation is identical by value to the one it was measured from, so
+/// the pipeline cannot tell the two apart from the numbers; only the caller
+/// knows, and this is how it says so. The stamp moves when, and only when,
+/// something measured the head again.
+///
+/// Only the settle window consults it, and only to refuse counting one
+/// measurement twice. Everything else in the pipeline treats the pose exactly
+/// as it treated a bare [`HeadPose`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SuppliedPose {
+    /// The pose itself, which wins over the geometric fallback — see
+    /// [`FramePipeline::offer`].
+    pub pose: HeadPose,
+    /// When the rotation in `pose` was measured. The same instant on two
+    /// frames is the same measurement on both.
+    pub rotation_at: Instant,
 }
 
 /// One rotation recentre in flight: the poses seen since it started.
@@ -258,6 +287,13 @@ pub struct FramePipeline {
     ///   the geometric path has no pitch to reference in any case.
     /// * **Not taken from the composed pose.** See the module docs.
     rot_ref: Option<[f64; 2]>,
+    /// The stamp on the last [`SuppliedPose`] this pipeline was handed.
+    ///
+    /// Compared, not aged: the caller has already decided how stale a held
+    /// rotation may be before it stops offering one at all. All this answers
+    /// is whether the rotation on this frame is one the settle window has
+    /// already counted.
+    last_rotation_at: Option<Instant>,
     /// A recentre being measured right now, if one is.
     recentre: Option<RecentreRun>,
     /// The last finished recentre, until somebody takes it.
@@ -300,6 +336,7 @@ impl FramePipeline {
             pair: PairOffset::new(),
             stats: FallbackStats::default(),
             rot_ref: None,
+            last_rotation_at: None,
             recentre: None,
             last_recentre: None,
         }
@@ -349,16 +386,28 @@ impl FramePipeline {
     /// *replace* the first rather than measure the residual of it.
     fn rereference(&mut self, head: HeadPose, rotation_held: bool, now: Instant) -> HeadPose {
         if let Some(run) = self.recentre.as_mut() {
+            // The window measures rotation, so it takes only frames that
+            // measured one — and there are two ways to be handed the same
+            // measurement twice.
+            //
             // A reconstructed frame's yaw and roll ARE the last two-eye
             // frame's: `PairOffset` holds the interocular vector, and
             // `pose_from_eyes` reads the rotation off precisely that vector,
-            // so only translation is new. The window measures rotation, so it
-            // takes only frames that measured one — pushing a held copy counts
-            // one measurement up to nine times (the most an outage fits inside
-            // `RECONSTRUCTION_MAX_AGE`), which pads `RECENTRE_MIN_POSES` and
-            // pulls the 10–90% spread toward zero while the head was free to
-            // move through the outage. That is both halves of the gate
-            // loosened by the same duplicates.
+            // so only translation is new. A supplied pose repeats itself for a
+            // different reason: the model runs on the camera stream, and the
+            // caller holds its last rotation across every gaze frame that
+            // arrived without a confident estimate behind it. See
+            // [`SuppliedPose`], which is how that frame says which it was.
+            //
+            // Either way, pushing the copies counts one measurement many
+            // times, which pads `RECENTRE_MIN_POSES` and pulls the 10–90%
+            // spread toward zero while the head was free to move through the
+            // gap: both halves of the gate loosened by the same duplicates.
+            // The supplied path is the worse of the two, because a held
+            // rotation stands for as long as the caller's staleness bound (a
+            // second, in both front ends) and so can fill a window outright,
+            // where an outage fits at most nine frames inside
+            // `RECONSTRUCTION_MAX_AGE`.
             //
             // Non-finite angles are dropped rather than sorted: a degenerate
             // model quaternion normalises to NaN, `partial_cmp` answers `None`
@@ -452,6 +501,10 @@ impl FramePipeline {
     /// construction. Passing `None` asks for the geometric pose, which is what
     /// a 5-DOF run gets.
     ///
+    /// It arrives as a [`SuppliedPose`] rather than a bare [`HeadPose`] so it
+    /// can carry the instant its rotation was measured, which is a fact only
+    /// the caller has and which the settle window needs.
+    ///
     /// The geometric pose comes from [`PairOffset`], so a frame carrying only
     /// one tracked eye still produces one — with the missing eye placed at the
     /// last measured offset, and never past `RECONSTRUCTION_MAX_AGE`. With
@@ -459,7 +512,7 @@ impl FramePipeline {
     pub fn offer(
         &mut self,
         sample: &GazeSample,
-        pose_in: Option<HeadPose>,
+        pose_in: Option<SuppliedPose>,
         cfg: &OutputConfig,
         corners: Option<DisplayCorners>,
         now: Instant,
@@ -491,15 +544,28 @@ impl FramePipeline {
             }
             None => {}
         }
-        // Whether this frame's rotation was held rather than measured, which
-        // is a question about the pose that actually goes out. Only the
-        // geometric path can hold one: where `pose_in` wins, the rotation came
-        // from the model and the reconstruction underneath it never reaches
-        // the output.
-        let rotation_held = pose_in.is_none() && source == Some(PoseSource::Reconstructed);
-        self.stats.active = rotation_held;
+        // `active` is about the pose that goes out, not about the rotation in
+        // it: a supplied pose is not a reconstruction, however the geometry
+        // underneath it turned out.
+        let reconstructed = pose_in.is_none() && source == Some(PoseSource::Reconstructed);
+        self.stats.active = reconstructed;
+        // Whether this frame's rotation was held rather than measured. Both
+        // paths can hold one, and only one of the two is this pipeline's to
+        // know: the supplied pose carries its own stamp, and a stamp already
+        // seen is that measurement arriving a second time. Inferring it from
+        // `pose_in.is_none()` alone covers the geometric path and nothing else,
+        // which lets a held model rotation — the longer-lived of the two holds
+        // by more than three to one — into the window unchallenged.
+        let rotation_held =
+            reconstructed || pose_in.is_some_and(|p| self.last_rotation_at == Some(p.rotation_at));
+        if let Some(p) = pose_in {
+            self.last_rotation_at = Some(p.rotation_at);
+        }
 
-        let pose = pose_in.or(geometric.map(|g| g.pose)).map(|raw| {
+        // The supplied pose wins over the geometric one; from here down the
+        // two are composed identically, and the stamp has done its work.
+        let incoming = pose_in.map(|p| p.pose).or(geometric.map(|g| g.pose));
+        let pose = incoming.map(|raw| {
             let (ev_yaw, ev_pitch) = match (cfg.extended_view.enabled, corners, gaze) {
                 (true, Some(c), Some(g)) => {
                     let ev = fusion::extended_view(
@@ -662,6 +728,16 @@ mod tests {
         }
     }
 
+    /// A pose handed in from outside, measured at `at` — the shape both front
+    /// ends offer. The stamp is the fact the pipeline cannot see for itself:
+    /// repeat one and the frame is carrying a rotation it has already counted.
+    fn supplied(pose: HeadPose, at: Instant) -> Option<SuppliedPose> {
+        Some(SuppliedPose {
+            pose,
+            rotation_at: at,
+        })
+    }
+
     fn cfg(ev: bool) -> OutputConfig {
         OutputConfig {
             extended_view: ExtendedView {
@@ -677,16 +753,17 @@ mod tests {
     #[test]
     fn a_supplied_model_pose_wins_over_the_geometric_fallback() {
         let mut p = FramePipeline::new(&cfg(false));
-        let supplied = HeadPose {
+        let model = HeadPose {
             pitch_deg: 17.0,
             ..Default::default()
         };
+        let now = Instant::now();
         let f = p.offer(
             &tracked_sample(Some([0.5, 0.5])),
-            Some(supplied),
+            supplied(model, now),
             &cfg(false),
             None,
-            Instant::now(),
+            now,
         );
         let got = f.pose.expect("a pose");
         assert!(
@@ -1042,12 +1119,12 @@ mod tests {
         let now = Instant::now();
         let c = cfg(false);
         let mut p = FramePipeline::new(&c);
-        let supplied = HeadPose {
+        let model = HeadPose {
             pitch_deg: 17.0,
             ..Default::default()
         };
         let both = seated(680.0);
-        let f = p.offer(&both, Some(supplied), &c, None, now);
+        let f = p.offer(&both, supplied(model, now), &c, None, now);
         assert_eq!(f.pose.expect("a pose").pitch_deg, 17.0, "the model won");
         assert_eq!(
             p.fallback_stats(),
@@ -1086,7 +1163,12 @@ mod tests {
         let mut p = FramePipeline::new(&c);
         let both = seated(680.0);
         let one = right_eye_lost(&both);
-        let measured = || Some(tobii_headpose::pose_from_sample(&both).expect("two eyes"));
+        let measured = || {
+            supplied(
+                tobii_headpose::pose_from_sample(&both).expect("two eyes"),
+                now,
+            )
+        };
 
         for _ in 0..20 {
             p.offer(&both, measured(), &c, None, now);
@@ -1453,7 +1535,7 @@ mod tests {
         let mut at = start;
         p.begin_recentre(at);
         for _ in 0..WINDOW_FRAMES * 2 {
-            p.offer(&sample, Some(model), &c, None, at);
+            p.offer(&sample, supplied(model, at), &c, None, at);
             at += CADENCE;
         }
         assert!(
@@ -1462,7 +1544,7 @@ mod tests {
         );
 
         let after = p
-            .offer(&sample, Some(model), &c, None, at)
+            .offer(&sample, supplied(model, at), &c, None, at)
             .pose
             .expect("a pose");
         assert!(
@@ -1511,9 +1593,9 @@ mod tests {
     ///
     /// Reported as its own outcome, not as `NoHead`. A run cut short can hold
     /// any number of poses, including plenty: this one holds twice
-    /// `RECENTRE_MIN_POSES`, so calling it "found you in only 20 frames" would
-    /// contradict the floor that sentence quotes and send the user to check
-    /// their tracker instead of to sit back down.
+    /// `RECENTRE_MIN_POSES`, so calling it "only 20 frames measured your head
+    /// angle" against a floor of ten would send the user to check their
+    /// tracker instead of to sit back down.
     #[test]
     fn a_window_the_user_walks_out_of_is_reported_as_interrupted() {
         let c = cfg(false);
@@ -1581,7 +1663,7 @@ mod tests {
         let mut at = Instant::now();
         p.begin_recentre(at);
         for _ in 0..WINDOW_FRAMES * 2 {
-            p.offer(&sample, Some(broken), &c, None, at);
+            p.offer(&sample, supplied(broken, at), &c, None, at);
             at += CADENCE;
         }
         assert_eq!(
@@ -1617,7 +1699,7 @@ mod tests {
         p.begin_recentre(at);
         for i in 0..WINDOW_FRAMES * 2 {
             let pose = if i % 2 == 0 { good } else { broken };
-            p.offer(&sample, Some(pose), &c, None, at);
+            p.offer(&sample, supplied(pose, at), &c, None, at);
             at += CADENCE;
         }
         match p.take_recentre() {
@@ -1675,6 +1757,101 @@ mod tests {
             None,
             "one measurement repeated is not a second of stillness"
         );
+    }
+
+    /// The same gate on the supplied path, where it costs more.
+    ///
+    /// The model runs on the camera stream, and both front ends hold its last
+    /// rotation across the gaze frames that arrive without a confident
+    /// estimate behind them — for up to a second, which is the whole window.
+    /// So a user who asks for a recentre just as the model loses confidence
+    /// would fill the run with one measurement republished ~33 times: the
+    /// floor cleared by duplicates, the spread reading 0.0, and a permanent
+    /// "straight ahead" adopted from a single stale frame. Three times what a
+    /// reconstruction can pad, and exactly what the window exists to refuse.
+    ///
+    /// Only the caller knows — a held rotation is bit for bit the one it was
+    /// measured from — so the frame carries the stamp and the run counts
+    /// stamps rather than frames.
+    #[test]
+    fn a_held_model_rotation_is_not_a_second_measurement_of_the_head() {
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let sitting = head_at(OFF_AXIS_YAW_DEG, 0.0);
+        // A model pose, which is the only path that carries pitch at all.
+        let model = HeadPose {
+            yaw_deg: OFF_AXIS_YAW_DEG,
+            pitch_deg: 4.0,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        // Measured once, one frame before the button was pressed, and held
+        // from there on: the stamp never moves again.
+        let measured_at = start - CADENCE;
+        p.begin_recentre(start);
+
+        let mut at = start;
+        for _ in 0..WINDOW_FRAMES * 2 {
+            p.offer(&sitting, supplied(model, measured_at), &c, None, at);
+            at += CADENCE;
+        }
+
+        assert_eq!(
+            p.take_recentre(),
+            Some(RecentreOutcome::NoHead { poses: 1 }),
+            "one measurement held across a window is one pose, not eighty"
+        );
+        assert_eq!(
+            p.rotation_reference(),
+            None,
+            "a reference from one stale frame is the reference this window exists to refuse"
+        );
+    }
+
+    /// And the gate asks whether the measurement is new, not whether it was
+    /// taken on this very frame.
+    ///
+    /// The camera and the gaze stream both run at ~33 Hz and are not in
+    /// lockstep, so every model measurement reaches the pipeline on a frame
+    /// slightly later than itself. Gating on "measured at this instant" would
+    /// refuse all of them and turn an ordinary session's recentre into
+    /// `NoHead` — a refusal the user could do nothing about, since sitting
+    /// stiller does not align two free-running streams.
+    #[test]
+    fn a_model_measurement_older_than_the_frame_carrying_it_still_counts() {
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let sitting = head_at(OFF_AXIS_YAW_DEG, 0.0);
+        let model = HeadPose {
+            yaw_deg: OFF_AXIS_YAW_DEG,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        p.begin_recentre(start);
+
+        let mut at = start;
+        for _ in 0..WINDOW_FRAMES * 2 {
+            // A new measurement each frame, each taken a few milliseconds
+            // before the gaze frame that carries it.
+            let measured_at = at - Duration::from_millis(7);
+            p.offer(&sitting, supplied(model, measured_at), &c, None, at);
+            at += CADENCE;
+        }
+
+        match p.take_recentre() {
+            Some(RecentreOutcome::Applied {
+                yaw_deg,
+                spread_deg,
+                ..
+            }) => {
+                assert!((yaw_deg - OFF_AXIS_YAW_DEG).abs() < 0.01, "yaw {yaw_deg}");
+                assert!(
+                    spread_deg < 0.01,
+                    "a still head has no spread: {spread_deg}"
+                );
+            }
+            other => panic!("a window of fresh measurements must be applied, got {other:?}"),
+        }
     }
 
     /// The reference is something the user asked for, so walking away does not

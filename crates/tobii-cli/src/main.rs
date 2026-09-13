@@ -2197,8 +2197,7 @@ fn headpose(args: &[String]) -> CmdResult {
                     let eyes = pose_from_sample(&sample);
                     let fresh = last_model
                         .as_ref()
-                        .filter(|(_, at)| at.elapsed() < HEAD_POSE_MAX_AGE)
-                        .map(|(m, _)| m);
+                        .filter(|(_, at)| at.elapsed() < HEAD_POSE_MAX_AGE);
                     // The model's pose wins where there is one; the pipeline
                     // falls back to the geometric pose otherwise. Tracking loss
                     // stops the send rather than emitting a synthetic pose —
@@ -2217,7 +2216,19 @@ fn headpose(args: &[String]) -> CmdResult {
                         pipeline.begin_recentre(at);
                         recentre_started = true;
                     }
-                    let frame = pipeline.offer(&sample, fuse_pose(eyes, fresh), &cfg, corners, at);
+                    // The stamp goes with the pose, not just the pose: a
+                    // rotation held across the gaze frames between two camera
+                    // frames is ONE measurement, and a settle window that
+                    // counted it once per frame would call a stalled model a
+                    // second of perfect stillness. See
+                    // `pipeline::SuppliedPose`.
+                    let pose_in = fuse_pose(eyes, fresh.map(|(m, _)| m)).map(|pose| {
+                        tobii_output::pipeline::SuppliedPose {
+                            pose,
+                            rotation_at: fresh.map_or(at, |(_, measured)| *measured),
+                        }
+                    });
+                    let frame = pipeline.offer(&sample, pose_in, &cfg, corners, at);
                     // A second later, when the window closes — including when
                     // it refuses, which is the answer somebody sitting still is
                     // waiting for.

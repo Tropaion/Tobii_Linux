@@ -651,7 +651,7 @@ impl GameOutput {
     pub fn offer(
         &mut self,
         sample: &tobii_protocol::GazeSample,
-        pose: Option<tobii_headpose::HeadPose>,
+        pose: Option<tobii_output::pipeline::SuppliedPose>,
         now: std::time::Instant,
     ) {
         // Asked for by the hub's button or over the socket, performed here:
@@ -1394,10 +1394,17 @@ mod tests {
         // One pose per 100 ms for the settle window and one frame past it, so
         // the window closes on a run with more than the poses it asks for.
         for i in 0..=11u32 {
+            let at = t0 + Duration::from_millis(100 * i as u64);
+            // A fresh stamp per frame: the model measured the head on each of
+            // them. A window of ONE measurement held across twelve frames is
+            // refused, which is `pipeline`'s own test.
             out.offer(
                 &sample,
-                Some(pose),
-                t0 + Duration::from_millis(100 * i as u64),
+                Some(tobii_output::pipeline::SuppliedPose {
+                    pose,
+                    rotation_at: at,
+                }),
+                at,
             );
         }
 
