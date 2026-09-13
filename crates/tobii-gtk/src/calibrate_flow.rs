@@ -216,7 +216,7 @@ enum GroupAction {
     /// would not be well defined here: the flow shows a group's three points
     /// simultaneously and lets gaze decide which one is focused, so the unit
     /// that can be repeated is the group, not a point.
-    Reshow { group: usize, attempt: u32 },
+    Reshow { attempt: u32 },
     /// Out of attempts: fail the run with exactly the message this weakness
     /// produced before per-group retry existed. The window's "Try again"
     /// button is untouched and still restarts the whole run from the first
@@ -224,13 +224,14 @@ enum GroupAction {
     Fail(String),
 }
 
-/// The per-group retry decision: how many attempts, and which group repeats.
-/// A free function (the tick loop below is its only caller) so a unit test
-/// can reach it without a display.
-fn weak_group_action(weakness: &GroupWeakness, group: usize, attempt: u32) -> GroupAction {
+/// The per-group retry decision: whether a weak group has an attempt left,
+/// and with what message the run gives up when it has not. Which group comes
+/// back is not part of the decision — it is the one the caller is already on
+/// (see `GroupAction::Reshow`). A free function (the tick loop below is its
+/// only caller) so a unit test can reach it without a display.
+fn weak_group_action(weakness: &GroupWeakness, attempt: u32) -> GroupAction {
     if attempt + 1 < MAX_GROUP_ATTEMPTS {
         return GroupAction::Reshow {
-            group,
             attempt: attempt + 1,
         };
     }
@@ -242,17 +243,41 @@ fn weak_group_action(weakness: &GroupWeakness, group: usize, attempt: u32) -> Gr
     })
 }
 
-/// Read `CalPhase::last_error` as an EDGE: the rejection this tick should be
-/// charged for, if any.
+/// Take the device's per-point error, so whatever it carries can be charged
+/// at most once.
 ///
-/// The field is a level — `CalPhase` holds the last error until the next
-/// successful collect clears it (`CalPhase::on_collect`) — and an attempt
-/// budget must not be emptied by one rejection being re-read on every
-/// subsequent tick. `requested` is what turns it into an edge: within a
-/// session nothing but this flow's own `CalCollect` ever sets that field, a
-/// collect is in flight only while `requested`, and the re-show below leaves
-/// `requested` false, so the error is charged exactly once, to the tick that
-/// was waiting for that ack.
+/// `CalPhase::last_error` is a level, not an edge: the device thread holds the
+/// last error until a SUCCESSFUL collect clears it (`CalPhase::on_collect`),
+/// and nothing else clears it — not `CalDiscard`, not a re-show. Left in
+/// place it is re-read by every later tick that has a collect in flight, so a
+/// re-shown group is charged for the refusal that ended the previous attempt
+/// the moment it asks for its first sample, and one transient rejection still
+/// spends the whole budget — the outcome `MAX_GROUP_ATTEMPTS` exists to
+/// prevent.
+///
+/// Consuming it on every `Collecting` tick, not only on the ticks that charge
+/// it, is what makes it an edge. An error that lands while no collect is in
+/// flight belongs to a point this flow has already given up on (the
+/// mid-collect discard, see `lost_focus_while_requested`), and is dropped here
+/// rather than billed to the user's next, good, sample.
+///
+/// The read is deliberately FRESH rather than from the tick's snapshot: a
+/// rejection the device has since replaced with a successful collect is no
+/// longer there to charge. It is token-guarded for the reason
+/// `Phase::Starting` gives — every field of a session that is not ours is
+/// meaningless here, and this one is now written as well as read.
+fn take_last_error(state: &Mutex<DeviceState>, token: u64) -> Option<String> {
+    let mut st = state.lock().unwrap();
+    if st.calibration.token != token {
+        return None;
+    }
+    st.calibration.last_error.take()
+}
+
+/// Read a taken error (see `take_last_error`) as the rejection this tick
+/// should be charged for, if any: a collect is in flight only while
+/// `requested`, and only a tick that was waiting for an ack has an attempt to
+/// charge.
 ///
 /// What the gate gives up: an error arriving after the lost-focus path has
 /// already cleared `requested` and discarded the point. That point was being
@@ -265,11 +290,26 @@ fn point_rejection(last_error: Option<&str>, requested: bool) -> Option<GroupWea
     }
 }
 
-/// The `Phase::Collecting` instruction line. `holding` is "gaze is
-/// established on a dot, or a sample is already in flight".
-fn collecting_instruction(attempt: u32, holding: bool, done: usize, total: usize) -> String {
+/// The `Phase::Collecting` instruction line.
+///
+/// "Hold still" belongs to a dwell that is actually running: a sample already
+/// in flight, or a live in-zone streak. Deliberately NOT to `focused` being
+/// set. `focus::resolve_group_focus` holds an established focus through a
+/// gaze gap and never hands back `None`, while `in_zone_ticks` is reset to 0
+/// by a re-show, by the mid-collect discard, and by a gap longer than
+/// `GAZE_GAP_TOLERANCE_TICKS` — so reading the carried focus would pin "Hold
+/// still" on a screen where nothing is being dwelled on and the ring sits at
+/// zero, and would keep the re-show line below off the path it was written
+/// for (a re-show carries `focused` across, see `reshow_group`).
+fn collecting_instruction(
+    attempt: u32,
+    requested: bool,
+    in_zone_ticks: u32,
+    done: usize,
+    total: usize,
+) -> String {
     let progress = format!("{done} of {total} points");
-    if holding {
+    if requested || in_zone_ticks > 0 {
         format!("Hold still — keep looking at the dot  ·  {progress}")
     } else if attempt > 0 {
         // A re-shown group is pixel-identical to a first showing, and the
@@ -554,24 +594,24 @@ fn update_ui(phase: &Phase, instr: &Label, w: &FlowWidgets) {
         }
         Phase::Collecting {
             calibrated,
-            focused,
             requested,
+            in_zone_ticks,
             attempt,
             ..
         } => {
             let done = calibrated.iter().filter(|c| **c).count();
             // Fixation matters once gaze is actually confirmed on a target
             // (or a sample has already been requested) — NOT once overall
-            // elapsed time on the group crosses a threshold. `focused.is_some()`
-            // plays the same role `in_zone_ticks > 0` played before this task
-            // (equivalent once `in_zone_ticks` only ever advances while
-            // `focused` is established): before gaze-verified capture, `ticks`
-            // alone was a reliable proxy for "the user is looking"; now
-            // nothing may be focused yet if the user hasn't found a dot in
-            // the newly-shown group.
+            // elapsed time on the group crosses a threshold: before
+            // gaze-verified capture, `ticks` alone was a reliable proxy for
+            // "the user is looking", and it no longer is, since nothing may be
+            // focused yet if the user hasn't found a dot in the newly-shown
+            // group. Which of the dwell counters says that is
+            // `collecting_instruction`'s own decision.
             instr.set_text(&collecting_instruction(
                 *attempt,
-                focused.is_some() || *requested,
+                *requested,
+                *in_zone_ticks,
                 done,
                 calibrated.len(),
             ));
@@ -1095,6 +1135,10 @@ pub fn launch(
                     *ticks,
                     *attempt,
                 );
+                // Consume the device's per-point error level once per tick, so
+                // one rejection can only ever be charged to one attempt (see
+                // `take_last_error`).
+                let rejection = take_last_error(&state, token);
                 if cal.token != token {
                     // Another session replaced ours — only reachable if a second
                     // flow window ever opened. Never act on counters that are not
@@ -1107,15 +1151,14 @@ pub fn launch(
                     // it explicitly.
                     let _ = tick_cmd.send(DeviceCommand::CalAbort);
                     next = Some(done_phase(Err(e.clone())));
-                } else if let Some(weakness) = point_rejection(cal.last_error.as_deref(), requested)
-                {
+                } else if let Some(weakness) = point_rejection(rejection.as_deref(), requested) {
                     // The device refused the point we were waiting on. That
                     // used to end the run outright; while this group has
                     // attempts left it is re-shown instead (see
                     // `MAX_GROUP_ATTEMPTS`), and only the last attempt still
                     // fails, with the same message it always gave.
-                    match weak_group_action(&weakness, group, attempt) {
-                        GroupAction::Reshow { group, attempt } => {
+                    match weak_group_action(&weakness, attempt) {
+                        GroupAction::Reshow { attempt } => {
                             // The device may be holding a partial sample for
                             // the point it failed on — an error here means no
                             // ack was seen, not that nothing was gathered — so
@@ -1127,11 +1170,13 @@ pub fn launch(
                             // race to re-check first: a success clears
                             // `last_error` and raises `collected` in the same
                             // locked update (`CalPhase::on_collect`), so an
-                            // error in hand is proof this point was not
-                            // accepted. Nor can this coordinate be holding an
-                            // accepted sample from an earlier attempt — that
-                            // would have marked it calibrated, which takes it
-                            // out of focus consideration entirely.
+                            // error taken under the lock this tick — not read
+                            // from the tick's snapshot — is proof this point
+                            // was not accepted. Nor can this coordinate be
+                            // holding an accepted sample from an earlier
+                            // attempt — that would have marked it calibrated,
+                            // which takes it out of focus consideration
+                            // entirely.
                             if let Some(f) = focused {
                                 let (px, py) = cal_points[f];
                                 let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
@@ -1429,23 +1474,37 @@ pub fn launch(
                             // points never got a confirmed dwell. While the
                             // group has attempts left it comes back with a
                             // fresh deadline instead of ending the run.
-                            match weak_group_action(&GroupWeakness::Deadline, group, attempt) {
-                                GroupAction::Reshow { group, attempt } => {
+                            match weak_group_action(&GroupWeakness::Deadline, attempt) {
+                                GroupAction::Reshow { attempt } => {
                                     // A collect can still be in flight at the
                                     // deadline (the device is bounded by
                                     // `tobii-usb`'s own CAL_POINT_TIMEOUT, not
-                                    // by ours). Discard that point like the
-                                    // lost-focus path does so the re-shown
-                                    // group starts clean — and note
-                                    // `reshow_group` keeps `focused` precisely
-                                    // so a late ack for it still lands
-                                    // somewhere.
-                                    if requested {
-                                        let (px, py) = cal_points
-                                            [focused.expect("requested implies focused is set")];
-                                        let _ = tick_cmd
-                                            .send(DeviceCommand::CalDiscard { x: px, y: py });
-                                    }
+                                    // by ours), and it is deliberately left
+                                    // alone rather than discarded like the
+                                    // lost-focus path does. `CalCollect` and
+                                    // `CalDiscard` share one FIFO device
+                                    // queue, so a discard sent now runs AFTER
+                                    // the collect it means to cancel: the
+                                    // device would ack the sample, raising the
+                                    // `CalPhase::collected` count that no
+                                    // discard ever decrements, and only then
+                                    // throw the sample away — and the next
+                                    // tick would read that advance, mark the
+                                    // point captured and fit the group without
+                                    // it, reporting a run as complete that is
+                                    // a point short. Carrying `focused`
+                                    // through the re-show (see `reshow_group`)
+                                    // is what lets such an ack land on the
+                                    // point it actually belongs to instead.
+                                    //
+                                    // If that collect fails instead, nothing
+                                    // is charged for it (the re-show has
+                                    // already cleared `requested`) and the
+                                    // device may still hold whatever it
+                                    // gathered for the point; the re-shown
+                                    // group collects it again on top of that,
+                                    // which is the situation every re-shown
+                                    // point is in.
                                     next = Some(reshow_group(
                                         token, mode, group, calibrated, focused, attempt,
                                     ));
@@ -1660,10 +1719,12 @@ mod tests {
         );
     }
 
-    /// A weak group is re-shown — the same group, never a different one and
+    /// A weak group comes back — the same group, never a different one and
     /// never a single point (the flow shows three at once and lets gaze pick
-    /// which is focused, so a point is not a unit that can be repeated) —
-    /// until the budget is spent, and only then does the run fail.
+    /// which is focused, so a point is not a unit that can be repeated;
+    /// `GroupAction::Reshow` names no group at all, so the call site can only
+    /// re-show the one it is already on) — until the budget is spent, and only
+    /// then does the run fail.
     #[test]
     fn weak_group_action_reshows_the_same_group_until_the_budget_runs_out() {
         // Pinned deliberately: `MAX_GROUP_ATTEMPTS`'s own comment derives the
@@ -1676,25 +1737,23 @@ mod tests {
             GroupWeakness::Deadline,
             GroupWeakness::PointRejected("device said no".into()),
         ] {
-            for group in 0..GROUPS.len() {
-                assert_eq!(
-                    weak_group_action(&weakness, group, 0),
-                    GroupAction::Reshow { group, attempt: 1 },
-                    "first showing of group {group} must come back, not fail the run"
-                );
-                assert_eq!(
-                    weak_group_action(&weakness, group, 1),
-                    GroupAction::Reshow { group, attempt: 2 },
-                    "the second attempt at group {group} must come back too"
-                );
-                assert!(
-                    matches!(
-                        weak_group_action(&weakness, group, MAX_GROUP_ATTEMPTS - 1),
-                        GroupAction::Fail(_)
-                    ),
-                    "the last attempt at group {group} must fail the run"
-                );
-            }
+            assert_eq!(
+                weak_group_action(&weakness, 0),
+                GroupAction::Reshow { attempt: 1 },
+                "a first showing must come back, not fail the run"
+            );
+            assert_eq!(
+                weak_group_action(&weakness, 1),
+                GroupAction::Reshow { attempt: 2 },
+                "the second attempt must come back too"
+            );
+            assert!(
+                matches!(
+                    weak_group_action(&weakness, MAX_GROUP_ATTEMPTS - 1),
+                    GroupAction::Fail(_)
+                ),
+                "the last attempt must fail the run"
+            );
         }
     }
 
@@ -1705,11 +1764,11 @@ mod tests {
     fn weak_group_action_gives_up_with_the_messages_it_always_gave() {
         let last = MAX_GROUP_ATTEMPTS - 1;
         assert_eq!(
-            weak_group_action(&GroupWeakness::Deadline, 2, last),
+            weak_group_action(&GroupWeakness::Deadline, last),
             GroupAction::Fail("Timed out reading a point.".into())
         );
         assert_eq!(
-            weak_group_action(&GroupWeakness::PointRejected("no eyes".into()), 2, last),
+            weak_group_action(&GroupWeakness::PointRejected("no eyes".into()), last),
             GroupAction::Fail(
                 "Couldn't read a point: no eyes. Make sure you're seated and looking at the dots."
                     .into()
@@ -1717,11 +1776,9 @@ mod tests {
         );
     }
 
-    /// `CalPhase::last_error` is a level that persists until the next
-    /// successful collect, so it must be charged to the attempt budget only
-    /// on the tick that was waiting for that ack (`requested`). Without this
-    /// one rejection would burn every attempt on consecutive ticks and fail
-    /// the run instantly — the very thing per-group retry exists to prevent.
+    /// A rejection is charged to the attempt budget only on a tick that was
+    /// waiting for an ack (`requested`); an error in hand with nothing in
+    /// flight belongs to a point the flow has already given up on.
     #[test]
     fn point_rejection_charges_an_error_only_while_a_collect_is_in_flight() {
         assert_eq!(
@@ -1731,10 +1788,64 @@ mod tests {
         assert_eq!(
             point_rejection(Some("no eyes"), false),
             None,
-            "the same error on a later tick, with nothing in flight, is the one already charged"
+            "an error with nothing in flight is one the flow already gave up on"
         );
         assert_eq!(point_rejection(None, true), None);
         assert_eq!(point_rejection(None, false), None);
+    }
+
+    /// One rejection may empty exactly one attempt. `CalPhase::last_error` is
+    /// a level that only a SUCCESSFUL collect clears — a discard does not, a
+    /// re-show does not — so the error that ended an attempt is still sitting
+    /// there when the re-shown group dwells again and sends its own
+    /// `CalCollect`, and reading it a second time would charge that sample for
+    /// the refusal that caused the re-show. Three attempts would then be spent
+    /// by a single transient rejection, ~2 s apart, which is the whole failure
+    /// per-group retry exists to prevent.
+    #[test]
+    fn a_rejection_is_charged_to_one_attempt_and_no_more() {
+        let state = Mutex::new(DeviceState::default());
+        {
+            let mut st = state.lock().unwrap();
+            st.calibration = CalPhase::begin(7);
+            st.calibration.on_collect(Err("no eyes".into()));
+        }
+
+        // The tick that was waiting for that ack: charged, and the group is
+        // re-shown with that message in hand.
+        let charged = take_last_error(&state, 7);
+        assert_eq!(
+            point_rejection(charged.as_deref(), true),
+            Some(GroupWeakness::PointRejected("no eyes".into()))
+        );
+
+        // The re-shown group's first sample, with the device yet to answer it
+        // and nothing having cleared what it wrote last time.
+        let next_tick = take_last_error(&state, 7);
+        assert_eq!(
+            point_rejection(next_tick.as_deref(), true),
+            None,
+            "the re-shown group must not be charged for the rejection that caused the re-show"
+        );
+    }
+
+    /// Taking the error writes to state the device thread owns, so it is
+    /// token-guarded exactly as every read of `CalPhase` is: another session's
+    /// error is neither charged here nor cleared out from under it.
+    #[test]
+    fn taking_the_error_never_touches_another_session() {
+        let state = Mutex::new(DeviceState::default());
+        {
+            let mut st = state.lock().unwrap();
+            st.calibration = CalPhase::begin(7);
+            st.calibration.on_collect(Err("not ours".into()));
+        }
+        assert_eq!(take_last_error(&state, 8), None);
+        assert_eq!(
+            state.lock().unwrap().calibration.last_error.as_deref(),
+            Some("not ours"),
+            "a session we do not own keeps its own error"
+        );
     }
 
     /// A re-shown group keeps the points it already collected (they are not
@@ -1745,12 +1856,7 @@ mod tests {
     fn reshow_group_keeps_what_the_group_already_collected() {
         // Group C part-way through: index 4 captured, 5 and 6 still to go,
         // with a collect having been in flight on index 5.
-        let mut calibrated = [false; 7];
-        calibrated[0] = true;
-        calibrated[1] = true;
-        calibrated[2] = true;
-        calibrated[3] = true;
-        calibrated[4] = true;
+        let calibrated = [true, true, true, true, true, false, false];
         match reshow_group(42, CalMode::Full, 2, calibrated, Some(5), 1) {
             Phase::Collecting {
                 token,
@@ -1793,11 +1899,9 @@ mod tests {
     /// per-group radius was introduced to fix.
     #[test]
     fn reshow_reuses_the_groups_own_radius() {
+        // 0.18, pinned with its hand-derivation by
+        // `group_zone_radii_group_c_matches_hand_derivation`.
         let group_c = group_zone_radii(&FULL_7, 1.0)[4];
-        assert!(
-            (group_c - 0.18).abs() < 1e-9,
-            "expected 0.18, got {group_c}"
-        );
 
         let lone_survivor = focus::zone_radius(&[FULL_7[4]], 1.0);
         assert_eq!(
@@ -1819,12 +1923,17 @@ mod tests {
     #[test]
     fn collecting_instruction_is_unchanged_on_a_first_showing() {
         assert_eq!(
-            collecting_instruction(0, false, 1, 7),
+            collecting_instruction(0, false, 0, 1, 7),
             "Follow the dot with your eyes  ·  1 of 7 points"
         );
         assert_eq!(
-            collecting_instruction(0, true, 1, 7),
+            collecting_instruction(0, true, 0, 1, 7),
             "Hold still — keep looking at the dot  ·  1 of 7 points"
+        );
+        assert_eq!(
+            collecting_instruction(0, false, 1, 1, 7),
+            "Hold still — keep looking at the dot  ·  1 of 7 points",
+            "one confirmed in-zone tick is a dwell in progress"
         );
     }
 
@@ -1834,13 +1943,47 @@ mod tests {
     #[test]
     fn collecting_instruction_says_when_a_group_came_back() {
         assert_eq!(
-            collecting_instruction(1, false, 4, 7),
+            collecting_instruction(1, false, 0, 4, 7),
             "Let's try those dots again  ·  4 of 7 points"
         );
         assert_eq!(
-            collecting_instruction(1, true, 4, 7),
+            collecting_instruction(1, false, 12, 4, 7),
             "Hold still — keep looking at the dot  ·  4 of 7 points",
             "dwelling on a dot reads the same whatever attempt the group is on"
         );
+    }
+
+    /// Read from the state a re-show really starts in, not from a hand-made
+    /// one: `reshow_group` carries `focused` across (a late ack needs a point
+    /// to land on), so copy derived from the focus would say "hold still" on
+    /// the first frame of a group that has just come back — with the ring at
+    /// zero and the progress count standing still, i.e. exactly the silently
+    /// stalled reading this line exists to prevent.
+    #[test]
+    fn a_re_shown_group_reads_as_coming_back_though_it_carries_a_focus() {
+        let calibrated = [true, true, true, true, false, false, false];
+        match reshow_group(42, CalMode::Full, 2, calibrated, Some(5), 1) {
+            Phase::Collecting {
+                focused,
+                requested,
+                in_zone_ticks,
+                attempt,
+                calibrated,
+                ..
+            } => {
+                assert_eq!(focused, Some(5), "a re-show carries the focus it had");
+                assert_eq!(
+                    collecting_instruction(
+                        attempt,
+                        requested,
+                        in_zone_ticks,
+                        calibrated.iter().filter(|c| **c).count(),
+                        calibrated.len(),
+                    ),
+                    "Let's try those dots again  ·  4 of 7 points"
+                );
+            }
+            _ => panic!("a re-show must stay in Collecting"),
+        }
     }
 }
