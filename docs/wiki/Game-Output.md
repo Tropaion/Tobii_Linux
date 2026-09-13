@@ -319,9 +319,9 @@ uinput           /dev/uinput NOT WRITABLE — … install 60-tobii.rules and log
 The X-Plane plugin Linux users actually run is
 [`amyinorbit/headtrack`](https://github.com/amyinorbit/headtrack) (MIT), whose
 own source calls itself "an implementation of a basic OpenTrack protocol
-receiver". It binds UDP `0.0.0.0:4242` and reads a 48-byte payload of six
-`double`s, then writes `sim/graphics/view/pilots_head_{x,y,z}` in **centimetres**
-and `pilots_head_{psi,the,phi}` in **degrees**.
+receiver". It takes that protocol on UDP port **4242** — a 48-byte payload of
+six `double`s — then writes `sim/graphics/view/pilots_head_{x,y,z}` in
+**centimetres** and `pilots_head_{psi,the,phi}` in **degrees**.
 
 That is byte-for-byte what our opentrack sink already emits, on the port we
 already default to. So install the plugin and run:
@@ -341,16 +341,21 @@ switched on:
 tobii games set enabled true      # opentrack sink is on by default at 127.0.0.1:4242
 ```
 
-That needs no launch option either. The plugin binds `0.0.0.0:4242`, which is
-exactly what the port watch looks for: with `wake_for_opentrack` on (the
-default) the hub lights the tracker while X-Plane holds that socket and lets go
-within a second of X-Plane closing it, the tracker going dark after the usual
-three-second linger — a wildcard bind counts as a listener on the configured
-loopback address, which is what `listener.rs`'s
-`a_wildcard_bind_counts_as_listening_on_loopback` pins. A wrapper is needed here
-only where the watch cannot answer: turned off, or an opentrack address on
-another machine, where `probe` says `Unknown` and takes no hold. The standalone
-`tobii headpose` route needs neither, because it holds the USB session itself.
+That needs no launch option either, and with `wake_for_opentrack` on (the
+default) it should need no wrapper: the hub lights the tracker while X-Plane
+holds that socket and lets go within a second of X-Plane closing it, the tracker
+going dark after the usual three-second linger. What is *known* is the port,
+4242, which the plugin documents. The watch answers for either address that
+matters on it — a wildcard bind, or the configured loopback address itself,
+since a wildcard counts as a listener on that address, which is what
+`listener.rs`'s `a_wildcard_bind_counts_as_listening_on_loopback` pins. Which of
+those the plugin actually does has **not been observed here**: no real X-Plane
+has been watched binding the socket, the same caveat §11.3e carries for
+opentrack. Should it bind some third interface, `probe` never matches and this
+route wants a wrapper after all. It wants one for certain where the watch cannot
+answer at all: turned off, or an opentrack address on another machine, where
+`probe` says `Unknown` and takes no hold. The standalone `tobii headpose` route
+needs neither, because it holds the USB session itself.
 
 This matters because the virtual joystick genuinely *cannot* reach X-Plane:
 Laminar's own developer documentation is explicit that a joystick axis cannot be

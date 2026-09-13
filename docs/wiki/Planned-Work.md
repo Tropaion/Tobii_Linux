@@ -184,7 +184,10 @@ last two-eye frame's bit for bit — `PairOffset` holds the interocular vector a
 `pose_from_eyes` reads the rotation off precisely that vector — so the window
 drops them rather than counting one measurement up to nine times, which would
 pad the floor and pull the spread towards zero with duplicates taken while the
-head was free to move through the outage.
+head was free to move through the outage. A supplied pose is dropped the same
+way, by the `SuppliedPose::rotation_at` stamp it carries: a held model pose,
+which the front ends re-offer for up to a second, is counted once rather than
+on every frame of the window.
 
 `RECENTRE_MAX_SPREAD_DEG` is not a new number either: it *is*
 `tobii_headpose::MOVED_SPREAD_DEG`, **8.0**, the spread at which

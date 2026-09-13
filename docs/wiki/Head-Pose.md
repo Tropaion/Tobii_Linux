@@ -136,8 +136,14 @@ tracker's optical axis loses the two independently.
   takes the model's own position. It is *counted* on every frame either way, so
   `FramePipeline::fallback_stats` measures the tracker's own one-eye rate rather
   than how often the reconstruction won; `tobii headpose` and `--check` print it
-  as `, one eye N%` at the end of the rate line. The angles themselves are
-  stateless in both readouts, and still say nothing about a one-eye frame.
+  as `, one eye N%` at the end of the rate line. The angle fields themselves
+  differ between the two readouts. The hub's are stateless: `device.rs` derives
+  them with `pose_from_sample` from the frame in hand, so a one-eye frame blanks
+  them. `tobii headpose`'s and `--check`'s are the pipeline's composed pose —
+  this reconstruction wherever it won, printed with no marker of its own, so on
+  a one-eye frame inside `RECONSTRUCTION_MAX_AGE` the line keeps showing a yaw
+  and a roll instead of "NO HEAD DETECTED". The rate fragment is the only place
+  a held frame is named.
 
 **[HYPOTHESIS]** — unit-tested only; never run against a tracker, and the 300 ms
 bound is a judgement anchored to session notes rather than a fitted

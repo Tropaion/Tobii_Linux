@@ -526,11 +526,17 @@ because the reasoning is worth more than the tidiness.
     2026-08-09 session's per-eye dropout rates (34% left, 18% right of 400
     frames), which are **not** a distribution of how many poses a one-second
     window yields — the arithmetic from one to the other was never done against a
-    recording. The ten are **measured rotations**, not poses: a reconstructed
-    frame's yaw and roll are the last two-eye frame's bit for bit, so the window
-    drops them rather than counting one measurement up to nine times — which
-    makes the floor harder to reach on exactly the tracker those dropout rates
-    describe, by an amount nothing here has measured either.
+    recording. The ten are **measured rotations**, not poses, on both paths. A
+    reconstructed frame is dropped because its yaw and roll are the last two-eye
+    frame's bit for bit; a supplied pose is dropped when it carries a
+    `SuppliedPose::rotation_at` stamp the window has already counted, which is
+    how a held model pose — the front ends re-offer one for up to
+    `HEAD_POSE_MAX_AGE`, about 33 frames — is counted once rather than every
+    ~30 ms. Identity, not freshness: the two streams run at ~33 Hz and are not
+    in lockstep, so "measured on this frame" is false for nearly every good
+    frame, and only the pipeline knows what it has already counted. What is
+    unmeasured is how much harder this makes the floor to reach on exactly the
+    tracker those dropout rates describe.
     `RECENTRE_WINDOW = 1000 ms` is this page's own original figure, and how long
     a user actually holds a pose after clicking is unmeasured.
   - `REQUEST_MAX_AGE = 2 s` and the hub's 6 s outcome message are chosen bounds
@@ -558,14 +564,17 @@ because the reasoning is worth more than the tidiness.
   straight through this, and no test or measurement rules one out.
 - **None of the four has been run against a tracker.** All are unit-tested, each
   new test negative-controlled by undoing the change it covers — a control that
-  proves the test sees its own line, not that the suite catches every mutation:
-  the reconstruction's right-eye arm carried the left arm's arithmetic past the
-  whole suite until a test was written for that arm specifically. The hardware
-  halves are untestable here: that a one-eye frame's surviving origin behaves as
-  the rigid-offset model assumes, that holding a sample is the right answer to a
-  real glitch, that the device refuses a point the way the re-show assumes and
-  then collects it on a second showing, and that a settle window of real head
-  data passes its own spread test.
+  proves the test sees its own line, not that the suite catches every mutation.
+  A deliberate copy-paste of the `Seen::Left` arithmetic into the
+  reconstruction's `Seen::Right` arm moved the head centre 63 mm and survived
+  the whole suite — a mutation introduced to measure the suite, not a defect the
+  code ever shipped — and it is why `a_lost_eye_does_not_move_the_head_centre`
+  was extended to exercise both arms.
+  The hardware halves are untestable here: that a one-eye frame's surviving
+  origin behaves as the rigid-offset model assumes, that holding a sample is the
+  right answer to a real glitch, that the device refuses a point the way the
+  re-show assumes and then collects it on a second showing, and that a settle
+  window of real head data passes its own spread test.
 
 ### 11.3e The opentrack port watch (new since v0.3.1)
 

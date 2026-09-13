@@ -488,12 +488,20 @@ mod proc_net {
         /// forever, and the standby rule would be quietly dead.
         #[test]
         fn our_own_sender_is_not_mistaken_for_a_listener() {
-            // A port that was free a moment ago: bound to learn the number, then
-            // released, so nothing is listening there for the rest of the test.
-            let probe_sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
-            let target = probe_sock.local_addr().expect("local addr");
-            drop(probe_sock);
-            assert_eq!(probe(target), Listening::No, "premise: {target} is free");
+            // A port that is free *now*: bound to learn the number, released,
+            // and then checked. The check is the racy part — the whole suite
+            // runs in parallel and the kernel is free to hand the number it
+            // just took back to another test in the gap — so the port is picked
+            // again rather than asserted once. Seen failing once in a full-suite
+            // run before this loop existed.
+            let target = (0..16)
+                .find_map(|_| {
+                    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+                    let addr = sock.local_addr().expect("local addr");
+                    drop(sock);
+                    (probe(addr) == Listening::No).then_some(addr)
+                })
+                .expect("sixteen ephemeral ports were all taken in the gap");
 
             // The collision the kernel is free to hand us: a wildcard sender of
             // ours holding the very port the hub watches.
