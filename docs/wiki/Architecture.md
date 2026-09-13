@@ -196,17 +196,19 @@ off the device thread on a **one-slot channel that drops rather than queues** �
 a backlog of stale frames is worse than a skipped one.
 
 `Demand` is the reference count on the USB session. Consumers take a
-`DemandGuard`: the hub while its window has focus, the gaze overlay while shown,
-a calibration or setup flow while it runs, and a **socket client** for as long as
-it stays subscribed to pose, gaze or camera (`outputs::Holds::hello`) — which is
-all `tobii game` is, and the only reason a game lights the tracker. Game output
-itself takes no guard: the switch routes frames, it does not ask for the device.
-A queued command is the one thing
-that opens a session WITHOUT taking a guard — the device thread's wait is
+`DemandGuard`: the hub while its window has focus, the gaze overlay while
+shown, a calibration or setup flow while it runs, and a **socket client** for
+as long as it stays subscribed to pose, gaze or camera
+(`outputs::Holds::hello`) — which is all `tobii game` is. One more consumer
+needs no client at all: `outputs::PortWatch` holds a guard while a socket is
+bound where the opentrack sink sends (`wake_for_opentrack`, default on, with
+game output enabled), asked once a second through
+`tobii_output::listener::probe`. Game output itself takes no guard: the switch
+routes frames, it does not ask for the device. A queued command is the one
+thing that opens a session WITHOUT taking a guard — the device thread's wait is
 `!demand.active() && pending.is_empty()`, so "select left eye only" typed into
 an idle hub still takes effect. Three seconds after the last guard drops, the
-session closes. See
-[[Runtime-View]] §6.2 for why the linger exists.
+session closes. See [[Runtime-View]] §6.2 for why the linger exists.
 
 **`tobii-update`** — `net.rs` is the only place the crate touches the network;
 `install.rs` does digest → unpack → probe → swap with all-or-nothing rollback.

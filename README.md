@@ -325,6 +325,18 @@ The model reports pitch in its own frame, offset by how your tracker is mounted;
 model's yaw and roll beside the geometry's, which is how the sign conventions
 were confirmed on hardware.
 
+**If your in-game view sits permanently off to one side**, hold the posture you
+want to count as straight ahead and take a rotation reference:
+`tobii headpose --recenter` (`--recentre` works too) for this route, or the
+**Recentre view** button on the hub's *Head tracking for games* card for the
+hub's. It measures for a second, takes the median of the yaw and roll it saw,
+and refuses — leaving whatever reference you had in place, and saying why — if
+your head moved more than 8° across that second, or if the tracker did not see
+enough of it. Pitch is not touched: that zero comes from `--calibrate-pitch`.
+The hub's button is greyed out when it would refuse anyway: while the tracker
+is not running, while a calibration or display setup has the device, and while
+head tracking for games is off or has no output turned on for it to act on.
+
 ### In a game — two routes, and only one of them needs a wrapper
 
 **Just opentrack: run `tobii headpose` and play.** It is a complete path on its
@@ -346,7 +358,9 @@ infrared illuminators dark unless something is asking for the tracker, and a
 game cannot ask — it speaks opentrack or TrackIR, not this program's socket.
 **Turning "Head tracking for games" on is not itself a request**: that switch
 decides where frames go, not whether the tracker runs. So something has to ask
-on the game's behalf, and that is the entire job of the wrapper:
+on the game's behalf. With opentrack, the receiver does that by binding its port
+(below); for the virtual joystick and the Wine bridge, it is the entire job of
+the wrapper:
 
 ```sh
 tobii game -- %command%        # Steam: paste this into Launch Options
@@ -492,6 +506,7 @@ this program keeps one open only while something actually wants data:
 | Preview my gaze | while the overlay is shown |
 | Calibration, display setup, the accuracy diagnostic | while the flow is running |
 | Any program connected to the hub's socket asking for pose, gaze or camera — a game started with `tobii game` is one | while it stays connected |
+| A program bound to the address game output sends opentrack to — opentrack's *UDP over network* input, X-Plane's `headtrack` plugin | while that socket is open, checked about once a second (`wake_for_opentrack`, default on, with game output turned on) |
 | A queued setting (e.g. select eyes) | until it has been applied |
 
 Three seconds after the last of those lets go, the session closes and the LEDs
@@ -501,9 +516,11 @@ calibration blob, so alt-tabbing away and back should not pay for that twice.
 
 That table is the whole list, and **turning game output on is not on it**: the
 "Head tracking for games" switch decides where frames go, not whether the
-tracker runs. A hub with the switch on and nothing playing sits dark on purpose
-— which is why the hub route needs `tobii game` (or another socket client) and
-the `tobii headpose` route does not.
+tracker runs. A hub with the switch on, nothing connected and nothing bound to
+the opentrack address sits dark on purpose — which is why the joystick and the
+Wine bridge need `tobii game` (or another socket client), while opentrack and
+X-Plane are covered by the row above them, and the `tobii headpose` route needs
+neither because it holds the device itself.
 
 A useful consequence: while the hub is unfocused it holds no USB session, so
 `tobii headpose` can claim the device for a game without closing the hub first.

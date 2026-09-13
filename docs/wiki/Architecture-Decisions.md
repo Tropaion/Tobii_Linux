@@ -234,12 +234,14 @@ willingness to say "I can see you".
 
 Since `a804686` that algorithm exists **twice**, deliberately:
 `tobii-headpose::PairOffset` does the same reconstruction for the **pose**, in
-tracker-space millimetres rather than normalized trackbox positions, and ages in
-wall-clock time (300 ms) rather than in frames, so a stalled stream cannot make
-an old offset look fresh by not arriving. Sharing one implementation would have
-meant one unit system and one notion of patience serving a drawing and a 6-DOF
-pose, which want neither. The head-pose copy has not been run against a tracker
-— [[Quality-and-Risks]] §11.3d.
+tracker-space millimetres rather than normalized trackbox positions, and ages
+against two clocks (300 ms on both) rather than in frames: the host's, so a
+stalled stream cannot make an old offset look fresh by not arriving, and the
+frame's own `timestamp_us`, so a drained transport backlog stamped with one
+host time cannot either. Sharing one implementation would have meant one unit
+system and one notion of patience serving a drawing and a 6-DOF pose, which
+want neither. The head-pose copy has not been run against a tracker —
+[[Quality-and-Risks]] §11.3d.
 
 **24. Calibration area is sized by gaze angle, not by Tobii's 600 mm**, and
 there is no runtime curvature correction — the calibration absorbs it, and the

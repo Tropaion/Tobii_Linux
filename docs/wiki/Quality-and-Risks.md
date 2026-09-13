@@ -441,7 +441,15 @@ because the reasoning is worth more than the tidiness.
   - `RECONSTRUCTION_MAX_AGE = 300 ms` is a judgement anchored to the 2026-08-09
     session's notes — ordinary outages of ~95 ms (left eye) and ~120 ms (right),
     with two extremes at 480 ms and 1260 ms — and the distribution between them
-    was never recorded.
+    was never recorded. The 300 ms is measured against **two clocks**, because
+    neither bounds what the other does: the host's `Instant` refuses a *stalled*
+    stream, which produces no frames to age an offset with, and the frame's own
+    `timestamp_us` refuses a *drained backlog* — `tobii-usb` soaks incoming
+    transfers while a large frame goes out, and both callers stamp
+    `Instant::now()` per sample inside the drain, so one host time covers a
+    whole burst however far apart the frames were recorded. A frame without the
+    timestamp column, or one whose timestamp went backwards, falls through to
+    the host bound alone.
   - `MAX_HELD_FRAMES = 3` (91 ms at that cadence) is a chosen bound as well;
     nothing recorded here says how long a glitch lasts.
   Closing this needs one `tobii record` with a head in the trackbox and the
@@ -453,37 +461,61 @@ because the reasoning is worth more than the tidiness.
   there. That is what the age bound is for, and it also means a user who turns
   their head during a dropout is reported as not having turned, for up to
   300 ms.
-- **Where the fallback takes effect is narrower than it reads.** Both front ends
-  derive their pose with the *stateless* `pose_from_sample` and hand it to the
-  pipeline, which reconstructs only when that returned nothing and no fresh
-  neural pose exists — with one, `onnx::fuse` supplies the model's own position
-  instead, and the reconstruction is neither used nor counted. The hub's
-  head-pose readout and `tobii headpose --check`'s `eyes` line still show
-  nothing on a one-eye frame, so the feature is invisible in both places a user
-  would look to confirm it.
+- **Where the fallback takes effect is narrower than where it is counted.** Both
+  front ends derive their pose with the *stateless* `pose_from_sample` and hand
+  it to the pipeline, which *uses* the reconstruction only when that returned
+  nothing and no fresh neural pose exists — with one, `onnx::fuse` supplies the
+  model's own position instead and the reconstruction goes nowhere. It is still
+  counted there: the pipeline runs the geometry on every frame whoever ends up
+  supplying the pose, which is what makes the ratio in the bullet below a
+  statement about the tracker rather than about which path won. The hub's
+  head-pose readout, and the yaw/pitch/roll fields of the `eyes` line in
+  `tobii headpose --check`, still carry no marker of their own on a one-eye
+  frame — the rate fragment at the end of that line is the only place it is
+  named.
 - **The calibration re-show rests on `discard_calibration_point`**, which
   `tobii-usb`'s own doc marks as reverse-engineered from native disassembly and
   **unverified on real hardware** (`0x438` is [CODE-VERIFIED] in
-  [[Op-Catalog]] — disassembly, never a hardware round trip). Every re-show
-  sends one for the point that was in flight, and the call is best-effort: a
-  failure is logged and the flow continues. If the device does not in fact
+  [[Op-Catalog]] — disassembly, never a hardware round trip). A re-show after a
+  *refused* point sends one for the point that was in flight, and the call is
+  best-effort: a failure is logged and the flow continues. A re-show at the
+  group's **deadline** sends none, deliberately — `CalCollect` and `CalDiscard`
+  share one FIFO device queue, so a discard sent there would run *after* the
+  collect it means to cancel, and the device would ack the sample (raising a
+  count no discard decrements) before throwing it away — which the next tick
+  reads as a point captured, fitting the group without it. What that path accepts
+  instead: the collect it left running can ack late, and `focused` is carried
+  across the re-show so the ack lands on the point it belongs to — unless the
+  user has since settled on another point and a new collect is in flight, in
+  which case it is attributed to that one. If the device does not in fact
   discard, a re-shown point is collected on top of a partial sample rather than
   in place of it, and nothing here can detect that.
-- **The fallback is counted, and displayed nowhere.**
+- **The fallback is counted, and named on one status line.**
   `FramePipeline::fallback_stats` reports the both-eye and reconstructed frame
-  counts and whether the last pose was reconstructed; no crate in the workspace
-  reads it. So a reconstructed pose currently reaches opentrack, the joystick
-  and the Wine bridge looking exactly like a measured one — the failure mode the
-  `PoseSource`/`SourcedPose` distinction exists to prevent.
+  counts and whether the pose that went out was reconstructed. `tobii-cli`'s
+  `fallback_note` is its only reader: it appends `, one eye N%` — plus `(now)`
+  while the pose at that instant is one — to the rates that `tobii headpose`
+  prints and that `--check` carries at the end of its `eyes` line. The hub,
+  `tobii debug` and the sinks do not read it, so a reconstructed pose still
+  reaches opentrack, the joystick and the Wine bridge looking exactly like a
+  measured one — the failure mode the `PoseSource`/`SourcedPose` distinction
+  exists to prevent. What the ratio measures is the **tracker**: both counters
+  are raised from the geometry the pipeline runs on every frame, so
+  `reconstructed / (both_eyes + reconstructed)` is the share of frames the
+  device delivered with one eye, and a ratio climbing towards parity is a
+  tracker that cannot see an eye rather than a defect in this code. `active` is
+  the one field about the outgoing pose.
 - **The rotation recentre's two thresholds are chosen, not fitted.** Both come
   from the same shortage as the numbers above — no recording here contains a
   tracked eye, so there is no distribution of what a head *holding still*
   actually does over a second:
-  - `RECENTRE_MAX_SPREAD_DEG = 8.0` is **borrowed, not measured for this
-    purpose**: it is the spread at which `--calibrate-pitch` already tells a user
-    their head moved. Same shape of measurement, different axes, and a different
-    consequence — the pitch run reports a spread it dislikes and still hands over
-    the number, while this one **refuses** and leaves the old reference standing.
+  - `RECENTRE_MAX_SPREAD_DEG` is `tobii_headpose::MOVED_SPREAD_DEG`, **8.0**,
+    and it is **borrowed, not measured for this purpose**: it is the spread at
+    which `--calibrate-pitch` already tells a user their head moved, named once
+    as a shared constant rather than asserted alike in two places. Same shape of
+    measurement, different axes, and a different consequence — the pitch run
+    reports a spread it dislikes and still hands over the number, while this one
+    **refuses** and leaves the old reference standing.
     The nearest thing to evidence that the bar is passable is §10.1's pitch-zero
     run on real hardware: 10–90% spread **2.57°** while sitting still, a third of
     the limit — but that is one person, one setup, one axis, and not this code.
@@ -494,10 +526,23 @@ because the reasoning is worth more than the tidiness.
     2026-08-09 session's per-eye dropout rates (34% left, 18% right of 400
     frames), which are **not** a distribution of how many poses a one-second
     window yields — the arithmetic from one to the other was never done against a
-    recording. `RECENTRE_WINDOW = 1000 ms` is this page's own original figure,
-    and how long a user actually holds a pose after clicking is unmeasured.
+    recording. The ten are **measured rotations**, not poses: a reconstructed
+    frame's yaw and roll are the last two-eye frame's bit for bit, so the window
+    drops them rather than counting one measurement up to nine times — which
+    makes the floor harder to reach on exactly the tracker those dropout rates
+    describe, by an amount nothing here has measured either.
+    `RECENTRE_WINDOW = 1000 ms` is this page's own original figure, and how long
+    a user actually holds a pose after clicking is unmeasured.
   - `REQUEST_MAX_AGE = 2 s` and the hub's 6 s outcome message are chosen bounds
     around a consumption latency of one gaze frame; nothing measures either.
+- **The recentre's "nothing is composing" refusal reads the settings, not the
+  device.** `outputs::composing` asks what `GameOutput::for_session` answers by
+  returning `None` — game output switched on, and at least one destination
+  configured — so a request made with the switch off, or with nothing to send
+  to, is refused instead of expiring unanswered. It therefore still accepts one
+  where a sink exists on paper and not in fact: a `/dev/uinput` the kernel
+  refused, or an opentrack socket that would not open. Those are named by the
+  standing status line, which is what a refusal falls back to.
 - **What a recentre is *for* has never been checked end to end.** The 17.4°
   off-axis session that motivates it was measured before this existed, and
   nothing since has confirmed that taking a reference from such a posture removes
@@ -512,7 +557,10 @@ because the reasoning is worth more than the tidiness.
   (yaw r = 0.998, roll r = 0.990) but a constant offset between them would ride
   straight through this, and no test or measurement rules one out.
 - **None of the four has been run against a tracker.** All are unit-tested, each
-  new test negative-controlled by undoing the change it covers, and the hardware
+  new test negative-controlled by undoing the change it covers — a control that
+  proves the test sees its own line, not that the suite catches every mutation:
+  the reconstruction's right-eye arm carried the left arm's arithmetic past the
+  whole suite until a test was written for that arm specifically. The hardware
   halves are untestable here: that a one-eye frame's surviving origin behaves as
   the rigid-offset model assumes, that holding a sample is the right answer to a
   real glitch, that the device refuses a point the way the re-show assumes and
@@ -526,6 +574,20 @@ because the reasoning is worth more than the tidiness.
   game, so the illuminators stay lit for as long as it is open. `tobii games set
   wake_for_opentrack false` turns the watch off; the wrapper remains exact about
   when a game starts and stops.
+- **Two kinds of socket do not count at all**, because neither can receive what
+  we send: one that has `connect`ed — the kernel delivers it only its peer's
+  datagrams, which is most of the outbound UDP on a desktop — and one of our own
+  sinks, recognised as our inode (from `/proc/self/fd`) bound to a wildcard. The
+  second closes a latch: `OpentrackUdp` and `BridgeUdp` bind `0.0.0.0:0`, the
+  kernel draws that port from `ip_local_port_range` (32768–60999 on a stock
+  Linux), and it is free to draw the configured opentrack port precisely when
+  nothing else is bound there — which is the case the watch is asked about. The
+  hold would then keep the session, the session the sink, and the sink the
+  answer, and the tracker would never return to standby. The collision needs a
+  configured port inside that range, which the shipped default (4242) is not.
+  What the rule does **not** cover: a *foreign* unconnected sender that
+  transiently holds the watched port still reads as a listener, for up to one
+  poll interval.
 - **It sees only this host, in this network namespace.** A configured opentrack
   address that is not local answers `Unknown`, never `No`, and `Unknown` takes no
   hold — so sending to another machine, or to a receiver in its own namespace,
@@ -537,9 +599,12 @@ because the reasoning is worth more than the tidiness.
 - **What is measured:** a background hub held 0 USB file descriptors with nothing
   listening, 1 within four seconds of a socket binding the configured address,
   and 0 again after it closed. The parser is tested against captured
-  `/proc/net/udp` and `udp6` text, and one test binds a real socket on an
-  OS-assigned port. What is **not** measured is a real opentrack or X-Plane doing
-  the binding — both were inferred from the port they document.
+  `/proc/net/udp` and `udp6` text, and three tests bind real sockets: one on an
+  OS-assigned port, one that binds the wildcard on the watched port to prove our
+  own sender is skipped while an unfiltered look still finds it, and one that
+  `connect`s to prove a connected socket stops counting. What is **not** measured
+  is a real opentrack or X-Plane doing the binding — both were inferred from the
+  port they document.
 
 ### 11.4 Environmental
 

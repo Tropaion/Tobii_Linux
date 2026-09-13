@@ -89,15 +89,15 @@ pinned; see [[Architecture-Decisions]] §18.
 | `tobii-protocol` | 82 | Inline unit tests over captured real frames |
 | `tobii-usb` | 51 | 43 unit + 8 replay (see below) |
 | `tobii-config` | 73 | Unit; SHA-256 cross-checked against coreutils |
-| `tobii-headpose` | 92 (+7 ignored) | The ignored ones need the 13 MB model |
+| `tobii-headpose` | 112 (+7 ignored) | The ignored ones need the 13 MB model |
 | `tobii-update` | 104 | 96 unit + 8 install end-to-end |
 | `tobii-diagnostics` | 20 | The report and the log; a test fails if it leaks a home path |
-| `tobii-cli` | 91 | Argument parsing, text helpers, and `tobii uninstall`'s plan and execute on temporary trees |
-| `tobii-ipc` | 41 | 32 unit + 9 in `tests/roundtrip.rs` |
-| `tobii-output` | 104 (+1 ignored) | Unit |
-| `tobii-gtk` | 247 (+3 ignored) | Inline; pure logic split out from widget code. The ignored three need a display |
+| `tobii-cli` | 94 | Argument parsing, text helpers, and `tobii uninstall`'s plan and execute on temporary trees |
+| `tobii-ipc` | 42 | 33 unit + 9 in `tests/roundtrip.rs` |
+| `tobii-output` | 137 (+1 ignored) | Unit |
+| `tobii-gtk` | 280 (+3 ignored) | Inline; pure logic split out from widget code. The ignored three need a display |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
-| **Total** | **937 (+11 ignored)** | |
+| **Total** | **1027 (+11 ignored)** | |
 
 Counted with `cargo test -p <crate>`, not from memory: this table said "41 unit
 + 6 replay" for `tobii-usb` long after both numbers had moved, which is the

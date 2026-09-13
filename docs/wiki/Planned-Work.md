@@ -72,19 +72,24 @@ translation keeps following the eye that is really there. `PoseSource` and
 `SourcedPose` carry that distinction out of the crate, because the whole risk of
 this path is a guess that reads exactly like a measurement.
 
-**Left out.** The visibility this item asked for. The fallback is **counted, not
-shown**: `FramePipeline::fallback_stats` reports the both-eye and reconstructed
-frame counts and whether the last pose was reconstructed, and nothing reads it
-yet — `tobii debug`, the hub and `tobii headpose --check` live in crates that
-commit did not own. `tobii-headpose` has no logger of its own (it cross-compiles
-for the Wine bridge), so counting was the only in-crate option.
+**Left out, then half closed.** The visibility this item asked for. The fallback
+shipped **counted, not shown**: `FramePipeline::fallback_stats` reports the
+both-eye and reconstructed frame counts and whether the pose that went out was
+reconstructed, and nothing in that commit read it — `tobii debug`, the hub and
+`tobii headpose --check` live in crates it did not own. `tobii-headpose` has no
+logger of its own (it cross-compiles for the Wine bridge), so counting was the
+only in-crate option. `f25a2ea` then added `fallback_note` in `tobii-cli`, which
+puts `, one eye N%` on the rate line of `tobii headpose` and of `--check`. The
+hub and `tobii debug` still show nothing.
 
 **Different from what this item proposed.** This page read as "wire
 `eyeview::PairOffset` in". What shipped is a second implementation rather than a
 shared one: the eyeview version carries normalized trackbox positions for a
-drawing, this one tracker-space millimetres for a pose, and this one ages in
-**wall-clock** time so a stalled stream cannot make an old offset look fresh by
-simply not arriving.
+drawing, this one tracker-space millimetres for a pose, and this one ages
+against **two clocks**: the host's, so a stalled stream cannot make an old
+offset look fresh by simply not arriving, and the frame's own `timestamp_us`, so
+a transport backlog drained in one burst — every sample stamped with the same
+host time — cannot either.
 
 **Where it changes the output, and where it does not.** Only on frames where
 nothing else produced a pose — in practice the 5-DOF path. Both front ends
@@ -92,8 +97,11 @@ compute their pose with the *stateless* `pose_from_sample` first
 (`tobii-cli`'s headpose loop, `tobii-gtk`'s `device.rs`), and the pipeline uses
 the reconstruction only when that comes up empty and no fresh model pose exists;
 with one, `onnx::fuse` already falls back to the model's own position, so the
-reconstruction is bypassed and not counted. The hub's own head-pose readout and
-`--check`'s `eyes` line still show nothing on a one-eye frame.
+reconstruction is bypassed. It is still counted there — the pipeline runs the
+geometry on every frame, which is what makes the ratio a statement about the
+tracker rather than about which path won. The hub's own head-pose readout, and
+the angles on `--check`'s `eyes` line, still say nothing about a one-eye frame;
+the `, one eye N%` fragment at the end of that line is where it shows.
 
 ## 2. Reject-and-hold for glitches in the pose filter — shipped in `2ea22cd`
 
@@ -165,22 +173,38 @@ rather than sorted (a degenerate model quaternion normalises to NaN, and
 `partial_cmp` answers `None` for it), which costs the run those frames and so
 shows up as a window with too few poses, which is the truth.
 
-**Two ways a window is refused, and both leave the old reference standing.**
-`RECENTRE_MIN_POSES = 10` of the ~33 frames a second holds: a chosen floor
-bounded by measurement in both directions — the 2026-08-09 session lost its left
-eye in 34% of 400 frames and its right in 18%, so demanding most of the window
-would refuse an ordinary session, while a window that yielded fewer than ten
-poses means the tracker was mostly not seeing the user.
-`RECENTRE_MAX_SPREAD_DEG = 8.0` is not a new number either: it is the spread at
-which `--calibrate-pitch` already tells the user their head moved during the
-measurement — the same shape of measurement, so the same figure. It is **the worse of yaw and roll, not their
-average** — a head that held its yaw while swinging in roll was still moving —
-and it refuses rather than merely flagging, because a pitch run prints the number
-it measured while a rotation reference is invisible once applied. The bias this
-exists to remove is twice the bar (17.4° against 8°), so an off-axis user is
-refused for *moving*, never for being off-axis. Both refusals are reported:
-`RecentreOutcome` names what went wrong, because a recentre that quietly did not
-take is indistinguishable from nothing happening.
+**Three ways a window is refused, and all of them leave the old reference
+standing.** `RECENTRE_MIN_POSES = 10` of the ~33 frames a second holds: a chosen
+floor bounded by measurement in both directions — the 2026-08-09 session lost
+its left eye in 34% of 400 frames and its right in 18%, so demanding most of the
+window would refuse an ordinary session, while a window that yielded fewer than
+ten poses means the tracker was mostly not seeing the user. The ten are
+*measured rotations*, not poses: a reconstructed frame's yaw and roll are the
+last two-eye frame's bit for bit — `PairOffset` holds the interocular vector and
+`pose_from_eyes` reads the rotation off precisely that vector — so the window
+drops them rather than counting one measurement up to nine times, which would
+pad the floor and pull the spread towards zero with duplicates taken while the
+head was free to move through the outage.
+
+`RECENTRE_MAX_SPREAD_DEG` is not a new number either: it *is*
+`tobii_headpose::MOVED_SPREAD_DEG`, **8.0**, the spread at which
+`--calibrate-pitch` already tells the user their head moved during the
+measurement — the same shape of measurement reduced by the same
+`median_and_spread`, so one constant rather than the same figure written twice.
+It is **the worse of yaw and roll, not their average** — a head that held its
+yaw while swinging in roll was still moving — and it refuses rather than merely
+flagging, because a pitch run prints the number it measured while a rotation
+reference is invisible once applied. The bias this exists to remove is twice the
+bar (17.4° against 8°), so an off-axis user is refused for *moving*, never for
+being off-axis.
+
+The third is the window the user walks out of. A run abandoned by the
+tracking-loss reset is reported as `Interrupted`, separately from the `NoHead`
+the floor produces: it can be holding any number of perfectly good poses, and
+saying "found you in only 20 frames" against a floor of ten sends the user to
+look at their tracker instead of at the measurement they left. All three are
+reported — `RecentreOutcome` names what went wrong, because a recentre that
+quietly did not take is indistinguishable from nothing happening.
 
 **Before `compose`, never after.** The exact opposite of the rule for
 translation, for the opposite reason: after `compose` the angle also carries the
@@ -194,8 +218,8 @@ so the recentre takes effect on the first frame it possibly can.
 and the geometric path has no pitch to reference at all. The reference also
 **survives a tracking loss**, unlike the neutral beside it — walking away is not
 a request to undo something the user asked for — though a settle window *in
-flight* when the head is gone for a second is abandoned and reported rather than
-averaged across the gap.
+flight* when the head is gone for a second is abandoned and reported as
+`Interrupted` rather than averaged across the gap.
 
 **Three ways in, one place they are decided.** The hub's "Recentre view" button
 in the games row, `tobii headpose --recenter` (`--recentre` is accepted too,
@@ -207,16 +231,23 @@ what the codec's `Unknown` arm exists to make safe for an older client. Only the
 is composing frames — it is not a `DeviceCommand`, because a recentre changes
 nothing on the tracker.
 
-**Refused before it is taken, in the two states the asker cannot see.**
+**Refused before it is taken, in the three states the asker cannot see.**
 `recentre_decision` refuses while a flow holds the device exclusively
 (`EXCLUSIVE = ["calibration", "display setup"]`) — a calibration has the user
 following a stimulus dot into the corners, so the "posture" a window would
-average is whichever corner the dot was in — and when nothing is tracking, which
-would otherwise be a control that appears to do nothing. The hub's button is
-insensitive exactly when that function would refuse. A request nobody consumes
-goes stale after `REQUEST_MAX_AGE = 2 s`: game output takes one on its next gaze
-frame, 30.208 ms away, so anything still waiting two seconds later was asked for
-while nothing was composing frames, and performing it when a game finally starts
+average is whichever corner the dot was in — when nothing is tracking, which
+would otherwise be a control that appears to do nothing, and when nothing is
+composing a pose to recentre: the pipeline that performs one lives inside a
+`GameOutput`, and there is none with game output switched off or with no
+destination set, which is the state a fresh install is in. That last question
+is asked of the settings (`outputs::composing`, the same condition
+`GameOutput::for_session` answers by returning `None`), so it cannot see a sink
+that exists in the settings and failed to open. The hub's button is insensitive
+exactly when that function would refuse. A request nobody consumes goes stale
+after `REQUEST_MAX_AGE = 2 s`: game output takes one on its next gaze frame,
+30.208 ms away, so anything still waiting two seconds later has nothing taking
+it — the settings that refusal reads can be true and the composing session end
+between the ask and the take — and performing it when a game finally starts
 would take a reference from a posture nobody was holding. Two presses before
 either is taken collapse into one, which is what they mean.
 
@@ -228,10 +259,12 @@ either is taken collapse into one, which is what they mean.
   with the gate is tunable without a rebuild.
 - **The one-eye fallback is visible.** `fallback_note` appends
   `, one eye N%` to the rates that `tobii headpose` and `--check` already print,
-  with `(now)` while the current pose is a reconstruction — so a tracker that
-  cannot see one eye at all reads differently from one that blinked twenty
-  minutes ago. Item 1's "left out" is half closed: the hub and `tobii debug`
-  still show nothing.
+  with `(now)` while the pose at that instant is a reconstruction — so a tracker
+  that cannot see one eye at all reads differently from one that blinked twenty
+  minutes ago. The share is of the frames the tracker delivered, counted whoever
+  supplied the pose for them, so a session running on the neural model reports
+  the device's dropouts rather than 0%. Item 1's "left out" is half closed: the
+  hub and `tobii debug` still show nothing.
 
 **Different from what this item proposed.** This page said "average over a settle
 window of about a second". What shipped takes a **median**, and can **refuse** —
@@ -250,23 +283,32 @@ point. On a 49" panel one bad corner therefore cost every point already
 collected, and nothing on the device side required it: this flow sends per-point
 `CalCollect`/`CalDiscard` and already discards and re-dwells mid-collect.
 
-**Shipped.** `MAX_GROUP_ATTEMPTS = 3` in `calibrate_flow.rs` — the first showing
-plus two re-shows; only the last attempt still fails, with the same message it
-always gave. "Try again" is untouched and still restarts a genuinely failed run
-from the first point. A re-show keeps the points the group already captured
-(`calibrated` is monotonic, and clearing a captured bit would panic the
-`expect()` that reads `collected` against it), keeps `focused` so a collect that
-acks late still has a point to be attributed to, sends `CalDiscard` for whatever
-was in flight, and takes a fresh deadline and fade-in. The instruction line
-reads "Let's try those dots again", because the progress count does not move
-when a group comes back and the run would otherwise look stalled.
+**Shipped.** `MAX_GROUP_ATTEMPTS = 3` in `calibrate_flow.rs` — the first
+showing plus two re-shows; only the last attempt still fails, with the same
+message it always gave. "Try again" is untouched and still restarts a genuinely
+failed run from the first point. A re-show keeps the points the group already
+captured (`calibrated` is monotonic, and clearing a captured bit would panic
+the `expect()` that reads `collected` against it), keeps `focused` so a collect
+that acks late still has a point to be attributed to, and takes a fresh
+deadline and fade-in. A re-show after a *refused* point sends `CalDiscard` for
+the point that was in flight; a re-show at the group's **deadline** sends none,
+because the two commands share one FIFO device queue — a discard sent there
+would run after the collect it means to cancel, and the device would ack the
+sample, raising a count no discard decrements, before throwing it away. The
+next tick would read that advance, mark the point captured and fit the group
+without it: a run reported complete that is a point short. The instruction line
+reads "Let's try those dots again" until gaze settles on a dot again, because
+the progress count does not move when a group comes back and the run would
+otherwise look stalled.
 
 **"Too weak" is two signals, because there are only two.** The device answers
 `add_calibration_point` with an ack or an error and nothing else — `tobii-usb`
 drops the reply payload, and no per-point sample count has ever been decoded out
-of it — so a weak group means the device refused a point (`CalPhase::last_error`,
-read as an *edge* by gating on `requested`, or one error would empty the budget
-on consecutive ticks) or the group's own deadline elapsed. The mid-collect
+of it — so a weak group means the device refused a point
+(`CalPhase::last_error`, which is a level the flow **takes** under the lock on
+every `Collecting` tick and charges only while a collect is in flight — left in
+place, one refusal would be charged again to the re-shown group's first sample
+and empty the budget) or the group's own deadline elapsed. The mid-collect
 discard on lost focus is deliberately **not** one: it already recovers on its
 own, and charging it an attempt would spend the budget on the one failure mode
 this flow handles well.
@@ -325,8 +367,12 @@ port"), and the wrapper stays for the routes and the machines this cannot reach.
 
 **Shipped.** `tobii_output::listener::probe` answers `Yes` / `No` /
 `Unknown(why)`; `Unknown` never takes a hold, so a configured address this host
-cannot see keeps the old behaviour rather than guessing. The /proc path is
-behind `cfg(target_os = "linux")` because this crate cross-compiles to
+cannot see keeps the old behaviour rather than guessing. Two sockets on the
+watched port do not count: one that has `connect`ed, which the kernel serves
+only its peer's datagrams, and one of our own sinks — our inode, wildcard-bound
+— which the kernel can hand the configured port whenever nothing else holds it,
+and which would then hold the tracker on for itself with no way out. The /proc
+path is behind `cfg(target_os = "linux")` because this crate cross-compiles to
 `x86_64-pc-windows-gnu` for the Wine bridge. The hub polls once a second, not at
 the socket loop's 50 ms. The key is `wake_for_opentrack`, default **on**, and it
 does nothing until game output is `enabled` (off out of the box) and an

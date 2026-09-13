@@ -43,7 +43,9 @@ calibration or setup flow, and **a socket client**
 client subscribed to pose, gaze or camera). **Game output is not on that list**
 — `GameOutput::from_config` opens sinks and takes no guard — so the switch
 decides where frames go and never whether the tracker runs. A game cannot take a
-count either: it speaks opentrack or TrackIR, not this program's socket.
+count either: it speaks opentrack or TrackIR, not this program's socket. For the
+opentrack route the hub can see the *receiver* instead, which is the one
+consumer below that is not a socket client.
 
 That gap is the whole reason `tobii game` exists. It transports nothing: it
 connects to the hub's socket, subscribes to pose for the lifetime of the child
@@ -55,15 +57,20 @@ subscription does the same job.
 to the opentrack destination appears in `/proc/net/udp` (and `udp6`), so
 `tobii_output::listener::probe` looks for one and `PortWatch` in
 `crates/tobii-gtk/src/outputs.rs` holds a `DemandGuard` while it is there,
-polling once a second rather than at the socket loop's 50 ms. `probe` answers
-`Yes`, `No` or `Unknown(why)`, and `Unknown` — a configured address this host
-cannot see, or a platform without `/proc` — never takes a hold, so it degrades
-to the old behaviour instead of guessing. The key is `wake_for_opentrack`,
-default on, and it does nothing until game output is `enabled` and an opentrack
-address is set. This closes the gap for one route only: the joystick and the
-bridge receivers bind nothing the hub can see. The trade is that a bound socket
-is not a request — opentrack left open on a second monitor is indistinguishable
-from opentrack feeding a game, so the illuminators stay lit until it is closed.
+polling once a second rather than at the socket loop's 50 ms. Two sockets on
+that port are skipped, because neither could receive our datagrams: one that
+has `connect`ed to a peer, and one of our own sinks — our inode, bound to a
+wildcard — which the kernel can hand the configured port whenever nothing else
+holds it, and which would otherwise hold the tracker on for itself for ever.
+`probe` answers `Yes`, `No` or `Unknown(why)`, and `Unknown` — a configured
+address this host cannot see, or a platform without `/proc` — never takes a
+hold, so it degrades to the old behaviour instead of guessing. The key is
+`wake_for_opentrack`, default on, and it does nothing until game output is
+`enabled` and an opentrack address is set. This closes the gap for one route
+only: the joystick and the bridge receivers bind nothing the hub can see. The
+trade is that a bound socket is not a request — opentrack left open on a second
+monitor is indistinguishable from opentrack feeding a game, so the illuminators
+stay lit until it is closed.
 
 ## The composition order is load-bearing
 
@@ -103,9 +110,14 @@ Where the pipeline is the one deriving the pose — the 5-DOF path, with no fres
 neural pose — a frame carrying only **one** tracked eye still produces one: the
 missing eye is placed at the last measured interocular offset, for up to 300 ms.
 Rotation is *held* at its last measurement there; only translation follows the
-surviving eye. `FramePipeline::fallback_stats` counts how many poses a session
-owes to that, though nothing displays it yet. See [[Head-Pose]] and
-[[Quality-and-Risks]] §11.3d — none of this has been run against a tracker.
+surviving eye. `FramePipeline::fallback_stats` counts the frames the tracker
+delivered with one eye against those it delivered with two — the geometry is run
+on every frame, so the ratio describes the device rather than which path won —
+and `tobii headpose` prints it at the end of its rate line as `, one eye N%`,
+`(now)` while the pose at that instant is a reconstruction. `--check` carries
+the same fragment on its `eyes` line. Nothing else reads it: the hub and
+`tobii debug` show nothing. See [[Head-Pose]] and [[Quality-and-Risks]] §11.3d —
+none of this has been run against a tracker.
 
 ## Virtual joystick
 
@@ -329,11 +341,16 @@ switched on:
 tobii games set enabled true      # opentrack sink is on by default at 127.0.0.1:4242
 ```
 
-with the caveat from the section above: the hub sends nothing while nothing is
-asking for the tracker, so X-Plane started on its own gets a dark tracker until
-`tobii game -- <the X-Plane launcher>`, or another socket client, holds the
-demand. That is the asymmetry worth knowing before choosing a route — the
-standalone command needs no such holder, because it *is* one.
+That needs no launch option either. The plugin binds `0.0.0.0:4242`, which is
+exactly what the port watch looks for: with `wake_for_opentrack` on (the
+default) the hub lights the tracker while X-Plane holds that socket and lets go
+within a second of X-Plane closing it, the tracker going dark after the usual
+three-second linger — a wildcard bind counts as a listener on the configured
+loopback address, which is what `listener.rs`'s
+`a_wildcard_bind_counts_as_listening_on_loopback` pins. A wrapper is needed here
+only where the watch cannot answer: turned off, or an opentrack address on
+another machine, where `probe` says `Unknown` and takes no hold. The standalone
+`tobii headpose` route needs neither, because it holds the USB session itself.
 
 This matters because the virtual joystick genuinely *cannot* reach X-Plane:
 Laminar's own developer documentation is explicit that a joystick axis cannot be

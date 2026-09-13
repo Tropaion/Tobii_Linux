@@ -128,13 +128,26 @@ The failure screen's "Try again" is unchanged and still restarts from the first
 point.
 
 A re-show keeps the points that group already captured, keeps `focused` so a
-late ack still has a point to land on, sends `discard_point` (`0x438`) for
-whatever collect was in flight, and takes a fresh deadline. Only two things
-count as "too weak", because the device offers nothing else: `add_point` answers
-with an ack or an error and no per-point sample count has ever been decoded out
-of it, so the signals are the error (read as an edge, charged to the tick that
-was waiting for that ack) and the group's own timeout. The mid-collect discard
-on lost focus is deliberately *not* one — it already recovers by itself.
+late ack still has a point to land on, and takes a fresh deadline. Whether it
+also sends `discard_point` (`0x438`) depends on which signal brought it back:
+after a *refused* point it does, for the point that was in flight; at the
+group's **deadline** it does not, because `add_point` and `discard_point` share
+one FIFO device queue, so a discard sent there would run after the collect it
+means to cancel — the device would ack the sample, raising a count no discard
+decrements, and the flow would fit the group without a point it believes it
+captured.
+
+Only two things count as "too weak", because the device offers nothing else:
+`add_point` answers with an ack or an error and no per-point sample count has
+ever been decoded out of it, so the signals are the error and the group's own
+timeout. The error is a *level* — the device thread holds the last one until a
+successful collect clears it — so the flow **takes** it out of the device state
+on every `Collecting` tick and charges it only while a collect is in flight;
+left in place it would be charged again the moment the re-shown group asked for
+its first sample, and one transient refusal would spend the whole budget. The
+mid-collect discard on lost focus is deliberately *not* a weakness — it already
+recovers by itself, and an error that lands after it has cleared `requested` is
+dropped rather than billed to the user's next good sample.
 
 Three attempts is a judgement bounded by arithmetic, not a measured or
 decompiled figure: ~33 s per member caps a three-point group's attempt at ~99 s,
