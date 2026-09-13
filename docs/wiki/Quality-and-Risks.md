@@ -420,7 +420,7 @@ because the reasoning is worth more than the tidiness.
   by the install-script tests with an entry, an icon and an applications folder
   the user cannot write (skipped as root, whom chmod does not bind).
 
-### 11.3d The one-eye fallback, the filter's gate, the calibration re-show and the rotation recentre (new since v0.3.1)
+### 11.3d The one-eye fallback, the filter's gate, the calibration re-show and the rotation recentre (new in v0.4.0)
 
 - **No committed recording in this repository contains a tracked eye**, so
   neither head-pose number below is fitted to real motion. Decoded rather than
@@ -576,7 +576,7 @@ because the reasoning is worth more than the tidiness.
   re-show assumes and then collects it on a second showing, and that a settle
   window of real head data passes its own spread test.
 
-### 11.3e The opentrack port watch (new since v0.3.1)
+### 11.3e The opentrack port watch (new in v0.4.0)
 
 - **A bound socket is not a request, and this cannot tell the difference.**
   opentrack left open on a second monitor looks exactly like opentrack feeding a
