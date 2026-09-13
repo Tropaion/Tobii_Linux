@@ -310,9 +310,10 @@ impl GamesRow {
             });
         }
 
-        // Its own row rather than a fourth item on the top row: the top row is
-        // already a switch and three radios, and the hub is laid out to stay
-        // narrow.
+        // Not on the top row: that is already a switch and three radios, and
+        // the hub is laid out to stay narrow. It shares the second row with the
+        // recentre button instead, which is 30px of card height cheaper than a
+        // row each and still well inside the column's width.
         let (joy, joy_row) = check_row("Virtual joystick");
         joy.set_active(cfg.joystick);
         joy_row.set_tooltip_text(Some(
@@ -374,10 +375,10 @@ impl GamesRow {
         top.append(&sw);
         top.append(&strength_ctl);
         controls.append(&top);
-        controls.append(&joy_row);
-        let recentre_row = gtk::Box::new(Orientation::Horizontal, 8);
-        recentre_row.append(&recentre);
-        controls.append(&recentre_row);
+        let second = gtk::Box::new(Orientation::Horizontal, 16);
+        second.append(&joy_row);
+        second.append(&recentre);
+        controls.append(&second);
         controls.append(&status);
 
         let row = GamesRow {

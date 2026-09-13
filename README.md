@@ -300,102 +300,78 @@ diagnostics (`streams`, `log`, `dump-stream`, `camera`, `cal-blob`,
 ## Head tracking for games
 
 ```sh
-tobii headpose --fetch-model      # optional: adds pitch (see below)
+tobii headpose --fetch-model      # optional: adds pitch
 tobii headpose --calibrate-pitch  # once, sitting normally
 tobii headpose                    # stream to opentrack on :4242
 ```
 
-(Installed, as above; from a build tree, `./target/release/tobii`.)
+Point opentrack's **UDP over network** input at `127.0.0.1:4242` and play. That
+command is the whole route: it opens the tracker, composes the pose and sends
+the datagram, with no hub running and nothing wrapping your game. **X-Plane
+11/12** binds that port natively and needs no opentrack at all. The tracker is
+lit for exactly as long as the command runs. (From a build tree, that is
+`./target/release/tobii`.)
 
-Point opentrack's **UDP over network** input at `127.0.0.1:4242`. Without the
-model this still works — you get position, yaw and roll, and pitch reads zero.
-That command is the whole route: it opens the tracker itself and sends the
-datagram itself, with no hub running and nothing wrapping your game.
+**The hub is the other route**, and the one to use if you want the virtual
+joystick, the Wine bridge and opentrack fed at once: only one process can claim
+the ET5 over USB, so they all have to come from the same place.
 
-**5 DOF with no extra download**: position in millimetres plus yaw and roll,
-derived from the two eye origins. **6 DOF with the optional model**: it adds
-**pitch**, which two eye origins cannot express — nodding rotates the head about
-the line through them and leaves both origins where they were. A neural model
-reads it from the tracker's own infrared camera at ~12 ms a frame. The model is
-**not shipped**: its weights are non-commercial-only, so the program shows the
-terms and fetches it only if you agree.
+### Five degrees of freedom, or six
+
+Position in millimetres plus yaw and roll come from the two eye origins, with
+nothing to download. **Pitch** cannot: nodding rotates your head about the line
+through your eyes and leaves both origins where they were. A neural model reads
+it from the tracker's own infrared camera at ~12 ms a frame. That model is **not
+shipped** — its weights are non-commercial-only, so the program shows you the
+terms and fetches it only if you agree. Without it pitch reads zero and
+everything else works.
 
 The model reports pitch in its own frame, offset by how your tracker is mounted;
 `--calibrate-pitch` measures that once. `tobii headpose --check` prints the
 model's yaw and roll beside the geometry's, which is how the sign conventions
 were confirmed on hardware.
 
-**If your in-game view sits permanently off to one side**, hold the posture you
-want to count as straight ahead and take a rotation reference:
-`tobii headpose --recenter` (`--recentre` works too) for this route, or the
-**Recentre view** button on the hub's *Head tracking for games* card for the
-hub's. It measures for a second, takes the median of the yaw and roll it saw,
-and refuses — leaving whatever reference you had in place, and saying why — if
-your head moved more than 8° across that second, or if the tracker did not see
-enough of it. Pitch is not touched: that zero comes from `--calibrate-pitch`.
-The hub's button is greyed out when it would refuse anyway: while the tracker
-is not running, while a calibration or display setup has the device, and while
-head tracking for games is off or has no output turned on for it to act on.
+### If your in-game view sits off to one side
 
-### In a game — two routes, and only one of them needs a wrapper
+Hold the posture that should count as straight ahead and take a rotation
+reference: `tobii headpose --recenter` (`--recentre` works too), or **Recentre
+view** on the hub's *Head tracking for games* card. It measures for a second,
+takes the median of the yaw and roll it saw, and refuses — keeping whatever
+reference you had, and saying why — if your head moved more than 8° across that
+second, or if the tracker saw too little of it. Pitch is untouched: that zero
+comes from `--calibrate-pitch`. The hub greys the button out wherever it would
+refuse anyway — no tracker running, a calibration or display setup holding the
+device, or nothing switched on for the recentre to act on.
 
-**Just opentrack: run `tobii headpose` and play.** It is a complete path on its
-own — it opens the tracker over USB, composes the pose and sends the 48-byte
-opentrack datagram to `127.0.0.1:4242` until you stop it. Anything that reads
-that datagram is served by it: opentrack itself, and **X-Plane 11/12**, which
-binds the port natively through the `headtrack` plugin and needs no opentrack at
-all (see [`docs/wiki/Game-Output.md`](docs/wiki/Game-Output.md)). No hub, no
-`tobii game`, no launch options. Start it before the game, Ctrl-C afterwards —
-the tracker is lit for exactly as long as the command runs.
+### What lights the tracker
 
-**Everything at once: let the hub own the device.** Only one process can claim
-the ET5 over USB, so if you want the virtual joystick, the Wine bridge and
-opentrack fed from one place, that place is the hub: it holds the connection and
-fans the same composed frame out to every sink you have turned on.
+The hub keeps the infrared illuminators dark unless something is asking for the
+tracker, and **turning "Head tracking for games" on is not itself a request**:
+that switch decides where frames go, not whether the tracker runs.
 
-The price of that is a signal the hub cannot get by itself. It keeps the
-infrared illuminators dark unless something is asking for the tracker, and a
-game cannot ask — it speaks opentrack or TrackIR, not this program's socket.
-**Turning "Head tracking for games" on is not itself a request**: that switch
-decides where frames go, not whether the tracker runs. So something has to ask
-on the game's behalf. With opentrack, the receiver does that by binding its port
-(below); for the virtual joystick and the Wine bridge, it is the entire job of
-the wrapper:
+For **opentrack**, the receiver asks by binding the port, and the hub watches for
+that — open opentrack and play, with no launch option at all. Measured on a hub
+with no window open: **0** USB file descriptors with nothing listening, **1**
+within four seconds of a socket binding `127.0.0.1:4242`, **0** again once it
+closed. The catch is that an opentrack left open with no game keeps the tracker
+lit; `tobii games set wake_for_opentrack false` turns the watch off.
+
+For the **virtual joystick and the Wine bridge** nothing binds a port the hub
+can see, so wrap the game instead:
 
 ```sh
 tobii game -- %command%        # Steam: paste this into Launch Options
 tobii game -- ./MyGame.x86_64  # or anywhere else
 ```
 
-It carries no tracking data at all. It connects to the hub's socket, subscribes
-to pose for as long as the child process lives, and lets go when it exits — so
-the hub lights the tracker while the game runs and drops it afterwards. Measured
-on the wrapper above: **0 USB file descriptors held before, 1 while the game
-runs, 0 again afterwards.** Any program that connects to that socket and asks
-for pose does the same; the wrapper is simply the one that knows exactly how
-long a game lives.
-
-**For opentrack, the hub can see the request without being told.** A program
-that binds the address the opentrack sink sends to — opentrack's "UDP over
-network" input, or X-Plane — is visible to the hub, which treats it as the ask,
-lights the tracker while the socket is open, and drops it when it closes.
-Measured on a hub with no window open: **0** USB file descriptors with nothing
-listening, **1** within four seconds of a socket binding `127.0.0.1:4242`, **0**
-again after it closed. So for opentrack through the hub there is no launch
-option either — open opentrack and play. The joystick and the Wine bridge still
-need the wrapper, because neither receiver binds anything the hub can see, and
-an opentrack left open with no game keeps the tracker lit, which the wrapper
-never does: `tobii games set wake_for_opentrack false` turns the watch off.
-
-The hub must be running for it (it is, if you closed its window rather than
-quitting). `tobii game` is transparent to whatever launched it: it exits with
-the game's own exit code, reports a killed game as 128 + the signal rather than
-as success, and **never stops the game starting**. With no hub running it prints
-a note and runs the game anyway — head tracking is worth less than the game
-launching.
-
-Steam's `%command%`, Lutris's and Heroic's wrapper fields, and a plain shell
-script all work with no further support, which is why this is a wrapper rather
+The wrapper carries no tracking data. It holds a subscription to the hub's
+socket for as long as the child process lives — measured: **0** USB file
+descriptors before, **1** while the game runs, **0** again afterwards — so the
+hub knows exactly how long a game lasts. It is transparent to whatever launched
+it, exiting with the game's own code and reporting a killed game as 128 + the
+signal, and it **never stops the game starting**: with no hub running it prints
+a note and launches anyway. Steam's `%command%`, Lutris's and Heroic's wrapper
+fields and a plain shell script all work, which is why this is a wrapper rather
 than a setting.
 
 <details>
