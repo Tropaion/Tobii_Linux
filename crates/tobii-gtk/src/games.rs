@@ -44,6 +44,16 @@ const STRENGTHS: [(&str, f64, f64); 3] = [
     ("Strong", 70.0, 40.0),
 ];
 
+/// The question the three names answer, since the names alone do not say what
+/// they are three strengths OF.
+///
+/// A tooltip rather than a caption because the card has just been cut to two
+/// rows and a status line on purpose, and a caption is a fourth line of card.
+/// It goes on the box around the three, which is what a pointer anywhere in
+/// that row resolves to: none of the radios or their labels carry one of their
+/// own, so the query walks up to it.
+const STRENGTH_TOOLTIP: &str = "How far the view swings when you look at the edge of the screen";
+
 /// Whether simply starting opentrack is enough to switch the tracker on.
 ///
 /// Asks [`crate::outputs::watch_target`] rather than reading the two settings
@@ -107,7 +117,22 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStat
     if sinks.is_empty() {
         return match trouble {
             Some(t) => format!("{t}. Nothing else is configured, so nothing will receive it."),
-            None => "On, but no destination is configured — nothing will receive it.".to_string(),
+            // The only sentence here that would otherwise leave the user with
+            // nothing to do: the window has exactly one control that sets a
+            // destination, and the other two live in `games.toml`, so both are
+            // named. Reachable only from a config with the joystick unticked
+            // AND both addresses cleared, which takes a `tobii games set` to
+            // arrange — but that is precisely a user who is in the file
+            // already.
+            //
+            // It costs no card height: at the status line's 44-character wrap
+            // it is three lines, the same as the "Ready to send to …" sentence
+            // every configured user already sees (measured at the card's 380px:
+            // 58px of label, against 77 for that sentence with three
+            // destinations named).
+            None => "On, but no destination is configured — nothing will receive it. \
+                     Tick Virtual joystick, or: tobii games set opentrack 127.0.0.1:4242"
+                .to_string(),
         };
     }
     let to = sinks.join(" and ");
@@ -149,6 +174,46 @@ fn sentence(s: &str) -> String {
     match c.next() {
         Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
         None => String::new(),
+    }
+}
+
+/// What the Recentre button is for — the hub's only explanation of it, since
+/// the card's prose was cut to the status line.
+///
+/// A const because it has to be on two widgets. GTK skips an insensitive
+/// widget when it picks a hover target, and this button is insensitive exactly
+/// when [`recentre_decision`] would refuse — which on a fresh install, with
+/// game output off, is from the first paint. So the button carries it while it
+/// is pressable, and the row around the button carries it the rest of the
+/// time, where the hover does land. See [`recentre_tooltip`].
+const RECENTRE_TOOLTIP: &str =
+    "Sit the way you play, look at the centre of the screen, and press this: \
+     the head angle you are holding becomes straight ahead in the game. Hold \
+     still for a second while it measures. Games with their own centring key \
+     still have it; this fixes a tracker that is not quite square to you.";
+
+/// What the virtual joystick is, on the control and not only on the box that
+/// lays it out.
+///
+/// The row is a container: it carries the sentence for the label beside the
+/// checkbox, because a tooltip query walks up from a child that has none. The
+/// checkbox is the thing the sentence is about, and it is now sharing its row
+/// with a button that carries a tooltip of its own.
+const JOYSTICK_TOOLTIP: &str =
+    "Present head pose and gaze as a game controller, for games with no \
+     head-tracking support. Works in native and Proton games without Wine \
+     or opentrack.";
+
+/// The tooltip for the row around the Recentre button: what recentring is,
+/// plus — while the button is refusing to be pressed — the reason it is.
+///
+/// The refusals in [`recentre_decision`] are written for someone who just
+/// pressed the button, and greying it out means nobody ever can. They are the
+/// answer to "why is this one grey", so this is where they are said instead.
+fn recentre_tooltip(decision: &Result<(), String>) -> String {
+    match decision {
+        Ok(()) => RECENTRE_TOOLTIP.to_string(),
+        Err(why) => format!("{RECENTRE_TOOLTIP}\n\nNot right now: {why}."),
     }
 }
 
@@ -205,6 +270,9 @@ pub struct GamesRow {
     /// pressable and then declines is worse than one that is plainly not
     /// available yet.
     recentre: gtk::Button,
+    /// The row the recentre button sits in, held for the tooltip GTK can still
+    /// show while the button itself is insensitive — see [`recentre_tooltip`].
+    recentre_row: gtk::Box,
     /// Where the request is left and the outcome comes back from.
     recentring: Recentring,
     demand: Demand,
@@ -252,6 +320,7 @@ impl GamesRow {
         status.add_css_class("section-desc");
 
         let strength_ctl = gtk::Box::new(Orientation::Horizontal, 16);
+        strength_ctl.set_tooltip_text(Some(STRENGTH_TOOLTIP));
         let mut buttons: Vec<CheckButton> = Vec::new();
         let selected = strength_index(&cfg);
         for (i, (name, _, _)) in STRENGTHS.iter().enumerate() {
@@ -316,11 +385,8 @@ impl GamesRow {
         // row each and still well inside the column's width.
         let (joy, joy_row) = check_row("Virtual joystick");
         joy.set_active(cfg.joystick);
-        joy_row.set_tooltip_text(Some(
-            "Present head pose and gaze as a game controller, for games with no \
-             head-tracking support. Works in native and Proton games without Wine \
-             or opentrack.",
-        ));
+        joy.set_tooltip_text(Some(JOYSTICK_TOOLTIP));
+        joy_row.set_tooltip_text(Some(JOYSTICK_TOOLTIP));
         {
             let refresh = refresh.clone();
             joy.connect_toggled(move |c| {
@@ -335,12 +401,7 @@ impl GamesRow {
         let tracker_on = Rc::new(Cell::new(false));
         let composing = Rc::new(Cell::new(crate::outputs::composing(&cfg)));
         let recentre = crate::widget::button("Recentre view");
-        recentre.set_tooltip_text(Some(
-            "Sit the way you play, look at the centre of the screen, and press this: \
-             the head angle you are holding becomes straight ahead in the game. Hold \
-             still for a second while it measures. Games with their own centring key \
-             still have it; this fixes a tracker that is not quite square to you.",
-        ));
+        recentre.set_tooltip_text(Some(RECENTRE_TOOLTIP));
         {
             let recentring = recentring.clone();
             let demand = demand.clone();
@@ -389,6 +450,7 @@ impl GamesRow {
             strength: buttons,
             joystick,
             recentre,
+            recentre_row: second,
             recentring,
             demand,
             tracker_on,
@@ -430,9 +492,15 @@ impl GamesRow {
         // says so by being unavailable rather than by refusing after the press.
         self.tracker_on.set(tracker_on);
         self.composing.set(crate::outputs::composing(&cfg));
-        self.recentre.set_sensitive(
-            recentre_decision(&self.demand.reasons(), tracker_on, self.composing.get()).is_ok(),
-        );
+        let decision = recentre_decision(&self.demand.reasons(), tracker_on, self.composing.get());
+        self.recentre.set_sensitive(decision.is_ok());
+        // Compared before writing for the same reason the controls above are:
+        // this runs on the 33 ms hub tick, and the refusal only changes when
+        // something the user did changes it.
+        let tip = recentre_tooltip(&decision);
+        if self.recentre_row.tooltip_text().as_deref() != Some(tip.as_str()) {
+            self.recentre_row.set_tooltip_text(Some(&tip));
+        }
 
         let js = self.joystick.lock().unwrap().clone();
         let text = match self.recentring.message(Instant::now()) {
@@ -510,6 +578,51 @@ mod tests {
                 assert_ne!(a, b, "two states read identically");
             }
         }
+    }
+
+    /// The one status line that used to end with nothing to do about it.
+    ///
+    /// Every other sentence either reports a working destination or names the
+    /// thing that failed; this one says nothing is configured, and the window
+    /// has exactly one control that configures anything — so it says which,
+    /// and says where the other destinations are set, since they are not in
+    /// this window at all.
+    #[test]
+    fn the_line_with_no_destination_says_how_to_get_one() {
+        let s = text(&cfg_with(true, None, None), true);
+        assert!(s.contains("no destination"), "{s}");
+        assert!(
+            s.contains("Virtual joystick"),
+            "the one remedy inside this window has to be named: {s}"
+        );
+        assert!(
+            s.contains("tobii games set opentrack"),
+            "and the one for a destination the window cannot set: {s}"
+        );
+    }
+
+    /// The Recentre button's tooltip is the hub's only explanation of what
+    /// recentring is, and GTK cannot show it while the button is insensitive —
+    /// which is exactly when a user asks what the grey button is. The row
+    /// around it carries the same sentence, plus the refusal that a press would
+    /// have printed if a press were possible.
+    #[test]
+    fn the_row_around_a_refusing_recentre_button_explains_it_and_says_why() {
+        let refused = recentre_decision(&[], false, false);
+        let why = refused.clone().expect_err("no tracker means no recentre");
+        let tip = recentre_tooltip(&refused);
+        assert!(
+            tip.starts_with("Sit the way you play"),
+            "a grey button still has to say what it is for: {tip}"
+        );
+        assert!(
+            tip.contains(&why),
+            "and why it is grey, in the words the click would have used: {tip}"
+        );
+
+        // Pressable: the button's own tooltip is reachable again and says the
+        // same thing, so the row must not add a reason that no longer applies.
+        assert_eq!(recentre_tooltip(&Ok(())), RECENTRE_TOOLTIP);
     }
 
     /// The wrapper is not the only way in any more, and the line that tells a

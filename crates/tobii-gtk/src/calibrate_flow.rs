@@ -397,6 +397,16 @@ enum Phase {
         /// `weak_group_action`), and back to 0 the moment the flow moves on
         /// to the next group — the budget is per group, not per run.
         attempt: u32,
+        /// How many device acks this flow has seen and deliberately charged to
+        /// no point at all — see [`Advance::Unattributable`], which is the only
+        /// thing that raises it.
+        ///
+        /// Counted rather than ignored because `CalPhase::collected` is a
+        /// level, not an edge: an ack left uncounted would still be above the
+        /// captured total on the next tick, and every tick after that. Carried
+        /// across groups for the same reason `calibrated` is — the device's
+        /// counter is per session, not per group.
+        swallowed: usize,
     },
     Computing {
         /// The session token this phase belongs to (see `Starting`).
@@ -413,10 +423,10 @@ enum Phase {
 /// **Points this group already collected stay collected** and are not offered
 /// again. That is not merely to save the user time: `CalPhase::collected` is a
 /// monotonic count of successful `add_point` calls that no discard ever
-/// decrements, so un-marking a captured point would make
-/// `cal.collected > total_captured` true on the next tick with no capture in
-/// flight — the branch reading that comparison would claim a capture nobody
-/// requested, and its `focused.expect(...)` would panic.
+/// decrements, so un-marking a captured point would make the ack count read
+/// as an advance on the next tick with no capture in flight — and the branch
+/// reading that comparison would claim a capture nobody requested (see
+/// [`read_advance`]).
 ///
 /// **`focused` is carried across**, for the same reason the mid-collect
 /// discard path carries it: if a collect was still in flight when the group
@@ -443,6 +453,7 @@ fn reshow_group(
     calibrated: [bool; 7],
     focused: Option<usize>,
     attempt: u32,
+    swallowed: usize,
 ) -> Phase {
     Phase::Collecting {
         token,
@@ -456,6 +467,62 @@ fn reshow_group(
         requested: false,
         ticks: 0, // a fresh deadline and fade-in: the group visibly comes back
         attempt,
+        swallowed, // session-wide, so it survives the re-show like `calibrated`
+    }
+}
+
+/// What one tick's reading of `CalPhase::collected` means for the flow.
+///
+/// The device's counter is a plain total of successful `add_point` calls, not
+/// indexed by point, so "a sample landed" is the counter standing above what
+/// this flow has already accounted for ([`accounted_acks`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Advance {
+    /// No ack since the last tick.
+    None,
+    /// A new ack, belonging to the point it names.
+    Captured(usize),
+    /// A new ack with no point to charge it to.
+    ///
+    /// Normally impossible, and it is worth being exact about why it is not:
+    /// capture requests go out ONE AT A TIME, only ever for whichever point is
+    /// `focused` when `requested` is set, and focus resolution never runs while
+    /// `requested` — so an ack arrives with `focused` still naming the point
+    /// that asked for it.
+    ///
+    /// What breaks that is the group deadline. A collect still in flight there
+    /// is deliberately left alone rather than discarded (see the deadline arm's
+    /// own reasoning), and the re-shown group can dwell on that same point and
+    /// ask for it AGAIN before the first ack lands — `state.latest_gaze` is
+    /// frozen while the device thread sits in the blocking call, so the dwell
+    /// that triggered the first request is still what the flow can see. Two
+    /// acks then arrive for one point. The flow takes one per tick, and the
+    /// tick that takes the first clears `focused`, so the second is read with
+    /// nothing focused at all.
+    ///
+    /// There is no honest point to charge it to, and charging it to whichever
+    /// sibling is focused next would be worse than dropping it: that marks a
+    /// point captured whose sample the device never took, and fits the group a
+    /// point short while reporting a complete run — exactly what the deadline
+    /// arm carries `focused` through the re-show to prevent.
+    Unattributable,
+}
+
+/// How many device acks this flow has already accounted for: one per captured
+/// point, plus any it charged to no point at all.
+fn accounted_acks(calibrated: &[bool; 7], swallowed: usize) -> usize {
+    calibrated.iter().filter(|c| **c).count() + swallowed
+}
+
+/// Read the device's ack counter against what this flow has accounted for.
+fn read_advance(collected: usize, accounted: usize, focused: Option<usize>) -> Advance {
+    if collected <= accounted {
+        Advance::None
+    } else {
+        match focused {
+            Some(point) => Advance::Captured(point),
+            None => Advance::Unattributable,
+        }
     }
 }
 
@@ -1084,6 +1151,7 @@ pub fn launch(
                         requested: false,
                         ticks: 0,
                         attempt: 0,
+                        swallowed: 0,
                     });
                 } else {
                     // Our CalBegin ran and its start/clear failed. `start` may
@@ -1109,6 +1177,7 @@ pub fn launch(
                 requested,
                 ticks,
                 attempt,
+                swallowed,
             } => {
                 let (
                     token,
@@ -1122,6 +1191,7 @@ pub fn launch(
                     requested,
                     ticks,
                     attempt,
+                    swallowed,
                 ) = (
                     *token,
                     *mode,
@@ -1134,6 +1204,7 @@ pub fn launch(
                     *requested,
                     *ticks,
                     *attempt,
+                    *swallowed,
                 );
                 // Consume the device's per-point error level once per tick, so
                 // one rejection can only ever be charged to one attempt (see
@@ -1182,7 +1253,7 @@ pub fn launch(
                                 let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
                             }
                             next = Some(reshow_group(
-                                token, mode, group, calibrated, focused, attempt,
+                                token, mode, group, calibrated, focused, attempt, swallowed,
                             ));
                         }
                         GroupAction::Fail(msg) => {
@@ -1194,21 +1265,13 @@ pub fn launch(
                     let active_group = GROUPS[group];
                     // The device's `cal.collected` is a plain counter of how
                     // many `add_point` calls have succeeded so far, total —
-                    // not indexed by which point. Comparing it against the
-                    // total captured-so-far tells us a NEW capture landed
-                    // this tick.
-                    let total_captured = calibrated.iter().filter(|c| **c).count();
+                    // not indexed by which point. Comparing it against what
+                    // this flow has accounted for tells us a NEW ack landed
+                    // this tick, and `focused` says whose it is.
+                    let accounted = accounted_acks(&calibrated, swallowed);
+                    let advance = read_advance(cal.collected, accounted, focused);
 
-                    if cal.collected > total_captured {
-                        // Capture requests are issued ONE AT A TIME, only
-                        // ever for whichever point is `focused` when
-                        // `requested` is set — and focus-resolution below
-                        // never runs while `requested` is true, so `focused`
-                        // cannot have moved since we sent that request.
-                        // Reading it here is therefore safe and correct.
-                        let captured = focused.expect(
-                            "cal.collected increased implies a CalCollect is in flight, which implies focused is set",
-                        );
+                    if let Advance::Captured(captured) = advance {
                         let mut calibrated = calibrated;
                         calibrated[captured] = true; // accumulates only — never reverts to false
                         {
@@ -1252,6 +1315,7 @@ pub fn launch(
                                 requested: false,
                                 ticks: 0,   // fresh fade-in for the new group
                                 attempt: 0, // and a fresh retry budget: it is per group
+                                swallowed,  // but the device's ack count is per session
                             });
                         } else {
                             // Points remain in this group: stay on it (same
@@ -1269,8 +1333,39 @@ pub fn launch(
                                 requested: false,
                                 ticks,
                                 attempt, // same group, same attempt: a capture is progress
+                                swallowed,
                             });
                         }
+                    } else if advance == Advance::Unattributable {
+                        // Swallow it (see `Advance::Unattributable` for how an
+                        // ack ends up with no point to belong to): `calibrated`
+                        // is left exactly as it is, and only the accounted
+                        // total moves, so the group carries on dwelling from
+                        // where it was. Counting it is the part that matters —
+                        // `cal.collected` is a level, so an ack merely ignored
+                        // would read as a fresh advance on this tick, the next,
+                        // and every tick until the group's deadline, and the
+                        // first of them to find a sibling focused would charge
+                        // it to a point the device never sampled.
+                        //
+                        // Nothing else about this tick changes, not even
+                        // `ticks`: the group keeps its deadline, and the one
+                        // frame in which its dots are not redrawn is the same
+                        // frame every capture already costs.
+                        next = Some(Phase::Collecting {
+                            token,
+                            mode,
+                            group,
+                            calibrated,
+                            focused,
+                            pending_ticks,
+                            in_zone_ticks,
+                            gap_ticks,
+                            requested,
+                            ticks,
+                            attempt,
+                            swallowed: swallowed + 1,
+                        });
                     } else {
                         let t = ticks + 1;
 
@@ -1418,12 +1513,12 @@ pub fn launch(
                             // an already-accepted sample. Skipping the
                             // discard here when the fresh read shows it
                             // already collected closes that race; the normal
-                            // `cal.collected > total_captured` branch above
-                            // will pick up the advance on a later tick.
+                            // `read_advance` branch above will pick up the
+                            // advance on a later tick.
                             let (px, py) =
                                 cal_points[focused.expect("requested implies focused is set")];
                             let already_collected =
-                                state.lock().unwrap().calibration.collected > total_captured;
+                                state.lock().unwrap().calibration.collected > accounted;
                             if !already_collected {
                                 let _ = tick_cmd.send(DeviceCommand::CalDiscard { x: px, y: py });
                             }
@@ -1439,6 +1534,7 @@ pub fn launch(
                                 requested: false,
                                 ticks: t,
                                 attempt, // a discard-and-redwell is not a weak group
+                                swallowed,
                             });
                         } else if !requested
                             && new_focused.is_some()
@@ -1458,6 +1554,7 @@ pub fn launch(
                                 requested: true,
                                 ticks: t,
                                 attempt,
+                                swallowed,
                             });
                         } else if t >= COLLECT_TIMEOUT_TICKS * active_group.len() as u32 {
                             // Applies REGARDLESS of `requested`/`focused` (a
@@ -1505,8 +1602,17 @@ pub fn launch(
                                     // group collects it again on top of that,
                                     // which is the situation every re-shown
                                     // point is in.
+                                    //
+                                    // And if it SUCCEEDS while the re-shown
+                                    // group is already dwelling on that same
+                                    // point, the device ends up holding it
+                                    // twice and acking twice for one point —
+                                    // the second of those lands with nothing
+                                    // focused, and is swallowed rather than
+                                    // charged to a sibling (see
+                                    // `Advance::Unattributable`).
                                     next = Some(reshow_group(
-                                        token, mode, group, calibrated, focused, attempt,
+                                        token, mode, group, calibrated, focused, attempt, swallowed,
                                     ));
                                 }
                                 GroupAction::Fail(msg) => {
@@ -1527,6 +1633,7 @@ pub fn launch(
                                 requested,
                                 ticks: t,
                                 attempt,
+                                swallowed,
                             });
                         }
                     }
@@ -1857,7 +1964,7 @@ mod tests {
         // Group C part-way through: index 4 captured, 5 and 6 still to go,
         // with a collect having been in flight on index 5.
         let calibrated = [true, true, true, true, true, false, false];
-        match reshow_group(42, CalMode::Full, 2, calibrated, Some(5), 1) {
+        match reshow_group(42, CalMode::Full, 2, calibrated, Some(5), 1, 0) {
             Phase::Collecting {
                 token,
                 group,
@@ -1882,6 +1989,92 @@ mod tests {
                     "dwell counters and the group deadline start over"
                 );
                 assert!(!requested, "nothing is in flight in a freshly-shown group");
+            }
+            _ => panic!("a re-show must stay in Collecting"),
+        }
+    }
+
+    /// The device can ack a sample this flow has no point to put it on, and a
+    /// GTK tick is not a place to find that out by panicking.
+    ///
+    /// It happens when a collect left in flight at a group's deadline is acked
+    /// late while the re-shown group has already asked for the same point
+    /// again: two acks for one point, taken one per tick, and the tick that
+    /// takes the first clears `focused` — so the second is read with nothing
+    /// focused. `read_advance` answers `Unattributable` for it instead of
+    /// handing a `None` to an `expect`.
+    #[test]
+    fn an_ack_with_nothing_focused_is_not_charged_to_a_point() {
+        assert_eq!(
+            read_advance(2, 1, None),
+            Advance::Unattributable,
+            "an ack that arrived with nothing focused belongs to no point"
+        );
+        assert_eq!(read_advance(2, 1, Some(5)), Advance::Captured(5));
+        assert_eq!(read_advance(1, 1, None), Advance::None);
+        assert_eq!(
+            read_advance(1, 1, Some(5)),
+            Advance::None,
+            "a focused point is not a capture on its own — the counter has to move"
+        );
+    }
+
+    /// Swallowing an ack means counting it, not ignoring it.
+    ///
+    /// `CalPhase::collected` is a level: an ack merely stepped over would still
+    /// stand above the captured total on the next tick, and on every tick until
+    /// the group's deadline — and the first of those to find a sibling focused
+    /// would mark that sibling captured off a sample the device never took,
+    /// fitting the group a point short. Counting it puts the two levels back
+    /// together, and the next REAL ack is still attributed to the point that
+    /// asked for it.
+    #[test]
+    fn a_swallowed_ack_is_not_read_again_and_does_not_displace_the_next_one() {
+        // Two acks arrived for point 5: the deadline's in-flight collect and
+        // the re-shown group's repeat of it. The first was attributed.
+        let mut calibrated = [false; 7];
+        calibrated[5] = true;
+        let mut swallowed = 0;
+
+        let accounted = accounted_acks(&calibrated, swallowed);
+        assert_eq!(read_advance(2, accounted, None), Advance::Unattributable);
+        swallowed += 1;
+
+        let accounted = accounted_acks(&calibrated, swallowed);
+        assert_eq!(
+            read_advance(2, accounted, None),
+            Advance::None,
+            "a swallowed ack must not be read as an advance again"
+        );
+        assert_eq!(
+            read_advance(2, accounted, Some(6)),
+            Advance::None,
+            "nor the moment a sibling takes the focus"
+        );
+
+        // The sibling's own ack still lands on the sibling.
+        assert_eq!(read_advance(3, accounted, Some(6)), Advance::Captured(6));
+    }
+
+    /// A re-show is a re-show of one group; the device's ack counter is for the
+    /// whole session, so what the flow has swallowed has to come across with it
+    /// — otherwise the re-shown group would re-read the swallowed ack as a
+    /// fresh capture on its first tick.
+    #[test]
+    fn a_re_show_carries_the_acks_the_flow_has_already_swallowed() {
+        let calibrated = [true, true, true, true, true, false, false];
+        match reshow_group(42, CalMode::Full, 2, calibrated, Some(5), 1, 2) {
+            Phase::Collecting {
+                swallowed,
+                calibrated: c,
+                ..
+            } => {
+                assert_eq!(swallowed, 2);
+                assert_eq!(
+                    read_advance(7, accounted_acks(&c, swallowed), None),
+                    Advance::None,
+                    "5 captured and 2 swallowed is level with a device that acked 7"
+                );
             }
             _ => panic!("a re-show must stay in Collecting"),
         }
@@ -1962,7 +2155,7 @@ mod tests {
     #[test]
     fn a_re_shown_group_reads_as_coming_back_though_it_carries_a_focus() {
         let calibrated = [true, true, true, true, false, false, false];
-        match reshow_group(42, CalMode::Full, 2, calibrated, Some(5), 1) {
+        match reshow_group(42, CalMode::Full, 2, calibrated, Some(5), 1, 0) {
             Phase::Collecting {
                 focused,
                 requested,
