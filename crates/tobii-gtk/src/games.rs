@@ -64,6 +64,23 @@ fn watching_opentrack(cfg: &OutputConfig) -> bool {
     crate::outputs::watch_target(cfg).is_some()
 }
 
+/// Whether turning this switch on is, by itself, enough to keep the tracker on.
+///
+/// The joystick is the one sink that has no other program to wait for. An
+/// opentrack listener announces itself by binding a port and a wrapped game
+/// announces itself by running, but a uinput device is presented whether or not
+/// anything ever opens it — so if switching game output on is not itself the
+/// signal, nothing is, and the tracker goes dark three seconds after the hub
+/// loses focus while the joystick sits there reporting a frozen centre.
+///
+/// That makes it the one destination whose hold lasts exactly as long as this
+/// switch, which is why the switch has to say so. Reported from the settings
+/// rather than from the live demand: the sentence is read while the switch is
+/// OFF, to decide whether to turn it on, when there is no hold to observe.
+fn waking_for_joystick(cfg: &OutputConfig) -> bool {
+    cfg.joystick
+}
+
 /// Which preset a config's values correspond to, if any.
 ///
 /// Matched on yaw alone: it is the axis the presets differ most on, and a
@@ -87,7 +104,24 @@ pub fn strength_index(cfg: &OutputConfig) -> Option<usize> {
 /// means nothing.
 pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStatus) -> String {
     if !cfg.enabled {
-        return "Off. Turn on to send head tracking to games.".to_string();
+        // The switch's own consequence, said where the switch is and not only
+        // in its tooltip. This sentence is the last thing read before the
+        // switch is flipped, and after it is flipped the thing it warns about
+        // is invisible: an infrared illuminator gives no sign it is lit, so a
+        // user who turns this on for one evening's flying and leaves it on has
+        // no way to find that out from the hardware.
+        //
+        // Conditional because it is only true of the joystick. With the other
+        // two sinks the hold belongs to another program — opentrack binding its
+        // port, or a game under `tobii game` — and claiming otherwise would
+        // send a Wine-bridge user off believing their tracker will stay on when
+        // it will not.
+        return if waking_for_joystick(cfg) {
+            "Off. Turn on to send head tracking to games. The tracker stays on while it is."
+                .to_string()
+        } else {
+            "Off. Turn on to send head tracking to games.".to_string()
+        };
     }
     let mut sinks: Vec<String> = Vec::new();
     // Reported from what the device thread actually did, never from the
@@ -149,8 +183,17 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStat
         // used to send those users off to wrap something in `tobii game` for no
         // reason. The wrapper is still named, because it is the answer for
         // everything that is not an opentrack listener.
+        //
+        // The wrapper leads, and that ordering is the point rather than taste.
+        // Everyone who reads this sentence is waiting for a tracker that has
+        // not come on; the port watch can only be the answer for the subset who
+        // both have an opentrack address AND are about to start opentrack, and
+        // for everybody else — a virtual joystick, a Wine bridge, opentrack on
+        // another machine — the wrapper is the only thing that works. Naming
+        // the narrower remedy first made the general one look like an
+        // afterthought to the users who needed exactly it.
         let starter = if watching_opentrack(cfg) {
-            "Starts when opentrack opens the port, or a game asks: tobii game -- <command>"
+            "Starts when a game asks — tobii game -- <command> — or when opentrack opens the port"
         } else {
             "Starts when a game asks: tobii game -- <command>"
         };
@@ -309,7 +352,9 @@ impl GamesRow {
         sw.set_valign(Align::Center);
         sw.set_active(cfg.enabled);
         sw.set_tooltip_text(Some(
-            "Send head tracking and gaze to games, over opentrack or the Wine bridge",
+            "Send head tracking and gaze to games — to a virtual joystick, to opentrack, \
+             or over the Wine bridge. With the virtual joystick on, the tracker stays on \
+             for as long as this switch does.",
         ));
 
         let status = Label::new(None);
@@ -653,6 +698,54 @@ mod tests {
         // Same when there is no opentrack sink at all: only the joystick.
         let joy = text(&joystick_only(), false);
         assert!(!joy.contains("opentrack opens the port"), "{joy}");
+    }
+
+    /// The off state has to say what turning it on costs, because once it is on
+    /// nothing says it: an infrared illuminator looks the same lit as dark.
+    ///
+    /// Only for the joystick. It is the one sink whose hold is the switch
+    /// itself; with a Wine bridge or an opentrack address the tracker waits for
+    /// another program, and promising otherwise would be the same false
+    /// reassurance this whole status line exists to avoid.
+    #[test]
+    fn the_off_switch_says_that_turning_it_on_keeps_the_tracker_on() {
+        let mut joy = joystick_only();
+        joy.enabled = false;
+        let s = text(&joy, false);
+        assert!(s.starts_with("Off."), "{s}");
+        assert!(
+            s.contains("tracker stays on"),
+            "the switch's own consequence has to be on the row, not only in its tooltip: {s}"
+        );
+
+        // A bridge-only user gets no such promise: nothing would keep their
+        // tracker on, and a sentence saying it would is worse than silence.
+        let bridge = cfg_with(false, None, Some(4243));
+        let b = text(&bridge, false);
+        assert!(b.starts_with("Off."), "{b}");
+        assert!(!b.contains("tracker stays on"), "{b}");
+    }
+
+    /// The wrapper is named before the port watch, because it is the remedy
+    /// that works for every reader of this line and the watch is the remedy for
+    /// a subset of one of them.
+    ///
+    /// A joystick or Wine-bridge user sees this sentence whenever their tracker
+    /// has not come on, and the port watch can do nothing for them: it fires
+    /// only for a program that binds the configured opentrack address. Leading
+    /// with it sent exactly the wrong people to wait for something that was
+    /// never going to happen.
+    #[test]
+    fn the_wrapper_is_named_before_the_port_watch() {
+        let ready = text(&cfg_with(true, Some("127.0.0.1:4242"), None), false);
+        let wrapper = ready.find("tobii game").expect("the wrapper is named");
+        let watch = ready
+            .find("opentrack opens the port")
+            .expect("the watch is still named");
+        assert!(
+            wrapper < watch,
+            "the remedy that works for everyone reading this has to come first: {ready}"
+        );
     }
 
     /// "Ready" is not a fault. With game output configured and nothing playing,

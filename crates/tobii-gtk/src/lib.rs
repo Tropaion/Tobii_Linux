@@ -76,6 +76,16 @@ window { background-color: #0d1013; color: #e8ecef; }
 .section-desc { font-size: 12px; color: #8a949d; }
 .section-warn { color: #f2b134; font-weight: bold; }
 .status { font-size: 12px; color: #8a949d; }
+/* The header badge for a setting that is costing the user something right now.
+   Amber and outlined, the same language `.readout-alert` and `.banner` already
+   speak for \"this wants your attention\", because that is exactly what it is:
+   standby switched off means the illuminators are lit until the user comes
+   back and turns it off, and nothing on the hardware will ever say so. It sits
+   in the header, which is present in every layout and every window width, so
+   the notice costs no card height anywhere. */
+.pill { font-size: 10px; font-weight: bold; letter-spacing: 0.12em;
+        color: #f2b134; background-color: #2a2313; border: 1px solid #4a3d1a;
+        border-radius: 999px; padding: 2px 8px; }
 .guidance { font-size: 14px; }
 .hint { font-size: 11px; color: #6f7982; }
 
@@ -810,12 +820,43 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     }
     let status_label = Label::new(Some("Disconnected"));
     status_label.add_css_class("status");
+
+    // `keep_awake`, said out loud for as long as it is on.
+    //
+    // The setting lives behind the cogwheel, and a setting behind a cogwheel is
+    // discoverable only by going back to look for it. This one cannot be left
+    // like that: it is the only switch in the program whose effect is invisible
+    // — an infrared illuminator gives no sign it is lit, the tracker makes no
+    // sound, and the hub it belongs to is usually minimised or in the tray by
+    // the time it matters. A user who turns it on for one evening and forgets
+    // has a tracker running until they next happen to open this window.
+    //
+    // In the header, beside the connection status, which is the one place that
+    // is present in all three layouts and at every window width. It costs no
+    // card height at all: the header is a fixed row, and the badge is shorter
+    // than the cogwheel beside it, so a hidden badge takes nothing and a shown
+    // one takes width the header already has.
+    //
+    // Before the dot rather than after the label, so it reads as a qualifier on
+    // the status that follows it — "always on, connected" — rather than as a
+    // third, unrelated status.
+    let awake_pill = Label::new(Some("ALWAYS ON"));
+    awake_pill.add_css_class("pill");
+    awake_pill.set_valign(Align::Center);
+    awake_pill.set_visible(false);
+    awake_pill.set_tooltip_text(Some(
+        "Standby is off: the tracker stays on, with its illuminators lit, for \
+         as long as this program runs. Turn it off under Keep the tracker \
+         awake, in Settings.",
+    ));
+
     // Connection state belongs beside the title, not stranded at the bottom of
     // the window: it is the first thing that decides whether anything else on
     // screen means anything.
     let status_bar = gtk::Box::new(Orientation::Horizontal, 8);
     status_bar.set_halign(Align::End);
     status_bar.set_valign(Align::Center);
+    status_bar.append(&awake_pill);
     status_bar.append(&status_dot);
     status_bar.append(&status_label);
 
@@ -1627,6 +1668,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             connected.set(conn);
             status_label.set_text(status_text(&snap.status));
             status_dot.queue_draw();
+            // Re-read from the file rather than remembered from the switch, for
+            // the same reason the games row re-reads `games.toml` on this tick:
+            // the CLI sets this too, and a badge that only believed the switch
+            // beside it would leave a hub that had been told from a terminal
+            // showing no notice at all. Below the visibility guard, so a hub
+            // hidden in the tray or minimised does no file I/O for a badge
+            // nobody can see.
+            awake_pill.set_visible(keep_awake::enabled());
             // Evaluate the calibration state machine once per fresh `Connected`
             // transition (reset on disconnect so a later reconnect — e.g. moved to
             // a different monitor — is re-evaluated). All branching logic lives in
@@ -1716,7 +1765,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 let ev = widget::eye_view_for(&snap);
                 for (cells, rows) in readout_cells
                     .iter()
-                    .zip(widget::readout_groups(&ev, head_now.as_ref()))
+                    // `conn` — the same fact the header's status label is set
+                    // from three screens up — so the readout can say "tracker
+                    // off" where it used to say "not detected", which is what a
+                    // faulty tracker says.
+                    .zip(widget::readout_groups(&ev, head_now.as_ref(), conn))
                 {
                     for ((n, v), r) in cells.iter().zip(rows) {
                         n.set_text(r.label);
@@ -2032,9 +2085,9 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
     banner.set_visible(true);
 }
 
-/// The cogwheel in the header, and the settings that are not about tracking.
+/// The cogwheel in the header, and the settings that are set once and forgotten.
 ///
-/// # Why these three, and why not in the rack
+/// # Why these, and why not in the rack
 ///
 /// The control rack answers one question per card — *how should the tracker
 /// behave?* Autostart, the update check and the diagnostics report answer a
@@ -2043,6 +2096,15 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 /// panel down and made the hub taller than the thing it is monitoring. Moving
 /// them behind a cogwheel gives the window back to what it is for and costs one
 /// click for settings that are set once and then forgotten.
+///
+/// "Keep the tracker awake" is the exception that had to be argued for: it IS
+/// about the tracker, so by the rule above it belongs in the rack. It is here
+/// anyway because it is a global override rather than one card's setting —
+/// there is no card it is the setting OF — and because putting it in the rack
+/// would have cost the games card height it does not have. What makes that
+/// acceptable is that its on-state does not stay behind the cogwheel: the
+/// header carries a badge for as long as it is on, which is the property a
+/// setting needs before it may be hidden one click deep.
 ///
 /// A `Popover`, not a second window: it is anchored to the button that opened
 /// it, it closes on click-away, and it needs no title bar, no size negotiation
@@ -2199,6 +2261,24 @@ fn settings_list() -> gtk::Box {
     list.set_margin_start(6);
     list.set_margin_end(6);
 
+    // First, and it is the only row here that is about the tracker rather than
+    // about this program. It is here because there is nowhere better: the games
+    // card is at its height budget and this is not a game-output setting
+    // anyway, and a rack card of its own would give the hub's most-regretted
+    // setting the same weight as calibration. What makes a popover an
+    // acceptable home for it is that its on-state does not stay in the popover
+    // — see `awake_pill` in `build_hub`.
+    list.append(&settings_row(
+        "Keep the tracker awake",
+        // The cost, not the benefit. What it gives is plain from its name;
+        // what it takes is a tracker nobody can see running, so that is what
+        // the sentence spends its lines on. Which setups need it at all is in
+        // the switch's tooltip, one hover away, where advice belongs.
+        "Switches standby off: the tracker stays on, illuminators lit, until \
+         you turn this off — overnight too, if you forget.",
+        &keep_awake_switch(),
+    ));
+    list.append(&hairline());
     list.append(&settings_row(
         "Start when I log in",
         // What this actually does, which is less than it used to claim. It said
@@ -2507,6 +2587,93 @@ fn autostart_switch() -> Switch {
     sw
 }
 
+/// The user's standing answer to "never let the tracker go into standby".
+///
+/// # Why it is a preference of this program and not a game-output setting
+///
+/// Everything in `games.toml` describes a pipeline — what is sent, how hard,
+/// and to whom. This describes the opposite: it says to stop asking whether
+/// anything wants data at all. It applies with game output off, with no sink
+/// configured, to the gaze overlay and to a `tobii headpose` in a terminal, so
+/// filing it under game output would put a global override inside the one
+/// feature it is least specific to.
+///
+/// A one-line file beside `config.toml`, in the same shape as the update-check
+/// preference, because that is what it is: one bit, set once, read by this
+/// window and by `tobii` in a terminal, and worth nothing if a parse error in
+/// an unrelated setting could take it with it.
+///
+/// # It is a last resort, and the default says so
+///
+/// Off by default, and it must stay off by default. The project's rule is that
+/// the illuminators burn only while something is asking for data, and every
+/// other wake path is bounded by some other program's lifetime: opentrack's
+/// port closes, a wrapped game exits. This one is bounded by the user
+/// remembering — a tracker left warm overnight is the failure mode — so it
+/// exists for the setups where nothing can be detected at all: a Wine bridge
+/// with no listener to watch, opentrack on another machine, a game that cannot
+/// be wrapped. That is also why turning it on is not silent; see `awake_pill`
+/// in [`build_hub`].
+pub mod keep_awake {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// The file, beside `config.toml`.
+    pub fn path() -> PathBuf {
+        tobii_config::config_path().with_file_name("keep_awake")
+    }
+
+    /// Whether the user has switched standby off.
+    pub fn enabled() -> bool {
+        enabled_at(&path())
+    }
+
+    /// [`enabled`] against a given path.
+    ///
+    /// Anything unreadable, missing or unexpected is the default, which is
+    /// off — a corrupt file must not be able to leave somebody's illuminators
+    /// lit, and off is the state they can always get back to by fixing it.
+    pub fn enabled_at(path: &Path) -> bool {
+        match std::fs::read_to_string(path) {
+            Ok(s) => s.trim() == "on",
+            Err(_) => false,
+        }
+    }
+
+    /// Persist the choice.
+    pub fn save(on: bool) -> io::Result<()> {
+        save_to(&path(), on)
+    }
+
+    /// [`save`] to a given path, for tests.
+    pub fn save_to(path: &Path, on: bool) -> io::Result<()> {
+        tobii_config::write_atomic(path, if on { b"on\n" } else { b"off\n" })
+    }
+}
+
+/// The switch that turns standby off altogether.
+///
+/// Its description says what it costs rather than what it gives, because what
+/// it gives is obvious from where it sits and what it costs is not: an infrared
+/// illuminator looks exactly the same lit as dark, so this is the one setting
+/// in the program whose consequence the user cannot see.
+fn keep_awake_switch() -> Switch {
+    let sw = Switch::new();
+    sw.set_valign(Align::Center);
+    sw.set_active(keep_awake::enabled());
+    sw.set_tooltip_text(Some(
+        "Only for setups nothing can detect. Everything else already wakes the \
+         tracker by itself.",
+    ));
+    sw.connect_state_set(|_, on| {
+        if let Err(e) = keep_awake::save(on) {
+            tobii_diagnostics::log::warn(&format!("could not save the keep-awake setting: {e}"));
+        }
+        glib::Propagation::Proceed
+    });
+    sw
+}
+
 /// The switch that turns the launch-time release check on and off.
 ///
 /// The check is the program's only unprompted network request, so it needs a
@@ -2569,6 +2736,43 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
 
 #[cfg(test)]
 mod tests {
+    /// Standby may only be switched off by somebody actually asking for it.
+    ///
+    /// Every other preference in this program defaults to the helpful answer;
+    /// this one defaults to the cautious one, because being wrong about it
+    /// leaves an infrared lamp burning in a room nobody is in. An absent file,
+    /// an unreadable one and a file with something else in it therefore all
+    /// mean off — the same rule the update check applies in the opposite
+    /// direction, for the same reason: the default is whichever way round a
+    /// corrupt file cannot hurt.
+    #[test]
+    fn standby_is_only_switched_off_by_an_explicit_yes() {
+        let dir = std::env::temp_dir().join(format!("tobii-keepawake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keep_awake");
+
+        assert!(!super::keep_awake::enabled_at(&path), "unset means off");
+
+        super::keep_awake::save_to(&path, true).unwrap();
+        assert!(super::keep_awake::enabled_at(&path));
+        super::keep_awake::save_to(&path, false).unwrap();
+        assert!(!super::keep_awake::enabled_at(&path));
+
+        for junk in ["", "yes", "1", "ON", "\u{feff}on"] {
+            std::fs::write(&path, junk).unwrap();
+            assert!(
+                !super::keep_awake::enabled_at(&path),
+                "{junk:?} is not a request to burn the illuminators"
+            );
+        }
+        // Trailing whitespace is what `save_to` itself writes, so it has to
+        // read back as the yes it was.
+        std::fs::write(&path, " on \n").unwrap();
+        assert!(super::keep_awake::enabled_at(&path));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Scaling rewrites the sizes themselves, because they are absolute px and
     /// an absolute size is exactly what will not inherit from a root rule.
     #[test]

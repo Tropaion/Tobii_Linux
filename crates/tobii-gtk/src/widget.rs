@@ -497,7 +497,7 @@ mod tests {
     /// which way it faces.
     #[test]
     fn the_readout_keeps_every_row_and_marks_missing_values_absent() {
-        let [placement, facing] = readout_groups(&EyeView::none(), None);
+        let [placement, facing] = readout_groups(&EyeView::none(), None, true);
         let names = |g: &[ReadoutRow]| g.iter().map(|r| r.label).collect::<Vec<_>>();
         assert_eq!(names(&placement), ["Position", "Distance"]);
         assert_eq!(names(&facing), ["Yaw", "Pitch", "Roll"]);
@@ -507,11 +507,39 @@ mod tests {
         }
     }
 
+    /// A tracker that has been switched off on purpose must not report itself
+    /// with the words a broken one uses.
+    ///
+    /// This is the readout in the bug report that prompted it: game output on,
+    /// a virtual joystick as the only sink, the hub loses focus, the session
+    /// closes three seconds later — and the panel said "not detected", which
+    /// names a tracker that is lit and cannot find a face. The two states are
+    /// indistinguishable from the eyes alone, so the session has to be an input
+    /// of its own.
+    #[test]
+    fn a_deliberately_dark_tracker_does_not_say_not_detected() {
+        let off = &readout_groups(&EyeView::none(), None, false)[0][0];
+        assert_eq!(off.value, "tracker off");
+        assert!(
+            !off.alert,
+            "standby is not a fault, so it must not be shown in the alert colour"
+        );
+
+        // Lit, and genuinely finding nothing: the original's own word, which
+        // has to stay reachable or the change would merely have renamed it.
+        let looking = &readout_groups(&EyeView::none(), None, true)[0][0];
+        assert_eq!(looking.value, "not detected");
+
+        // And a live view is unaffected by the flag it now takes.
+        let seen = ev(Guidance::Centered, Some(684.0), true);
+        assert_eq!(readout_groups(&seen, None, true)[0][0].value, "good");
+    }
+
     /// Side by side, the taller group sets the height. Five values stacked was
     /// what made the panel too long.
     #[test]
     fn the_readout_is_three_rows_tall_not_five() {
-        let [placement, facing] = readout_groups(&EyeView::none(), None);
+        let [placement, facing] = readout_groups(&EyeView::none(), None, true);
         assert_eq!(placement.len().max(facing.len()), 3);
         assert_eq!(placement.len() + facing.len(), 5, "no value may be dropped");
     }
@@ -527,7 +555,11 @@ mod tests {
             sigma: None,
             has_pitch: false,
         };
-        let [_, facing] = readout_groups(&ev(Guidance::Centered, Some(684.0), true), Some(&head));
+        let [_, facing] = readout_groups(
+            &ev(Guidance::Centered, Some(684.0), true),
+            Some(&head),
+            true,
+        );
         let get = |n: &str| facing.iter().find(|r| r.label == n).unwrap().value.clone();
         let pitch = get("Pitch");
         assert!(pitch.contains("no model"), "{pitch}");
@@ -543,7 +575,7 @@ mod tests {
     #[test]
     fn the_position_row_is_emphasised_only_while_it_is_asking_for_a_move() {
         let alert = |g: Guidance, d: Option<f32>, tracked: bool| {
-            readout_groups(&ev(g, d, tracked), None)[0][0].alert
+            readout_groups(&ev(g, d, tracked), None, true)[0][0].alert
         };
         assert!(
             !alert(Guidance::Centered, Some(684.0), true),
@@ -564,13 +596,13 @@ mod tests {
     fn the_position_text_and_its_emphasis_never_disagree() {
         let mut e = ev(Guidance::Centered, Some(684.0), true);
         e.raw_guidance = Guidance::MoveLeft; // mid-damping
-        let row = &readout_groups(&e, None)[0][0];
+        let row = &readout_groups(&e, None, true)[0][0];
         assert_eq!(row.value, "good");
         assert!(!row.alert, "the word says good, so the styling must too");
 
         e.guidance = Guidance::MoveLeft;
         e.raw_guidance = Guidance::Centered; // damping the other way
-        let row = &readout_groups(&e, None)[0][0];
+        let row = &readout_groups(&e, None, true)[0][0];
         assert_eq!(row.value, "move left");
         assert!(
             row.alert,
@@ -580,7 +612,7 @@ mod tests {
 
     #[test]
     fn the_distance_is_reported_in_whole_millimetres() {
-        let [placement, _] = readout_groups(&ev(Guidance::Centered, Some(683.7), true), None);
+        let [placement, _] = readout_groups(&ev(Guidance::Centered, Some(683.7), true), None, true);
         assert_eq!(placement[1].value, "684 mm");
     }
 
@@ -588,7 +620,7 @@ mod tests {
     /// in a table would print the same millimetres twice, one row apart.
     #[test]
     fn the_position_row_does_not_repeat_the_distance() {
-        let [placement, _] = readout_groups(&ev(Guidance::Centered, Some(684.0), true), None);
+        let [placement, _] = readout_groups(&ev(Guidance::Centered, Some(684.0), true), None, true);
         assert_eq!(placement[0].value, "good");
         assert!(
             !placement[0].value.contains("684"),
@@ -774,7 +806,19 @@ pub struct ReadoutRow {
 /// Every row is always present. A value that is unavailable reads as absent
 /// rather than being dropped: a row that vanishes leaves the user wondering
 /// whether the feature broke.
-pub fn readout_groups(eyes: &EyeView, head: Option<&HeadView>) -> [Vec<ReadoutRow>; 2] {
+///
+/// `tracker_on` is whether the device session is open right now — the hub's
+/// `Connected` state, not a health check. It is a separate input because the
+/// eyes cannot tell the two silences apart: a dark tracker reports no eyes, and
+/// so does a lit one that cannot find a face. Calling the first "not detected"
+/// is what makes the standby behaviour look like a fault — the user sees the
+/// words their eye tracker uses when it is failing, at the moment it is doing
+/// exactly what it was asked to do.
+pub fn readout_groups(
+    eyes: &EyeView,
+    head: Option<&HeadView>,
+    tracker_on: bool,
+) -> [Vec<ReadoutRow>; 2] {
     const ABSENT: &str = "—";
     let tracked = eyes.left.is_some() || eyes.right.is_some();
     let row = |label, value: String, alert| ReadoutRow {
@@ -788,15 +832,25 @@ pub fn readout_groups(eyes: &EyeView, head: Option<&HeadView>) -> [Vec<ReadoutRo
     // and lowercased for a table. Its "centred" string appends the distance,
     // which here would print the same millimetres twice one row apart, so that
     // one is the status alone and Distance has its own row.
-    let position = match (tracked, eyes.guidance) {
-        (false, _) | (_, Guidance::NoEyes) => "not detected".to_string(),
-        (_, Guidance::Centered) => "good".to_string(),
-        (_, Guidance::MoveCloser) => "move closer".to_string(),
-        (_, Guidance::MoveBack) => "lean back".to_string(),
-        (_, Guidance::MoveRight) => "move right".to_string(),
-        (_, Guidance::MoveLeft) => "move left".to_string(),
-        (_, Guidance::MoveDown) => "move down".to_string(),
-        (_, Guidance::MoveUp) => "move up".to_string(),
+    //
+    // A closed session is answered first, and its word is not one of the
+    // original's: with no session there are no frames, so every arm below would
+    // be reached with the same empty view and say "not detected" — which is the
+    // one thing on this panel a user reads as a fault. It is the same fact the
+    // header's status already states, repeated where the user is looking.
+    let position = if !tracker_on {
+        "tracker off".to_string()
+    } else {
+        match (tracked, eyes.guidance) {
+            (false, _) | (_, Guidance::NoEyes) => "not detected".to_string(),
+            (_, Guidance::Centered) => "good".to_string(),
+            (_, Guidance::MoveCloser) => "move closer".to_string(),
+            (_, Guidance::MoveBack) => "lean back".to_string(),
+            (_, Guidance::MoveRight) => "move right".to_string(),
+            (_, Guidance::MoveLeft) => "move left".to_string(),
+            (_, Guidance::MoveDown) => "move down".to_string(),
+            (_, Guidance::MoveUp) => "move up".to_string(),
+        }
     };
     let placement = vec![
         row(
