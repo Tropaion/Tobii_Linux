@@ -44,6 +44,24 @@ const NP_KEY: &str = r"HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location
 /// Registry key a FreeTrack game reads to find its client DLL.
 const FT_KEY: &str = r"HKCU\Software\Freetrack\FreeTrackClient";
 
+/// Both discovery keys: the name each is recorded under, the key, its ABI.
+///
+/// Paired in one place because everything that touches one touches both —
+/// install reads and writes both, uninstall puts both back — and because the
+/// short name is what ends up in [`PRIOR_FILE`], where a rename would silently
+/// orphan an existing prefix's record.
+const KEYS: [(&str, &str, &str); 2] = [("ft", FT_KEY, "FreeTrack"), ("np", NP_KEY, "TrackIR")];
+
+/// Where, inside the prefix, we remember what those keys said before we first
+/// wrote to them.
+///
+/// Inside the prefix on purpose, under the directory the artifacts already go
+/// in. The registration belongs to *that* prefix and to nothing else: a Steam
+/// title whose compatdata is deleted takes the record with it, whereas a record
+/// kept in the user's own config would outlive the prefix it describes and
+/// promise to restore a value into something that no longer exists.
+const PRIOR_FILE: &str = "prior-registry.txt";
+
 /// Directories an installed opentrack keeps its client DLLs in.
 const OPENTRACK_DIRS: [&str; 5] = [
     "/usr/libexec/opentrack",
@@ -538,12 +556,263 @@ fn wine_run(
         .status()
 }
 
+/// Run a wine command against `prefix` and capture what it printed.
+///
+/// Separate from [`wine_run`] because reading the registry needs the output,
+/// and because `reg query`'s own chatter would otherwise land in the middle of
+/// the installer's lines.
+fn wine_output(wine: &Path, prefix: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(wine)
+        .args(args)
+        .env("WINEPREFIX", prefix)
+        .env("WINEDEBUG", "-all")
+        .output()
+}
+
+/// Pull the `Path` value out of `reg query <key> /v Path` output.
+///
+/// The line is `    Path    REG_SZ    C:\tobii-bridge`, and the value is the
+/// whole remainder of the line rather than the next whitespace-separated word:
+/// `C:\Program Files\...` is an entirely ordinary thing to find registered
+/// here, and taking one word of it would have us compare a truncated path
+/// against ours and call another program's registration foreign or our own
+/// missing.
+fn reg_query_path(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let rest = line.trim_end_matches('\r').trim_start();
+        let Some(rest) = rest.strip_prefix("Path") else {
+            continue;
+        };
+        // `Path` and not `PathX`: the name must end where we stopped reading.
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Some((_, value)) = rest.split_once("REG_SZ") else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// The `Path` value under `key`, or `None` when nothing is registered there.
+///
+/// `reg query` exits non-zero when the key or the value is missing, which is
+/// the ordinary "nothing here" answer. A prefix this wine cannot serve at all
+/// fails the same way and so reads as "nothing here" too — which does not stay
+/// hidden, because the write that follows fails as well and [`set_key`] reports
+/// that as the failed install it is.
+fn read_key(wine: &Path, prefix: &Path, key: &str) -> Result<Option<String>, String> {
+    let out = wine_output(wine, prefix, &["reg", "query", key, "/v", "Path"])
+        .map_err(|e| format!("{e}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(reg_query_path(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// What one key said before this installer first wrote to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prior {
+    /// The key had no `Path` value at all, so uninstall deletes it. That is
+    /// only correct *because* it was recorded: deleting on a guess is the
+    /// whole fault this record exists to prevent.
+    Unset,
+    /// The key named this directory, and uninstall puts it back.
+    Value(String),
+}
+
+/// What a key already says, judged against the value this install would write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Existing {
+    /// Nothing registered.
+    Absent,
+    /// Our own install directory inside this prefix. Nothing but this
+    /// installer ever names it, so there is nothing of anyone else's here.
+    Ours,
+    /// Already exactly what this install would write, but naming a directory
+    /// outside the prefix — so it may just as well be that program's own
+    /// registration of the same client DLL, written before we ever ran.
+    /// Writing it again changes nothing; putting it back on the way out is the
+    /// reading that cannot break anything.
+    Same(String),
+    /// Another program's registration, which is not ours to overwrite.
+    Foreign(String),
+}
+
+impl Existing {
+    /// What uninstall should put back, if this install writes over it.
+    fn prior(&self) -> Prior {
+        match self {
+            Existing::Absent | Existing::Ours => Prior::Unset,
+            Existing::Same(v) | Existing::Foreign(v) => Prior::Value(v.clone()),
+        }
+    }
+}
+
+/// Judge an existing `Path` value against the one we mean to write.
+///
+/// Compared case-insensitively because Windows paths are, and because a prefix
+/// that spells the drive letter the other way round is not a different
+/// registration — refusing over that would be a refusal nobody could act on.
+fn classify(current: Option<&str>, want: &str) -> Existing {
+    match current {
+        // An empty `Path` registers nothing, so it is the same situation as no
+        // value at all — and restoring an empty string would be a promise to
+        // put back something that never worked.
+        None => Existing::Absent,
+        Some(v) if v.trim().is_empty() => Existing::Absent,
+        Some(v) if v.eq_ignore_ascii_case(INSTALL_WIN_DIR) => Existing::Ours,
+        Some(v) if v.eq_ignore_ascii_case(want) => Existing::Same(v.to_string()),
+        Some(v) => Existing::Foreign(v.to_string()),
+    }
+}
+
+/// Render the record: one line per key, `<name> unset` or `<name> value <path>`.
+///
+/// Two states and not one string, because "there was no value" and "there was
+/// this value" need opposite things done on the way out, and a format that
+/// cannot tell them apart restores the wrong one — the same class of mistake as
+/// recording nothing at all. The value is the rest of the line and is never
+/// quoted or escaped, so a path containing spaces survives a round trip.
+fn render_prior(entries: &[(String, Prior)]) -> String {
+    let mut out = String::from(
+        "# What this prefix's TrackIR and FreeTrack registry said before\n\
+         # `tobii bridge install` first wrote to it. `tobii bridge uninstall`\n\
+         # puts it back. Lines are `<key> unset` or `<key> value <path>`.\n",
+    );
+    for (name, prior) in entries {
+        match prior {
+            Prior::Unset => out.push_str(&format!("{name} unset\n")),
+            Prior::Value(v) => out.push_str(&format!("{name} value {v}\n")),
+        }
+    }
+    out
+}
+
+/// Read back what [`render_prior`] wrote.
+///
+/// A line that is not understood is dropped rather than guessed at: a record
+/// that cannot be read is the same situation as no record, and uninstall's
+/// answer to that is to leave the key alone.
+fn parse_prior(text: &str) -> Vec<(String, Prior)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut field = line.splitn(3, ' ');
+        let (Some(name), Some(kind)) = (field.next(), field.next()) else {
+            continue;
+        };
+        match (kind, field.next()) {
+            ("unset", None) => out.push((name.to_string(), Prior::Unset)),
+            ("value", Some(v)) if !v.is_empty() => {
+                out.push((name.to_string(), Prior::Value(v.to_string())))
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The record kept in `dir`, empty when there is none.
+fn read_prior(dir: &Path) -> Vec<(String, Prior)> {
+    parse_prior(&std::fs::read_to_string(dir.join(PRIOR_FILE)).unwrap_or_default())
+}
+
+/// Add what was found to the record, and write it.
+///
+/// The record names whatever this installer took the key from. A re-install
+/// finds our own value in the keys and must not overwrite the answer with it —
+/// that would leave uninstall restoring a directory it is about to delete — but
+/// a run that takes the key off another program has to be written down even if
+/// there is already a record, or `--force` promises to put back something
+/// uninstall then deletes.
+fn record_prior(dir: &Path, found: &[(&str, Existing)]) -> Result<(), String> {
+    let mut entries = read_prior(dir);
+    for (name, existing) in found {
+        match entries.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => {
+                if matches!(existing, Existing::Foreign(_)) {
+                    slot.1 = existing.prior();
+                }
+            }
+            None => entries.push(((*name).to_string(), existing.prior())),
+        }
+    }
+    std::fs::write(dir.join(PRIOR_FILE), render_prior(&entries)).map_err(|e| {
+        format!(
+            "could not record what the registry said in {} ({e}) — refusing to \
+             overwrite keys we could then not put back",
+            dir.join(PRIOR_FILE).display()
+        )
+    })
+}
+
 /// `tobii bridge install` — copy the artifacts in and register them.
 fn install(args: &[String]) -> CmdResult {
     let prefix = resolve_prefix(args)?;
     let wine = resolve_wine(&prefix, args)?;
     let src = artifact_dir(args)?;
     let dest = prefix.join(INSTALL_SUBDIR);
+
+    // Which client TrackIR is pointed at decides what its key should say, so it
+    // is settled before the registry is looked at rather than in the middle of
+    // writing it.
+    let explicit_np = crate::flag_value(args, "--npclient");
+    let np_source = choose_npclient(explicit_np, find_installed_npclient())?;
+    // FreeTrack always gets our own DLL: that ABI has no signature check, so
+    // nothing stands between it and our data.
+    let np_target = match &np_source {
+        NpSource::Ours => INSTALL_WIN_DIR.to_string(),
+        NpSource::Installed(dir) => wine_path_for(dir),
+    };
+    let want_for = |key: &str| {
+        if key == NP_KEY {
+            np_target.as_str()
+        } else {
+            INSTALL_WIN_DIR
+        }
+    };
+
+    // Read before write, and before anything is copied. A prefix that already
+    // has a working head-tracking setup has to come out of a refusal exactly as
+    // it went in — no directory created, no key touched.
+    let mut found: Vec<(&str, Existing)> = Vec::new();
+    for (name, key, _) in KEYS {
+        found.push((
+            name,
+            classify(read_key(&wine, &prefix, key)?.as_deref(), want_for(key)),
+        ));
+    }
+    let taken: Vec<String> = KEYS
+        .iter()
+        .zip(&found)
+        .filter_map(|((_, _, abi), (_, e))| match e {
+            Existing::Foreign(v) => Some(format!("  {abi:<9} {v}")),
+            _ => None,
+        })
+        .collect();
+    if !taken.is_empty() && !args.iter().any(|a| a == "--force") {
+        return Err(format!(
+            "another program has already registered a head-tracking client in \
+             this prefix:\n{}\n\
+             Overwriting that would break it, and for a game that checks \
+             NaturalPoint's\nsignature the client already registered is the one \
+             that WORKS — ours is the\none it rejects. Pass --force to replace \
+             it anyway; the old value is recorded\nand `tobii bridge uninstall` \
+             puts it back.",
+            taken.join("\n")
+        )
+        .into());
+    }
+
     std::fs::create_dir_all(&dest)?;
 
     let mut copied = 0;
@@ -576,8 +845,11 @@ fn install(args: &[String]) -> CmdResult {
     // find a DLL is indistinguishable from every other "no tracking" cause.
     println!("  (64-bit games only — a 32-bit game looks for freetrackclient.dll)");
 
-    // FreeTrack always gets our own DLL: that ABI has no signature check, so
-    // nothing stands between it and our data.
+    // Written before the keys, never after: a record of a value we then failed
+    // to overwrite is harmless, while a key overwritten with nothing recorded
+    // is precisely the fault this exists to fix.
+    record_prior(&dest, &found)?;
+
     let mut all_written = set_key(&wine, &prefix, FT_KEY, INSTALL_WIN_DIR)?;
     // Held rather than printed as we go: "registered X" is only true once every
     // write has landed, and printing it before the check put confident lines
@@ -585,8 +857,7 @@ fn install(args: &[String]) -> CmdResult {
     let registered;
 
     let mut third_party_np = false;
-    let explicit_np = crate::flag_value(args, "--npclient");
-    match choose_npclient(explicit_np, find_installed_npclient())? {
+    match &np_source {
         NpSource::Ours => {
             all_written &= set_key(&wine, &prefix, NP_KEY, INSTALL_WIN_DIR)?;
             registered = format!("registered {INSTALL_WIN_DIR} for TrackIR and FreeTrack");
@@ -600,9 +871,9 @@ fn install(args: &[String]) -> CmdResult {
                 );
             }
         }
-        NpSource::Installed(dir) => {
-            let win = wine_path_for(&dir);
-            all_written &= set_key(&wine, &prefix, NP_KEY, &win)?;
+        NpSource::Installed(_) => {
+            let win = np_target.as_str();
+            all_written &= set_key(&wine, &prefix, NP_KEY, win)?;
             registered = format!(
                 "registered {INSTALL_WIN_DIR} for FreeTrack\n\
                  registered {win} for TrackIR\n\n\
@@ -634,6 +905,11 @@ fn install(args: &[String]) -> CmdResult {
     }
 
     println!("{registered}");
+    for ((_, _, abi), (_, e)) in KEYS.iter().zip(&found) {
+        if let Existing::Foreign(v) = e {
+            println!("replaced the {abi} registration {v} — uninstall puts it back");
+        }
+    }
     println!();
     if third_party_np {
         println!(
@@ -709,19 +985,71 @@ fn run(args: &[String]) -> CmdResult {
     Ok(())
 }
 
-/// `tobii bridge uninstall` — remove the keys and the directory.
+/// `tobii bridge uninstall` — put the keys back and remove the directory.
+///
+/// "Put back", not "delete". These two keys are how *any* head-tracking client
+/// is found, not just ours, so deleting them on the way out leaves a prefix
+/// with nothing registered at all — worse than it was before we touched it, and
+/// for a prefix that had opentrack's client it silently throws away the one
+/// registration a signature-checking game accepts. What install found is
+/// recorded in [`PRIOR_FILE`]; this undoes exactly that.
 fn uninstall(args: &[String]) -> CmdResult {
     let prefix = resolve_prefix(args)?;
     let wine = resolve_wine(&prefix, args)?;
-    for key in [NP_KEY, FT_KEY] {
-        let _ = wine_run(&wine, &prefix, &["reg", "delete", key, "/f"]);
-    }
     let dir = prefix.join(INSTALL_SUBDIR);
+    // Read before the directory goes: the record lives inside it.
+    let prior = read_prior(&dir);
+
+    let mut restored: Vec<String> = Vec::new();
+    let mut unregistered: Vec<&str> = Vec::new();
+    let mut untouched: Vec<&str> = Vec::new();
+    for (name, key, abi) in KEYS {
+        match prior.iter().find(|(n, _)| n == name).map(|(_, p)| p) {
+            Some(Prior::Value(v)) => {
+                restored.push(if set_key(&wine, &prefix, key, v)? {
+                    format!("restored the {abi} client path to {v}")
+                } else {
+                    format!(
+                        "could not restore the {abi} client path to {v} — it still points at us"
+                    )
+                });
+            }
+            Some(Prior::Unset) => {
+                let _ = wine_run(&wine, &prefix, &["reg", "delete", key, "/f"]);
+                unregistered.push(abi);
+            }
+            // No record — an older install, or a prefix someone else set up.
+            // Deleting another program's registration on a guess is the fault
+            // being fixed, so the key is left exactly as it is and said out
+            // loud rather than quietly skipped.
+            None => untouched.push(key),
+        }
+    }
+
     if dir.is_dir() {
         std::fs::remove_dir_all(&dir)?;
         println!("removed {}", dir.display());
     }
-    println!("unregistered TrackIR and FreeTrack client paths");
+    for line in &restored {
+        println!("{line}");
+    }
+    if unregistered.len() == KEYS.len() {
+        println!("unregistered TrackIR and FreeTrack client paths");
+    } else {
+        for abi in &unregistered {
+            println!("unregistered the {abi} client path");
+        }
+    }
+    if !untouched.is_empty() {
+        println!(
+            "\nnothing recorded what these keys held before the bridge was installed \
+             here,\nso they were left as they are rather than deleting a registration \
+             that may\nnot be ours:"
+        );
+        for key in untouched {
+            println!("  {key}");
+        }
+    }
     Ok(())
 }
 
@@ -987,5 +1315,352 @@ mod tests {
     fn the_registry_keys_are_the_published_discovery_paths() {
         assert!(NP_KEY.contains(r"NaturalPoint\NATURALPOINT\NPClient Location"));
         assert!(FT_KEY.contains(r"Freetrack\FreeTrackClient"));
+    }
+
+    /// A fake `wine`: a shell script that records every argv it is handed,
+    /// answers `reg query` from a file the test writes, and can be told to fail
+    /// a write. `ROOT` is replaced with the temp directory before it is written.
+    const FAKE_WINE: &str = r#"#!/bin/sh
+{ for a in "$@"; do printf '[%s]' "$a"; done; printf '\n'; } >> 'ROOT/argv'
+if [ "$1" = reg ] && [ "$2" = query ]; then
+  case "$3" in
+    *NaturalPoint*) reply='ROOT/np.reply' ;;
+    *)              reply='ROOT/ft.reply' ;;
+  esac
+  [ -f "$reply" ] || exit 1
+  cat "$reply"
+  exit 0
+fi
+if [ "$1" = reg ] && [ "$2" = add ] && [ -f 'ROOT/fail-add' ]; then
+  exit 1
+fi
+exit 0
+"#;
+
+    /// A prefix, an artifact directory and that fake wine, in one temp tree.
+    ///
+    /// The registry *is* the installation, so nothing install and uninstall do
+    /// to it can be observed without a wine to talk to — which is why this
+    /// exists rather than more pure-function tests. It needs no real Wine, no
+    /// real prefix, no `$HOME` and no particular uid, so it runs unchanged in
+    /// CI's root container.
+    struct FakeWine {
+        root: PathBuf,
+    }
+
+    impl FakeWine {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("tobii-bridge-{tag}-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::create_dir_all(root.join("prefix/drive_c")).expect("prefix");
+            std::fs::create_dir_all(root.join("artifacts")).expect("artifact dir");
+            std::fs::write(root.join("artifacts").join(REQUIRED_ARTIFACT), b"dll").expect("dll");
+            let wine = root.join("wine");
+            std::fs::write(
+                &wine,
+                FAKE_WINE.replace("ROOT", &root.display().to_string()),
+            )
+            .expect("fake wine");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wine, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+            Self { root }
+        }
+
+        fn prefix(&self) -> PathBuf {
+            self.root.join("prefix")
+        }
+
+        fn dest(&self) -> PathBuf {
+            self.prefix().join(INSTALL_SUBDIR)
+        }
+
+        /// Make `reg query` answer for one key, in wine's own output shape.
+        fn registered(&self, which: &str, value: &str) {
+            std::fs::write(
+                self.root.join(format!("{which}.reply")),
+                format!(
+                    "\r\nHKEY_CURRENT_USER\\Software\\Whatever\r\n    \
+                     Path    REG_SZ    {value}\r\n\r\n"
+                ),
+            )
+            .expect("canned reply");
+        }
+
+        /// Make every `reg add` fail, as a wine that cannot serve the prefix
+        /// does.
+        fn fail_writes(&self) {
+            std::fs::write(self.root.join("fail-add"), b"").expect("switch");
+        }
+
+        fn argv(&self) -> String {
+            std::fs::read_to_string(self.root.join("argv")).unwrap_or_default()
+        }
+
+        fn record(&self) -> String {
+            std::fs::read_to_string(self.dest().join(PRIOR_FILE)).unwrap_or_default()
+        }
+
+        fn put_record(&self, text: &str) {
+            std::fs::create_dir_all(self.dest()).expect("install dir");
+            std::fs::write(self.dest().join(PRIOR_FILE), text).expect("record");
+        }
+
+        fn args(&self, sub: &str, extra: &[&str]) -> Vec<String> {
+            let mut v: Vec<String> = ["tobii", "bridge", sub]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for (flag, value) in [
+                ("--prefix", self.prefix().display().to_string()),
+                ("--wine", self.root.join("wine").display().to_string()),
+                (
+                    "--artifacts",
+                    self.root.join("artifacts").display().to_string(),
+                ),
+                // Pinned, so the outcome does not depend on whether the machine
+                // running the test happens to have opentrack installed.
+                ("--npclient", "ours".to_string()),
+            ] {
+                v.push(flag.to_string());
+                v.push(value);
+            }
+            v.extend(extra.iter().map(|s| (*s).to_string()));
+            v
+        }
+    }
+
+    impl Drop for FakeWine {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    /// A registered path may contain spaces, so the value is the rest of the
+    /// line — one word of `C:\Program Files\opentrack` would be compared
+    /// against ours and called someone else's.
+    #[test]
+    fn the_registered_path_is_read_out_of_reg_query_whole() {
+        assert_eq!(
+            reg_query_path(
+                "\r\nHKEY_CURRENT_USER\\Software\\Freetrack\\FreeTrackClient\r\n    \
+                 Path    REG_SZ    C:\\Program Files\\opentrack\r\n\r\n"
+            )
+            .as_deref(),
+            Some(r"C:\Program Files\opentrack")
+        );
+        // What wine prints when there is nothing there.
+        assert_eq!(
+            reg_query_path("ERROR: The system was unable to find the specified registry key\n"),
+            None
+        );
+        // A different value whose name merely starts with `Path`.
+        assert_eq!(reg_query_path("    PathOther    REG_SZ    x\n"), None);
+        assert_eq!(reg_query_path(""), None);
+    }
+
+    /// The cases install has to tell apart, and what each leaves for uninstall
+    /// to put back.
+    #[test]
+    fn a_value_that_is_neither_absent_nor_ours_is_someone_elses() {
+        assert_eq!(classify(None, INSTALL_WIN_DIR), Existing::Absent);
+        // An empty Path registers nothing, so it is the same as no value.
+        assert_eq!(classify(Some("  "), INSTALL_WIN_DIR), Existing::Absent);
+        // Windows paths are case-insensitive; refusing over a drive letter
+        // would be a refusal nobody could act on.
+        assert_eq!(
+            classify(Some(r"c:\TOBII-BRIDGE"), INSTALL_WIN_DIR),
+            Existing::Ours
+        );
+        assert_eq!(
+            classify(Some(r"C:\opentrack"), INSTALL_WIN_DIR),
+            Existing::Foreign(r"C:\opentrack".to_string())
+        );
+        // Only our own directory is deleted on the way out. A third-party path
+        // equal to what we would write may be that program's own registration,
+        // so it is put back rather than removed.
+        assert_eq!(Existing::Ours.prior(), Prior::Unset);
+        assert_eq!(Existing::Absent.prior(), Prior::Unset);
+        assert_eq!(
+            classify(
+                Some(r"Z:\usr\libexec\opentrack"),
+                r"Z:\usr\libexec\opentrack"
+            )
+            .prior(),
+            Prior::Value(r"Z:\usr\libexec\opentrack".to_string())
+        );
+    }
+
+    /// Restoring "there was no value" and "there was this value" are opposite
+    /// actions, so a record that cannot tell them apart is the same bug again.
+    #[test]
+    fn the_record_tells_no_value_apart_from_a_value() {
+        let entries = vec![
+            (
+                "np".to_string(),
+                Prior::Value(r"C:\Program Files\x".to_string()),
+            ),
+            ("ft".to_string(), Prior::Unset),
+        ];
+        assert_eq!(parse_prior(&render_prior(&entries)), entries);
+        // A damaged line is dropped, never guessed at: no record and an
+        // unreadable one must both end in leaving the key alone.
+        assert_eq!(
+            parse_prior("np value\nft wat\n# a comment\n\nnp unset\n"),
+            vec![("np".to_string(), Prior::Unset)]
+        );
+    }
+
+    /// The bug this whole path exists for: a prefix that already has a working
+    /// head-tracking setup must not be overwritten by a blind `reg add`.
+    #[test]
+    fn install_refuses_to_clobber_another_programs_registration() {
+        let w = FakeWine::new("refuse");
+        w.registered("np", r"Z:\usr\libexec\opentrack");
+        w.registered("ft", r"Z:\usr\libexec\opentrack");
+        let err = install(&w.args("install", &[]))
+            .expect_err("must refuse")
+            .to_string();
+        assert!(
+            err.contains(r"Z:\usr\libexec\opentrack"),
+            "must say what is registered: {err}"
+        );
+        assert!(err.contains("--force"), "must name the way through: {err}");
+        let argv = w.argv();
+        assert!(argv.contains("[query]"), "must have read first: {argv}");
+        assert!(!argv.contains("[add]"), "nothing may be written: {argv}");
+        assert!(!w.dest().exists(), "and nothing copied either");
+    }
+
+    /// `--force` is the deliberate override, and the point of it is that it is
+    /// still recoverable: what it replaced is written down.
+    #[test]
+    fn force_replaces_it_but_records_what_it_replaced() {
+        let w = FakeWine::new("force");
+        w.registered("np", r"Z:\usr\libexec\opentrack");
+        w.registered("ft", r"C:\freetrack");
+        install(&w.args("install", &["--force"])).expect("installs");
+        let rec = w.record();
+        assert!(rec.contains(r"np value Z:\usr\libexec\opentrack"), "{rec}");
+        assert!(rec.contains(r"ft value C:\freetrack"), "{rec}");
+        let argv = w.argv();
+        assert!(
+            argv.contains(
+                r"[add][HKCU\Software\Freetrack\FreeTrackClient][/v][Path][/t][REG_SZ][/d][C:\tobii-bridge][/f]"
+            ),
+            "{argv}"
+        );
+    }
+
+    /// The other half of the record: an untouched prefix held nothing, and
+    /// uninstall may then delete — which is only right because it was recorded.
+    #[test]
+    fn an_unregistered_prefix_is_recorded_as_having_held_nothing() {
+        let w = FakeWine::new("absent");
+        install(&w.args("install", &[])).expect("installs");
+        let rec = w.record();
+        assert!(rec.contains("np unset"), "{rec}");
+        assert!(rec.contains("ft unset"), "{rec}");
+    }
+
+    /// The record answers "what did this prefix say before `tobii` ever wrote
+    /// to it", so re-installing — which finds our own value there — must not
+    /// overwrite the answer with our own value, and must not refuse either.
+    #[test]
+    fn a_second_install_neither_refuses_nor_overwrites_the_first_record() {
+        let w = FakeWine::new("twice");
+        w.registered("np", r"Z:\usr\libexec\opentrack");
+        install(&w.args("install", &["--force"])).expect("first install");
+        w.registered("np", INSTALL_WIN_DIR);
+        w.registered("ft", INSTALL_WIN_DIR);
+        install(&w.args("install", &[])).expect("our own value is not someone else's");
+        // Read back as entries and compared whole: a second entry for the same
+        // key appended below the first would leave the text assertion happy
+        // while the record had two answers to one question.
+        assert_eq!(
+            read_prior(&w.dest()),
+            vec![
+                ("ft".to_string(), Prior::Unset),
+                (
+                    "np".to_string(),
+                    Prior::Value(r"Z:\usr\libexec\opentrack".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// The other side of that: a run that takes the key off another program
+    /// must say so even though a record already exists, or `--force` promises
+    /// to put back a value uninstall then deletes.
+    #[test]
+    fn a_later_run_records_whatever_it_most_recently_took() {
+        let w = FakeWine::new("retake");
+        install(&w.args("install", &[])).expect("first install");
+        // Something else claims the TrackIR key after we were already here.
+        w.registered("np", r"Z:\usr\libexec\opentrack");
+        w.registered("ft", INSTALL_WIN_DIR);
+        install(&w.args("install", &["--force"])).expect("second install");
+        assert_eq!(
+            read_prior(&w.dest()),
+            vec![
+                ("ft".to_string(), Prior::Unset),
+                (
+                    "np".to_string(),
+                    Prior::Value(r"Z:\usr\libexec\opentrack".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// Deleting leaves the prefix with NO client registered, which is worse
+    /// than it was before we touched it.
+    #[test]
+    fn uninstall_puts_back_what_was_there_instead_of_deleting_it() {
+        let w = FakeWine::new("restore");
+        w.put_record("np value Z:\\usr\\libexec\\opentrack\nft unset\n");
+        uninstall(&w.args("uninstall", &[])).expect("uninstalls");
+        let argv = w.argv();
+        assert!(
+            argv.contains(
+                r"[add][HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location][/v][Path][/t][REG_SZ][/d][Z:\usr\libexec\opentrack][/f]"
+            ),
+            "the TrackIR key must be restored: {argv}"
+        );
+        assert!(
+            !argv.contains(r"[delete][HKCU\Software\NaturalPoint"),
+            "and not deleted: {argv}"
+        );
+        // Recorded as having held nothing, so deleting is the restoration.
+        assert!(
+            argv.contains(r"[delete][HKCU\Software\Freetrack\FreeTrackClient][/f]"),
+            "{argv}"
+        );
+    }
+
+    /// With no record there is nothing to say the key is ours, and deleting
+    /// another program's registration on the way out is the fault being fixed.
+    #[test]
+    fn uninstall_without_a_record_leaves_both_keys_alone() {
+        let w = FakeWine::new("norecord");
+        std::fs::create_dir_all(w.dest()).expect("install dir");
+        std::fs::write(w.dest().join(REQUIRED_ARTIFACT), b"dll").expect("dll");
+        uninstall(&w.args("uninstall", &[])).expect("uninstalls");
+        let argv = w.argv();
+        assert!(!argv.contains("[delete]"), "nothing may be deleted: {argv}");
+        assert!(!argv.contains("[add]"), "and nothing written: {argv}");
+        assert!(!w.dest().exists(), "the directory still goes");
+    }
+
+    /// The registry path IS the installation, so a write that did not land is
+    /// a failed install however many files were copied.
+    #[test]
+    fn a_registry_write_that_fails_still_fails_the_install() {
+        let w = FakeWine::new("failwrite");
+        w.fail_writes();
+        let err = install(&w.args("install", &[]))
+            .expect_err("must fail")
+            .to_string();
+        assert!(err.contains("registry keys could not be written"), "{err}");
     }
 }
