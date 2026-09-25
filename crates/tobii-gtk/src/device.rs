@@ -93,6 +93,21 @@ impl Demand {
 /// gaze preview — is just watching, and can be interrupted.
 const EXCLUSIVE: [&str; 2] = ["calibration", "display setup"];
 
+/// Why the tracker is held on for a virtual joystick.
+///
+/// Deliberately not in [`EXCLUSIVE`]: this claim is held by the hub itself,
+/// for as long as the setting says so, and a claim that never ends must never
+/// be a claim that refuses. It would otherwise make `tobii headpose`, a
+/// recentre and a calibration impossible to start for exactly the users who
+/// turned it on.
+const JOYSTICK_REASON: &str = "the virtual joystick";
+
+/// Why the tracker is held on when the user has switched standby off.
+///
+/// Non-exclusive for the same reason as [`JOYSTICK_REASON`], and more so: this
+/// one is held whatever else is configured.
+const KEEP_AWAKE_REASON: &str = "standby turned off in the settings";
+
 /// Whether any current reason forbids handing the device over.
 ///
 /// Reads the reasons rather than a separate flag, so a new exclusive flow
@@ -198,6 +213,21 @@ impl Drop for DemandGuard {
             }
         }
     }
+}
+
+/// Whether the device thread must sit in its idle wait instead of opening the
+/// tracker.
+///
+/// Extracted from the loop because the standby holds made the second term
+/// load-bearing in a way it was not before. Every other claim ends by itself —
+/// a window loses focus, a client disconnects, a game exits — but the hub's own
+/// claims (the virtual joystick's, and `keep_awake`) end only when the user
+/// changes a setting, so for those users "something wants the tracker" is
+/// permanently true. The lease term is what still lets `tobii headpose` or a
+/// calibration take the device, and it is an `||` rather than a term weighed
+/// against the demand for precisely that reason: it overrides.
+fn must_wait(demand_active: bool, pending_empty: bool, lease_blocks: bool) -> bool {
+    (!demand_active && pending_empty) || lease_blocks
 }
 
 /// How long the session stays open after the last consumer lets go.
@@ -939,6 +969,10 @@ pub fn spawn() -> Session {
         recentring.clone(),
     );
     let thread_recentring = recentring.clone();
+    // `GameSide` does not merely read the settings, it acts on two of them by
+    // holding the tracker on — so it needs a `Demand` of its own. See
+    // `GameSide::sync_wake`.
+    let thread_game_demand = demand.clone();
     std::thread::spawn(move || {
         // Commands that arrived while the tracker was off. They are not
         // dropped: "select left eye only" typed into an idle hub has to take
@@ -946,7 +980,11 @@ pub fn spawn() -> Session {
         let mut pending: Vec<DeviceCommand> = Vec::new();
         // Game output's settings, polled rather than read once — see
         // `GameSide`.
-        let mut game_side = GameSide::new(thread_joystick_status, thread_recentring);
+        let mut game_side = GameSide::new(
+            thread_game_demand,
+            thread_joystick_status,
+            thread_recentring,
+        );
         loop {
             game_side.poll();
             // Nothing wants the tracker: do not open it. This is the whole
@@ -954,9 +992,11 @@ pub fn spawn() -> Session {
             // the USB device free for `tobii headpose`.
             // A lease is the inverse of a demand: something else has the
             // device, so the hub waits regardless of who wants it here.
-            while (!thread_demand.active() && pending.is_empty())
-                || thread_lease.lock().unwrap().hub_must_not_open()
-            {
+            while must_wait(
+                thread_demand.active(),
+                pending.is_empty(),
+                thread_lease.lock().unwrap().hub_must_not_open(),
+            ) {
                 while let Ok(cmd) = rx.try_recv() {
                     pending.push(cmd);
                 }
@@ -1059,6 +1099,14 @@ pub enum JoystickStatus {
 ///   session. `/dev/uinput` being unwritable is a standing condition with a
 ///   standing fix, not an event.
 struct GameSide {
+    /// Used to hold the tracker on, not merely to read it: two of the settings
+    /// this polls are reasons to keep the illuminators lit.
+    demand: Demand,
+    /// Held while a virtual joystick that really exists is configured to wake
+    /// the tracker. See [`GameSide::sync_wake`].
+    wake: Option<DemandGuard>,
+    /// Held while `keep_awake` is set, whatever else is configured.
+    awake: Option<DemandGuard>,
     /// The virtual joystick, if the setting asks for one. Owned here rather
     /// than by a session because a game enumerates controllers when it launches
     /// and the tracker is dark until something asks for it — see
@@ -1086,12 +1134,33 @@ fn wants_joystick(cfg: &tobii_output::games::OutputConfig) -> bool {
     cfg.enabled && cfg.joystick
 }
 
+/// Whether the virtual joystick is a reason to keep the tracker running.
+///
+/// `have_device` is the load-bearing term and the reason this is not derived
+/// from the settings alone: a `/dev/uinput` that refuses leaves nothing for a
+/// game to read, so holding the tracker on for it would light the illuminators
+/// for a controller that does not exist. It also cannot be answered by asking
+/// who has the device open — the kernel exports no open count, and the
+/// processes that hold a uinput node are not a signal (an idle-wake daemon, a
+/// browser probing gamepads and `winedevice.exe` all take ours within
+/// milliseconds of it appearing, and never let go).
+fn wants_joystick_wake(cfg: &tobii_output::games::OutputConfig, have_device: bool) -> bool {
+    have_device && cfg.wake_for_joystick && wants_joystick(cfg)
+}
+
 /// How often the settings are re-read.
 const GAMES_POLL: Duration = Duration::from_secs(1);
 
 impl GameSide {
-    fn new(status: Arc<Mutex<JoystickStatus>>, recentring: crate::outputs::Recentring) -> GameSide {
+    fn new(
+        demand: Demand,
+        status: Arc<Mutex<JoystickStatus>>,
+        recentring: crate::outputs::Recentring,
+    ) -> GameSide {
         GameSide {
+            demand,
+            wake: None,
+            awake: None,
             joystick: None,
             status,
             recentring,
@@ -1119,7 +1188,7 @@ impl GameSide {
 
         let cfg = tobii_output::games::load_output_config();
         let had_device = self.joystick.is_some();
-        self.sync_joystick(&cfg);
+        self.apply(&cfg);
         let changed = self.last_cfg.as_ref().is_some_and(|last| *last != cfg)
             || had_device != self.joystick.is_some();
         self.last_cfg = Some(cfg);
@@ -1134,6 +1203,55 @@ impl GameSide {
     /// owned by the thread rather than by a session.
     fn output(&self) -> Option<crate::outputs::GameOutput> {
         crate::outputs::GameOutput::for_session(self.joystick.clone(), self.recentring.clone())
+    }
+
+    /// Bring everything this owns into line with `cfg`: the joystick device
+    /// and the two claims on the tracker.
+    ///
+    /// Split from [`GameSide::poll`] so a test can drive it with a config of
+    /// its own — `poll` reads the settings of whoever is running the tests,
+    /// which in CI is root in a container.
+    fn apply(&mut self, cfg: &tobii_output::games::OutputConfig) {
+        self.sync_joystick(cfg);
+        self.sync_keep_awake(cfg);
+    }
+
+    /// Hold the tracker on for a joystick that really exists, or let go.
+    ///
+    /// One guard, kept rather than re-taken. Assigning a fresh `hold` every
+    /// second would behave the same — but only because assignment drops the old
+    /// guard *after* taking the new one, so the count never touches zero. The
+    /// version of that which drops first closes and reopens the USB session
+    /// once a second, which on this device means rebooting the tracker once a
+    /// second. (The opentrack watch learned this the same way; see
+    /// `crate::outputs::PortWatch`.)
+    fn sync_wake(&mut self, cfg: &tobii_output::games::OutputConfig, have_device: bool) {
+        if wants_joystick_wake(cfg, have_device) {
+            let demand = &self.demand;
+            self.wake
+                .get_or_insert_with(|| demand.hold(JOYSTICK_REASON));
+        } else {
+            self.wake = None;
+        }
+    }
+
+    /// Hold the tracker on for as long as the hub runs, if the user asked for
+    /// that.
+    ///
+    /// Not gated on game output, on a sink, or on anything observable: this is
+    /// the fallback for the setups where nothing IS observable — a Wine bridge
+    /// whose only listener lives inside the prefix, an opentrack on another
+    /// machine, a game that cannot be wrapped. It is the user telling the hub
+    /// what it cannot work out, so the only thing it is gated on is them
+    /// saying it.
+    fn sync_keep_awake(&mut self, cfg: &tobii_output::games::OutputConfig) {
+        if cfg.keep_awake {
+            let demand = &self.demand;
+            self.awake
+                .get_or_insert_with(|| demand.hold(KEEP_AWAKE_REASON));
+        } else {
+            self.awake = None;
+        }
     }
 
     /// Create or destroy the device to match the setting.
@@ -1186,7 +1304,37 @@ impl GameSide {
                 }
             }
         }
+        // After the match, so it reads the handle the arms just settled: the
+        // claim exists exactly when the device does. A `/dev/uinput` that
+        // refused therefore costs no sessions, and a joystick the user has
+        // just unticked lets the illuminators go out with it.
+        let have_device = self.joystick.is_some();
+        self.sync_wake(cfg, have_device);
     }
+}
+
+/// The line logged when a session ends because nothing wants the tracker any
+/// more.
+///
+/// # Why there has to be one
+///
+/// `crate::outputs` logs *"game output on, sending to: …"* every time a
+/// session builds its outputs, and nothing was ever logged when a session
+/// ended. So the log a user attaches to a bug report said the tracker had been
+/// switched on twelve times and never off — which is precisely the shape of
+/// the report "it stops sending after a few seconds", with the cause missing.
+/// Once per close, which is once per [`LINGER`] at most, because this is the
+/// only way a session ends quietly.
+fn standby_notice(was_sending: bool) -> String {
+    format!(
+        "tracker off: nothing has asked for it for {}s{}",
+        LINGER.as_secs(),
+        if was_sending {
+            ", so game output stopped too"
+        } else {
+            ""
+        }
+    )
 }
 
 /// Tell whoever is waiting that a queued command will never run.
@@ -1343,6 +1491,8 @@ fn device_session(
                         if since.elapsed() >= LINGER {
                             // Dropping `conn` closes the session, which the ET5
                             // answers by rebooting — and the illuminators go out.
+                            // Said out loud: see `standby_notice`.
+                            tobii_diagnostics::log::info(&standby_notice(games.is_some()));
                             break;
                         }
                     }
@@ -1550,6 +1700,211 @@ mod tests {
         assert!(d.joystick, "premise: the sink itself is on by default");
         assert!(!d.enabled, "premise: game output is off by default");
         assert!(!super::wants_joystick(&d));
+    }
+
+    // --- holding the tracker for the things that cannot ask ---------------
+
+    /// A joystick nothing can be seen to be reading is still a reason to keep
+    /// the tracker on — but only when the device really exists. Holding it on
+    /// for a `/dev/uinput` that refused would light the illuminators for a
+    /// controller no game can bind.
+    #[test]
+    fn the_joystick_wakes_the_tracker_only_when_the_device_really_exists() {
+        use tobii_output::games::OutputConfig;
+        let cfg = |enabled, joystick, wake| OutputConfig {
+            enabled,
+            joystick,
+            wake_for_joystick: wake,
+            ..OutputConfig::default()
+        };
+        assert!(super::wants_joystick_wake(&cfg(true, true, true), true));
+        assert!(
+            !super::wants_joystick_wake(&cfg(true, true, true), false),
+            "a joystick that could not be created must cost no sessions"
+        );
+        assert!(
+            !super::wants_joystick_wake(&cfg(true, true, false), true),
+            "and the user can switch the whole thing off"
+        );
+        assert!(!super::wants_joystick_wake(&cfg(false, true, true), true));
+        assert!(!super::wants_joystick_wake(&cfg(true, false, true), true));
+        assert!(
+            !super::wants_joystick_wake(&OutputConfig::default(), true),
+            "a fresh install holds the tracker for nothing"
+        );
+    }
+
+    /// A `GameSide` with nothing plumbed into the real world. No joystick is
+    /// ever created in the tests below: every config they apply has game
+    /// output off, so nothing here ever reaches `/dev/uinput`.
+    fn game_side(demand: &Demand) -> GameSide {
+        GameSide::new(
+            demand.clone(),
+            Arc::new(Mutex::new(JoystickStatus::Off)),
+            crate::outputs::Recentring::default(),
+        )
+    }
+
+    /// The whole of the issue this was written for: with the hub out of focus
+    /// and a game bound to the virtual joystick, something has to hold the
+    /// tracker on. And it has to let go again when the user says so, or the
+    /// setting is a one-way door.
+    #[test]
+    fn a_present_joystick_holds_the_tracker_until_the_setting_goes_off() {
+        use tobii_output::games::OutputConfig;
+        let on = OutputConfig {
+            enabled: true,
+            joystick: true,
+            ..OutputConfig::default()
+        };
+        let d = Demand::new();
+        let mut gs = game_side(&d);
+
+        gs.sync_wake(&on, true);
+        assert_eq!(d.reasons(), vec![JOYSTICK_REASON]);
+        gs.sync_wake(&on, true);
+        assert_eq!(d.reasons(), vec![JOYSTICK_REASON], "one claim, not two");
+
+        gs.sync_wake(
+            &OutputConfig {
+                wake_for_joystick: false,
+                ..on.clone()
+            },
+            true,
+        );
+        assert!(!d.active(), "unticking it must let the illuminators go out");
+
+        gs.sync_wake(&on, true);
+        assert!(d.active(), "and ticking it again must light them");
+        gs.sync_wake(&on, false);
+        assert!(!d.active(), "so must losing the device");
+
+        // And through the real path, which is what the poll calls: switching
+        // game output off destroys the device, and the claim must go with it.
+        // (`enabled` false, so this reaches no `/dev/uinput` either.)
+        gs.sync_wake(&on, true);
+        assert!(d.active(), "premise: held again");
+        gs.apply(&OutputConfig {
+            enabled: false,
+            ..on.clone()
+        });
+        assert!(!d.active(), "game output off must release it too");
+    }
+
+    /// `keep_awake` is the fallback for what cannot be detected, so it has to
+    /// work with game output off — that is the case it exists for (a Wine
+    /// bridge, an opentrack on another machine). Driven through `apply`, the
+    /// one seam `poll` uses, so this pins the wiring and not just the rule.
+    #[test]
+    fn keep_awake_holds_the_tracker_with_game_output_switched_off() {
+        use tobii_output::games::OutputConfig;
+        let d = Demand::new();
+        let mut gs = game_side(&d);
+
+        let mut cfg = OutputConfig {
+            enabled: false,
+            keep_awake: true,
+            ..OutputConfig::default()
+        };
+        gs.apply(&cfg);
+        assert_eq!(d.reasons(), vec![KEEP_AWAKE_REASON]);
+        gs.apply(&cfg);
+        assert_eq!(d.reasons(), vec![KEEP_AWAKE_REASON], "one claim, not two");
+
+        cfg.keep_awake = false;
+        gs.apply(&cfg);
+        assert!(!d.active(), "unticking it must put the illuminators out");
+    }
+
+    /// The default settings must leave the tracker exactly as dark as they did
+    /// before these two keys existed.
+    #[test]
+    fn the_default_settings_hold_the_tracker_for_nothing() {
+        let d = Demand::new();
+        let mut gs = game_side(&d);
+        gs.apply(&tobii_output::games::OutputConfig::default());
+        assert!(!d.active(), "{:?}", d.reasons());
+    }
+
+    /// The silent failure mode: a claim the hub holds on its own behalf never
+    /// ends by itself, so were either of these exclusive, the users who turned
+    /// them on could never start `tobii headpose`, a calibration or a recentre
+    /// again — and the refusal would read as the tracker being busy with
+    /// something they cannot see.
+    #[test]
+    fn the_standby_claims_refuse_neither_a_lease_nor_a_recentre() {
+        let reasons = [JOYSTICK_REASON, KEEP_AWAKE_REASON];
+        assert!(
+            !wants_exclusive(&reasons),
+            "a claim that never ends must never refuse"
+        );
+        // Both of the hub's refusal paths read `wants_exclusive`.
+        assert_eq!(
+            crate::outputs::recentre_decision(&reasons, true, true),
+            Ok(())
+        );
+        let d = Demand::new();
+        let mut gs = game_side(&d);
+        gs.apply(&tobii_output::games::OutputConfig {
+            keep_awake: true,
+            ..Default::default()
+        });
+        gs.sync_wake(
+            &tobii_output::games::OutputConfig {
+                enabled: true,
+                joystick: true,
+                ..Default::default()
+            },
+            true,
+        );
+        assert_eq!(d.reasons().len(), 2, "premise: both are held");
+        assert!(!wants_exclusive(&d.reasons()));
+    }
+
+    /// The claims above keep a session open for as long as the setting says,
+    /// which is intended — but the lease has to win anyway, or the device can
+    /// never be handed to `tobii headpose`. That is the `||`, and this is the
+    /// only thing pinning it.
+    #[test]
+    fn a_standby_claim_keeps_the_session_open_but_still_yields_to_a_lease() {
+        assert!(
+            !must_wait(true, true, false),
+            "a claim of our own opens the session and keeps it open"
+        );
+        assert!(
+            must_wait(true, true, true),
+            "and a lease still takes the device away from it"
+        );
+        assert!(
+            must_wait(false, true, false),
+            "nothing asked for it: stay dark"
+        );
+        assert!(
+            !must_wait(false, false, false),
+            "a queued command is itself a reason to open"
+        );
+        assert!(
+            must_wait(false, false, true),
+            "but not while somebody else has the device"
+        );
+    }
+
+    /// The line that pairs with "game output on, sending to: …". Without one,
+    /// the 15-line tail in a bug report shows a tracker switched on a dozen
+    /// times and never off.
+    #[test]
+    fn a_session_closing_says_so_in_the_log() {
+        let quiet = standby_notice(false);
+        assert!(quiet.contains("3s"), "the linger is named: {quiet}");
+        assert!(
+            !quiet.contains("game output"),
+            "nothing was being sent: {quiet}"
+        );
+        let sending = standby_notice(true);
+        assert!(
+            sending.contains("game output"),
+            "the reader has to see what stopped: {sending}"
+        );
     }
 
     // --- the lease -------------------------------------------------------

@@ -52,6 +52,38 @@ pub struct OutputConfig {
     /// gets the same thing they always got, until they turn this on or pass
     /// `--extended-view`.
     pub enabled: bool,
+    /// Whether to switch standby off entirely: hold the tracker on for as long
+    /// as the hub is running, whatever anything else says.
+    ///
+    /// # Why this exists
+    ///
+    /// Every other reason the tracker switches itself on is something the hub
+    /// can *observe*: a focused window, a client on its socket, a socket bound
+    /// at the opentrack address, a virtual joystick that exists. Some setups
+    /// leave nothing observable — a Wine bridge whose only listener is inside
+    /// the prefix, an opentrack on another machine, a game that cannot be
+    /// wrapped — and there the honest answer is that the hub cannot tell. This
+    /// is the user saying it instead.
+    ///
+    /// # Why it is here and not in `config.toml`
+    ///
+    /// It is not a game-output setting, and it is deliberately not gated on
+    /// [`enabled`](Self::enabled): it holds the tracker on with game output
+    /// off. It lives in this file because this is the file the hub re-reads
+    /// once a second — the device thread's `GameSide` poll, which runs in the
+    /// idle wait as well as inside a session — so ticking it takes effect
+    /// while the user is looking at the tracker rather than at the next
+    /// restart. `config.toml` is rewritten wholesale by `tobii setup` (see the
+    /// module docs) and is read once, at connect.
+    ///
+    /// # Why it is off by default, and must stay off
+    ///
+    /// This is the one key here that weakens standby without any bound on it.
+    /// [`wake_for_opentrack`](Self::wake_for_opentrack)'s hold ends when the
+    /// program holding that port exits; this one ends when the user closes the
+    /// hub or unticks it. On, the illuminators are lit for as long as the hub
+    /// runs — overnight included, if the hub was left open.
+    pub keep_awake: bool,
     /// Frames per second delivered to sinks. Sampling and smoothing still run
     /// at the device's full rate; this throttles only the wire.
     pub rate_hz: f64,
@@ -126,6 +158,38 @@ pub struct OutputConfig {
     /// neither present, turning game output on would otherwise have no effect
     /// whatsoever and no way to tell that apart from a fault.
     pub joystick: bool,
+    /// Whether the virtual joystick existing is itself a reason to switch the
+    /// tracker on.
+    ///
+    /// # Why the default is on
+    ///
+    /// Without it, the joystick is the one sink nothing can wake the tracker
+    /// for. The opentrack sink has its port watched, a game started with
+    /// `tobii game` subscribes over the hub's socket — but a game that binds
+    /// the virtual controller says nothing to anybody, so the tracker went
+    /// dark three seconds after the hub lost focus and the game kept reading
+    /// the axes it had. That does not look like an unplugged controller,
+    /// which would at least be legible: it looks like a working tracker whose
+    /// numbers have stopped moving, frozen at centre.
+    ///
+    /// # Why it cannot be narrower than this
+    ///
+    /// The opentrack watch asks a real question — is anything bound at that
+    /// address — and lets go when the answer changes. There is no equivalent
+    /// question for a uinput device: the kernel exports no open count, and the
+    /// processes that hold ours open are not a signal (a faithful replica of
+    /// it was opened by an idle-wake daemon, by a browser probing gamepads and
+    /// by `winedevice.exe` within 30 ms of appearing, and never had zero
+    /// openers afterwards). So this hold is bounded by the setting and not by
+    /// any program's lifetime: with game output on, the illuminators stay lit
+    /// until game output goes off — overnight included, if it is forgotten.
+    ///
+    /// Like [`wake_for_opentrack`](Self::wake_for_opentrack) it cannot light
+    /// the tracker on its own: it needs [`enabled`](Self::enabled), which is
+    /// off out of the box, it needs [`joystick`](Self::joystick), and it needs
+    /// the device to have actually been created — a `/dev/uinput` that refuses
+    /// costs no sessions.
+    pub wake_for_joystick: bool,
     /// Gaze-driven camera offset.
     pub extended_view: ExtendedView,
 }
@@ -134,6 +198,7 @@ impl Default for OutputConfig {
     fn default() -> Self {
         OutputConfig {
             enabled: false,
+            keep_awake: false,
             rate_hz: DEFAULT_RATE_HZ,
             filter_alpha: tobii_headpose::filter::DEFAULT_ALPHA,
             filter_max_step_mm: tobii_headpose::filter::DEFAULT_MAX_STEP_MM,
@@ -142,6 +207,7 @@ impl Default for OutputConfig {
             bridge_port: Some(DEFAULT_BRIDGE_PORT),
             joystick_full_deg: [70.0, 35.0, 20.0],
             joystick: true,
+            wake_for_joystick: true,
             extended_view: ExtendedView::default(),
         }
     }
@@ -176,13 +242,21 @@ impl OutputConfig {
         let mut s = String::from(
             "# tobii-linux game output — edit with `tobii games set KEY VALUE`\n\
              #\n\
+             # keep_awake = true switches standby OFF: the tracker stays on, and\n\
+             #                 its illuminators lit, for as long as the hub runs.\n\
+             #                 Not a game-output setting — it is here because this\n\
+             #                 is the file the hub re-reads once a second.\n\
              # opentrack = \"\"  disables the opentrack sink\n\
              # bridge_port = 0 disables the Wine-bridge sink\n\
              # wake_for_opentrack = false stops a program bound to the opentrack\n\
              #                 address from switching the tracker on by itself\n\
+             # wake_for_joystick = false stops the virtual joystick from doing the\n\
+             #                 same. With it off, a game reading those axes sees\n\
+             #                 them frozen at centre once the hub loses focus.\n\
              [games]\n",
         );
         s.push_str(&format!("enabled = {}\n", self.enabled));
+        s.push_str(&format!("keep_awake = {}\n", self.keep_awake));
         s.push_str(&format!("rate_hz = {}\n", self.rate_hz));
         s.push_str(&format!("filter_alpha = {}\n", self.filter_alpha));
         s.push_str(&format!(
@@ -202,6 +276,7 @@ impl OutputConfig {
             self.bridge_port.unwrap_or(0)
         ));
         s.push_str(&format!("joystick = {}\n", self.joystick));
+        s.push_str(&format!("wake_for_joystick = {}\n", self.wake_for_joystick));
         s.push_str(&format!(
             "joystick_yaw_full_deg = {}\n",
             self.joystick_full_deg[0]
@@ -270,6 +345,10 @@ impl OutputConfig {
                 Ok(b) => self.enabled = b,
                 Err(_) => return false,
             },
+            "keep_awake" => match value.parse::<bool>() {
+                Ok(b) => self.keep_awake = b,
+                Err(_) => return false,
+            },
             "rate_hz" => match f(value).filter(|v| *v > 0.0) {
                 Some(v) => self.rate_hz = v,
                 None => return false,
@@ -318,6 +397,10 @@ impl OutputConfig {
             },
             "joystick" => match value.parse::<bool>() {
                 Ok(b) => self.joystick = b,
+                Err(_) => return false,
+            },
+            "wake_for_joystick" => match value.parse::<bool>() {
+                Ok(b) => self.wake_for_joystick = b,
                 Err(_) => return false,
             },
             // Zero or negative would be a division by zero downstream, and
@@ -389,6 +472,7 @@ impl OutputConfig {
     pub fn keys() -> &'static [&'static str] {
         &[
             "enabled",
+            "keep_awake",
             "rate_hz",
             "filter_alpha",
             "filter_max_step_mm",
@@ -396,6 +480,7 @@ impl OutputConfig {
             "wake_for_opentrack",
             "bridge_port",
             "joystick",
+            "wake_for_joystick",
             "joystick_yaw_full_deg",
             "joystick_pitch_full_deg",
             "joystick_roll_full_deg",
@@ -457,6 +542,8 @@ mod tests {
         let base = ExtendedView::default();
         let mut c = OutputConfig {
             enabled: true,
+            // On, because the default is off — see the note above `joystick`.
+            keep_awake: true,
             rate_hz: 120.0,
             filter_alpha: 0.4,
             filter_max_step_mm: 220.0,
@@ -467,6 +554,7 @@ mod tests {
             // Off, because the default is on: the round-trip tests below only
             // mean anything if every field differs from its default.
             joystick: false,
+            wake_for_joystick: false,
             joystick_full_deg: [55.0, 30.0, 18.0],
             extended_view: ExtendedView {
                 hold_ms: 350,
@@ -541,6 +629,58 @@ mod tests {
             "a value that is not a boolean is refused rather than guessed"
         );
         assert!(!c.wake_for_opentrack, "and leaves the setting as it was");
+    }
+
+    /// The same deliberate default as the opentrack watch, and for the same
+    /// reason: the joystick is the one sink with nothing to observe, so the
+    /// setting is the only thing that can hold the tracker on for it. On, and
+    /// still useless until game output itself is switched on.
+    #[test]
+    fn waking_for_the_joystick_is_on_but_useless_until_game_output_is() {
+        let d = OutputConfig::default();
+        assert!(
+            d.wake_for_joystick,
+            "a game reading those axes is asking for tracking"
+        );
+        assert!(!d.enabled, "and it is still gated behind game output");
+    }
+
+    /// Turning it off has to survive the file, or the switch is decorative.
+    #[test]
+    fn the_joystick_wake_can_be_turned_off_and_stays_off() {
+        let mut c = OutputConfig::default();
+        assert!(c.apply_key("wake_for_joystick", "false"));
+        assert!(!c.wake_for_joystick);
+        assert!(!OutputConfig::from_toml(&c.to_toml()).wake_for_joystick);
+        assert!(
+            !c.apply_key("wake_for_joystick", "when playing"),
+            "a value that is not a boolean is refused rather than guessed"
+        );
+        assert!(!c.wake_for_joystick, "and leaves the setting as it was");
+    }
+
+    /// `keep_awake` is the fallback for the setups nothing can detect, and it
+    /// is the one key here that is NOT a game-output setting: it must hold the
+    /// tracker with game output off, and it must be off out of the box,
+    /// because on it lights the illuminators for as long as the hub runs.
+    #[test]
+    fn keeping_the_tracker_awake_is_off_by_default_and_independent_of_game_output() {
+        let d = OutputConfig::default();
+        assert!(
+            !d.keep_awake,
+            "standby stays on unless the user says otherwise"
+        );
+
+        let mut c = OutputConfig::default();
+        assert!(c.apply_key("keep_awake", "true"));
+        assert!(c.keep_awake);
+        assert!(!c.enabled, "and it did not turn game output on to do it");
+        assert!(OutputConfig::from_toml(&c.to_toml()).keep_awake);
+        assert!(
+            !c.apply_key("keep_awake", "yes"),
+            "a value that is not a boolean is refused rather than guessed"
+        );
+        assert!(c.keep_awake, "and leaves the setting as it was");
     }
 
     #[test]
@@ -680,7 +820,8 @@ mod tests {
         let mut c = OutputConfig::default();
         for key in OutputConfig::keys() {
             let value = match *key {
-                "enabled" | "extended_view" | "joystick" | "wake_for_opentrack" => "true",
+                "enabled" | "extended_view" | "joystick" | "wake_for_opentrack"
+                | "wake_for_joystick" | "keep_awake" => "true",
                 k if k.starts_with("joystick_") => "45",
                 "opentrack" => "127.0.0.1:9999",
                 "bridge_port" => "4243",

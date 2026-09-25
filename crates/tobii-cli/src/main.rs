@@ -2754,7 +2754,8 @@ mod tests {
         let mut cfg = OutputConfig::default();
         for key in OutputConfig::keys() {
             let probe = match *key {
-                "enabled" | "extended_view" | "joystick" | "wake_for_opentrack" => "true",
+                "enabled" | "extended_view" | "joystick" | "wake_for_opentrack"
+                | "wake_for_joystick" | "keep_awake" => "true",
                 "opentrack" => "127.0.0.1:9999",
                 "bridge_port" => "4243",
                 "ev_hold_ms" => "150",
