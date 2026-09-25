@@ -13,3 +13,10 @@ tobii-update = { path = "../tobii-update" }
 # `model_store` is not behind the `onnx` feature, so the 110-crate tract tree is
 # not pulled in just to say whether a model file is present.
 tobii-headpose = { path = "../tobii-headpose", default-features = false }
+# For the `game output` section: the settings themselves, and
+# `listener::probe`, which answers the question that section turns on — whether
+# anything is bound at the opentrack address right now. The dependency runs one
+# way only: `tobii-output` knows nothing about this crate, and the Wine
+# bridge's separate workspace depends on `tobii-output` rather than on this
+# one, so its cross-compile to x86_64-pc-windows-gnu compiles nothing new.
+tobii-output = { path = "../tobii-output" }
