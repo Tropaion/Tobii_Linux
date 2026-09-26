@@ -77,8 +77,19 @@ fn watching_opentrack(cfg: &OutputConfig) -> bool {
 /// switch, which is why the switch has to say so. Reported from the settings
 /// rather than from the live demand: the sentence is read while the switch is
 /// OFF, to decide whether to turn it on, when there is no hold to observe.
+///
+/// Both settings, because the hold this predicts is gated on both:
+/// `device::wants_joystick_wake` is `have_device && cfg.wake_for_joystick &&
+/// cfg.enabled && cfg.joystick`. The two terms left out are the two this
+/// question is not allowed to ask — `cfg.enabled`, because the sentence is
+/// read while it is false and the point is what happens when it stops being,
+/// and `have_device`, because no uinput node has been asked for yet either.
+/// `cfg.joystick` alone promised the hold to a user who had run `tobii games
+/// set wake_for_joystick false`, which is the documented way to stop the
+/// joystick pinning the illuminators on — the exact false reassurance the
+/// conditional below exists to avoid.
 fn waking_for_joystick(cfg: &OutputConfig) -> bool {
-    cfg.joystick
+    cfg.joystick && cfg.wake_for_joystick
 }
 
 /// Which preset a config's values correspond to, if any.
@@ -111,17 +122,29 @@ pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStat
         // user who turns this on for one evening's flying and leaves it on has
         // no way to find that out from the hardware.
         //
-        // Conditional because it is only true of the joystick. With the other
-        // two sinks the hold belongs to another program — opentrack binding its
-        // port, or a game under `tobii game` — and claiming otherwise would
-        // send a Wine-bridge user off believing their tracker will stay on when
-        // it will not.
-        return if waking_for_joystick(cfg) {
-            "Off. Turn on to send head tracking to games. The tracker stays on while it is."
-                .to_string()
-        } else {
-            "Off. Turn on to send head tracking to games.".to_string()
-        };
+        // Conditional because it is only true of the joystick, and only while
+        // the joystick is allowed to ask. With the other two sinks the hold
+        // belongs to another program — opentrack binding its port, or a game
+        // under `tobii game` — and claiming otherwise would send a Wine-bridge
+        // user off believing their tracker will stay on when it will not.
+        //
+        // One literal and a clause, not two literals: the sentence they share
+        // is the same sentence, and two copies of it are two things to keep in
+        // step for nothing.
+        //
+        // The clause costs a line of card, which is worth saying plainly
+        // because the card was deliberately cut not long before this arrived:
+        // measured at the card's 380 px, this label is 17 px without the
+        // clause and 33 px with it, at every width below ~480 px. It is paid
+        // only while the switch is off — with it on, the same label is 33 px
+        // for the joystick alone and 50 px with the default three destinations
+        // named — so the card's height in use is unchanged, and what grew by
+        // one line is its height while idle.
+        let mut off = "Off. Turn on to send head tracking to games.".to_string();
+        if waking_for_joystick(cfg) {
+            off.push_str(" The tracker stays on while it is.");
+        }
+        return off;
     }
     let mut sinks: Vec<String> = Vec::new();
     // Reported from what the device thread actually did, never from the
@@ -260,6 +283,28 @@ fn recentre_tooltip(decision: &Result<(), String>) -> String {
     }
 }
 
+/// What the game-output switch sends, and — when it is true — what it holds.
+///
+/// A function rather than a const because its second sentence is the same
+/// promise [`status_text`]'s off state makes, true under exactly the same
+/// condition, and one predicate with two readers is the arrangement this file
+/// already chose for the opentrack half of the same question. Set once at
+/// construction, it claimed the hold to everyone, including the user who had
+/// just turned `wake_for_joystick` off — so it is put back in step from
+/// [`GamesRow::refresh`], like every other control on this row.
+fn switch_tooltip(cfg: &OutputConfig) -> String {
+    let mut tip = "Send head tracking and gaze to games — to a virtual joystick, to \
+                   opentrack, or over the Wine bridge."
+        .to_string();
+    if waking_for_joystick(cfg) {
+        tip.push_str(
+            " With the virtual joystick on, the tracker stays on for as long as this \
+             switch does.",
+        );
+    }
+    tip
+}
+
 /// A checkbox with its label beside it, as one row.
 ///
 /// Separate labels rather than a `CheckButton`'s built-in one: the tops of tall
@@ -351,11 +396,10 @@ impl GamesRow {
         let sw = Switch::new();
         sw.set_valign(Align::Center);
         sw.set_active(cfg.enabled);
-        sw.set_tooltip_text(Some(
-            "Send head tracking and gaze to games — to a virtual joystick, to opentrack, \
-             or over the Wine bridge. With the virtual joystick on, the tracker stays on \
-             for as long as this switch does.",
-        ));
+        // No tooltip here: what this switch holds depends on settings that
+        // change under it, so `row.refresh(false)` at the end of this function
+        // sets it, the same way the recentre row's is set. See
+        // [`switch_tooltip`].
 
         let status = Label::new(None);
         status.set_halign(Align::Start);
@@ -530,6 +574,16 @@ impl GamesRow {
                     b.set_active(true);
                 }
             }
+        }
+
+        // The tooltip makes the same promise as the status line at the foot
+        // of the same card, so it is re-derived from the same file on the same
+        // tick — otherwise `tobii games set wake_for_joystick false` in a
+        // terminal leaves the two contradicting each other. Compared before
+        // writing for the same reason the controls above are.
+        let tip = switch_tooltip(&cfg);
+        if self.enabled.tooltip_text().as_deref() != Some(tip.as_str()) {
+            self.enabled.set_tooltip_text(Some(&tip));
         }
 
         // A recentre needs a head to measure, something composing a pose out of
@@ -724,6 +778,60 @@ mod tests {
         let b = text(&bridge, false);
         assert!(b.starts_with("Off."), "{b}");
         assert!(!b.contains("tracker stays on"), "{b}");
+
+        // Nor does the joystick user who turned the hold off. `tobii games set
+        // wake_for_joystick false` is the documented way to stop the joystick
+        // pinning the illuminators on, and the device thread's gate reads it:
+        // promising the hold to the one user who opted out of it is the same
+        // false reassurance, aimed at somebody who asked not to get it.
+        let mut opted_out = joystick_only();
+        opted_out.enabled = false;
+        opted_out.wake_for_joystick = false;
+        let o = text(&opted_out, false);
+        assert!(o.starts_with("Off."), "{o}");
+        assert!(
+            !o.contains("tracker stays on"),
+            "the hold was switched off in the settings, so the row must not promise it: {o}"
+        );
+    }
+
+    /// The switch's tooltip and the status line beneath it make one promise
+    /// between them, so they may not disagree about it.
+    ///
+    /// The tooltip is the copy that used to make it unconditionally — it was
+    /// set once at construction and never read the settings again.
+    #[test]
+    fn the_switch_tooltip_promises_the_hold_on_the_same_terms_as_the_row() {
+        let mut joy = joystick_only();
+        joy.enabled = false;
+        let tip = switch_tooltip(&joy);
+        assert!(tip.contains("tracker stays on"), "{tip}");
+
+        joy.wake_for_joystick = false;
+        let opted_out = switch_tooltip(&joy);
+        assert!(
+            !opted_out.contains("tracker stays on"),
+            "the tooltip may not promise a hold the settings have turned off: {opted_out}"
+        );
+        // And it still says what the switch is for, which is its first job.
+        assert!(
+            opted_out.contains("head tracking and gaze to games"),
+            "{opted_out}"
+        );
+
+        // Both halves of the row, in both directions, from one predicate.
+        for wake in [true, false] {
+            let cfg = OutputConfig {
+                enabled: false,
+                wake_for_joystick: wake,
+                ..joystick_only()
+            };
+            assert_eq!(
+                switch_tooltip(&cfg).contains("tracker stays on"),
+                text(&cfg, false).contains("tracker stays on"),
+                "tooltip and status line disagree with wake_for_joystick = {wake}"
+            );
+        }
     }
 
     /// The wrapper is named before the port watch, because it is the remedy
