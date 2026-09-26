@@ -80,7 +80,11 @@ pub fn report() -> String {
     let _ = writeln!(o, "\ndevice");
     let _ = writeln!(o, "  {:<16} {}", format!("usb {VID}:{PID}"), usb_present());
     let _ = writeln!(o, "  {:<16} {}", "udev rule", udev_rule());
-    let _ = writeln!(o, "  {:<16} {}", "uinput", uinput());
+    // Probed once and read twice: the `uinput` line here and the game-output
+    // verdict below have to be two readings of the same fact, never two probes
+    // that can disagree about the same node.
+    let uinput = Uinput::probe();
+    let _ = writeln!(o, "  {:<16} {}", "uinput", uinput.message());
 
     // Under sudo this whole block would be a lie, so it does not get printed.
     //
@@ -133,15 +137,24 @@ pub fn report() -> String {
         // every one of them reads as absent — which here would print a
         // confident "game output off, nothing can wake the tracker" about a
         // machine where game output is on.
+        //
+        // Every setting in this section comes out of this one parse, which is
+        // the parse the hub acts on (`GameSide::poll` -> `load_output_config`).
+        //
+        // Two of them were read out of the file by name instead, so that the
+        // report would describe what the hub will act on rather than a default.
+        // The aim was right and the mechanism was wrong twice: the line scan
+        // knew nothing of the `[games]` header and took the first match where
+        // the real parser takes the last, so it disagreed with the hub on
+        // exactly the hand-edited files it was written for; and `keep_awake`
+        // was read from a one-word file beside `config.toml` that the device
+        // thread never opens, which made the verdict wrong in both directions
+        // at once.
         let cfg = tobii_output::games::load_output_config();
-        // The two wake settings that are stored outside `OutputConfig`'s
-        // parser, read by name: what the hub acts on is what is on disk.
-        let wake_for_joystick = games_flag(WAKE_FOR_JOYSTICK, true);
-        let keep_awake = flag_file(KEEP_AWAKE).unwrap_or(false);
         let _ = write!(
             o,
             "{}",
-            game_output_section(&cfg, wake_for_joystick, keep_awake, listening(&cfg))
+            game_output_section(&cfg, &Measured::of(&cfg, &uinput))
         );
         salted
     };
@@ -445,14 +458,52 @@ fn udev_rule() -> String {
 /// Access is probed by actually opening the node for writing rather than by
 /// reading its mode: the grant is an ACL applied by logind, so the mode bits
 /// say `rw-rw----` root:root on a machine where it works perfectly.
-fn uinput() -> String {
-    const NODE: &str = "/dev/uinput";
-    let access = std::fs::OpenOptions::new()
-        .write(true)
-        .open(NODE)
-        .map(|_| ())
-        .map_err(|e| e.kind());
-    uinput_message(Path::new(NODE).exists(), access, rules_grant_uinput())
+///
+/// A value rather than a line of text, because two parts of the report need it.
+/// The hub keeps the tracker lit for the joystick only while it HAS a device —
+/// `wants_joystick_wake`'s `have_device`, which its own doc calls the
+/// load-bearing term — so a verdict that named that wake path while the
+/// `uinput` line four lines above it said MISSING would be the report
+/// contradicting itself, and would tell a user whose tracker is dark that
+/// something is keeping it awake. That is the bug report this section was
+/// added for.
+struct Uinput {
+    exists: bool,
+    access: Result<(), std::io::ErrorKind>,
+    rules_have_uinput: Option<bool>,
+}
+
+impl Uinput {
+    const NODE: &'static str = "/dev/uinput";
+
+    fn probe() -> Uinput {
+        Uinput {
+            exists: Path::new(Uinput::NODE).exists(),
+            access: std::fs::OpenOptions::new()
+                .write(true)
+                .open(Uinput::NODE)
+                .map(|_| ())
+                .map_err(|e| e.kind()),
+            rules_have_uinput: rules_grant_uinput(),
+        }
+    }
+
+    /// The report line.
+    fn message(&self) -> String {
+        uinput_message(self.exists, self.access, self.rules_have_uinput)
+    }
+
+    /// Whether the hub could create the device from here.
+    ///
+    /// A node that opens for writing is as close as a separate process can get:
+    /// whether the hub's own open and its ioctls then succeeded is a fact only
+    /// the hub has. It is the same open `GameSide::sync_joystick` makes, so a
+    /// `false` here is a device the hub does not have either — which is the
+    /// direction that matters, since it is the one that turns an asserted wake
+    /// path into a dark tracker.
+    fn usable(&self) -> bool {
+        self.exists && self.access.is_ok()
+    }
 }
 
 /// The wording, separated from the probe so every branch can be tested.
@@ -606,12 +657,6 @@ fn head_model() -> String {
 
 // ------------------------------------------------------------------ game output
 
-/// The game-output key that lets the virtual joystick switch the tracker on.
-const WAKE_FOR_JOYSTICK: &str = "wake_for_joystick";
-
-/// The file beside `config.toml` that disables standby outright.
-const KEEP_AWAKE: &str = "keep_awake";
-
 /// What [`listening`] answers when the configured address is not an address.
 ///
 /// Its own answer rather than a missing line: `watch_target` parses the string
@@ -632,48 +677,74 @@ fn listening(cfg: &OutputConfig) -> Option<Listening> {
     })
 }
 
-/// A boolean setting stored as a whole file beside `config.toml`, in the shape
-/// every hub preference uses: `on`, or `off`, and nothing else in the file.
+/// The facts the game-output verdict needs that no setting can carry, measured
+/// on this machine.
 ///
-/// `None` for absent, unreadable or unrecognised, so each caller states its own
-/// default rather than inheriting one from here. `true`/`false` are accepted
-/// beside `on`/`off` because a person who edits these files by hand writes
-/// whichever of the two they saw last.
-fn flag_file(name: &str) -> Option<bool> {
-    let path = tobii_config::config_path().with_file_name(name);
-    flag_word(&std::fs::read_to_string(path).ok()?)
+/// Gathered here so that [`game_output_section`] stays pure — given its inputs
+/// rather than reading them — and every shape it can print, the reported one
+/// included, can be asserted without a config file, a socket or a
+/// `/dev/uinput`.
+struct Measured {
+    /// Whether anything is bound where the opentrack sink sends, or `None` when
+    /// no opentrack address is configured at all.
+    listening: Option<Listening>,
+    /// Whether the virtual joystick's device can exist. See [`Uinput::usable`].
+    uinput: bool,
+    /// Whether a listener seen at the opentrack address could be the hub's own
+    /// sender. See [`port_is_ephemeral`].
+    listener_could_be_ours: bool,
 }
 
-/// The whole-file spelling, separated from the read so it can be tested.
-fn flag_word(text: &str) -> Option<bool> {
-    match text.trim() {
-        "on" | "true" | "1" => Some(true),
-        "off" | "false" | "0" => Some(false),
-        _ => None,
+impl Measured {
+    fn of(cfg: &OutputConfig, uinput: &Uinput) -> Measured {
+        let listening = listening(cfg);
+        Measured {
+            listener_could_be_ours: listening == Some(Listening::Yes)
+                && cfg.opentrack.as_deref().is_some_and(port_is_ephemeral),
+            listening,
+            uinput: uinput.usable(),
+        }
     }
 }
 
-/// One boolean `key = value` from the game-output file, by name.
+/// Whether a listener seen at this address might be the hub's own sink rather
+/// than something the hub would light the tracker for.
 ///
-/// By name rather than through `OutputConfig`, because the report has to
-/// describe the file the *hub* will act on: a key this binary's parser did not
-/// know about would otherwise be reported as its default, which is exactly the
-/// line somebody would be reading to find out why their tracker sleeps.
-fn games_flag(key: &str, default: bool) -> bool {
-    std::fs::read_to_string(tobii_output::games::games_path())
-        .ok()
-        .and_then(|text| flag_in(&text, key))
-        .unwrap_or(default)
+/// [`listener::probe`](tobii_output::listener::probe) leaves out the project's
+/// own wildcard-bound senders, identified by inode through `/proc/self/fd` —
+/// the *calling* process. Inside the hub that is exactly right, and it is what
+/// stops the hub's own opentrack sink latching the tracker on forever. Inside
+/// `tobii debug` "self" is this CLI, so the hub's sender is not left out, and
+/// the report can count as a listener the very socket the hub does not.
+///
+/// It takes the kernel handing the hub's sender — bound `0.0.0.0:0` — the one
+/// port the user configured, so it is confined to the ephemeral range and
+/// cannot happen at the default 4242, which is below that range everywhere.
+/// The range is tunable, so it is read rather than assumed; when it cannot be
+/// read, nothing is claimed either way.
+fn port_is_ephemeral(addr: &str) -> bool {
+    let range =
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap_or_default();
+    port_in_range(addr, ephemeral_range(&range))
 }
 
-/// The parse, separated from the read so it can be tested — and written to
-/// cope with a file a person has edited: spacing, and a trailing comment.
-fn flag_in(text: &str, key: &str) -> Option<bool> {
-    text.lines()
-        .filter_map(|l| l.split_once('='))
-        .find(|(k, _)| k.trim() == key)
-        .and_then(|(_, v)| v.trim().split('#').next())
-        .and_then(|v| v.trim().parse::<bool>().ok())
+/// The comparison, separated from the read so it can be tested against a range
+/// rather than against whatever this machine's `/proc` happens to say — a
+/// sysctl is not a fixture.
+fn port_in_range(addr: &str, range: Option<(u16, u16)>) -> bool {
+    let (Ok(addr), Some((lo, hi))) = (addr.parse::<std::net::SocketAddr>(), range) else {
+        return false;
+    };
+    (lo..=hi).contains(&addr.port())
+}
+
+/// The parse, separated from the read so it can be tested: the low port then
+/// the high one, whitespace-separated, as `/proc` writes them.
+fn ephemeral_range(text: &str) -> Option<(u16, u16)> {
+    let mut f = text.split_whitespace();
+    let lo = f.next()?.parse().ok()?;
+    let hi = f.next()?.parse().ok()?;
+    (lo <= hi).then_some((lo, hi))
 }
 
 /// What game output is set to, and — the part a bug report turns on — what is
@@ -693,33 +764,13 @@ fn flag_in(text: &str, key: &str) -> Option<bool> {
 ///
 /// Pure, and given its inputs rather than reading them, so every shape — the
 /// reported one included — can be asserted without a config file or a socket.
-fn game_output_section(
-    cfg: &OutputConfig,
-    wake_for_joystick: bool,
-    keep_awake: bool,
-    listening: Option<Listening>,
-) -> String {
+fn game_output_section(cfg: &OutputConfig, m: &Measured) -> String {
     let mut o = String::new();
     let _ = writeln!(o, "\ngame output");
-    let _ = writeln!(
-        o,
-        "  {:<16} {}",
-        "enabled",
-        if cfg.enabled { "on" } else { "off" }
-    );
+    let _ = writeln!(o, "  {:<16} {}", "enabled", on_off(cfg.enabled));
     let _ = writeln!(o, "  {:<16} {}", "sinks", sinks(cfg));
-    let _ = writeln!(
-        o,
-        "  {:<16} {}",
-        "wake settings",
-        wake_settings(cfg, wake_for_joystick, keep_awake, listening)
-    );
-    let _ = writeln!(
-        o,
-        "  {:<16} {}",
-        "can wake it now",
-        can_wake_now(cfg, wake_for_joystick, keep_awake, listening)
-    );
+    let _ = writeln!(o, "  {:<16} {}", "wake settings", wake_settings(cfg, m));
+    let _ = writeln!(o, "  {:<16} {}", "can wake it now", can_wake_now(cfg, m));
     o
 }
 
@@ -744,15 +795,17 @@ fn sinks(cfg: &OutputConfig) -> String {
 
 /// The three settings that decide whether the tracker may run unattended, each
 /// with the fact that makes it effective or not.
-fn wake_settings(
-    cfg: &OutputConfig,
-    wake_for_joystick: bool,
-    keep_awake: bool,
-    listening: Option<Listening>,
-) -> String {
+fn wake_settings(cfg: &OutputConfig, m: &Measured) -> String {
     let addr = cfg.opentrack.as_deref().map(sane).unwrap_or_default();
-    let at_opentrack = match listening {
+    let at_opentrack = match m.listening {
         None => "no address configured".to_string(),
+        // Said where the probe result is printed, because this is the one
+        // answer in the section that `tobii debug` cannot measure the way the
+        // hub does. See [`port_is_ephemeral`].
+        Some(Listening::Yes) if m.listener_could_be_ours => format!(
+            "{addr} — a program is bound there, but that port is inside this machine's \
+             ephemeral range, so it may be the hub's own sender, which the hub does not count"
+        ),
         Some(Listening::Yes) => format!("{addr} — a program is bound there"),
         Some(Listening::No) => format!("{addr} — nothing is bound there now"),
         Some(Listening::Unknown(why)) => format!("{addr} — {why}"),
@@ -760,8 +813,8 @@ fn wake_settings(
     let mut s = format!(
         "wake_for_opentrack {} ({at_opentrack}), wake_for_joystick {}, keep_awake {}",
         on_off(cfg.wake_for_opentrack),
-        on_off(wake_for_joystick),
-        on_off(keep_awake),
+        on_off(cfg.wake_for_joystick),
+        on_off(cfg.keep_awake),
     );
     // The shape both wake settings share: on, and doing nothing, until the
     // output they wake the tracker for is on as well.
@@ -785,35 +838,48 @@ fn on_off(b: bool) -> &'static str {
 /// The conditions are the hub's, not a paraphrase of them: the opentrack watch
 /// needs game output on, the setting on, and a socket actually bound (an
 /// address it cannot see is `Unknown`, which the watch treats as no listener);
-/// the joystick wake needs game output on and the joystick sink present;
-/// `keep_awake` needs neither.
-fn can_wake_now(
-    cfg: &OutputConfig,
-    wake_for_joystick: bool,
-    keep_awake: bool,
-    listening: Option<Listening>,
-) -> String {
+/// the joystick wake needs game output on, the joystick sink, the setting, and
+/// a device that can be created — `wants_joystick_wake`'s `have_device`, the
+/// term without which this line credited a wake path on machines whose
+/// `/dev/uinput` the same report had already called MISSING; `keep_awake` needs
+/// none of them.
+fn can_wake_now(cfg: &OutputConfig, m: &Measured) -> String {
     let mut ways: Vec<String> = Vec::new();
-    if keep_awake {
+    if cfg.keep_awake {
         ways.push("keep_awake, for as long as the hub runs".into());
     }
-    if cfg.enabled && cfg.wake_for_opentrack && listening == Some(Listening::Yes) {
-        ways.push(format!(
-            "the program bound at {}",
-            sane(cfg.opentrack.as_deref().unwrap_or(""))
-        ));
+    if cfg.enabled && cfg.wake_for_opentrack && m.listening == Some(Listening::Yes) {
+        let addr = sane(cfg.opentrack.as_deref().unwrap_or(""));
+        ways.push(if m.listener_could_be_ours {
+            format!("the program bound at {addr}, unless that is the hub's own sender")
+        } else {
+            format!("the program bound at {addr}")
+        });
     }
-    if cfg.enabled && cfg.joystick && wake_for_joystick {
+    if cfg.enabled && cfg.joystick && cfg.wake_for_joystick && m.uinput {
         ways.push("the virtual joystick, while game output is on".into());
     }
     if ways.is_empty() {
         // Naming what is left is the whole point: an IPC subscriber and the hub
         // window are the only two demands nothing here can switch off, and both
         // of them stop the moment the user looks somewhere else.
-        let remedy = if cfg.enabled {
-            "turn on wake_for_joystick, or keep_awake"
-        } else {
+        //
+        // And naming the term that actually failed. The remedy used to be "turn
+        // on wake_for_joystick" for every setup with game output on — which the
+        // wake-settings line directly above it contradicted whenever that
+        // setting was already on, and which changes nothing at all when what is
+        // missing is the sink or the device.
+        let remedy = if !cfg.enabled {
             "with game output off, only keep_awake changes that"
+        } else if !m.uinput {
+            "the joystick wake needs a /dev/uinput the hub can open — see the uinput \
+             line above — so until then only keep_awake changes that"
+        } else if !cfg.joystick {
+            "turn the virtual joystick on, with wake_for_joystick, or keep_awake"
+        } else {
+            // Game output on, the joystick sink on and a device that can be
+            // created: `wake_for_joystick` is the only term left to be false.
+            "turn on wake_for_joystick, or keep_awake"
         };
         return format!(
             "NOTHING — the tracker runs only while the hub window has focus or something \
@@ -1169,15 +1235,46 @@ mod tests {
     }
 
     /// The setup that was reported: game output on, all three sinks, no game
-    /// running and no opentrack.
+    /// running and no opentrack — and neither wake setting on, which is what
+    /// left the tracker dark.
+    ///
+    /// The wake settings are fields of this config rather than arguments to the
+    /// section, so the fixture has to state them: `OutputConfig::default()`
+    /// turns `wake_for_joystick` on, and a fixture that inherited that would be
+    /// describing a different machine from the one in the bug report.
     fn reported_setup() -> OutputConfig {
         OutputConfig {
             enabled: true,
             joystick: true,
             opentrack: Some("127.0.0.1:4242".into()),
             bridge_port: Some(4243),
+            wake_for_joystick: false,
+            keep_awake: false,
             ..OutputConfig::default()
         }
+    }
+
+    /// The facts the section cannot derive from settings, supplied by the test.
+    ///
+    /// `listener_could_be_ours` is off here because it is the rare shape; the
+    /// one test that wants it sets it by name.
+    fn measured(listening: Option<Listening>, uinput: bool) -> Measured {
+        Measured {
+            listening,
+            uinput,
+            listener_could_be_ours: false,
+        }
+    }
+
+    /// The verdict line's value — the line the bug report turned on, and the
+    /// one several of these tests are about. Asserting on the whole section
+    /// would let the `sinks` line answer for it: both name the joystick.
+    fn verdict(section: &str) -> String {
+        section
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix("can wake it now"))
+            .map(|v| v.trim().to_string())
+            .expect("the section has a verdict line")
     }
 
     /// The report this section exists for has to answer itself.
@@ -1189,7 +1286,7 @@ mod tests {
     /// tracker and a hardware measurement to establish once.
     #[test]
     fn the_setup_that_was_reported_diagnoses_itself() {
-        let s = game_output_section(&reported_setup(), false, false, Some(Listening::No));
+        let s = game_output_section(&reported_setup(), &measured(Some(Listening::No), true));
 
         assert!(s.contains("enabled          on"), "{s}");
         assert!(
@@ -1215,18 +1312,26 @@ mod tests {
     fn each_wake_path_is_named_when_it_is_the_one_that_applies() {
         let cfg = reported_setup();
 
-        let joystick = game_output_section(&cfg, true, false, Some(Listening::No));
+        let wanted = OutputConfig {
+            wake_for_joystick: true,
+            ..reported_setup()
+        };
+        let joystick = game_output_section(&wanted, &measured(Some(Listening::No), true));
         assert!(joystick.contains("the virtual joystick"), "{joystick}");
         assert!(!joystick.contains("NOTHING"), "{joystick}");
 
-        let awake = game_output_section(&cfg, false, true, Some(Listening::No));
+        let kept = OutputConfig {
+            keep_awake: true,
+            ..reported_setup()
+        };
+        let awake = game_output_section(&kept, &measured(Some(Listening::No), true));
         assert!(
             awake.contains("keep_awake, for as long as the hub runs"),
             "{awake}"
         );
         assert!(!awake.contains("NOTHING"), "{awake}");
 
-        let opentrack = game_output_section(&cfg, false, false, Some(Listening::Yes));
+        let opentrack = game_output_section(&cfg, &measured(Some(Listening::Yes), true));
         assert!(
             opentrack.contains("the program bound at 127.0.0.1:4242"),
             "{opentrack}"
@@ -1237,9 +1342,10 @@ mod tests {
         // nothing until the output is on" shape `wake_for_opentrack` has.
         let off = OutputConfig {
             enabled: false,
+            wake_for_joystick: true,
             ..reported_setup()
         };
-        let s = game_output_section(&off, true, false, Some(Listening::Yes));
+        let s = game_output_section(&off, &measured(Some(Listening::Yes), true));
         assert!(s.contains("NOTHING"), "{s}");
         assert!(
             s.contains("do nothing while game output is off"),
@@ -1265,7 +1371,7 @@ mod tests {
             ..reported_setup()
         };
         let why = tobii_output::listener::NOT_LOCAL;
-        let s = game_output_section(&cfg, false, false, Some(Listening::Unknown(why)));
+        let s = game_output_section(&cfg, &measured(Some(Listening::Unknown(why)), true));
         assert!(s.contains("NOTHING"), "{s}");
         assert!(
             s.contains(why),
@@ -1286,10 +1392,32 @@ mod tests {
             bridge_port: None,
             ..OutputConfig::default()
         };
+        let loud = OutputConfig {
+            wake_for_joystick: true,
+            keep_awake: true,
+            ..reported_setup()
+        };
         for s in [
-            game_output_section(&reported_setup(), false, false, Some(Listening::No)),
-            game_output_section(&reported_setup(), true, true, Some(Listening::Yes)),
-            game_output_section(&quiet, true, false, None),
+            game_output_section(&reported_setup(), &measured(Some(Listening::No), true)),
+            game_output_section(&loud, &measured(Some(Listening::Yes), true)),
+            game_output_section(&quiet, &measured(None, true)),
+            // The longest values this section can print, which are the ones a
+            // `\` continuation can wreck: the ephemeral-range note, and the
+            // remedy that names /dev/uinput.
+            game_output_section(
+                &loud,
+                &Measured {
+                    listener_could_be_ours: true,
+                    ..measured(Some(Listening::Yes), true)
+                },
+            ),
+            game_output_section(
+                &OutputConfig {
+                    wake_for_joystick: true,
+                    ..reported_setup()
+                },
+                &measured(Some(Listening::No), false),
+            ),
         ] {
             let lines: Vec<&str> = s.lines().collect();
             assert_eq!(lines.len(), 6, "a blank, a header and four fields: {s:?}");
@@ -1303,38 +1431,193 @@ mod tests {
             }
         }
         // Nowhere to send is its own answer, not an empty list.
-        let s = game_output_section(&quiet, true, false, None);
+        let s = game_output_section(&quiet, &measured(None, true));
         assert!(s.contains("none — game output has nowhere to send"), "{s}");
         assert!(s.contains("no address configured"), "{s}");
     }
 
-    /// The wake settings are read out of the files by name, so the report says
-    /// what the hub will act on rather than what a default would be.
+    /// The joystick wake needs a device, and this process can see whether one
+    /// could be made.
+    ///
+    /// The hub's condition is `wants_joystick_wake` (tobii-gtk/src/device.rs) =
+    /// `have_device && wake_for_joystick && enabled && joystick`, and its doc
+    /// calls `have_device` the load-bearing term. Without it this line said
+    /// "the virtual joystick" sixteen lines under the same report's
+    /// "/dev/uinput MISSING" — the fresh-install state, with no udev rule
+    /// installed or the module not loaded, where nothing holds the tracker at
+    /// all and the verdict claimed something did.
     #[test]
-    fn a_wake_setting_is_read_from_the_file_by_name() {
-        let games = "[games]\nenabled = true\nwake_for_joystick = false\njoystick = true\n";
-        assert_eq!(flag_in(games, "wake_for_joystick"), Some(false));
-        assert_eq!(flag_in(games, "enabled"), Some(true));
-        // A key the file does not carry is the caller's default, never a
-        // `false` — those two are different lines in the report.
-        assert_eq!(flag_in(games, "keep_awake"), None);
-        // A commented-out key is not a key.
-        assert_eq!(
-            flag_in("# wake_for_joystick = true\n", "wake_for_joystick"),
-            None
+    fn the_joystick_wake_is_not_credited_without_a_device() {
+        let cfg = OutputConfig {
+            wake_for_joystick: true,
+            opentrack: None,
+            ..reported_setup()
+        };
+
+        let with = verdict(&game_output_section(&cfg, &measured(None, true)));
+        assert!(with.contains("the virtual joystick"), "{with}");
+
+        let without = verdict(&game_output_section(&cfg, &measured(None, false)));
+        assert!(
+            !without.contains("the virtual joystick"),
+            "a wake path that needs a device the hub cannot create: {without}"
         );
-        // Spacing and a trailing comment, which `tobii games set` never writes
-        // and a person editing the file does.
-        assert_eq!(
-            flag_in("wake_for_joystick=true # for now\n", "wake_for_joystick"),
-            Some(true)
+        assert!(without.contains("NOTHING"), "{without}");
+        // And it says which term failed, so the reader is not left to pair the
+        // verdict with a `uinput` line sixteen lines above it themselves.
+        assert!(without.contains("/dev/uinput"), "{without}");
+    }
+
+    /// The remedy names a term that is actually false.
+    ///
+    /// It used to be "turn on wake_for_joystick" for every setup with game
+    /// output on — printed directly under a wake-settings line reading
+    /// `wake_for_joystick on`, since that is the shipped default, and inert
+    /// when what is missing is the sink or the device. The hub's chain is
+    /// enabled, then the sink, then the device, then the setting, so the remedy
+    /// names the first of those that is false.
+    #[test]
+    fn the_remedy_names_the_term_that_actually_failed() {
+        // Game output on with no joystick sink: the Wine-bridge-only setup the
+        // README names, where the remedies are the sink itself, `tobii game`,
+        // or keep_awake — never the setting, which is already on.
+        let no_sink = OutputConfig {
+            joystick: false,
+            opentrack: None,
+            wake_for_joystick: true,
+            ..reported_setup()
+        };
+        let s = verdict(&game_output_section(&no_sink, &measured(None, true)));
+        assert!(s.contains("NOTHING"), "{s}");
+        assert!(
+            !s.contains("turn on wake_for_joystick"),
+            "it is on already, and the line above this one says so: {s}"
         );
-        // The whole-file form every hub preference beside `config.toml` uses.
-        assert_eq!(flag_word("on\n"), Some(true));
-        assert_eq!(flag_word("off\n"), Some(false));
-        assert_eq!(flag_word("true"), Some(true));
-        assert_eq!(flag_word(""), None);
-        assert_eq!(flag_word("maybe"), None);
+        assert!(s.contains("virtual joystick on"), "{s}");
+
+        // The sink on, a device to be had, and the setting off: then it is the
+        // setting, and the old advice was right.
+        let unset = OutputConfig {
+            opentrack: None,
+            ..reported_setup()
+        };
+        let s = verdict(&game_output_section(&unset, &measured(None, true)));
+        assert!(s.contains("turn on wake_for_joystick"), "{s}");
+    }
+
+    /// The one answer in this section `tobii debug` cannot measure the way the
+    /// hub does, and the range that bounds it.
+    ///
+    /// `listener::probe` leaves out our own wildcard-bound senders, by inode
+    /// from `/proc/self/fd` — which is what stops the hub counting its own
+    /// opentrack sink as the listener it is sending to and latching the tracker
+    /// on forever. Inside `tobii debug` "self" is the CLI, so that same socket
+    /// IS counted here. It takes the kernel handing the hub's sender the very
+    /// port the user configured, which confines it to the ephemeral range and
+    /// puts the default 4242 out of reach — so the note must appear there and
+    /// nowhere else.
+    #[test]
+    fn a_listener_that_could_be_the_hubs_own_sender_says_so() {
+        assert_eq!(ephemeral_range("32768\t60999\n"), Some((32768, 60999)));
+        assert_eq!(ephemeral_range("32768 60999"), Some((32768, 60999)));
+        // Unreadable, or not a range: no claim either way, which is what the
+        // report did before the note existed.
+        assert_eq!(ephemeral_range(""), None);
+        assert_eq!(ephemeral_range("60999 32768"), None);
+        assert_eq!(ephemeral_range("32768"), None);
+        let usual = Some((32768, 60999));
+        assert!(!port_in_range("127.0.0.1:4242", usual), "the default port");
+        assert!(port_in_range("127.0.0.1:40000", usual));
+        assert!(!port_in_range("127.0.0.1:40000", None));
+        assert!(!port_in_range("127.0.0.1;4242", usual), "not an address");
+
+        let cfg = reported_setup();
+        let plain = game_output_section(&cfg, &measured(Some(Listening::Yes), true));
+        assert!(plain.contains("a program is bound there"), "{plain}");
+        assert!(
+            !plain.contains("own sender"),
+            "the ordinary report must not carry the rare case's caveat: {plain}"
+        );
+
+        let ours = game_output_section(
+            &cfg,
+            &Measured {
+                listener_could_be_ours: true,
+                ..measured(Some(Listening::Yes), true)
+            },
+        );
+        assert!(ours.contains("ephemeral range"), "{ours}");
+        assert!(
+            verdict(&ours).contains("unless that is the hub's own sender"),
+            "{ours}"
+        );
+    }
+
+    /// Which store each wake setting comes from.
+    ///
+    /// Both were read the wrong way once, and neither miss could be seen from
+    /// inside `game_output_section`, which is handed its values. `keep_awake`
+    /// was read from a one-word file beside `config.toml` that the device
+    /// thread never opens: the report said "off" to a user who had set it with
+    /// the documented `tobii games set keep_awake true` — and then prescribed
+    /// it as the remedy — and "on" to one whose hub was taking no hold at all.
+    /// `wake_for_joystick` was read by a line scan that knew nothing of the
+    /// `[games]` header and stopped at the first match, where the parser the
+    /// hub uses ignores everything outside the section and lets the last match
+    /// win.
+    ///
+    /// So the file is written the way the divergence needs it: a decoy above
+    /// the header, the value the hub will act on inside it, and beside it the
+    /// flag file the cogwheel used to write, saying the opposite.
+    #[test]
+    fn the_wake_settings_come_from_the_store_the_hub_acts_on() {
+        let _env = env_lock();
+        let dir = std::env::temp_dir().join(format!("tobii-diag-stores-{}", std::process::id()));
+        let cfg_dir = dir.join("tobii-linux");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&cfg_dir).expect("config dir");
+        std::fs::write(
+            cfg_dir.join("games.toml"),
+            "wake_for_joystick = true\n\
+             [games]\n\
+             enabled = true\n\
+             joystick = true\n\
+             opentrack = \"\"\n\
+             wake_for_joystick = false\n\
+             keep_awake = true\n",
+        )
+        .expect("games.toml");
+        std::fs::write(cfg_dir.join("keep_awake"), "off\n").expect("flag file");
+
+        let config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let sudo = std::env::var_os("SUDO_USER");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        // The configuration section is not printed under sudo, on purpose.
+        std::env::remove_var("SUDO_USER");
+        let r = report();
+        match config_home {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        if let Some(u) = sudo {
+            std::env::set_var("SUDO_USER", u);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            r.contains("keep_awake on"),
+            "keep_awake comes from games.toml, not from the file beside \
+             config.toml that nothing acts on:\n{r}"
+        );
+        assert!(
+            r.contains("keep_awake, for as long as the hub runs"),
+            "and the verdict follows the same store:\n{r}"
+        );
+        assert!(
+            r.contains("wake_for_joystick off"),
+            "the `[games]` value is the one the hub parses, not the first line \
+             that spells the key:\n{r}"
+        );
     }
 
     use super::*;
