@@ -25,7 +25,11 @@ device itself (`UsbTransport::open`, then `Connection::connect`), builds a
 `Router` with the opentrack sink — and the bridge sink and joystick, where
 `games.toml` asks for them — and streams until it is stopped. The tracker is lit
 for exactly as long as the command runs, because that process holds the USB
-session. For the **opentrack UDP** route this is the whole story: opentrack's
+session. Where a hub is running it asks that hub to stand down first
+(`lease_the_tracker`, `crates/tobii-cli/src/main.rs:2112`) rather than failing
+under it, and gives the device back when it ends; with no hub it opens the
+device directly and waits for nothing. For the **opentrack UDP** route this is
+the whole story: opentrack's
 "UDP over network" input, or a direct listener like X-Plane (below), receives
 the datagram with no hub running and nothing wrapping the game.
 
@@ -69,7 +73,11 @@ both the idle wait and inside a session, and already owns the joystick handle.
 * **`keep_awake`** (default off) — a guard labelled *standby turned off in the
   settings*, synced by `GameSide::sync_keep_awake` from the same once-a-second
   `apply`, and gated on nothing at all. It holds with game output off, with no
-  sink configured, and it covers the gaze overlay and `tobii headpose` too.
+  sink configured, and it covers the gaze overlay too. It does **not** cover
+  `tobii headpose`: that is a separate process holding its own USB session, and
+  the relationship is the opposite of coverage — `keep_awake` is what makes the
+  hub's claim permanent, which is why `tobii headpose` has to ask for the lease
+  and take the device off it.
 
 Neither reason is in `EXCLUSIVE`. These are the first claims the hub holds on
 its own behalf that never end by themselves, and an exclusive one would
@@ -397,7 +405,9 @@ route wants a wrapper after all. It wants one for certain where the watch cannot
 answer at all: turned off, or an opentrack address on another machine, where
 `probe` says `Unknown` and takes no hold — and where the alternative to the
 wrapper is `keep_awake`. The standalone `tobii headpose` route
-needs neither, because it holds the USB session itself.
+needs neither, because it holds the USB session itself — taking it from the hub
+where there is one, by asking for the lease first (`lease_the_tracker`,
+`crates/tobii-cli/src/main.rs:2112`).
 
 This matters because the virtual joystick genuinely *cannot* reach X-Plane:
 Laminar's own developer documentation is explicit that a joystick axis cannot be
@@ -478,6 +488,49 @@ records the version that built it, and a different wine touching it runs
 `wineboot -u` and upgrades it — so reaching for the system wine to write two
 registry values could rewrite a Proton prefix out from under the game that owns
 it.
+
+### The discovery keys are not ours to overwrite
+
+`HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location` and
+`HKCU\Software\Freetrack\FreeTrackClient` (`NP_KEY`/`FT_KEY`,
+`crates/tobii-cli/src/bridge.rs:74,77`) are how *any* head-tracking client in a
+prefix is found, ours included. So the installer treats them as shared state
+rather than as its own:
+
+* **`install` reads before it writes**, and **refuses** when a key holds
+  something it cannot account for — `bridge.rs:1258`, message built by
+  `refusal` at `bridge.rs:1121`. The error names each key, what it holds and
+  whose it looks like, and prints the exact
+  `WINEPREFIX=… wine reg delete … /v Path /f` to clear it if it is stale. The
+  refusal happens before anything is copied and before any key is touched, so a
+  prefix comes out of it exactly as it went in. Reachable from an ordinary
+  state: a Windows opentrack installed inside the prefix, or a v0.4.0 install
+  whose Linux opentrack has since been removed.
+* **What it will not refuse over** is a key that already holds, byte for byte,
+  the value this run would write with nothing on record either way
+  (`bridge.rs:1246-1249`). That is precisely what v0.4.0 left behind on a
+  machine with opentrack installed, and refusing there would refuse the upgrade
+  path over a write that changes nothing, in a sentence blaming another program
+  for a value this program wrote. The cost is stated in `is_ours`'
+  **[LIMITATION]** (`bridge.rs:885`, doc comment from 870): such a key is then recorded as ours and
+  comes out on the way out.
+* **`--force` goes through and promises nothing.** The installer writes down
+  only the values it wrote itself (`RECORD_FILE`, `registered.txt`), so there
+  is no previous value to put back — the refusal text says so in those words.
+  It prints what it replaced.
+* **`uninstall` is the same rule from the other side** (`bridge.rs:1644`): a key
+  is deleted only while it still points at our own install directory or holds
+  exactly what the record says we wrote; anything else is left in place and
+  named. A blind `reg delete` here would take opentrack's own registration with
+  it and leave the prefix with nothing registered at all — worse than before we
+  touched it.
+
+Every file `install` puts in the prefix — both DLLs, the exe and the record —
+is written to a staging name beside the target and renamed into place
+(`staging_name`, `bridge.rs:977`, used at `1284` and `991`). The name carries
+the writing process's pid, `.<artifact>.<pid>.new`, so two installs into one
+prefix cannot stage over each other, and a half-written record is never read
+back as a record with a line missing.
 
 ### Verified
 

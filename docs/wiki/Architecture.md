@@ -56,7 +56,7 @@ Not negotiable, and most of them are the device's doing rather than ours.
 | **The protocol is undocumented.** Everything is inferred from captures and disassembly. | Confidence markers ([CONFIRMED] / [CODE-VERIFIED] / [HYPOTHESIS]) are part of the source. A claim without evidence is treated as a defect. |
 | **The ET5 reboots on session close, wiping its display area *and* its calibration.** | Both must be re-applied on **every** connect, or the tracker reports no eyes at all. This shapes the whole device thread. |
 | **The IR illuminators are lit for as long as a USB session is open.** | The session is reference-counted (`Demand`) rather than held for the process lifetime. |
-| **One process at a time may claim the USB interface.** | The GUI must release the device when it is not using it, or `tobii headpose` cannot run for a game. |
+| **One process at a time may claim the USB interface.** | The GUI must release the device when it is not using it, *and* on request, or `tobii headpose` cannot run for a game. Releasing on idle alone stopped being enough once the hub gained holds that never end by themselves (`keep_awake`, the virtual joystick), so the hub honours a **lease**: a client asks, the hub drops its session and waits, whatever its own demand says (`must_wait`, `crates/tobii-gtk/src/device.rs:229`). |
 | **The head-pose model's weights are non-commercial-only** (opentrack). | Not shipped. Fetched only after the user is shown the terms and agrees. |
 | **A dynamically linked binary needs a glibc at least as new as the one it was built against.** | Releases are built in a Debian 13 container, and the floor is enforced in CI. |
 | **GPL-3.0-only.** | Dependencies must be compatible. |

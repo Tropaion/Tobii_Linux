@@ -676,17 +676,54 @@ fault.
   field's docs. The failure direction is at least the safe one: a `games.toml`
   that cannot be read at all falls back to `OutputConfig::default()`, where
   `keep_awake` is off — a corrupt file cannot leave somebody's illuminators lit.
-- **The GUI half has no unit test, for the reason every control in that file has
-  none**: the switch, the badge and their refresh are GTK wiring inside
-  `build_hub`, unreachable without a display. They were verified by `.measure()`
-  on a replica header (40 px with the badge hidden, 40 px shown — no added
-  height) and by a clean `load_css()`. The stored bit and its parsing *are*
-  tested.
+- **The GUI half is tested on both sides of the display line**, which it was not
+  when it briefly had a store of its own. Headless, in CI:
+  `the_switch_writes_the_bit_the_device_thread_reads` (`crates/tobii-gtk/src/lib.rs`)
+  writes through the switch's own save path and reads back through
+  `load_output_config_from` — the function `GameSide::poll` reads with — checks
+  the other settings survived the load-modify-save, and asserts the config
+  directory holds `games.toml` and no second file. The GTK wiring itself, which
+  is still unreachable without a display, is covered by
+  `crates/tobii-gtk/tests/keep_awake_switch.rs`, `#[ignore]`d and run with
+  `cargo test -p tobii-gtk --test keep_awake_switch -- --ignored`: it builds a
+  real hub, rewrites `games.toml` underneath it the way
+  `tobii games set keep_awake true` does, and checks that the switch and the
+  ALWAYS ON badge follow within the hub's tick; that the file is **byte
+  identical** afterwards, which is what proves a refresh does not re-enter the
+  save handler and write the hub's stale idea back; and that switching it off in
+  the hub lands in the field `sync_keep_awake` takes the hold from. It needs no
+  tracker. The header geometry is still the older, separate measurement:
+  `.measure()` on a replica header, 40 px with the badge hidden and 40 px shown
+  — no added height — and a clean `load_css()`.
 - **The settings popover now clips sooner.** Its natural height went from 814 px
   to 942 px with the new row, and it has no `ScrolledWindow`. At the hub's text
   size multiplier that already cut off the bottom row on a 1080p screen at about
   1.3×; this makes a pre-existing bug roughly 128 px worse. Left alone rather
   than redesigned inside a bug fix.
+- **The two permanent holds made `tobii headpose` unrunnable, and the fix ends
+  in a three-second guess against an older hub.** `wake_for_joystick` ships on,
+  so a user with game output on, **and a joystick device the hub could actually
+  create**, has the hub holding libusb interface 0 for its
+  whole lifetime — and `tobii headpose`, `--check` and `--calibrate-pitch`, the
+  documented way to tell a gaze fault from a head-tracking one, failed with
+  *already claimed by another process* for exactly those users. The CLI now
+  asks for the lease the hub has always honoured (`must_wait`'s third term is an
+  `||` for precisely this); it was the protocol's first client, since nothing
+  outside the tests had ever sent `Msg::Lease`. **Measured**, on the merged
+  tree with a real ET5: with `keep_awake` on the hub held one USB file
+  descriptor; `tobii headpose --check` printed *the hub has let go of the
+  tracker for this run*, opened the device, and the hub's count went to 0; about
+  three seconds after the command exited it was back to 1. With no hub running,
+  the same command opened the device directly and waited for nothing.
+  **Not measured:** the mixed-version case. A hub older than this build does not
+  know the message, so the CLI waits out `LEASE_WAIT = 3 s` and opens anyway —
+  which succeeds where that hub is in standby and fails with the same
+  `DeviceBusy` as before where it is not. No older hub has been run against this
+  CLI. Also not watched: what a **focused** hub shows while the lease is out.
+  The path is decided rather than observed — the lease term of `must_wait` is an
+  override and not a weighing, the idle wait sets `ConnStatus::Idle`, and the
+  eye-position panel renders a closed session as **tracker off** rather than
+  *not detected* — but it was read out of the code, not seen on a screen.
 
 [issue #2]: https://github.com/Tropaion/Tobii_Linux/issues/2
 

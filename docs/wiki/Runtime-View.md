@@ -117,7 +117,9 @@ than observations: *the virtual joystick* (`wake_for_joystick`) and *standby
 turned off in the settings* (`keep_awake`). Neither is in `EXCLUSIVE`, so a
 lease, a recentre or a calibration still takes the device from them — the wait
 is `must_wait(demand_active, pending_empty, lease_blocks)`, where the lease term
-is an override and not a weighing. See [[Game-Output]].
+is an override and not a weighing. `tobii headpose` is the lease's first client
+(§6.4): the hub has honoured the message since it learned to serve clients, and
+until v0.4.1 nothing outside the tests sent one. See [[Game-Output]].
 
 The linger is not arbitrary. Closing costs a device reboot, so the next connect
 must re-apply display area, eye selection and calibration before any data flows.
@@ -152,13 +154,14 @@ A tick-driven state machine in `calibrate_flow.rs` over the device thread:
 
 ### 6.4 `tobii headpose` to a game
 
-Its own process, its own connection — which is only possible because the hub
-releases the device when unfocused. Nothing below goes through the hub or its
-socket: this path holds the USB session itself, so the tracker is lit for
-exactly as long as the command runs, and the `tobii game` wrapper has nothing to
-do here. That wrapper is a socket client and nothing else — it exists for the
-hub's route, where the sink plumbing takes no `DemandGuard` of its own and so
-cannot light the tracker for a game that never connects. Since v0.4.1 the hub
+Its own process, its own connection — which is possible because the hub gives
+the device up: on going idle, and, since v0.4.1, **on request**. No tracking
+goes through the hub or its socket: this path holds the USB session itself, so
+the tracker is lit for exactly as long as the command runs, and the `tobii game`
+wrapper has nothing to do here. That wrapper is a socket client and nothing
+else — it exists for the hub's route, where the sink plumbing takes no
+`DemandGuard` of its own and so cannot light the tracker for a game that never
+connects. Since v0.4.1 the hub
 can be told to hold the session anyway, by `wake_for_joystick` or `keep_awake`,
 but those hold it for as long as a setting says so while the wrapper holds it
 for exactly as long as the child process lives (§6.2, and [[Game-Output]]).
@@ -167,10 +170,24 @@ for exactly as long as the child process lives (§6.2, and [[Game-Output]]).
 2. Bind an ephemeral local socket; opentrack only ever receives.
 3. Load the ONNX model if installed and apply the saved pitch zero. Without a
    model this prints a 5-DOF notice and continues — pitch reads zero.
-4. Connect, **re-apply the display area** (the ET5 reports no eyes without one).
-5. Subscribe `0x501` for the NIR camera; a refusal downgrades to 5 DOF rather
+4. **Ask the hub for the tracker** (`lease_the_tracker`,
+   `crates/tobii-cli/src/main.rs:2112`) — deliberately *after* the model load,
+   because a granted lease puts the hub's tracker out and loading weights can
+   take seconds. Three answers: the socket will not connect (no hub — the
+   ordinary case, open directly); a `LeaseReply { ok: true }` (the hub has
+   dropped its session, and stays in standby until this command lets go); or
+   `ok: false` (mid-calibration, mid-display-setup, or another client holds it
+   — fail with the hub's own sentence). No answer inside `LEASE_WAIT = 3 s`
+   opens the device anyway, which is what keeps a hub older than this build
+   working. A status broadcast is **not** an answer: granting the lease is what
+   puts the hub in standby, so the status change often arrives first, and
+   `lease_answer` skips everything that is not a `LeaseReply`. The lease is
+   released explicitly on drop, so `--calibrate-pitch` gives the device back
+   where it returns.
+5. Connect, **re-apply the display area** (the ET5 reports no eyes without one).
+6. Subscribe `0x501` for the NIR camera; a refusal downgrades to 5 DOF rather
    than failing.
-6. Per frame: **position from the eye origins, rotation from the model.** The
+7. Per frame: **position from the eye origins, rotation from the model.** The
    fusion is the point — two eye origins cannot express pitch, because nodding
    rotates the head about the line through them and leaves both origins where
    they were. Without a fresh model pose, a frame with only one tracked eye
@@ -178,7 +195,7 @@ for exactly as long as the child process lives (§6.2, and [[Game-Output]]).
    interocular offset for up to 300 ms, holding rotation at its last
    measurement. With a model pose that path is bypassed — `onnx::fuse` takes the
    model's own position when the eye geometry is missing.
-7. Encode six `f64` little-endian into the opentrack datagram and send — x, y, z,
+8. Encode six `f64` little-endian into the opentrack datagram and send — x, y, z,
    yaw, pitch, roll, which is 48 bytes, as `datagram_is_exactly_48_bytes` pins.
    `TRANSLATION_SCALE = 0.1` converts millimetres to the centimetres opentrack's
    `data[]` expects.

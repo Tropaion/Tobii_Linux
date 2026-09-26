@@ -515,6 +515,26 @@ sent from Linux as `yaw 7.5°, pitch −3.25°, roll 1.5°, (11, 22, 33) mm` rea
 through `FTGetData` as `yaw=0.1309, pitch=-0.0567, roll=0.0262` radians and
 `pos=(11.0, 22.0, 33.0)`, with `DataID` advancing.
 
+**`install` refuses rather than overwriting somebody else's registration.** The
+two discovery keys —
+`HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location` and
+`HKCU\Software\Freetrack\FreeTrackClient` — are how *any* head-tracking client
+is found in a prefix, not just ours. Install writes down what it put in them,
+and if a key holds something that record does not account for it stops, names
+the key and what it holds, and prints the `reg delete` line to clear it by hand
+if it is stale. It does not stop over a key that already holds, byte for byte,
+what this run would write **with nothing on record either way** — the prefix a
+v0.4.0 install left behind, where refusing would block a write that changes
+nothing. A record naming a different value is a different fact, and is refused
+whether or not the key currently matches.
+
+`--force` goes ahead, and **promises nothing about putting the old value back**
+— the installer records only the values it wrote itself, so what was there is
+gone. `uninstall` is the other half of the same rule: it deletes a key only
+while it still holds our own install directory or exactly the value the record
+says this installer wrote, and leaves anything else alone and named, so it
+cannot take opentrack's registration with it on the way out.
+
 `tobii bridge uninstall --prefix PATH` removes it again.
 </details>
 
@@ -555,7 +575,8 @@ with the switch on, no joystick, nothing connected and nothing bound to the
 opentrack address sits dark on purpose — which is why a **Wine-bridge-only**
 setup still needs `tobii game` (or another socket client, or `keep_awake`),
 while opentrack and X-Plane are covered by their own row, and the
-`tobii headpose` route needs none of it because it holds the device itself.
+`tobii headpose` route needs none of it because it holds the device itself —
+asking the hub to stand down first when there is one.
 
 The hub says which of these it is doing. A session closed by the linger writes
 one line to the log — `tracker off: nothing has asked for it for 3s`, with
@@ -563,12 +584,45 @@ one line to the log — `tracker off: nothing has asked for it for 3s`, with
 eye-position panel reads **tracker off** rather than *not detected*, which is
 reserved for a tracker that is lit and cannot find a face.
 
-A useful consequence: while the hub is unfocused it holds no USB session, so
-`tobii headpose` can claim the device for a game without closing the hub first.
-That is what makes the standalone route work with the hub open — but only one
-process can have the device at a time, so focusing the hub while
-`tobii headpose` runs gets "already claimed by another process" rather than a
-live view.
+Only one process can have the device at a time, so `tobii headpose` **asks the
+hub for it** before opening it. The hub has honoured that request since it
+learned to serve clients; since v0.4.1 the CLI is the first thing that sends
+one. The three answers are each decided rather than defaulted:
+
+- **No hub.** Connecting to the socket fails, which is the ordinary state for
+  anyone who has not opened one, so nothing is waited for and the device is
+  opened directly. That is the standalone route and it has to keep working.
+- **The hub lets go.** It prints `the hub has let go of the tracker for this
+  run`, drops its USB session, and stays in standby for as long as the command
+  runs — **whatever its window is doing**, because a lease overrides every
+  demand rather than being weighed against them. While it is out, the hub's
+  eye-position panel reads **tracker off**, the same word a linger-closed
+  session gets, not an error. The tracker goes back when the command ends —
+  released explicitly, not left to the socket closing, so `--calibrate-pitch`
+  (the one form that returns on its own rather than running until Ctrl-C) hands
+  it back where it finishes.
+- **The hub refuses.** It is mid-calibration, mid-display-setup, or another
+  client already holds the lease — all three mean something is in a stateful
+  conversation with the device that handing it over would break. The command
+  fails with the hub's own sentence. That sentence lists everything the hub is
+  currently holding, not only the part that refused, so it can name a standing
+  setting such as `keep_awake` alongside the calibration you are actually
+  waiting for.
+
+A hub that gives none of those three answers within three seconds is wedged or
+older than this build; the device is opened anyway, which for the common case of
+an older hub sitting in standby simply succeeds. Refusing there would make the
+command *less* usable than it was before it learned to ask.
+
+That is what makes the standalone route work with the hub open, and it is what
+makes it work at all now that the joystick and `keep_awake` can ask for the
+tracker: both holds are open-ended and `wake_for_joystick` is on by default, so
+without the request the hub keeps libusb interface 0 for its whole lifetime and
+`tobii headpose`, `--check` and `--calibrate-pitch` fail for exactly the users
+those commands exist for. Measured here with `keep_awake` on: the hub held one
+USB file descriptor, `tobii headpose --check` printed the stand-down line and
+opened the device, the hub's count went to 0, and it was back to 1 about three
+seconds after the command exited.
 
 ## Configuration
 
