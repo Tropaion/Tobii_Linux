@@ -2511,6 +2511,16 @@ fn usage_for(sub: &str, known: &[&str]) -> String {
 ///     every reader is `flag_value`, which compares the whole token — so the
 ///     command would install into a prefix the user did not name.
 ///   * `--prefix` with nothing after it, which falls back to the same default.
+///   * a bare path — `tobii bridge install /games/pfx`, the most natural
+///     spelling of all. Nothing downstream reads a positional: `resolve_prefix`
+///     looks at `--steam`, `--prefix`, `$WINEPREFIX` and then `~/.wine`, so the
+///     typed path was dropped and the install went into the default prefix —
+///     the maintainer's own `~/.wine` when nothing else names one — and said
+///     so nowhere. It is refused rather than read as `--prefix` because the
+///     commonest way to produce one is not a forgotten flag at all: `--steam
+///     Star Citizen` leaves `Citizen` standing alone, and quietly treating that
+///     as a prefix path is the same class of mistake one layer down. A refusal
+///     names both.
 ///
 /// A flag's VALUE is not inspected: `--wine /opt/-odd/wine` is a real path, and
 /// refusing it for its leading dash would refuse a correct command.
@@ -2518,10 +2528,14 @@ fn reject_unknown_flags(args: &[String], sub: &str, known: &[&str]) -> Result<()
     let usage = usage_for(sub, known);
     let mut it = args.iter().skip(3);
     while let Some(a) = it.next() {
-        // A bare `-` is not a flag, and neither is a positional. This command
-        // has never read positionals; ignoring them is the behaviour it had.
+        // A bare `-` is not a flag either, and this command reads no stdin, so
+        // it is a positional like any other.
         if a == "-" || !a.starts_with('-') {
-            continue;
+            return Err(format!(
+                "`{a}` stands on its own, and this command reads no positional \
+                 arguments. A prefix is named with `--prefix {a}`; a `--steam` \
+                 title with spaces in it has to be quoted as one argument. {usage}"
+            ));
         }
         if let Some((name, _)) = a.split_once('=') {
             return Err(format!(
@@ -2611,10 +2625,11 @@ mod tests {
         assert!(err.contains("--help"), "name the flag: {err}");
     }
 
-    /// Three spellings that reached a real install into the default Wine
-    /// prefix, all found by a pre-release check of the gate that was supposed
-    /// to stop exactly this. `-h` is the one that matters most: a gate looking
-    /// only at `--` leaves the bug one keystroke away from where it was.
+    /// Four spellings that reached a real install into the default Wine
+    /// prefix, all found by checks of the gate that was supposed to stop
+    /// exactly this. `-h` is the one that matters most among the flags: a gate
+    /// looking only at `--` leaves the bug one keystroke away from where it
+    /// was. The bare path is the one most likely to be typed at all.
     #[test]
     fn every_spelling_that_reached_an_install_is_refused() {
         let run = |tail: &[&str]| {
@@ -2627,6 +2642,11 @@ mod tests {
             vec!["-help"],
             vec!["--prefix=/tmp/x"],
             vec!["--prefix"],
+            // The fourth: a bare path, which nothing downstream reads.
+            vec!["/games/pfx"],
+            // And a bare dash, which is a positional like any other here —
+            // this command reads no stdin.
+            vec!["-"],
         ] {
             let err = run(&tail).expect_err(&format!("{tail:?} must be refused"));
             assert!(
@@ -2634,9 +2654,46 @@ mod tests {
                 "the message must name what was rejected: {err}"
             );
         }
-        // A bare `-` is not a flag, and a value may begin with one.
+        // A flag's value may begin with a dash, and refusing it for that would
+        // refuse a correct command.
         run(&["--prefix", "-odd-path"]).expect("a value that starts with a dash is still a value");
-        run(&["-"]).expect("a bare dash is not an option");
+    }
+
+    /// The most natural spelling of all, and the one that shipped: a bare path
+    /// after the subcommand.
+    ///
+    /// `resolve_prefix` reads `--steam`, `--prefix`, `$WINEPREFIX` and then
+    /// `~/.wine`, and `flag_value` compares whole tokens — so no positional
+    /// ever reached a reader. `tobii bridge install /games/pfx` left that
+    /// prefix byte for byte untouched, installed into the default one instead,
+    /// wrote both discovery keys there and exited 0. With nothing naming a
+    /// prefix, the default is the user's own `~/.wine`.
+    ///
+    /// Refused rather than read as `--prefix`, because the commonest way to
+    /// produce a positional is not a forgotten flag: `--steam Star Citizen`
+    /// leaves `Citizen` standing alone, and silently treating that as a prefix
+    /// path is the same mistake one layer down.
+    #[test]
+    fn a_bare_path_is_not_quietly_installed_somewhere_else() {
+        let w = FakeWine::new("positional");
+        let typed = w.root.join("the-one-the-user-meant");
+        std::fs::create_dir_all(typed.join("drive_c")).expect("other prefix");
+        let mut args = w.args("install", &[]);
+        args.push(typed.display().to_string());
+
+        let err = bridge(&args)
+            .expect_err("a path this command cannot read must stop it")
+            .to_string();
+        assert!(
+            err.contains(&typed.display().to_string()),
+            "the message must name the argument it refused: {err}"
+        );
+        assert!(err.contains("--prefix"), "and how to name a prefix: {err}");
+        // Neither prefix: not the one that was typed, and not the one that
+        // would have been used instead of it.
+        assert!(!typed.join(INSTALL_SUBDIR).exists(), "{}", typed.display());
+        assert!(!w.dest().exists(), "{}", w.dest().display());
+        assert!(w.argv().is_empty(), "and no wine ran at all: {}", w.argv());
     }
 
     /// A usage line that lists the flag it has just called unknown tells the
