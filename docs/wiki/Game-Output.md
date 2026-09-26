@@ -40,18 +40,45 @@ reference-counted (`Demand`, see [[Runtime-View]] §6.2), and the things that
 take a count are the hub window while it has focus, the gaze overlay, a
 calibration or setup flow, and **a socket client**
 (`crates/tobii-gtk/src/outputs.rs`: `Holds::hello` takes a `DemandGuard` for a
-client subscribed to pose, gaze or camera). **Game output is not on that list**
-— `GameOutput::from_config` opens sinks and takes no guard — so the switch
-decides where frames go and never whether the tracker runs. A game cannot take a
-count either: it speaks opentrack or TrackIR, not this program's socket. For the
-opentrack route the hub can see the *receiver* instead, which is the one
-consumer below that is not a socket client.
+client subscribed to pose, gaze or camera). A game cannot take a count itself:
+it speaks opentrack or TrackIR or evdev, not this program's socket.
+`GameOutput::from_config` opens sinks and takes no guard either, so **switching
+game output on does not, by that route, ask for the device**.
 
 That gap is the whole reason `tobii game` exists. It transports nothing: it
 connects to the hub's socket, subscribes to pose for the lifetime of the child
 process, and drops the connection when the child exits — the wrapper is a
 `DemandGuard` with a launcher's sense of timing. Any program that holds that
 subscription does the same job.
+
+Which left, through v0.4.0, exactly one route that worked unattended — the
+opentrack watch below — and three that did not. The two that close the rest of
+the gap are not observations; they are the user's standing answer, and they are
+held by `GameSide` on the device thread rather than by the socket thread
+(`crates/tobii-gtk/src/device.rs`). That placement is deliberate:
+`outputs::spawn` returns *before* it spawns its thread when `Server::bind()`
+fails, so a hold parked there would be missing precisely on the second
+`tobii serve`, while `GameSide` already re-reads `games.toml` once a second in
+both the idle wait and inside a session, and already owns the joystick handle.
+
+* **`wake_for_joystick`** (default on) — `GameSide::sync_joystick` ends by
+  syncing a guard labelled *the virtual joystick*, taken when
+  `have_device && cfg.wake_for_joystick && enabled && joystick`. Gated on the
+  handle actually existing, not on the settings alone: a `/dev/uinput` that
+  refused leaves nothing for a game to bind, so it must cost no sessions.
+* **`keep_awake`** (default off) — a guard labelled *standby turned off in the
+  settings*, synced by `GameSide::sync_keep_awake` from the same once-a-second
+  `apply`, and gated on nothing at all. It holds with game output off, with no
+  sink configured, and it covers the gaze overlay and `tobii headpose` too.
+
+Neither reason is in `EXCLUSIVE`. These are the first claims the hub holds on
+its own behalf that never end by themselves, and an exclusive one would
+permanently refuse leases, recentres and calibration to exactly the users who
+turned the setting on — with a "busy with" message naming something they cannot
+see. The device thread's idle wait is now the named
+`must_wait(demand_active, pending_empty, lease_blocks)`, so the lease override
+is provably an override and not a weighing: a lease still takes the device from
+a permanent claim, and a queued command still opens a session.
 
 **One receiver announces itself, and the hub listens for that.** A socket bound
 to the opentrack destination appears in `/proc/net/udp` (and `udp6`), so
@@ -66,11 +93,25 @@ holds it, and which would otherwise hold the tracker on for itself for ever.
 address this host cannot see, or a platform without `/proc` — never takes a
 hold, so it degrades to the old behaviour instead of guessing. The key is
 `wake_for_opentrack`, default on, and it does nothing until game output is
-`enabled` and an opentrack address is set. This closes the gap for one route
-only: the joystick and the bridge receivers bind nothing the hub can see. The
-trade is that a bound socket is not a request — opentrack left open on a second
-monitor is indistinguishable from opentrack feeding a game, so the illuminators
-stay lit until it is closed.
+`enabled` and an opentrack address is set. The trade is that a bound socket is
+not a request — opentrack left open on a second monitor is indistinguishable
+from opentrack feeding a game, so the illuminators stay lit until it is closed.
+
+**The joystick has no equivalent question, and this was measured rather than
+assumed.** The kernel exports no open count for a uinput node, and the
+processes that hold one open are not a signal: a faithful replica of our device
+was opened within 30 ms by `joystickwake`, by Chrome probing gamepads on
+hotplug, and by `winedevice.exe` for the life of a Wine prefix; across 30
+samples it never had zero openers, and a real reader would appear as one more
+identical row in `/proc/*/fd`. Reader detection is therefore not implemented
+and should not be re-proposed — the refutation is written into
+`wants_joystick_wake`'s doc comment so the next person to think of it finds it
+next to the code. What `wake_for_joystick` costs instead is stated plainly:
+with it on, the illuminators stay lit for as long as game output is on, not for
+as long as a game is running. `wake_for_opentrack`'s hold ends when another
+program exits; this one ends when the user unticks something. The Wine bridge
+gets neither — its listener is inside the prefix — which is the case
+`keep_awake` exists for, and the case `tobii game` served all along.
 
 ## The composition order is load-bearing
 
@@ -354,7 +395,8 @@ has been watched binding the socket, the same caveat §11.3e carries for
 opentrack. Should it bind some third interface, `probe` never matches and this
 route wants a wrapper after all. It wants one for certain where the watch cannot
 answer at all: turned off, or an opentrack address on another machine, where
-`probe` says `Unknown` and takes no hold. The standalone `tobii headpose` route
+`probe` says `Unknown` and takes no hold — and where the alternative to the
+wrapper is `keep_awake`. The standalone `tobii headpose` route
 needs neither, because it holds the USB session itself.
 
 This matters because the virtual joystick genuinely *cannot* reach X-Plane:
@@ -422,7 +464,11 @@ app's rather than the host's, so the `tobii game -- %command%` launch option
 this prints may not resolve or may not reach the hub's socket. If you run
 Flatpak Steam, `flatpak-spawn --host tobii game -- %command%` is the shape to
 try first. Whether the sandboxed game sees the uinput device, and whether the
-DLL's loopback bind lands in the host's namespace, are both unmeasured.
+DLL's loopback bind lands in the host's namespace, are both unmeasured. For the
+joystick route this matters less than it did: `wake_for_joystick` holds the
+tracker from the host side, so a launch option that will not resolve inside the
+sandbox no longer costs the tracker — the DLL and socket questions above are
+unchanged.
 
 ### Which wine writes the registry matters
 

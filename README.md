@@ -348,8 +348,8 @@ device, or nothing switched on for the recentre to act on.
 ### What lights the tracker
 
 The hub keeps the infrared illuminators dark unless something is asking for the
-tracker, and **turning "Head tracking for games" on is not itself a request**:
-that switch decides where frames go, not whether the tracker runs.
+tracker. Each of the three game-output sinks asks in a different way, and one
+of them cannot ask at all.
 
 For **opentrack**, the receiver asks by binding the port, and the hub watches
 for that whenever game output is on — open opentrack and play, with no launch
@@ -359,8 +359,22 @@ binding `127.0.0.1:4242`, **0** again once it closed. The catch is that an
 opentrack left open with no game keeps the tracker lit; `tobii games set
 wake_for_opentrack false` turns the watch off.
 
-The hub watches the opentrack address and nothing else, so for the **virtual
-joystick and the Wine bridge** you wrap the game instead:
+For the **virtual joystick** there is nothing to watch, so the switch itself is
+the request: while game output is on and the joystick device has actually been
+created, the hub holds the tracker on. A game that binds an evdev joystick
+tells nobody it has done so, and there is no narrower question to ask — the
+kernel exports no open count for a uinput node, and the processes holding one
+open are not a signal. Measured on a faithful replica of our device: an
+idle-wake daemon, a browser probing gamepads on hotplug and `winedevice.exe`
+had all opened it within 30 ms, it never had zero openers again for the life of
+the Wine prefix, and a real reader would have been one more identical row.
+Reader detection was tried, measured and rejected; this hold is what replaces
+it. `tobii games set wake_for_joystick false` turns it off — and then a game
+reading those axes sees them freeze at centre a few seconds after the hub loses
+focus, which is what v0.4.0 did to everyone.
+
+The **Wine bridge** is the one route with nothing to see at all: its only
+listener is the DLL inside the prefix. Wrap the game instead:
 
 ```sh
 tobii game -- %command%        # Steam: paste this into Launch Options
@@ -379,6 +393,33 @@ program that connects to that socket and asks for pose does the same job; the
 wrapper is just the one that knows exactly how long a game lasts. Steam's
 `%command%`, Lutris's and Heroic's wrapper fields and a plain shell script all
 work, which is why this is a wrapper rather than a setting.
+
+And when nothing can be detected and nothing can be wrapped — a Wine bridge
+whose listener is inside the prefix, an opentrack on another machine, a
+launcher that will not pass a command through — there is a last resort that
+switches standby off altogether:
+
+```sh
+tobii games set keep_awake true   # off by default
+```
+
+or **Keep the tracker awake** in the hub's cogwheel. It holds the tracker on
+for as long as the hub is running, whatever else is or is not happening, and it
+is deliberately not tied to game output: it applies with the switch off, with
+no sink configured, and to the gaze overlay just the same. While it is on the
+hub shows an **ALWAYS ON** badge in its header, because that is the only place
+the state is visible — an infrared illuminator looks identical lit and dark.
+
+**These two settings weaken standby, and it is worth being plain about how.**
+With `keep_awake` on, the illuminators stay lit for as long as the hub runs.
+With `wake_for_joystick` on, they stay lit for as long as game output is on —
+including overnight, if you forget. `wake_for_opentrack`'s hold is bounded by
+another program's lifetime: opentrack exits, the port closes, the tracker goes
+dark about three seconds later. These two are bounded only by your memory. That
+asymmetry is why the hub carries the badge, why the eye-position panel now says
+*tracker off* rather than *not detected* when the session is closed on purpose,
+and why `tobii debug` prints which of the three, if any, is allowed to wake the
+tracker on your machine.
 
 <details>
 <summary><b>Games that have never heard of head tracking (the virtual joystick)</b></summary>
@@ -489,6 +530,8 @@ this program keeps one open only while something actually wants data:
 | Calibration, display setup, the accuracy diagnostic | while the flow is running |
 | Any program connected to the hub's socket asking for pose, gaze or camera — a game started with `tobii game` is one | while it stays connected |
 | A program bound to the address game output sends opentrack to — opentrack's *UDP over network* input, X-Plane's `headtrack` plugin | while that socket is open, checked about once a second (`wake_for_opentrack`, default on, with game output turned on) |
+| The virtual joystick, once game output has created it | while game output stays on (`wake_for_joystick`, default on) |
+| Standby switched off by hand — **Keep the tracker awake**, `keep_awake` | while the hub runs. Not conditional on anything else: not on game output, not on a sink, not on a window |
 | A queued setting (e.g. select eyes) | until it has been applied |
 
 Three seconds after the last of those lets go, the session closes and the LEDs
@@ -496,13 +539,29 @@ go out. The linger is not arbitrary: closing the session makes the ET5 reboot,
 and the next connect has to re-apply the display area, the eye selection and the
 calibration blob, so alt-tabbing away and back should not pay for that twice.
 
-That table is the whole list, and **turning game output on is not on it**: the
-"Head tracking for games" switch decides where frames go, not whether the
-tracker runs. A hub with the switch on, nothing connected and nothing bound to
-the opentrack address sits dark on purpose — which is why the joystick and the
-Wine bridge need `tobii game` (or another socket client), while opentrack and
-X-Plane are covered by the row above them, and the `tobii headpose` route needs
-neither because it holds the device itself.
+That table is the whole list. The last two rows before the queued setting are
+new in v0.4.1, and they **weaken standby**: with `keep_awake` the illuminators
+stay lit for as long as the hub runs, and with `wake_for_joystick` for as long
+as game output is on — including overnight if the user forgets. Every other row
+ends on its own. `wake_for_opentrack`'s hold is bounded by another program's
+lifetime; these two are bounded only by the user's memory, which is why the hub
+badges `keep_awake` in its header and why `tobii debug` now prints what is
+allowed to wake the tracker.
+
+What is still **not** on the list is game output by itself: with
+`wake_for_joystick` off, or with no joystick device, the "Head tracking for
+games" switch decides where frames go and not whether the tracker runs. A hub
+with the switch on, no joystick, nothing connected and nothing bound to the
+opentrack address sits dark on purpose — which is why a **Wine-bridge-only**
+setup still needs `tobii game` (or another socket client, or `keep_awake`),
+while opentrack and X-Plane are covered by their own row, and the
+`tobii headpose` route needs none of it because it holds the device itself.
+
+The hub says which of these it is doing. A session closed by the linger writes
+one line to the log — `tracker off: nothing has asked for it for 3s`, with
+`, so game output stopped too` when frames were being sent — and the
+eye-position panel reads **tracker off** rather than *not detected*, which is
+reserved for a tracker that is lit and cannot find a face.
 
 A useful consequence: while the hub is unfocused it holds no USB session, so
 `tobii headpose` can claim the device for a game without closing the hub first.
@@ -1122,8 +1181,11 @@ The full list, per release, is in
 [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1.
 
 **Reporting a problem:** `tobii debug` prints the report an issue asks for, and
-the hub's cogwheel can copy or save it. For an install or update problem, say how
-you installed and paste what `tobii uninstall --dry-run` prints; it shows where
+the hub's cogwheel can copy or save it. Since v0.4.1 it carries a **game
+output** section — the sinks, the three wake settings, and a `can wake it now`
+line that names every path that could light the tracker at that moment, or says
+`NOTHING` and what to turn on. For an install or update problem, say how you
+installed and paste what `tobii uninstall --dry-run` prints; it shows where
 every copy is and who owns it.
 
 ## Contributing

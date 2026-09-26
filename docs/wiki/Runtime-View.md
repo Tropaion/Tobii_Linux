@@ -106,6 +106,19 @@ the ~33 Hz gaze stream and was silently dropping ~3 frames a second.
    session close by rebooting, and the illuminators go out.**
 4. The outer loop finds demand still false, resets state to `Idle`, and parks.
 
+Step 3 also writes one line to the log — `tracker off: nothing has asked for it
+for 3s`, plus `, so game output stopped too` when a session was sending — which
+is the close the hub never used to report. It logged "game output on, sending
+to: …" on every open and nothing on the way down, so a log from a user whose
+tracker kept sleeping read as twelve openings and no closes.
+
+Two `DemandGuard`s can hold this off indefinitely, and both are settings rather
+than observations: *the virtual joystick* (`wake_for_joystick`) and *standby
+turned off in the settings* (`keep_awake`). Neither is in `EXCLUSIVE`, so a
+lease, a recentre or a calibration still takes the device from them — the wait
+is `must_wait(demand_active, pending_empty, lease_blocks)`, where the lease term
+is an override and not a weighing. See [[Game-Output]].
+
 The linger is not arbitrary. Closing costs a device reboot, so the next connect
 must re-apply display area, eye selection and calibration before any data flows.
 Without it, alt-tabbing away and back would pay that twice, and every dialog —
@@ -144,9 +157,11 @@ releases the device when unfocused. Nothing below goes through the hub or its
 socket: this path holds the USB session itself, so the tracker is lit for
 exactly as long as the command runs, and the `tobii game` wrapper has nothing to
 do here. That wrapper is a socket client and nothing else — it exists for the
-hub's route, where game output itself takes no `DemandGuard` and so cannot light
-the tracker for a game that never connects (§6.2, and
-[[Game-Output]]).
+hub's route, where the sink plumbing takes no `DemandGuard` of its own and so
+cannot light the tracker for a game that never connects. Since v0.4.1 the hub
+can be told to hold the session anyway, by `wake_for_joystick` or `keep_awake`,
+but those hold it for as long as a setting says so while the wrapper holds it
+for exactly as long as the child process lives (§6.2, and [[Game-Output]]).
 
 1. Resolve `--udp` (default `127.0.0.1:4242`) and `--rate` (default 60 Hz).
 2. Bind an ephemeral local socket; opentrack only ever receives.

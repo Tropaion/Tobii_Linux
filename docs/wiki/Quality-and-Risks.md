@@ -44,7 +44,9 @@ What is measured, what is assumed, and what is known to be wrong. Background in
 ### 10.4 Not surprising the user
 
 - Exactly **one** unprompted network request, with an opt-out.
-- The tracker runs only while something needs it.
+- The tracker runs only while something needs it — with two settings that let
+  the user answer that question themselves, and a badge and a diagnostics line
+  so an answer left switched on is visible (§11.3f).
 - The autostart session opens **no window** and **no USB session** —
   measured: zero USB fds and zero GPU fds while idle.
 
@@ -614,6 +616,79 @@ because the reasoning is worth more than the tidiness.
   `connect`s to prove a connected socket stops counting. What is **not** measured
   is a real opentrack or X-Plane doing the binding — both were inferred from the
   port they document.
+
+### 11.3f Waking the tracker for the joystick, and switching standby off (new in v0.4.1)
+
+Reported as [issue #2]: game output on, the virtual joystick and the Wine
+bridge as sinks, and the tracker going dark three to five seconds after the hub
+window lost focus. It was not a fault. It was the standby model meeting the one
+configuration it could not serve, and every visible surface described it as a
+fault.
+
+- **The two new holds are bounded only by the user's memory, and that is a
+  deliberate weakening of standby.** With `keep_awake` on, the illuminators are
+  lit for as long as the hub runs. With `wake_for_joystick` on (the default),
+  they are lit for as long as game output is on — including overnight, if it is
+  forgotten. Every other wake path ends on its own: a focused window loses
+  focus, a wrapped game exits, `wake_for_opentrack`'s hold ends when the program
+  holding that port does. These two end when a human ends them. The visibility
+  that pays for it — the header's **ALWAYS ON** badge, the switch's off-state
+  sentence, the `can wake it now` line in `tobii debug`, the close line in the
+  log — is therefore not decoration, and removing any of it re-opens the
+  bargain.
+- **What is measured.** The linger is **3.00 s**, timed, which is the "3 to 5
+  seconds" of the report. The joystick's uinput node **persists while the
+  tracker is dark**: `GameSide::poll` → `sync_joystick` runs from the device
+  thread's idle loop as well as from a session, so a game saw axes frozen at
+  centre rather than a disappearing controller — which is why gating a hold on
+  the handle really existing cannot deadlock. Reader detection was measured and
+  **rejected**: a faithful replica of our device was held open by
+  `joystickwake`, by Chrome probing gamepads on hotplug and by
+  `winedevice.exe` within 30 ms,
+  never had zero openers across 30 samples, and the kernel exports no open
+  count, so a real reader is one more identical row in `/proc/*/fd`. The hold's
+  placement was decided by reading `outputs::spawn`, which returns *before*
+  `std::thread::spawn` when `Server::bind()` fails — a waker parked on the
+  socket thread would be missing on precisely the second `tobii serve` — so it
+  lives on `GameSide`, which already polls at 1 Hz in both loops.
+- **What is not measured: nobody has run a tracker lit for eight hours.** There
+  is no soak test of either hold, no thermal measurement, and nothing is known
+  about what continuous illumination does to an ET5 over a night beyond the
+  obvious. The "overnight" case in every warning above is reasoned, not
+  observed.
+- **No real game has been watched reading unfrozen axes.** The hold is proven by
+  unit tests over `GameSide` (the claim exists exactly when the handle does,
+  released on the setting, on losing the device, and on game output going off)
+  and the lease behaviour by tests over `must_wait` and `EXCLUSIVE`. What has
+  not been done is: turn it on, start a game, alt-tab, and watch the view still
+  follow.
+- **The close line's emission site is untested.** `standby_notice`'s wording has
+  a test; the `log::info` call that emits it does not, because `device_session`
+  opens `UsbTransport` directly and is not generic over `Transport` the way
+  `device_tick` is. Making it generic was judged a larger change than the bug
+  needed.
+- **`keep_awake` lives in `games.toml`, which is the wrong-sounding file for
+  it.** It is there because that is the only config the hub re-reads once a
+  second, in the idle wait *and* in a session, so the GUI and the CLI both take
+  effect within a second in either state; `config.toml` is read once at connect
+  and is rewritten wholesale by `tobii setup`. The cost is that the file's name
+  undersells one of its keys, paid down in the file's header comment and in the
+  field's docs. The failure direction is at least the safe one: a `games.toml`
+  that cannot be read at all falls back to `OutputConfig::default()`, where
+  `keep_awake` is off — a corrupt file cannot leave somebody's illuminators lit.
+- **The GUI half has no unit test, for the reason every control in that file has
+  none**: the switch, the badge and their refresh are GTK wiring inside
+  `build_hub`, unreachable without a display. They were verified by `.measure()`
+  on a replica header (40 px with the badge hidden, 40 px shown — no added
+  height) and by a clean `load_css()`. The stored bit and its parsing *are*
+  tested.
+- **The settings popover now clips sooner.** Its natural height went from 814 px
+  to 942 px with the new row, and it has no `ScrolledWindow`. At the hub's text
+  size multiplier that already cut off the bottom row on a 1080p screen at about
+  1.3×; this makes a pre-existing bug roughly 128 px worse. Left alone rather
+  than redesigned inside a bug fix.
+
+[issue #2]: https://github.com/Tropaion/Tobii_Linux/issues/2
 
 ### 11.4 Environmental
 

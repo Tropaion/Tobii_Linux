@@ -203,12 +203,28 @@ as long as it stays subscribed to pose, gaze or camera
 needs no client at all: `outputs::PortWatch` holds a guard while a socket is
 bound where the opentrack sink sends (`wake_for_opentrack`, default on, with
 game output enabled), asked once a second through
-`tobii_output::listener::probe`. Game output itself takes no guard: the switch
+`tobii_output::listener::probe`.
+
+Two more are the **hub's own standing claims**, held by `GameSide` on the
+device thread and synced from the same once-a-second config read that runs in
+the idle wait and inside a session: *the virtual joystick* (`wake_for_joystick`,
+default on — taken while game output is on and the uinput device really
+exists) and *standby turned off in the settings* (`keep_awake`, default off —
+taken unconditionally). They are the first reasons the hub holds on its own
+behalf that **never end by themselves**, which is exactly why neither may be in
+`EXCLUSIVE`: an exclusive claim that never ends would permanently refuse every
+lease, recentre and calibration, naming something the user cannot see. See
+[[Game-Output]] for why the joystick cannot be watched instead.
+
+The sink plumbing still takes no guard of its own: `GameOutput::from_config`
 routes frames, it does not ask for the device. A queued command is the one
 thing that opens a session WITHOUT taking a guard — the device thread's wait is
-`!demand.active() && pending.is_empty()`, so "select left eye only" typed into
-an idle hub still takes effect. Three seconds after the last guard drops, the
-session closes. See [[Runtime-View]] §6.2 for why the linger exists.
+the named `must_wait(demand_active, pending_empty, lease_blocks)`, which is
+`(!demand.active() && pending.is_empty()) || lease_blocks`, so "select left eye
+only" typed into an idle hub still takes effect and a lease still takes the
+device from a claim that would otherwise never let go. Three seconds after the
+last guard drops, the session closes, and the device thread logs why. See
+[[Runtime-View]] §6.2 for why the linger exists.
 
 **`tobii-update`** — `net.rs` is the only place the crate touches the network;
 `install.rs` does digest → unpack → probe → swap with all-or-nothing rollback.
