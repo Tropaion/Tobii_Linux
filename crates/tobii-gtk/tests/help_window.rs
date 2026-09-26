@@ -363,6 +363,13 @@ struct Seen {
     selected_on_open: i32,
     /// Whether the last help window was still alive 800 ms after closing.
     alive_after_close: bool,
+    /// How many of the window's INNER widgets were still alive 800 ms after
+    /// closing. The window freeing is not enough: two siblings that capture
+    /// each other — the search box and the topic list, or the sidebar and the
+    /// narrow-mode toggle — keep each other's refcount off zero, so the whole
+    /// content subtree leaks while the window itself disappears. A test that
+    /// weak-refs only the window cannot see that, and did not.
+    inner_alive_after_close: usize,
     /// The six cards of the real hub.
     rack: Vec<Card>,
     /// Per card: its description, its height at the narrowest its own column
@@ -573,20 +580,29 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
             // The weak reference is taken with the window still open, so what
             // is checked after the close is whether anything still holds it.
             let weak: Rc<RefCell<Option<gtk::glib::WeakRef<gtk::Window>>>> = Rc::default();
+            let inner: Rc<RefCell<Vec<gtk::glib::WeakRef<gtk::Widget>>>> = Rc::default();
             {
-                let (a, s, weak) = (app.clone(), seen.clone(), weak.clone());
+                let (a, s, weak, inner) = (app.clone(), seen.clone(), weak.clone(), inner.clone());
                 at(
                     3100,
                     Box::new(move || {
                         let help = help_windows(&a).remove(0);
                         *weak.borrow_mut() = Some(help.downgrade());
+                        for w in all(help.upcast_ref()) {
+                            if w.downcast_ref::<gtk::SearchEntry>().is_some()
+                                || w.downcast_ref::<gtk::ListBox>().is_some()
+                                || w.downcast_ref::<gtk::Stack>().is_some()
+                            {
+                                inner.borrow_mut().push(w.downgrade());
+                            }
+                        }
                         button_labelled(help.upcast_ref(), "Close").emit_clicked();
                         s.borrow_mut().closed.push(("Close button", usize::MAX));
                     }),
                 );
             }
             {
-                let (a, s, weak) = (app.clone(), seen.clone(), weak.clone());
+                let (a, s, weak, inner) = (app.clone(), seen.clone(), weak.clone(), inner.clone());
                 at(
                     3900,
                     Box::new(move || {
@@ -594,6 +610,11 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                         s.closed.last_mut().unwrap().1 = help_windows(&a).len();
                         s.alive_after_close =
                             weak.borrow().as_ref().and_then(|w| w.upgrade()).is_some();
+                        s.inner_alive_after_close = inner
+                            .borrow()
+                            .iter()
+                            .filter(|w| w.upgrade().is_some())
+                            .count();
                     }),
                 );
             }
@@ -995,6 +1016,13 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
     );
 
     // --- the v0.3.1 rule: it must not keep itself alive ---
+    assert_eq!(
+        seen.inner_alive_after_close, 0,
+        "{} of the help window's inner widgets outlived it. The window freeing is \
+         not the whole question: two siblings that capture each other keep each \
+         other alive, and the content subtree hangs off them",
+        seen.inner_alive_after_close
+    );
     assert!(
         !seen.alive_after_close,
         "the help window was never freed after closing — something inside it holds \

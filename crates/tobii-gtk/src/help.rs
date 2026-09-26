@@ -621,8 +621,12 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
         });
     }
     {
-        let (sb, bs, rl) = (sidebar.clone(), body_scroll.clone(), rule.clone());
+        // `sidebar` WEAKLY: it is the parent of `list`, and `list` holds this
+        // toggle through its row-activated handler, so a strong capture here
+        // closes sidebar -> list -> toggle -> sidebar.
+        let (sb, bs, rl) = (sidebar.downgrade(), body_scroll.clone(), rule.clone());
         toggle.connect_toggled(move |t| {
+            let Some(sb) = sb.upgrade() else { return };
             if t.is_visible() {
                 sb.set_visible(t.is_active());
                 bs.set_visible(!t.is_active());
@@ -675,7 +679,12 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
         // A plain (bubble-phase) controller on the list is enough to preempt
         // it: GtkWindow's own move-focus is a class keybinding, which runs at
         // the window in the bubble phase — after this.
-        let (bs, se) = (body_scroll.clone(), search.clone());
+        // `search` WEAKLY: its own handlers hold `list` (the filter, and
+        // Enter-into-the-list), so a strong capture here closes a cycle
+        // between two siblings and neither is ever disposed. The window itself
+        // still frees — nothing holds an ancestor — which is why a test that
+        // weak-refs only the window cannot see it.
+        let (bs, se) = (body_scroll.clone(), search.downgrade());
         let keys = gtk::EventControllerKey::new();
         keys.connect_key_pressed(move |_, key, _, state| {
             if key != gtk::gdk::Key::Tab && key != gtk::gdk::Key::ISO_Left_Tab {
@@ -684,6 +693,9 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
             let back = state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
                 || key == gtk::gdk::Key::ISO_Left_Tab;
             if back {
+                let Some(se) = se.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
                 se.grab_focus();
                 return glib::Propagation::Stop;
             }
