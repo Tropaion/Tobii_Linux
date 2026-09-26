@@ -881,7 +881,7 @@ built for the purpose.
   real prefix; no user reported any of them**, on the one command in this
   project that writes into somebody else's Wine prefix.
 
-### 11.3h The shortened cards and the F1 help window (unreleased, after v0.4.1)
+### 11.3h The shortened cards and the F1 help window (new in v0.5.0)
 
 **Two halves of the help window's display test do not run anywhere available to
 this project, and now say so rather than failing.** The Tab walk needs the
@@ -1000,7 +1000,7 @@ touchscreen, and two cards' guidance is now in exactly that position.
   compositor to make its window ACTIVE, which it checks and says so about
   rather than blaming Tab.
 
-### 11.3i The wineserver lock, and what yielding to it does not prove (unreleased, after v0.4.1)
+### 11.3i The wineserver lock, and what yielding to it does not prove (new in v0.5.0)
 
 `tobii bridge run` now probes the prefix's wineserver lock before it starts and
 watches `/proc/locks` for a blocked launch while it runs
@@ -1068,7 +1068,7 @@ means for a real game is not.
   workspace is that `tobii bridge run` passes `--no-register`
   (`bridge.rs`, `run_starts_the_provider_with_the_registry_write_turned_off`).
 
-### 11.3j `bridge status`, and the reads that no longer run wine (unreleased, after v0.4.1)
+### 11.3j `bridge status`, and the reads that no longer run wine (new in v0.5.0)
 
 `tobii bridge status` is new, and with it a rule the other subcommands now keep
 too: **a `tobii bridge` command that ends up writing nothing must not have
