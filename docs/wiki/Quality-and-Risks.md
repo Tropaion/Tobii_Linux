@@ -929,6 +929,53 @@ touchscreen, and two cards' guidance is now in exactly that position.
   and a display test walks the real hub's six cards and requires every tooltip
   it finds, paragraph by paragraph, in the help text. Sixteen control runs
   reverted each behaviour in turn and watched the test fail.
+### 11.3h The wineserver lock, and what yielding to it does not prove (new since v0.4.1)
+
+`tobii bridge run` now probes the prefix's wineserver lock before it starts and
+watches `/proc/locks` for a blocked launch while it runs
+(`crates/tobii-cli/src/wineserver.rs`). The mechanism it is built on is
+documented in wine's and Proton's own sources and was reproduced here; what it
+means for a real game is not.
+
+- **What was measured, on this machine, 2026-09-26.** With one wine process
+  holding a throwaway prefix, `wineserver -w` timed out at 4 s (exit 124) and
+  returned 0 the instant the holder died. The lock path derived from a `stat`
+  of a prefix (`dev 53, ino 15664805` → `/tmp/.wine-1000/server-35-ef06a5/lock`)
+  named the file wine had actually created. With the bridge running on that
+  prefix, a real `wineserver -w` blocked, the bridge read the waiter out of
+  `/proc/locks`, stopped itself, and `wineserver -w` returned 0. The
+  already-held branch was checked against a persistent wineserver and named the
+  same pid `/proc/locks` did.
+- **What is NOT established, and is stated as unknown in the code and in
+  [[Game-Output]] rather than assumed.** Whether a `wine` started by `tobii
+  bridge run` **joins** a containerised game's wineserver rather than merely
+  contending with it: the cross-process proof used host wine on a host prefix.
+  The Steam Linux Runtime shares the host `/tmp` (measured: same device and
+  inode on both sides), which is why the lock contends at all — but the joining
+  half is unconfirmed. If it does not join, yielding still fixes the freeze and
+  the user still gets no tracking from `bridge run`.
+- **And it does not make a game accept the data.** Nothing here has been run
+  against MSFS 2024 or any other title: this tree's only evidence that a game
+  reads `HKCU\…\NPClient Location` at all is `StarCitizen.exe`
+  (`bridge/core/src/lib.rs`). The change stops a second process breaking the
+  launch. That is its entire claim, and the messages are worded to claim no
+  more.
+- **The watch loop's own I/O is untested.** `blocked_waiter` is a pure function
+  checked against the measured `/proc/locks` text and five negatives, and
+  `supervise` is checked against a real child with an injected waiter — but the
+  wiring between them (the lock file's inode reaching the parser, on a real
+  prefix, under a real launch) is covered only by the manual run above, not by
+  a test. Staging a blocked POSIX waiter needs a forked process, which a
+  threaded test binary cannot do safely.
+- **The provider's flag parsing has no automated test at all.** `bridge/` is a
+  separate workspace that cross-compiles to `x86_64-pc-windows-gnu` and has no
+  host test runner — its crates call `advapi32`/`kernel32` directly, so a host
+  build does not link. `--register`, `--no-register` and the default were
+  checked by hand under wine 11.18 against a throwaway prefix: a seeded
+  third-party registration survived a default start and a `--no-register`
+  start, and `--register` overwrote it. What *is* tested from the root
+  workspace is that `tobii bridge run` passes `--no-register`
+  (`bridge.rs`, `run_starts_the_provider_with_the_registry_write_turned_off`).
 
 ### 11.4 Environmental
 

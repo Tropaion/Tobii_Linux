@@ -17,6 +17,7 @@ type CmdResult = Result<(), Box<dyn std::error::Error>>;
 
 mod bridge;
 mod uninstall;
+mod wineserver;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();

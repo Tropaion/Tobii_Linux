@@ -1394,7 +1394,8 @@ fn install(args: &[String]) -> CmdResult {
              Start the game FIRST and that command second. While it runs it is a\n\
              wineserver on this prefix, and Steam waits for every wineserver on a\n\
              prefix to exit before it spawns the game — so a bridge started first\n\
-             leaves the launch sitting there.\n\
+             leaves the launch sitting there. The command says this before it starts,\n\
+             and stops itself if a launch starts waiting behind it.\n\
              FreeTrack games need nothing running.",
             prefix.display()
         );
@@ -1465,7 +1466,90 @@ fn del_value(wine: &Path, prefix: &Path, key: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+/// How a supervised child ended.
+#[derive(Debug)]
+enum Supervised {
+    /// It finished on its own, with this status.
+    Exited(std::process::ExitStatus),
+    /// We stopped it because a launch was blocked behind it, by this pid.
+    Yielded(i32),
+}
+
+/// How often the watch loop looks for a blocked launch.
+///
+/// The thing being waited on is a `wineserver -w` that waits forever, so
+/// latency here is only how long the user stares at a launcher that has not
+/// started yet. A quarter of a second is short enough not to be noticed and
+/// long enough that reading one small proc file costs nothing.
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Run `child` to completion, unless a launch starts waiting on the prefix.
+///
+/// `waiter` is a parameter rather than a direct `/proc/locks` read so that the
+/// yield path — the part that kills a live process — is testable against a real
+/// child without needing a real blocked `fcntl` waiter, which cannot be staged
+/// from inside a threaded test binary.
+fn supervise(
+    child: &mut std::process::Child,
+    mut waiter: impl FnMut() -> Option<i32>,
+) -> std::io::Result<Supervised> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Supervised::Exited(status));
+        }
+        if let Some(pid) = waiter() {
+            stop(child);
+            return Ok(Supervised::Yielded(pid));
+        }
+        std::thread::sleep(WATCH_INTERVAL);
+    }
+}
+
+/// Ask the child to go, then insist.
+///
+/// `SIGTERM` first because wine turns it into an ordinary process termination:
+/// the Windows process exits, wine detaches from the wineserver, and the
+/// wineserver — which holds the lock for exactly as long as it has clients —
+/// goes with it. `SIGKILL` straight away would get there too, but only after
+/// wine's own cleanup did not happen, and the point of this path is to leave
+/// the prefix in the state a launch is about to walk into.
+///
+/// The child is deliberately NOT put in a process group of its own. It shares
+/// ours, so a Ctrl-C at the terminal still reaches wine; a child in its own
+/// group would survive the interrupt that kills this process and go on holding
+/// the lock with nothing left to stop it — the exact failure this whole module
+/// is here to prevent, made permanent.
+fn stop(child: &mut std::process::Child) {
+    // SAFETY: a pid this process owns and has not reaped — only `try_wait` and
+    // `wait` reap it, and both are here. A child that died a moment ago is
+    // still a zombie holding its pid, so the signal lands on nothing rather
+    // than on somebody else's process.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => return,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// `tobii bridge run` — run the provider in the foreground.
+///
+/// This command is a wine process on the game's prefix, which makes it a
+/// wineserver holder by construction, which makes it able to hang the next
+/// Steam launch of that game — see [`crate::wineserver`] for the mechanism and
+/// for what is measured versus assumed about it. Two things follow from that
+/// and they are the only reason this is not three lines:
+///
+/// * it says, before it starts, what starting it now will cost;
+/// * it gets out of the way when a launch does start waiting behind it.
+///
+/// Neither makes a game *accept* the tracking data. Both stop a second process
+/// from breaking the launch, and nothing said here may claim more.
 fn run(args: &[String]) -> CmdResult {
     let prefix = resolve_prefix(args)?;
     let (wine, _) = resolve_wine(&prefix, args)?;
@@ -1488,15 +1572,54 @@ fn run(args: &[String]) -> CmdResult {
         wine_args.push("--port");
         wine_args.push(port);
     }
+
+    let lock = crate::wineserver::lock_for(&prefix);
+    match &lock {
+        Ok(path) => eprint!(
+            "{}",
+            crate::wineserver::before_run(&crate::wineserver::probe(path))
+        ),
+        Err(why) => eprint!(
+            "{}",
+            crate::wineserver::before_run(&crate::wineserver::Lock::Unknown(why.clone()))
+        ),
+    }
     eprintln!(
-        "running the bridge in {} (Ctrl-C to stop)",
+        "\nrunning the bridge in {} (Ctrl-C to stop)",
         prefix.display()
     );
-    let status = wine_run(&wine, &prefix, &wine_args)?;
-    if !status.success() {
-        return Err(format!("the bridge exited with {status}").into());
+
+    let mut child = std::process::Command::new(&wine)
+        .args(&wine_args)
+        .env("WINEPREFIX", &prefix)
+        // Wine is chatty and none of it is ours; the bridge's own output is
+        // what the user needs to see.
+        .env("WINEDEBUG", "-all")
+        .spawn()?;
+
+    // Asked for again on every pass rather than once, because the usual case is
+    // that the lock file does not exist yet: nothing has served this prefix, so
+    // our own wine is about to create it, moments from now.
+    let lock = lock.ok();
+    let mut ids = lock.as_deref().and_then(crate::wineserver::lock_ids);
+    let outcome = supervise(&mut child, || {
+        if ids.is_none() {
+            ids = lock.as_deref().and_then(crate::wineserver::lock_ids);
+        }
+        let (dev, ino) = ids?;
+        crate::wineserver::waiting_launch(dev, ino)
+    })?;
+
+    match outcome {
+        Supervised::Yielded(pid) => {
+            eprint!("{}", crate::wineserver::yielding(pid));
+            Ok(())
+        }
+        Supervised::Exited(status) if !status.success() => {
+            Err(format!("the bridge exited with {status}").into())
+        }
+        Supervised::Exited(_) => Ok(()),
     }
-    Ok(())
 }
 
 /// What uninstall should do to one key, having read what it says now.
@@ -3491,5 +3614,53 @@ exit 0
         run(&w.run_args(&["--port", "4999"])).expect("run");
         let argv = w.argv();
         assert!(argv.contains("[--no-register][--port][4999]"), "{argv}");
+    }
+
+    /// A child that is asked to stand down while a launch waits behind it is
+    /// actually stopped, and the pid of the waiter comes back so the message
+    /// can name it.
+    ///
+    /// The waiter is injected rather than staged as a real blocked `fcntl`,
+    /// which would need a forked process inside a threaded test binary. What
+    /// this covers is the half that acts: a live child, killed, reaped, and the
+    /// loop returning rather than waiting for a process that is never going to
+    /// exit on its own.
+    #[test]
+    fn a_waiting_launch_stops_the_child_and_names_the_waiter() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let outcome = supervise(&mut child, || Some(1_140_518)).expect("supervise");
+        assert!(
+            matches!(outcome, Supervised::Yielded(1_140_518)),
+            "{outcome:?}"
+        );
+        // Reaped, not merely signalled: a second wait would block forever on a
+        // child still running, and `/proc/<pid>` outliving us is how a
+        // "stopped" bridge goes on holding the lock.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}/task")).exists(),
+            "pid {pid} still alive"
+        );
+    }
+
+    /// With nothing waiting, the child runs to completion and its status is
+    /// what comes back — the ordinary case, which the watch loop must not
+    /// change.
+    #[test]
+    fn a_child_nobody_is_waiting_for_runs_to_completion() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 3")
+            .spawn()
+            .expect("spawn");
+        let outcome = supervise(&mut child, || None).expect("supervise");
+        match outcome {
+            Supervised::Exited(status) => assert_eq!(status.code(), Some(3)),
+            other => panic!("{other:?}"),
+        }
     }
 }

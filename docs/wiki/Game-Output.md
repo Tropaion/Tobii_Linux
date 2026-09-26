@@ -439,6 +439,15 @@ Wine is a different session: its `FT_SharedMem` is a different object in a
 different server, and the game never sees it. Getting a second executable into
 the game's session means reproducing Proton's entire launch environment.
 
+(That last claim is this project's working assumption and has never been
+measured from both sides. `run` now resolves the prefix's own Proton build
+rather than the system wine, and the prefix's server directory is derived from
+the prefix's inode, which a container shares — so *whether* a bridge started
+from outside now joins the game's wineserver is genuinely open. It is written
+up as unknown under [Ordering](#ordering-the-game-first-the-bridge-second),
+and nothing below depends on the answer: the DLL feeding itself needs no
+second process either way.)
+
 The DLL is already inside the game's process. So the receive loop lives there:
 same wineserver by construction, no second process, no environment to
 reproduce. Wine's winsock is a thin shim over host sockets, so a datagram from
@@ -567,6 +576,64 @@ third-party client is a pure consumer of `FT_SharedMem`. Our DLLs are what
 create and feed that mapping, and a TrackIR-only game never loads ours — so
 something has to fill it. `install` says so when it sets that up. FreeTrack
 games need nothing running.
+
+### Ordering: the game first, the bridge second
+
+`tobii bridge run` is a `wine` process on the game's prefix, and that is enough
+to stop the game from launching at all.
+
+Steam launches a Proton title with the verb `waitforexitandrun`, and Proton's
+launcher runs `wineserver -w` **before** it spawns the game executable.
+`wineserver -w` is `fcntl(F_SETLKW)` on byte 0 of
+`/tmp/.wine-<uid>/server-<dev>-<ino>/lock` (wine's `server/request.c`,
+`wait_for_lock`), and a live wineserver holds that write lock for its whole
+lifetime by design — `acquire_lock` takes it and deliberately never closes the
+descriptor. So any wine process alive on that prefix means the game executable
+is never reached. The launcher does not crash and does not complain; it sits
+there. That is what gets reported as "the game freezes while the bridge is
+running", and it is not specific to any title or to this project — opentrack
+hits the same wall (opentrack#2211, an Arma 3 report).
+
+Measured 2026-09-26: with one wine process holding a throwaway prefix,
+`wineserver -w` timed out at 4 s (exit 124) and returned 0 the instant the
+holder died.
+
+**So the rule is: start the game, let it reach its menu, then start the
+bridge.** Late is not too late. Measured the same day: opentrack's
+`NPClient64.dll`, driven through the full handshake, polled `NP_GetData` 102
+times with no `FT_SharedMem` present at all — all zeros — and then picked the
+mapping up mid-run, reporting a correct pose, when a separate process created
+and fed it. It does not cache the absence.
+
+Two things enforce the rule rather than only documenting it
+(`crates/tobii-cli/src/wineserver.rs`):
+
+* **Before it starts**, `run` derives the lock path from a `stat` of the prefix
+  and probes it with a non-blocking `F_GETLK`. Nothing holding it means the
+  bridge is about to become the holder, and it says so in those words. Something
+  already holding it is the supported order, and it says that instead.
+* **While it runs**, `run` watches `/proc/locks` for a blocked waiter on that
+  same lock file — the shape, measured, is a second line on the same inode with
+  a `->` prefix naming the waiter's pid. On seeing one it stops, so the launch
+  goes through, and says to start it again once the game is up.
+
+Verified end to end on a throwaway prefix on 2026-09-26: with the bridge
+running, a real `wineserver -w` blocked on the lock, the bridge saw the waiter,
+stopped itself, and `wineserver -w` returned 0.
+
+**[UNKNOWN]** Two things this does *not* establish, and no message in the code
+claims either:
+
+* Whether a `wine` started by `tobii bridge run` actually **joins** a
+  containerised game's wineserver rather than merely contending with it. The
+  cross-process proof used host wine on a host prefix. The Steam Linux Runtime
+  shares the host `/tmp` (measured: same device and inode inside and out),
+  which is why the lock contends at all — but the joining half is unconfirmed.
+  If it turns out not to join, yielding still fixes the freeze and there is
+  still no tracking from `bridge run`; starting the helper from inside the
+  game's own session would then be the next thing to try.
+* Whether any of this makes a game **use** the data. It only stops a second
+  process from breaking the launch.
 
 ### The provider no longer writes the registry unless asked
 
