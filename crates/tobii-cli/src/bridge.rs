@@ -718,7 +718,17 @@ impl Reading {
 /// we did not write: the two negative answers are not interchangeable, and only
 /// one of them is safe to be wrong about.
 fn reg_query_path(stdout: &[u8]) -> Reading {
-    for line in stdout.split(|b| *b == b'\n') {
+    // Wine terminates every line it prints with CRLF, so a chunk that arrived
+    // without its CR did not end where the split did: the break came from
+    // inside the value itself. What we would hold is a fragment, and a fragment
+    // must never be compared — it can equal our own computed path and then be
+    // removed as ours. The last chunk is exempt: it is what follows the final
+    // newline, and is empty on well-formed output.
+    let chunks: Vec<&[u8]> = stdout.split(|b| *b == b'\n').collect();
+    let last = chunks.len().saturating_sub(1);
+    for (i, line) in chunks.iter().enumerate() {
+        let line = *line;
+        let whole_line = i == last || line.ends_with(b"\r");
         // Everything up to the value — the name, the whitespace, the type — is
         // ASCII whatever codepage wine chose, so the line is parsed as ASCII up
         // to the first byte that is not one, and only the value itself raises
@@ -730,13 +740,23 @@ fn reg_query_path(stdout: &[u8]) -> Reading {
         let Ok(head) = std::str::from_utf8(ascii) else {
             continue;
         };
-        let head = head.trim_end_matches('\r').trim_start();
+        // Exactly one CR, which is wine's. `trim_end_matches` took every one
+        // of them, so a value whose own last byte is a CR came back a byte
+        // short and then failed to match itself.
+        let head = head.strip_suffix('\r').unwrap_or(head).trim_start();
         let Some(rest) = head.strip_prefix("Path") else {
             continue;
         };
         // `Path` and not `PathX`: the name must end where we stopped reading.
         if !rest.starts_with(char::is_whitespace) {
             continue;
+        }
+        if !whole_line {
+            return Reading::Other(
+                "a value with a line break in it, which this installer never writes \
+                 and cannot read back whole"
+                    .to_string(),
+            );
         }
         if ascii.len() != line.len() {
             return Reading::Other(
@@ -2114,6 +2134,36 @@ exit 0
     /// A registered path may contain spaces, so the value is the rest of the
     /// line — one word of `C:\Program Files\opentrack` would be compared
     /// against ours and called someone else's.
+    /// A value carrying a newline arrives split across two chunks, so what the
+    /// first one holds is a fragment of it. The danger is precise: a fragment
+    /// that happens to equal our own computed path would be read as ours and
+    /// removed by uninstall, destroying a registration we never made. Neither
+    /// half may be returned as a value.
+    #[test]
+    fn a_value_broken_across_lines_is_not_read_as_its_first_half() {
+        let out = b"\r\n    Path    REG_SZ    C:\\tobii-bridge\nEVIL\r\n\r\n";
+        match reg_query_path(out) {
+            Reading::Other(why) => assert!(
+                why.contains("line break"),
+                "a fragment must say why it is unreadable, got {why:?}"
+            ),
+            other => panic!("a fragment must never be a value or an absence: {other:?}"),
+        }
+    }
+
+    /// The CR wine puts at the end of a line and a CR the value itself ends
+    /// with are the same byte. Eating every one of them took the value's, so a
+    /// path registered that way never matched itself again.
+    #[test]
+    fn a_value_ending_in_a_carriage_return_keeps_it() {
+        let out = b"\r\n    Path    REG_SZ    C:\\odd\r\r\n\r\n";
+        assert_eq!(
+            reg_query_path(out),
+            Reading::Plain("C:\\odd\r".to_string()),
+            "wine's CR comes off, the value's own stays on"
+        );
+    }
+
     #[test]
     fn the_registered_path_is_read_out_of_reg_query_whole() {
         assert_eq!(
