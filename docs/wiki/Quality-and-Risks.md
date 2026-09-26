@@ -883,6 +883,23 @@ built for the purpose.
 
 ### 11.3h The shortened cards and the F1 help window (unreleased, after v0.4.1)
 
+**Two halves of the help window's display test do not run anywhere available to
+this project, and now say so rather than failing.** The Tab walk needs the
+window to be ACTIVE — `child_focus` is GTK's own focus walk, and in a window the
+compositor never brought to the front it reports that it moved and leaves the
+focus where it was — and the narrow-layout block needs a window manager to grant
+a resize to 420px. A desktop session has something else in front; a bare
+Xwayland has no window manager at all. Both blocks print a SKIPPED line naming
+what went unchecked, and everything that does not need focus still runs: the
+leak census, the coverage contract, the search, Escape, and reopening where it
+was left. CI skips the whole test regardless, having no display.
+
+The consequence worth stating: **the folding-sidebar leak this section records
+is not covered in any environment we can run.** The census runs, but the Topics
+toggle it is meant to exercise needs the resize that is not granted here, so a
+regression in that specific path would pass. It was measured by hand, once.
+
+
 Three card descriptions were shortened and two were removed from the card
 altogether — five of the six cards; "Head tracking for games" was already one
 line at v0.4.1 and was not touched. One of the two removals is a correction
