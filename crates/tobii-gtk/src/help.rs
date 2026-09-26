@@ -299,15 +299,28 @@ pub fn topics() -> Vec<Topic> {
             // `tests/help_window.rs`, which drives the same path with GTK's own
             // `child_focus` and `move-cursor` — the actions Tab and the arrow
             // keys resolve to — rather than trusting the sentence.
+            //
+            // The example words are held to the same standard, by
+            // `the_word_on_the_control_opens_the_topic`: it reads every word
+            // this paragraph QUOTES back out of this string and checks it
+            // against the table of words that really are printed on the hub.
+            // The sentence used to offer four and get three of them wrong —
+            // "strength", "cogwheel" and "pitch" are on no control anywhere —
+            // so a user who did as they were told read their own instructions
+            // back, or got the no-match page. Quote nothing here that is not in
+            // that table.
             "F1 opens this window, and closes it again. Esc closes it too, from \
              anywhere in it, and closes a full-screen setup or calibration flow.\n\n\
              It opens with the search box focused, so you can type your question \
              straight away: the search reads every topic's heading and all of its \
-             text, and a word off the control you are looking at — \"joystick\", \
-             \"strength\", \"cogwheel\", \"pitch\" — is usually enough. Down moves \
-             from the box into the list of topics; Up and Down then walk it, and \
-             the topic beside the list changes as you go. Ctrl+F comes back to the \
-             search box from anywhere in the window.\n\n\
+             text, so a word from the thing you are asking about — \"joystick\", \
+             \"recentre\", \"standby\", \"tray\" — usually lands on it. Those \
+             four are printed on the hub itself, but not every caption is in this \
+             text: if a word off a control finds nothing, type what the control \
+             does rather than what it is called. Down moves from the box into the \
+             list of topics; Up and Down then walk it, and the topic beside the \
+             list changes as you go. Ctrl+F comes back to the search box from \
+             anywhere in the window.\n\n\
              Tab moves on from the list into the topic itself, whose text can be \
              focused, selected and copied, and Page Up and Page Down scroll it. Tab \
              again reaches Close.\n\n\
@@ -610,8 +623,8 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
             // first one typed into a box that was empty is a question, and the
             // topic on screen then was not chosen for it — it is whichever one
             // the window resumed on, or the first. Letting that win meant the
-            // Keyboard topic, which advertises "joystick", "strength",
-            // "cogwheel" and "pitch" as words worth typing, quotes all four:
+            // Keyboard topic, which advertises "joystick", "recentre",
+            // "standby" and "tray" as words worth typing, quotes all four:
             // read it, press F1 again, type one of them, and the list narrowed
             // correctly while the pane stayed where it was.
             let keep = if refining {
@@ -1158,10 +1171,27 @@ mod tests {
     /// different topic altogether, which is exactly the state the search's pick
     /// exists to prevent and so the state worth asserting.
     ///
-    /// Two tables, because the words come from two different promises and only
-    /// one of them is a caption. The eight words this test used to carry were
-    /// all claimed as captions; three of them — `strength`, `cogwheel` and
-    /// `infrared` — are on no control anywhere in the hub.
+    /// One table and one derivation, because the words come from two different
+    /// promises. The table is the hub's: these words are printed on a control,
+    /// so the control's word must open the control's topic. The derivation is
+    /// this window's own: the "Keyboard" topic tells the user to type a word
+    /// off a control, and every word it quotes as an example has to be one of
+    /// the table's.
+    ///
+    /// That second half is read out of the topic instead of retyped here,
+    /// because the prose and this test drifted apart exactly once and that is
+    /// the whole finding: the topic went on advertising `strength`, `cogwheel`
+    /// and `pitch` as words off the hub's controls after the table had dropped
+    /// them for being on no control anywhere. Retyping the list in the test is
+    /// what made that possible, so the list is not retyped.
+    ///
+    /// The check this replaces was `assert!(matches(&all[i], word))` on
+    /// `best_match`'s own answer, which cannot fail: `best_match` filters on
+    /// `matches` before it picks, so every index it can return already
+    /// satisfies it. Worse, the two words it looked like it was defending —
+    /// `strength` and `cogwheel` — were reachable at all only because the
+    /// Keyboard topic quoted them while advertising them. The topic was its own
+    /// evidence, and a test written that way cannot see it.
     #[test]
     fn the_word_on_the_control_opens_the_topic() {
         let all = super::topics();
@@ -1171,12 +1201,13 @@ mod tests {
         // (`games::check_row`), a button caption, or a settings-row
         // description, which `lib::settings_row` draws as a visible label. Each
         // must open the one topic that is about that control.
-        for (word, topic) in [
+        const PRINTED_ON_THE_HUB: [(&str, &str); 4] = [
             ("joystick", "Head tracking for games"),
             ("recentre", "Head tracking for games"),
             ("standby", "Eye position"),
             ("tray", "Settings, behind the cogwheel"),
-        ] {
+        ];
+        for (word, topic) in PRINTED_ON_THE_HUB {
             assert_eq!(
                 opened(word),
                 Some(topic),
@@ -1193,26 +1224,42 @@ mod tests {
         // control you are asking about lands on the no-match page. Closing it
         // means naming the presets in the topic FROM `STRENGTHS`, rather than
         // retyping them here, and that needs the constant to be visible outside
-        // `games.rs`.
+        // `games.rs`. Until it is, the Keyboard topic says the true thing in
+        // the user's own terms — that not every caption is in this text, and
+        // what to type instead — which is the part that can be honest from in
+        // here.
 
-        // The second promise: this window's own "Keyboard" topic names four
-        // words as the sort of thing to type, so those four have to work
-        // whatever else does. Which topic each opens is not fixed — "pitch" is
-        // answered by two of them, and the first says where to read the rest —
-        // but every one must open SOMETHING, and that something must be a topic
-        // the word is really in. `None` is the no-match page: the window
-        // telling a user that a word it advertised is not in it.
-        for word in ["joystick", "strength", "cogwheel", "pitch"] {
-            let i = super::best_match(&all, word).unwrap_or_else(|| {
-                panic!(
-                    "the Keyboard topic advertises {word:?} as a word worth typing, \
-                     and typing it lands on the no-match page"
-                )
-            });
+        // The second promise, read off the topic rather than retyped. Every
+        // word the Keyboard paragraph puts in quotes is offered to the user as
+        // a word to read off a control and type, so every one of them has to be
+        // a word this test has already checked is printed on one AND opens that
+        // control's topic. Note what that rules out and "it opens something"
+        // did not: a word that appears only in the Keyboard topic passes the
+        // weaker test, because the paragraph advertising it is itself a match —
+        // the window answering an invitation with the invitation.
+        let keyboard = all
+            .iter()
+            .find(|t| t.title == "Keyboard")
+            .expect("the Keyboard topic, which documents the search");
+        let advertised: Vec<&str> = keyboard.body.split('"').skip(1).step_by(2).collect();
+        assert!(
+            !advertised.is_empty(),
+            "the Keyboard topic quotes no example word at all, so the loop below \
+             checks nothing. Either it stopped advertising words — and then this \
+             half of the test wants deleting with them — or the quotes went away \
+             and took the guard with them"
+        );
+        for word in advertised {
             assert!(
-                super::matches(&all[i], word),
-                "typing {word:?} opened {:?}, which does not contain it",
-                all[i].title
+                PRINTED_ON_THE_HUB.iter().any(|(w, _)| *w == word),
+                "the Keyboard topic offers {word:?} as a word to read off a control \
+                 and type, but it is not one of the words checked above as printed \
+                 on one: {:?}. Either {word:?} is on no control — which is what \
+                 \"strength\", \"cogwheel\" and \"pitch\" were, so a user who did \
+                 as they were told got the page that suggested it, or nothing at \
+                 all — or it is on one, and belongs in that table beside the topic \
+                 it must open",
+                PRINTED_ON_THE_HUB.map(|(w, _)| w)
             );
         }
     }
