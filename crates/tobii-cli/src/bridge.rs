@@ -40,16 +40,28 @@
 //!   [`RECORD_FILE`] says we wrote there, or, where no record says anything at
 //!   all, exactly the value this run would write — and it is written. Anything
 //!   else — another program's path, a type we never write, bytes wine did not
-//!   print back in a form we can read — is refused, with nothing written and
-//!   nothing created, and named without accusing anyone the record cannot
-//!   name. `--force` goes ahead and promises *nothing* about putting the old
-//!   value back.
+//!   print back in a form we can read — is refused, with nothing written,
+//!   nothing created and nothing started, and named without accusing anyone the
+//!   record cannot name. `--force` goes ahead and promises *nothing* about
+//!   putting the old value back.
 //! * uninstall reads the key first too, and removes the `Path` value it added,
 //!   only while the key still says what we wrote. Anything else is left exactly
 //!   as it is, and named.
 //! * the record holds only values this program computed itself, written down
 //!   after the key took one and naming only the keys that took it. A value read
 //!   out of a key is compared and then dropped: never stored, never written.
+//!
+//! **Where that first read comes from.** `wine reg query` is the accurate
+//! answer and an expensive one: wine initialises or upgrades whatever prefix it
+//! is pointed at before it answers anything, so a refusal that reached for it
+//! rewrote the prefix it had just declined to touch — measured on a
+//! Proton-shaped throwaway prefix, `.update-timestamp` moved and 2764 lines of
+//! `system.reg` rewritten by an install that created no directory and wrote no
+//! key. The refusal above, and an uninstall with nothing of ours to remove, now
+//! decide from the prefix's own `user.reg`, which costs no process at all; wine
+//! is started only once this run has decided it is going to write, which is
+//! something it was going to do anyway. [`settled_keys`] holds the two cases
+//! where the file cannot settle it and wine is asked after all.
 //!
 //! That last line is what the other two rest on. Two earlier versions of this
 //! module remembered the old value and put it back on the way out, and every
@@ -76,6 +88,9 @@ const NP_KEY: &str = r"HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location
 /// Registry key a FreeTrack game reads to find its client DLL.
 const FT_KEY: &str = r"HKCU\Software\Freetrack\FreeTrackClient";
 
+/// One entry of [`KEYS`]: the name it is recorded under, the key, its ABI.
+type KeyEntry = (&'static str, &'static str, &'static str);
+
 /// Both discovery keys: the name each is recorded under, the key, its ABI.
 ///
 /// Paired in one place because everything that touches one touches both —
@@ -83,7 +98,7 @@ const FT_KEY: &str = r"HKCU\Software\Freetrack\FreeTrackClient";
 /// it put there — and because the short name is what ends up in
 /// [`RECORD_FILE`], where a rename would silently orphan an existing prefix's
 /// record.
-const KEYS: [(&str, &str, &str); 2] = [("ft", FT_KEY, "FreeTrack"), ("np", NP_KEY, "TrackIR")];
+const KEYS: [KeyEntry; 2] = [("ft", FT_KEY, "FreeTrack"), ("np", NP_KEY, "TrackIR")];
 
 /// Where, inside the prefix, this installer writes down what it put in those
 /// keys.
@@ -953,13 +968,7 @@ fn hkcu_path(key: &str) -> Option<&str> {
 /// a failure to read it is a failure to answer either question. The keys that
 /// *were* answered are still returned alongside it — nothing here is
 /// `Reading::Absent` that was not read as absent.
-#[allow(clippy::type_complexity)]
-fn read_keys_read_only(
-    prefix: &Path,
-) -> (
-    Vec<((&'static str, &'static str, &'static str), Reading)>,
-    Option<String>,
-) {
+fn read_keys_read_only(prefix: &Path) -> (Vec<(KeyEntry, Reading)>, Option<String>) {
     let file = prefix.join(crate::userreg::FILE);
     let text = match std::fs::read(&file) {
         Ok(t) => t,
@@ -1004,6 +1013,64 @@ fn read_keys_read_only(
         ));
     }
     (out, None)
+}
+
+/// What [`KEYS`] hold according to the prefix's own files, when those files
+/// settle it well enough to *act* on. `None` means "ask wine".
+///
+/// [`read_keys_read_only`] is what lets `status` report a prefix without
+/// changing it. `install` and `uninstall` need the same read for a narrower
+/// job: finding out, before any wine starts, whether this run is going to write
+/// at all. A run that turns out to write nothing must not have booted the
+/// prefix to discover that — `wine reg query` is still `wine`, and against a
+/// prefix whose `.update-timestamp` is stale, which is what a Proton prefix
+/// looks like to the host's wine, it runs the `wineboot -u` that [`WineOrigin`]
+/// exists to warn about. Measured: an install that printed the refusal, created
+/// no directory and wrote no key still moved the stamp and rewrote 2764 lines
+/// of `system.reg`; so did an uninstall that removed nothing. The refusal text
+/// warns the user that pasting that very wine binary would upgrade the prefix,
+/// having just done it.
+///
+/// **`None` in the two cases where the file is not an answer this may act on:**
+///
+/// * It could not be read whole. A prefix that has never been started has no
+///   `user.reg` at all, and an install is exactly the thing that would create
+///   one.
+/// * Something is serving the prefix, or whether anything is could not be
+///   determined. A wineserver holds registry changes in memory until the last
+///   process on the prefix exits, so while one is alive the file lags it —
+///   [`staleness`] is where `status` discloses that and leaves it to the
+///   reader. A command that *acts* cannot leave it to the reader, because both
+///   directions of the lag do harm: a key the file calls free may hold a live
+///   registration this run would then overwrite, and one it calls taken may
+///   already be gone.
+///
+/// Which is the whole reason the check is here and not inside
+/// [`read_keys_read_only`]: with the lock free, nothing has the prefix open, so
+/// `user.reg` *is* the registry and a decision taken from it is the decision
+/// wine would have given — at no cost to the prefix. Anything else falls
+/// through to wine, which is accurate and which the caller is about to start
+/// anyway.
+///
+/// **[LIMITATION]** A wineserver that starts between this probe and the write
+/// is not seen. That window exists today with the wine read too — nothing here
+/// holds the prefix — and it is not made worse by asking the lock first.
+fn settled_keys(prefix: &Path) -> Option<Vec<(KeyEntry, Reading)>> {
+    let lock = match crate::wineserver::lock_for(prefix) {
+        Ok(path) => crate::wineserver::probe(&path),
+        Err(why) => crate::wineserver::Lock::Unknown(why),
+    };
+    if lock != crate::wineserver::Lock::Free {
+        return None;
+    }
+    let (readings, unreadable) = read_keys_read_only(prefix);
+    // Every key or none: a partial answer is one this may not act on either,
+    // and `read_keys_read_only` returns what it managed alongside the reason it
+    // stopped.
+    if unreadable.is_some() || readings.len() != KEYS.len() {
+        return None;
+    }
+    Some(readings)
 }
 
 /// Is this the value this installer put in the key?
@@ -1382,18 +1449,33 @@ fn install(args: &[String]) -> CmdResult {
 
     // Read before write, and before anything is copied. A prefix that already
     // has a working head-tracking setup has to come out of a refusal exactly as
-    // it went in — no directory created, no key touched.
+    // it went in — no directory created, no key touched, and nothing started
+    // that would boot it.
     //
     // The record is read first too, because what this installer wrote here last
     // time is part of reading the key honestly: without it our own previous
     // registration of a third-party client looks exactly like a stranger's.
     let record = read_record(&dest);
+    // The prefix's own `user.reg` where it can settle this, and wine only where
+    // it cannot — because a refusal that ran wine rewrote the prefix it was
+    // refusing to touch. See [`settled_keys`]; the wine read below is the
+    // accurate one and is reached only on the way to writing.
+    let readings = match settled_keys(&prefix) {
+        Some(readings) => readings,
+        None => {
+            let mut v = Vec::with_capacity(KEYS.len());
+            for entry in KEYS {
+                v.push((entry, read_key(&wine, &prefix, entry.1)?));
+            }
+            v
+        }
+    };
     let mut taken: Vec<Taken> = Vec::new();
-    for (name, key, abi) in KEYS {
+    for (entry, current) in &readings {
+        let (name, key, abi) = *entry;
         let wrote = recorded(&record, name);
         let want = want_for(key);
-        let current = read_key(&wine, &prefix, key)?;
-        if current == Reading::Absent || is_ours(&current, wrote) {
+        if *current == Reading::Absent || is_ours(current, wrote) {
             continue;
         }
         // Nothing here to refuse over: the key already holds, byte for byte,
@@ -1409,8 +1491,7 @@ fn install(args: &[String]) -> CmdResult {
         // refused, identical value or not: that is positive evidence the key
         // changed hands since we wrote it, which makes the match a reason to
         // leave it alone rather than to proceed — somebody else put it there.
-        if wrote.is_none() && matches!(&current, Reading::Plain(v) if v.eq_ignore_ascii_case(want))
-        {
+        if wrote.is_none() && matches!(current, Reading::Plain(v) if v.eq_ignore_ascii_case(want)) {
             continue;
         }
         taken.push(Taken {
@@ -1903,6 +1984,27 @@ fn undo_keys(
     prefix: &Path,
     record: &[(String, String)],
 ) -> Result<(Vec<KeyOutcome>, Option<String>), String> {
+    // An uninstall that takes nothing out writes nothing, and must not have run
+    // wine against the prefix to establish that: it upgraded prefixes it then
+    // reported as untouched — see [`settled_keys`]. `collect` into an `Option`
+    // is the whole test: the first key that IS ours to remove makes this run a
+    // write, and a write reads through wine, because a `reg delete` aimed at a
+    // reading that has gone stale deletes whatever replaced it.
+    if let Some(readings) = settled_keys(prefix) {
+        let settled: Option<Vec<KeyOutcome>> = readings
+            .iter()
+            .map(
+                |((name, key, abi), current)| match undo_for(current, recorded(record, name)) {
+                    Undo::Nothing => Some((*abi, *key, Outcome::Nothing)),
+                    Undo::Leave(why) => Some((*abi, *key, Outcome::Left(why))),
+                    Undo::Remove => None,
+                },
+            )
+            .collect();
+        if let Some(outcomes) = settled {
+            return Ok((outcomes, None));
+        }
+    }
     let mut outcomes: Vec<KeyOutcome> = Vec::new();
     for (name, key, abi) in KEYS {
         let wrote = recorded(record, name);
@@ -3093,7 +3195,25 @@ fi
 exit 0
 "#;
 
-    /// The one fake wine, written once and shared by every test.
+    /// A "wine" that wrecks the prefix it is pointed at.
+    ///
+    /// Handed to a command that must not run wine at all, so that running it
+    /// IS the failure. A fake that merely declines to write can only prove
+    /// that this particular fake wrote nothing — which is all every install
+    /// test in this file proved, and why a refusal that upgraded real prefixes
+    /// passed every one of them.
+    ///
+    /// Modelled on what the host's wine does to a Proton-shaped prefix before
+    /// it answers anything: `.update-timestamp` overwritten, `system.reg`
+    /// rewritten, files under `drive_c` created and removed.
+    const WRECKING_WINE: &str = "#!/bin/sh\n\
+         rm -rf \"$WINEPREFIX/drive_c/windows\"\n\
+         echo wrecked > \"$WINEPREFIX/system.reg\"\n\
+         echo wrecked > \"$WINEPREFIX/.update-timestamp\"\n\
+         echo wrecked > \"$WINEPREFIX/user.reg\"\n\
+         exit 0\n";
+
+    /// Both test scripts, written once and shared by every test.
     ///
     /// Once, and not once per test, for a reason that cost an afternoon: a
     /// script written by one thread and executed moments later fails with
@@ -3107,28 +3227,50 @@ exit 0
     ///
     /// `OnceLock` closes that window: the write happens while every other test
     /// is blocked on this very lock, so nothing in this process can fork during
-    /// it. The finished file is then renamed into place under a stable name, by
-    /// which time no write descriptor to it exists anywhere — so a second test
-    /// process running at the same time can execute it safely, and reuses it
-    /// instead of leaving a file of its own behind.
-    fn fake_wine() -> &'static Path {
-        static WINE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        WINE.get_or_init(|| {
-            let shared = std::env::temp_dir().join("tobii-fake-wine.sh");
-            if std::fs::read(&shared).is_ok_and(|b| b == FAKE_WINE.as_bytes()) {
-                return shared;
-            }
-            let staged =
-                std::env::temp_dir().join(format!("tobii-fake-wine-{}.sh", std::process::id()));
-            std::fs::write(&staged, FAKE_WINE).expect("fake wine");
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod +x");
-            match std::fs::rename(&staged, &shared) {
-                Ok(()) => shared,
-                Err(_) => staged,
-            }
+    /// it. One lock for both scripts rather than one each, because that
+    /// guarantee is "every test that will spawn anything is blocked here", and
+    /// two locks would let a test past the first one fork during the second's
+    /// write.
+    fn scripts() -> &'static (PathBuf, PathBuf) {
+        static SCRIPTS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+        SCRIPTS.get_or_init(|| {
+            (
+                shared_script("tobii-fake-wine", FAKE_WINE),
+                shared_script("tobii-wrecking-wine", WRECKING_WINE),
+            )
         })
+    }
+
+    /// Put `body` at a stable path under a name of its own, executable.
+    ///
+    /// The finished file is renamed into place, by which time no write
+    /// descriptor to it exists anywhere — so a second test process running at
+    /// the same time can execute it safely, and reuses it instead of leaving a
+    /// file of its own behind.
+    fn shared_script(name: &str, body: &str) -> PathBuf {
+        let shared = std::env::temp_dir().join(format!("{name}.sh"));
+        if std::fs::read(&shared).is_ok_and(|b| b == body.as_bytes()) {
+            return shared;
+        }
+        let staged = std::env::temp_dir().join(format!("{name}-{}.sh", std::process::id()));
+        std::fs::write(&staged, body).expect("script");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+        match std::fs::rename(&staged, &shared) {
+            Ok(()) => shared,
+            Err(_) => staged,
+        }
+    }
+
+    /// The one fake wine: a stateful registry, in wine's own output shape.
+    fn fake_wine() -> &'static Path {
+        &scripts().0
+    }
+
+    /// The one wrecking wine. See [`WRECKING_WINE`].
+    fn wrecking_wine() -> &'static Path {
+        &scripts().1
     }
 
     /// A prefix and an artifact directory, in one temp tree, served by that
@@ -3219,14 +3361,24 @@ exit 0
             self.root.join(format!("{which}.reply"))
         }
 
-        /// Make one key hold `value`, in wine's own output shape.
+        /// Make one key hold `value`: in wine's own output shape AND in the
+        /// prefix's `user.reg`, which is where real wine would also have put
+        /// it.
+        ///
+        /// Both halves, because both are read. `install` and `uninstall`
+        /// decide from the file when nothing is serving the prefix and from
+        /// `reg query` only when the file cannot answer — see
+        /// [`settled_keys`]. A key seeded into one half alone puts the prefix
+        /// in a state no real prefix can be in, and a test set up that way
+        /// proves nothing about either reader: it was how nine of these tests
+        /// went on passing while install still ran wine to reach its refusal.
         fn registered(&self, which: &str, value: &str) {
             self.registered_as(which, "REG_SZ", value);
         }
 
         /// The same, for a value stored as some other type.
         fn registered_as(&self, which: &str, ty: &str, value: &str) {
-            self.registered_bytes(
+            self.wine_reply_bytes(
                 which,
                 format!(
                     "\r\nHKEY_CURRENT_USER\\Software\\Whatever\r\n    \
@@ -3234,12 +3386,42 @@ exit 0
                 )
                 .as_bytes(),
             );
+            let escaped = value.replace('\\', r"\\").replace('"', "\\\"");
+            // Wine spells `REG_SZ` bare and every other string type with its
+            // numeric type in front — `str(2)` is `REG_EXPAND_SZ`. A type this
+            // does not know how to spell is one the file half cannot express,
+            // and guessing would seed a line wine never writes.
+            self.assigned_in_file(
+                which,
+                &match ty {
+                    "REG_SZ" => format!("\"Path\"=\"{escaped}\""),
+                    "REG_EXPAND_SZ" => format!("\"Path\"=str(2):\"{escaped}\""),
+                    other => panic!("no user.reg spelling here for {other}"),
+                },
+            );
         }
 
-        /// The same again, byte for byte — for output that is not UTF-8, which
-        /// is what wine prints for a path with a non-ASCII character in it.
-        fn registered_bytes(&self, which: &str, bytes: &[u8]) {
+        /// Wine's canned answer alone, byte for byte — for output that is not
+        /// UTF-8, which is what wine prints for a path with a non-ASCII
+        /// character in it.
+        ///
+        /// One half only, and named so it cannot be mistaken for the other:
+        /// `user.reg` has no codepage, so a non-ASCII value has no equivalent
+        /// there to seed. A test using this reaches wine's reader only from a
+        /// prefix the file cannot answer for — see [`FakeWine::without_user_reg`].
+        fn wine_reply_bytes(&self, which: &str, bytes: &[u8]) {
             std::fs::write(self.reply(which), bytes).expect("canned reply");
+        }
+
+        /// Take the prefix's `user.reg` away, so the command under test falls
+        /// through to the wine reader.
+        ///
+        /// Not a contrivance: [`settled_keys`] hands `install` and `uninstall`
+        /// the file where it can answer and wine where it cannot, and a prefix
+        /// that has never been started has no `user.reg` at all. A test about
+        /// wine's reader has to be in the state that reaches it.
+        fn without_user_reg(&self) {
+            std::fs::remove_file(self.user_reg()).expect("user.reg");
         }
 
         /// What the key holds now, as the fake wine would print it.
@@ -3278,6 +3460,21 @@ exit 0
         /// in here.
         fn vanish_after_read(&self) {
             std::fs::write(self.root.join("vanish"), b"").expect("switch");
+        }
+
+        /// Make the prefix look lived-in, so a wine run has something to
+        /// damage — and give it the stale `.update-timestamp` a Proton prefix
+        /// wears, which is what makes the host's wine upgrade it rather than
+        /// leave it alone.
+        fn lived_in(&self) {
+            std::fs::create_dir_all(self.prefix().join("drive_c/windows/system32"))
+                .expect("windows");
+            std::fs::write(
+                self.prefix().join("system.reg"),
+                "WINE REGISTRY Version 2\n",
+            )
+            .expect("hklm");
+            std::fs::write(self.prefix().join(".update-timestamp"), "0\n").expect("stamp");
         }
 
         /// A directory holding a third-party client, for `--npclient DIR`.
@@ -3349,13 +3546,19 @@ exit 0
         }
 
         fn args(&self, sub: &str, extra: &[&str]) -> Vec<String> {
+            self.args_with_wine(sub, fake_wine(), extra)
+        }
+
+        /// The same, for a test that hands the command a wine of its own —
+        /// [`wrecking_wine`], for the commands that must not start one.
+        fn args_with_wine(&self, sub: &str, wine: &Path, extra: &[&str]) -> Vec<String> {
             let mut v: Vec<String> = ["tobii", "bridge", sub]
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect();
             for (flag, value) in [
                 ("--prefix", self.prefix().display().to_string()),
-                ("--wine", fake_wine().display().to_string()),
+                ("--wine", wine.display().to_string()),
                 (
                     "--artifacts",
                     self.root.join("artifacts").display().to_string(),
@@ -3784,6 +3987,12 @@ exit 0
     /// bare `wine` acts on `~/.wine`, and a foreign wine build runs
     /// `wineboot -u` against a Proton prefix and upgrades it out from under the
     /// game — which is the reason this module resolves a wine at all.
+    ///
+    /// Including by running it itself, which is what this used to do: the
+    /// refusal read the keys with `wine reg query`, so the sentence warning
+    /// against the upgrade was printed by a run that had just performed one.
+    /// The argv assertion below is the whole of that fix — nothing may be
+    /// spawned on the way to saying no.
     #[test]
     fn install_refuses_to_clobber_another_programs_registration() {
         let w = FakeWine::new("refuse");
@@ -3806,9 +4015,18 @@ exit 0
             "and the wine that serves it: {err}"
         );
         let argv = w.argv();
-        assert!(argv.contains("[query]"), "must have read first: {argv}");
-        assert!(!argv.contains("[add]"), "nothing may be written: {argv}");
+        assert!(
+            argv.is_empty(),
+            "nothing may be written, and nothing spawned either — a wine started \
+             here boots the prefix this run is refusing to touch: {argv}"
+        );
         assert!(!w.dest().exists(), "and nothing copied either");
+        // It did read, out of the prefix's own file: a run that answered
+        // nothing would also have started nothing.
+        assert!(
+            w.user_reg().is_file(),
+            "the read has to have come from somewhere"
+        );
     }
 
     /// The refusal may say only what this run established. Two claims used to
@@ -3948,6 +4166,10 @@ exit 0
     fn a_registration_of_nothing_but_spaces_is_not_an_empty_key() {
         let w = FakeWine::new("spaces");
         w.registered("np", "   ");
+        // About `reg query`'s reader, which is reached from a prefix the file
+        // cannot answer for. `user.reg` has its own wording for this shape and
+        // its own test, in `crate::userreg`.
+        w.without_user_reg();
         let err = install(&w.args("install", &[]))
             .expect_err("must refuse")
             .to_string();
@@ -4165,7 +4387,11 @@ exit 0
                 .to_vec();
         reply.push(0x81);
         reply.extend_from_slice(b"ller opentrack\r\n\r\n");
-        w.registered_bytes("np", &reply);
+        w.wine_reply_bytes("np", &reply);
+        // Wine's reader is the one that cannot read these bytes: `user.reg`
+        // has no codepage and decodes the character exactly, so there is
+        // nothing to seed there and nothing for it to refuse.
+        w.without_user_reg();
         let err = install(&w.args("install", &[]))
             .expect_err("must refuse")
             .to_string();
@@ -4261,6 +4487,11 @@ exit 0
 
     /// With no record there is nothing to say the key is ours, and deleting
     /// another program's registration on the way out is the fault being fixed.
+    ///
+    /// And an uninstall that takes nothing out writes nothing, so it has no
+    /// business starting wine to find that out: it used to, and moved a
+    /// Proton-shaped prefix's `.update-timestamp` while reporting that it had
+    /// left everything alone.
     #[test]
     fn uninstall_without_a_record_leaves_a_foreign_key_alone() {
         let w = FakeWine::new("norecord");
@@ -4269,8 +4500,11 @@ exit 0
         w.registered("np", r"Z:\usr\libexec\opentrack");
         uninstall(&w.args("uninstall", &[])).expect("uninstalls");
         let argv = w.argv();
-        assert!(!argv.contains("[delete]"), "nothing may be deleted: {argv}");
-        assert!(!argv.contains("[add]"), "and nothing written: {argv}");
+        assert!(
+            argv.is_empty(),
+            "nothing comes out, so nothing may be deleted, written, or even \
+             spawned: {argv}"
+        );
         assert!(!w.dest().exists(), "the directory still goes");
     }
 
@@ -4353,6 +4587,10 @@ exit 0
     fn a_registry_that_cannot_be_read_is_not_nothing_registered() {
         let w = FakeWine::new("blind");
         w.fail_wine();
+        // No file to fall back on, so the question really does go to wine —
+        // which is the state this test is about. With a readable `user.reg`
+        // the registry CAN be read, and reading it is the right answer.
+        w.without_user_reg();
         let err = install(&w.args("install", &[]))
             .expect_err("must not guess")
             .to_string();
@@ -4889,22 +5127,8 @@ exit 0
     fn status_runs_no_wine_and_leaves_the_prefix_byte_for_byte_as_it_was() {
         let fw = FakeWine::new("status-readonly");
         fw.registered_in_file("np", r"Z:\usr\libexec\opentrack");
-        // A prefix that looks lived-in, so there is something to damage.
-        std::fs::create_dir_all(fw.prefix().join("drive_c/windows/system32")).expect("windows");
-        std::fs::write(fw.prefix().join("system.reg"), "WINE REGISTRY Version 2\n").expect("hklm");
-        std::fs::write(fw.prefix().join(".update-timestamp"), "1234567890\n").expect("stamp");
-
-        let wrecker = fw.root.join("wrecking-wine.sh");
-        std::fs::write(
-            &wrecker,
-            "#!/bin/sh\nrm -rf \"$WINEPREFIX/drive_c/windows\"\n\
-             echo wrecked > \"$WINEPREFIX/system.reg\"\n\
-             echo wrecked > \"$WINEPREFIX/.update-timestamp\"\n\
-             echo wrecked > \"$WINEPREFIX/user.reg\"\nexit 0\n",
-        )
-        .expect("wrecker");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrecker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        fw.lived_in();
+        let wrecker = wrecking_wine();
 
         let before = snapshot(&fw.prefix());
         let args: Vec<String> = [
@@ -4937,6 +5161,86 @@ exit 0
         assert!(
             out.contains(&fw.user_reg().display().to_string()),
             "the report must name the file it read: {out}"
+        );
+        assert_wrecker_wrecks(&fw, before);
+    }
+
+    /// The install half of the same test, and for the same reason: every
+    /// install test in this file drives a fake wine that is a shell script
+    /// doing nothing, so "the refusal wrote nothing" was a true statement
+    /// about this code and a false one about the command.
+    ///
+    /// `wine reg query` is `wine`. Against a prefix whose `.update-timestamp`
+    /// is stale — which is what a Proton prefix looks like to the host's wine,
+    /// and the ordinary case, since the command announces the fallback itself
+    /// ("no runner found inside the prefix, falling back to the system wine")
+    /// — it runs `wineboot -u` before it answers anything. Measured with real
+    /// wine 11.18 on a throwaway prefix: an install that printed the refusal,
+    /// created no directory and wrote no key still moved the stamp and rewrote
+    /// 2764 lines of `system.reg`, having just warned the user in that very
+    /// refusal that a foreign wine "upgrades it out from under the game".
+    #[test]
+    fn a_refused_install_runs_no_wine_and_leaves_the_prefix_as_it_was() {
+        let w = FakeWine::new("refuse-readonly");
+        // A stranger's registration, put there the way a stranger would: in
+        // the prefix's own file, with no wine of ours involved.
+        w.registered_in_file("np", r"Z:\opt\SomeoneElse\tracker");
+        w.lived_in();
+
+        let before = snapshot(&w.prefix());
+        let err = install(&w.args_with_wine("install", wrecking_wine(), &[]))
+            .expect_err("a registration this install did not write must be refused")
+            .to_string();
+
+        assert!(err.contains(r"Z:\opt\SomeoneElse\tracker"), "{err}");
+        assert_eq!(
+            snapshot(&w.prefix()),
+            before,
+            "the prefix changed while being refused"
+        );
+        assert!(!w.dest().exists(), "and nothing was created");
+        assert_wrecker_wrecks(&w, before);
+    }
+
+    /// And the same for an uninstall with nothing to take out, which is the
+    /// other command that reaches a decision without writing. Measured the
+    /// same way: `tobii bridge uninstall` on a prefix holding neither key
+    /// printed "no head-tracking client was registered in this prefix", exited
+    /// 0, removed nothing — and moved `.update-timestamp` from 0 to the host
+    /// wine's own, rewriting 2764 lines of `system.reg` on the way.
+    #[test]
+    fn an_uninstall_with_nothing_to_remove_runs_no_wine() {
+        let w = FakeWine::new("undo-readonly");
+        w.lived_in();
+
+        let before = snapshot(&w.prefix());
+        uninstall(&w.args_with_wine("uninstall", wrecking_wine(), &[]))
+            .expect("a prefix with nothing of ours in it is not a failure");
+
+        assert_eq!(
+            snapshot(&w.prefix()),
+            before,
+            "the prefix changed while being told there was nothing to undo"
+        );
+        assert_wrecker_wrecks(&w, before);
+    }
+
+    /// Prove the wrecking wine can wreck, in the test that just relied on it
+    /// not having run.
+    ///
+    /// Without this, a script that could not be executed at all — a failed
+    /// `chmod`, a `noexec` mount, the `ETXTBSY` window [`scripts`] describes —
+    /// would satisfy every assertion above it. That is the exact shape of test
+    /// this file has shipped three of, and the one thing that stops it is
+    /// making the same test show the failure it claims to be watching for.
+    fn assert_wrecker_wrecks(w: &FakeWine, before: String) {
+        wine_run(wrecking_wine(), &w.prefix(), &["reg", "query", FT_KEY])
+            .expect("the wrecking wine has to be runnable");
+        assert_ne!(
+            snapshot(&w.prefix()),
+            before,
+            "the wrecking wine did not wreck anything, so the assertion above \
+             proved nothing about whether it ran"
         );
     }
 
