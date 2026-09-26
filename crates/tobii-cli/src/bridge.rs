@@ -1390,6 +1390,11 @@ fn install(args: &[String]) -> CmdResult {
              tobii bridge run --prefix {}\n\
              It is a plain consumer of the shared memory our own DLLs create, and a\n\
              TrackIR-only game never loads ours — so something has to fill it.\n\
+             \n\
+             Start the game FIRST and that command second. While it runs it is a\n\
+             wineserver on this prefix, and Steam waits for every wineserver on a\n\
+             prefix to exit before it spawns the game — so a bridge started first\n\
+             leaves the launch sitting there.\n\
              FreeTrack games need nothing running.",
             prefix.display()
         );
@@ -1472,7 +1477,13 @@ fn run(args: &[String]) -> CmdResult {
         )
         .into());
     }
-    let mut wine_args = vec![r"C:\tobii-bridge\tobii-bridge.exe"];
+    // `--no-register` always, never conditionally. `install` settled both
+    // discovery keys under the read-before-write contract this module's header
+    // describes, and the provider's own blind write knows none of it: in the
+    // one configuration that needs this command at all — TrackIR pointed at a
+    // third-party client — a write here replaces that client's registration
+    // with ours and quietly takes away the thing the user came for.
+    let mut wine_args = vec![r"C:\tobii-bridge\tobii-bridge.exe", "--no-register"];
     if let Some(port) = crate::flag_value(args, "--port") {
         wine_args.push("--port");
         wine_args.push(port);
@@ -2399,6 +2410,24 @@ exit 0
         fn put_record(&self, text: &str) {
             std::fs::create_dir_all(self.dest()).expect("install dir");
             std::fs::write(self.dest().join(RECORD_FILE), text).expect("record");
+        }
+
+        /// `run`'s flags, which are not `install`'s: it reads no
+        /// `--npclient`, and [`FakeWine::args`] pins one.
+        fn run_args(&self, extra: &[&str]) -> Vec<String> {
+            let mut v: Vec<String> = ["tobii", "bridge", "run"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            for (flag, value) in [
+                ("--prefix", self.prefix().display().to_string()),
+                ("--wine", fake_wine().display().to_string()),
+            ] {
+                v.push(flag.to_string());
+                v.push(value);
+            }
+            v.extend(extra.iter().map(|s| (*s).to_string()));
+            v
         }
 
         fn args(&self, sub: &str, extra: &[&str]) -> Vec<String> {
@@ -3424,5 +3453,43 @@ exit 0
             .expect_err("must fail")
             .to_string();
         assert!(err.contains("registry keys could not be written"), "{err}");
+    }
+
+    /// `tobii bridge run` exists for the configuration where TrackIR is pointed
+    /// at somebody else's client DLL — and the provider it starts used to write
+    /// both discovery keys at its own directory on every single start, which
+    /// takes that registration away and leaves the user with our unsigned
+    /// client instead of the one they installed.
+    ///
+    /// Passed always, not only when a third-party client is registered: this
+    /// side cannot read the keys without spending another wine invocation on
+    /// it, and the flag costs nothing in the case where our own path is
+    /// registered — the write it suppresses would have rewritten the value it
+    /// already holds.
+    #[test]
+    fn run_starts_the_provider_with_the_registry_write_turned_off() {
+        let w = FakeWine::new("runnoreg");
+        std::fs::create_dir_all(w.dest()).expect("install dir");
+        std::fs::write(w.dest().join("tobii-bridge.exe"), b"exe").expect("exe");
+        run(&w.run_args(&[])).expect("run");
+        let argv = w.argv();
+        assert!(
+            argv.contains("[C:\\tobii-bridge\\tobii-bridge.exe][--no-register]"),
+            "{argv}"
+        );
+    }
+
+    /// The flag the user passes still reaches the provider, behind the one this
+    /// command adds. A `--port` swallowed by the new argument would be a silent
+    /// downgrade to the default port, which looks exactly like "no frames
+    /// arrive".
+    #[test]
+    fn a_port_still_reaches_the_provider() {
+        let w = FakeWine::new("runport");
+        std::fs::create_dir_all(w.dest()).expect("install dir");
+        std::fs::write(w.dest().join("tobii-bridge.exe"), b"exe").expect("exe");
+        run(&w.run_args(&["--port", "4999"])).expect("run");
+        let argv = w.argv();
+        assert!(argv.contains("[--no-register][--port][4999]"), "{argv}");
     }
 }

@@ -60,9 +60,17 @@ pub const PATH_VALUE: &str = "Path";
 
 /// Point both registries at `dir`, so games load our DLLs from there.
 ///
-/// Idempotent, and done by the provider at startup rather than only by the
-/// installer: the keys then always describe wherever the DLLs actually are,
-/// even if someone moved them by hand.
+/// Idempotent, and blind: it overwrites whatever the keys hold, having read
+/// nothing. There is no `reg query` in this workspace to read them with, which
+/// is why the caller — not this function — has to have decided that
+/// overwriting is what was wanted. The provider used to call this on every
+/// start; it does not any more, because the configuration it is normally
+/// started in is the one where an overwrite destroys a third-party TrackIR
+/// registration. See `provider/src/main.rs`.
+///
+/// The careful version of this decision lives on the Linux side, in
+/// `crates/tobii-cli/src/bridge.rs`: read the key, write only what can be
+/// accounted for, refuse the rest.
 pub fn register(dir: &str) -> Result<(), String> {
     for key in [NP_KEY, FT_KEY] {
         winapi::set_hkcu_string(key, PATH_VALUE, dir)

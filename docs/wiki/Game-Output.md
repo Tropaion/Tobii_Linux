@@ -568,6 +568,21 @@ create and feed that mapping, and a TrackIR-only game never loads ours — so
 something has to fill it. `install` says so when it sets that up. FreeTrack
 games need nothing running.
 
+### The provider no longer writes the registry unless asked
+
+`tobii-bridge.exe` used to call `register()` on every start, writing both
+discovery keys blind. That is wrong in exactly the configuration above: TrackIR
+is pointed at a third-party client, the provider is started *because* of that,
+and the write replaces that client's registration with `C:\tobii-bridge` —
+taking away the thing the user set up, on every start or restart.
+
+The default is now off; `--register` asks for it, as a repair for a prefix
+whose keys were clobbered. `tobii bridge run` passes `--no-register` explicitly,
+so that command cannot start a registering provider whichever way the default
+ever moves. Note that an *older* `tobii-bridge.exe` already sitting in a prefix
+ignores unknown flags and will still register — re-run `tobii bridge install`
+to replace it.
+
 **[UNKNOWN]** Two things about our own `NPClient64.dll` are unmeasured because
 no game has yet consumed it:
 

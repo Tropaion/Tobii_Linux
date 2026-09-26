@@ -5,11 +5,35 @@
 //! for a game to get tracking. What this still gives you is a console: it prints
 //! what arrives and what is rejected, which is the difference between "the game
 //! sees nothing" and "the game sees nothing *because the frames never arrive*".
-//! It also writes the registry keys, so it doubles as a repair tool for a prefix
-//! whose keys were clobbered.
+//! With `--register` it also writes the registry keys, so it doubles as a repair
+//! tool for a prefix whose keys were clobbered — see below for why that is not
+//! what it does by default.
 //!
 //! Whoever binds the port first wins; if this is running, the DLLs read the
 //! mapping it creates instead of making their own.
+//!
+//! # Why it does not write the registry any more
+//!
+//! It used to, on every start, unconditionally — both discovery keys, blind.
+//! That is wrong in precisely the configuration this program still exists for.
+//! `tobii bridge run` starts it when TrackIR is pointed at a **third-party**
+//! client DLL, because that client is a pure consumer of `FT_SharedMem` and
+//! something has to fill the mapping; a blind write then replaces that client's
+//! registration with `C:\tobii-bridge` and takes away the very thing the user
+//! set up. Any restart, or anything that ever auto-starts this, does it again.
+//!
+//! It is also the one write in the project that answers to no rules. The
+//! installer on the Linux side reads each key before it writes it and refuses
+//! anything it cannot account for (`crates/tobii-cli/src/bridge.rs`); this had
+//! the opposite habit on the same two keys, in a second binary, with no way to
+//! read them back.
+//!
+//! So the default is now to leave the registry alone, and `--register` asks for
+//! the old behaviour — still useful as a repair for a prefix whose keys were
+//! clobbered, but only when somebody has decided that is what they want.
+//! `--no-register` spells the default out, and `tobii bridge run` passes it, so
+//! that command cannot start a registering provider whichever way this default
+//! ever moves.
 
 use std::net::UdpSocket;
 
@@ -19,6 +43,11 @@ use tobii_output::TrackingFrame;
 fn main() {
     let mut port = tobii_bridge_core::feeder::port();
     let mut dir = INSTALL_DIR.to_string();
+    // Off unless asked. A write here can only ever be a no-op (the installer
+    // already put our own path in both keys) or destructive (it replaces a
+    // third-party client's registration), and the destructive case is the one
+    // this program is normally started for.
+    let mut want_register = false;
     // A flag's value is consumed whether or not it parses, so `--port nonsense`
     // keeps the default rather than trying to read `nonsense` as the next flag.
     let mut args = std::env::args().skip(1);
@@ -34,19 +63,30 @@ fn main() {
                     dir = v;
                 }
             }
+            "--register" => want_register = true,
+            "--no-register" => want_register = false,
             "--help" | "-h" => {
                 println!("usage: tobii-bridge.exe [--port PORT] [--dir 'C:\\tobii-bridge']");
+                println!("                        [--register | --no-register]");
+                println!();
+                println!("--register writes both discovery keys, pointing them at --dir.");
+                println!("Off by default: it overwrites whatever is registered there,");
+                println!("including a third-party TrackIR client this bridge exists to feed.");
+                println!("--no-register spells the default out.");
                 return;
             }
             _ => {}
         }
     }
 
-    // Written at startup rather than only by the installer, so the keys always
-    // describe wherever the DLLs actually are.
-    match register(&dir) {
-        Ok(()) => println!("registered TrackIR + FreeTrack client path: {dir}"),
-        Err(e) => eprintln!("warning: {e}"),
+    // Only on request. See the header: a blind write on every start is how a
+    // third-party TrackIR registration disappears, and this program is started
+    // mostly *for* that configuration.
+    if want_register {
+        match register(&dir) {
+            Ok(()) => println!("registered TrackIR + FreeTrack client path: {dir}"),
+            Err(e) => eprintln!("warning: {e}"),
+        }
     }
 
     let provider = match Provider::create() {
