@@ -97,6 +97,18 @@ pub enum Lookup {
 /// The name of the file this module reads, inside a prefix.
 pub const FILE: &str = "user.reg";
 
+/// The first line wine requires of a `user.reg`, exactly.
+///
+/// Measured against wine 11.18 rather than assumed. With the line missing, a
+/// UTF-8 BOM in front of it, a blank line before it, one leading space, one
+/// trailing space, `Version 1` in place of `Version 2`, or the same words in
+/// lower case, wine prints `user.reg is not a valid registry file`, loads no
+/// `HKCU` at all, and answers every query in that prefix with "key not found".
+/// A zero-byte file is refused the same way. Only a trailing `\r` is tolerated,
+/// and only because a file copied off a Windows filesystem ends every line
+/// that way. Wine does not rewrite the bad file either, so the state persists.
+const FILE_HEADER: &str = "WINE REGISTRY Version 2";
+
 /// Find `value_name` under `key_path` in the bytes of a `user.reg`.
 ///
 /// `key_path` is spelled the way the file does — relative to `HKCU`, with
@@ -112,7 +124,34 @@ pub const FILE: &str = "user.reg";
 /// decoding the file lossily first would replace those bytes with U+FFFD and
 /// then hand the caller a "value" equal to nothing that is in the registry.
 pub fn lookup(text: &[u8], key_path: &str, value_name: &str) -> Lookup {
+    // Wine reads this one line before it reads anything else, and a file whose
+    // first line is not exactly [`FILE_HEADER`] is not half-loaded: no `HKCU`
+    // is loaded at all, so every key in the prefix is gone and not just this
+    // one. Asked here, because a parser that skipped to the sections read such
+    // a file as authoritative — `status` printed the path and "registered by
+    // this installer" for a BOM'd copy of a real registration that no process
+    // in that prefix could see.
+    //
+    // Refused and not called absent, for the reason the module header gives:
+    // what is wrong here is the whole file, and "nothing is registered here" is
+    // the answer whose next move is to write.
+    let first = text.split(|b| *b == b'\n').next().unwrap_or_default();
+    if first.strip_suffix(b"\r").unwrap_or(first) != FILE_HEADER.as_bytes() {
+        return Lookup::Rejected(format!(
+            "a {FILE} wine itself will not load, \
+             because its first line is not `{FILE_HEADER}`"
+        ));
+    }
     let mut inside = false;
+    // Wine's loader applies the file top to bottom into one tree, so a key or a
+    // value spelled twice leaves the LAST one in memory. Measured on wine 11.18
+    // four ways — the section repeated, the section respelled in another case,
+    // the value repeated, the value respelled in another case — and all four
+    // answer `C:\SECOND` where this parser, returning at the first match,
+    // answered `C:\FIRST`. A path that is not the one the game reads is a wrong
+    // ownership verdict in either direction, so the whole file is scanned and
+    // the last match kept.
+    let mut found: Option<Lookup> = None;
     for raw in text.split(|b| *b == b'\n') {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         // Wine writes headers and values hard against the left margin, but it
@@ -150,7 +189,9 @@ pub fn lookup(text: &[u8], key_path: &str, value_name: &str) -> Lookup {
         // `"P\x0061th"` as `Path` — so it is decoded before it is compared.
         // A name in OUR section that cannot be decoded is refused rather than
         // skipped: skipping it would report the value absent, and an
-        // undecodable name may well be the one being asked about.
+        // undecodable name may well be the one being asked about. Still a hard
+        // return under the last-match rule below, and for the same reason: a
+        // later readable assignment does not tell us this one was not ours.
         let Ok(name_text) = std::str::from_utf8(name) else {
             return Lookup::Rejected(
                 "a value whose name is not text this installer can read".to_string(),
@@ -168,9 +209,9 @@ pub fn lookup(text: &[u8], key_path: &str, value_name: &str) -> Lookup {
                 "a value whose line is not text this installer can read".to_string(),
             );
         };
-        return read_assignment(rest);
+        found = Some(read_assignment(rest));
     }
-    Lookup::Absent
+    found.unwrap_or(Lookup::Absent)
 }
 
 /// Split `"name"…` — with the opening quote already eaten — into the raw name
@@ -179,14 +220,25 @@ pub fn lookup(text: &[u8], key_path: &str, value_name: &str) -> Lookup {
 /// Escape-aware: a `\"` inside the name is part of it, not its end. Returns
 /// `None` for a name that never closes.
 fn split_quoted(after_quote: &[u8]) -> Option<(&[u8], &[u8])> {
+    let i = end_of_unescaped(after_quote, b'"')?;
+    Some((&after_quote[..i], &after_quote[i + 1..]))
+}
+
+/// Where `end` first appears in `b` without a backslash in front of it.
+///
+/// The one escape-skipping rule in this file, written once: a name, a value and
+/// a section header all end at the first *unescaped* terminator, and this is
+/// the rule the parser's whole agreement with wine turns on. Stating it twice
+/// is how the two readers drift apart.
+fn end_of_unescaped(b: &[u8], end: u8) -> Option<usize> {
     let mut i = 0;
-    while i < after_quote.len() {
-        match after_quote[i] {
-            // Skip the escaped byte whatever it is: only an *unescaped* quote
-            // closes the string, and `\\` must not leave its second backslash
-            // to be read as the start of a new escape.
+    while i < b.len() {
+        match b[i] {
+            // Skip the escaped byte whatever it is: only an *unescaped*
+            // terminator ends the run, and `\\` must not leave its second
+            // backslash to be read as the start of a new escape.
             b'\\' => i += 2,
-            b'"' => return Some((&after_quote[..i], &after_quote[i + 1..])),
+            c if c == end => return Some(i),
             _ => i += 1,
         }
     }
@@ -205,29 +257,58 @@ fn header_names(line: &str, key_path: &str) -> bool {
         // A key path is compared, not shown, so a header this parser cannot
         // decode simply is not the one we are looking for — ours decodes.
         Unescaped::Bad(_) => false,
-        Unescaped::Ok(k) => k.eq_ignore_ascii_case(key_path),
+        Unescaped::Ok(k) => key_names_match(&k, key_path),
     }
 }
 
-/// Split a section header body at its first unescaped `]`.
-fn split_bracket(body: &str) -> Option<(&str, &str)> {
-    let b = body.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\\' => i += 2,
-            b']' => return Some((&body[..i], &body[i + 1..])),
-            _ => i += 1,
-        }
+/// Do these two spellings name the same key, the way wine's loader decides it?
+///
+/// Wine splits a key name on backslashes and ignores a single empty component
+/// at the end, so `Software\Freetrack\FreeTrackClient\` is the same key as
+/// `Software\Freetrack\FreeTrackClient`. Measured on wine 11.18: a header
+/// written with that trailing separator serves `Path` to `reg query` exactly as
+/// the plain spelling does, while a whole-string compare called it absent —
+/// "nothing is registered here" about a value wine was handing the game.
+///
+/// One trailing separator and nothing more forgiving. A leading separator, a
+/// doubled one, or two trailing ones do not name the key more loosely: all
+/// three kill the wineserver outright (`wine client error:0: recvmsg:
+/// connection reset`, each measured), so nothing at all can be read out of such
+/// a prefix and a parser that matched them would be answering for a registry
+/// no process can open.
+fn key_names_match(header_key: &str, key_path: &str) -> bool {
+    fn trim(k: &str) -> &str {
+        k.strip_suffix('\\').unwrap_or(k)
     }
-    None
+    trim(header_key).eq_ignore_ascii_case(trim(key_path))
+}
+
+/// Split a section header body at its first unescaped `]`.
+///
+/// The index comes back a character boundary even when an escape step lands
+/// mid-character: `]` is ASCII, so it can never be a UTF-8 continuation byte.
+fn split_bracket(body: &str) -> Option<(&str, &str)> {
+    let i = end_of_unescaped(body.as_bytes(), b']')?;
+    Some((&body[..i], &body[i + 1..]))
 }
 
 /// Read `=<something>` — everything after the value's name — into an answer.
 fn read_assignment(rest: &str) -> Lookup {
-    let Some(rest) = rest.strip_prefix('=') else {
+    // Wine tolerates whitespace on either side of the `=` and this parser did
+    // not. Measured on wine 11.18: `"Path" = "C:\spaced"`, a space on one side
+    // alone, and tabs on both sides are all read back as the path, while this
+    // answered "a value line this installer cannot read" — about a key that may
+    // hold, byte for byte, this installer's own directory, and that `uninstall`
+    // reads perfectly well because it goes through wine. The direction was
+    // safe (never an absence) but the report was wrong and it contradicted the
+    // other command.
+    fn trim(s: &str) -> &str {
+        s.trim_start_matches(|c: char| c.is_ascii_whitespace())
+    }
+    let Some(rest) = trim(rest).strip_prefix('=') else {
         return Lookup::Rejected("a value line this installer cannot read".to_string());
     };
+    let rest = trim(rest);
     // `"…"` is wine's spelling for REG_SZ, and `str(1):"…"` is the same type
     // written the long way — legal input even though wine's own writer never
     // produces it.
@@ -270,11 +351,18 @@ fn read_string(body: &str) -> Lookup {
     let Some((raw, after)) = split_quoted(body.as_bytes()) else {
         return Lookup::Rejected("a value whose text never ends".to_string());
     };
-    if !after.is_empty() {
+    if !after.iter().all(u8::is_ascii_whitespace) {
         // Wine writes the value and then the line ends. Anything after the
         // closing quote means this line is not the shape this parser proved
         // against wine, and guessing which half is the value is how a value
         // gets read as its own first fragment.
+        //
+        // Anything but whitespace, that is: wine does not mind a tail of it.
+        // Measured on wine 11.18, `"Path"="C:\x"` followed by spaces and the
+        // same followed by a tab both read back as the path, while this refused
+        // them. A value ending in a space is still decoded to its last
+        // character, because the space that matters is INSIDE the quotes and
+        // `split_quoted` has already ended the string before this runs.
         return Lookup::Rejected(
             "a value followed by something this installer cannot read".to_string(),
         );
@@ -378,55 +466,60 @@ fn unescape(s: &str) -> Unescaped {
             out.push(p);
             continue;
         }
-        if e == 'x' {
-            // One to four hex digits, greedily — wine pads to four exactly when
-            // the character after the escape is itself a hex digit, so reading
-            // four whenever four are there is what puts `C:\\\x00fcab` back
-            // together as `C:\üab` instead of `C:\ずab`.
-            let mut digits = String::new();
-            while digits.len() < 4 && it.peek().is_some_and(char::is_ascii_hexdigit) {
-                digits.push(it.next().unwrap_or_default());
+        // `\x` names a UTF-16 code unit in one to four hex digits; an escape
+        // that begins with an octal digit names one in up to three octal
+        // digits, which is wine's spelling for a control character it has no
+        // letter for. The same five steps over different numbers, so one
+        // reader, with the branch reduced to picking the numbers.
+        let numeric = match e {
+            'x' => Some((16, 4, None)),
+            '0'..='7' => Some((8, 3, Some(e))),
+            _ => None,
+        };
+        if let Some((radix, max, seed)) = numeric {
+            match escape_digits(&mut it, radix, max, seed) {
+                Ok(ch) => out.push(ch),
+                Err(why) => return Unescaped::Bad(why),
             }
-            if digits.is_empty() {
-                return Unescaped::Bad("a value holding an escape this installer cannot read");
-            }
-            // Infallible: at most four hex digits is at most 0xffff.
-            let Ok(unit) = u32::from_str_radix(&digits, 16) else {
-                return Unescaped::Bad("a value holding an escape this installer cannot read");
-            };
-            // A UTF-16 code unit, so a lone surrogate is possible and is not a
-            // character. Wine stores keys as UTF-16 and a surrogate pair would
-            // arrive as two escapes; putting one back together is guesswork
-            // this file does not do, and a half of one is certainly not a path.
-            let Some(ch) = char::from_u32(unit) else {
-                return Unescaped::Bad(
-                    "a value holding a character this installer cannot read back",
-                );
-            };
-            out.push(ch);
-            continue;
-        }
-        if ('0'..='7').contains(&e) {
-            // Octal, one to three digits — wine's spelling for a control
-            // character it has no letter for.
-            let mut digits = String::from(e);
-            while digits.len() < 3 && it.peek().is_some_and(|c| ('0'..='7').contains(c)) {
-                digits.push(it.next().unwrap_or_default());
-            }
-            let Ok(unit) = u32::from_str_radix(&digits, 8) else {
-                return Unescaped::Bad("a value holding an escape this installer cannot read");
-            };
-            let Some(ch) = char::from_u32(unit) else {
-                return Unescaped::Bad(
-                    "a value holding a character this installer cannot read back",
-                );
-            };
-            out.push(ch);
             continue;
         }
         return Unescaped::Bad("a value holding an escape this installer cannot read");
     }
     Unescaped::Ok(out)
+}
+
+/// Read the digits of a numeric escape and turn them into a character.
+///
+/// `seed` is the digit the escape has already named — octal spells its first
+/// digit in the escape itself and `\x` does not — `max` is how many digits the
+/// escape can hold, and `radix` says which characters count as digits.
+fn escape_digits(
+    it: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    radix: u32,
+    max: usize,
+    seed: Option<char>,
+) -> Result<char, &'static str> {
+    // Greedily, to `max` and no further — wine pads to four exactly when
+    // the character after the escape is itself a hex digit, so reading
+    // four whenever four are there is what puts `C:\\\x00fcab` back
+    // together as `C:\üab` instead of `C:\ずab`.
+    let mut digits = String::new();
+    digits.extend(seed);
+    while digits.len() < max && it.peek().is_some_and(|c| c.is_digit(radix)) {
+        digits.push(it.next().unwrap_or_default());
+    }
+    if digits.is_empty() {
+        return Err("a value holding an escape this installer cannot read");
+    }
+    // Infallible: at most four hex digits is at most 0xffff.
+    let Ok(unit) = u32::from_str_radix(&digits, radix) else {
+        return Err("a value holding an escape this installer cannot read");
+    };
+    // A UTF-16 code unit, so a lone surrogate is possible and is not a
+    // character. Wine stores keys as UTF-16 and a surrogate pair would
+    // arrive as two escapes; putting one back together is guesswork
+    // this file does not do, and a half of one is certainly not a path.
+    char::from_u32(unit).ok_or("a value holding a character this installer cannot read back")
 }
 
 #[cfg(test)]
@@ -503,6 +596,34 @@ mod tests {
         lookup(REAL.as_bytes(), key, "Path")
     }
 
+    /// A scratch `user.reg`: the one line wine insists on, then these bytes.
+    ///
+    /// Every fixture that means to exercise the parser goes through this,
+    /// because a file without that line is one wine refuses whole — which is a
+    /// different fact, tested on its own in
+    /// [`a_file_wine_will_not_load_is_not_a_registration`].
+    fn file(rest: &[u8]) -> Vec<u8> {
+        let mut out = format!("{FILE_HEADER}\n\n").into_bytes();
+        out.extend_from_slice(rest);
+        out
+    }
+
+    /// The same, with a FreeTrack section header in front of `rest`, built from
+    /// the one spelling of that header rather than from a fresh hand-escaping
+    /// each time. Several tests below assert [`Lookup::Absent`], and `Absent`
+    /// is also what a mis-escaped header produces, so a typo in one copy of
+    /// that header would make its test pass for the wrong reason.
+    fn ft_file(rest: &str) -> Vec<u8> {
+        ft_bytes(rest.as_bytes())
+    }
+
+    /// The same, for the fixtures whose body is deliberately not UTF-8.
+    fn ft_bytes(rest: &[u8]) -> Vec<u8> {
+        let mut out = format!("[{}] 1790444400\n", FT.replace('\\', r"\\")).into_bytes();
+        out.extend_from_slice(rest);
+        file(&out)
+    }
+
     /// The whole reason this module exists: a real prefix's real file, read
     /// without a wine anywhere near it.
     /// Wine writes its own file hard against the left margin, but it READS a
@@ -512,10 +633,11 @@ mod tests {
     /// `Path REG_SZ C:\\tobii-bridge`, this said nothing was registered.
     #[test]
     fn an_indented_line_is_read_the_way_wine_reads_it() {
-        let indented =
-            b"  [Software\\\\Freetrack\\\\FreeTrackClient]\n  \"Path\"=\"C:\\\\tobii-bridge\"\n";
+        let indented = file(
+            b"  [Software\\\\Freetrack\\\\FreeTrackClient]\n  \"Path\"=\"C:\\\\tobii-bridge\"\n",
+        );
         assert_eq!(
-            lookup(indented, r"Software\Freetrack\FreeTrackClient", "Path"),
+            lookup(&indented, FT, "Path"),
             Lookup::Text("C:\\tobii-bridge".to_string()),
             "an indented header and value are still a header and a value"
         );
@@ -527,22 +649,18 @@ mod tests {
     /// it is the answer that says nobody else has claimed the key.
     #[test]
     fn an_escaped_value_name_is_decoded_before_it_is_compared() {
-        let escaped =
-            b"[Software\\\\Freetrack\\\\FreeTrackClient]\n\"P\\x0061th\"=\"C:\\\\tobii-bridge\"\n";
+        let escaped = ft_file("\"P\\x0061th\"=\"C:\\\\tobii-bridge\"\n");
         assert_eq!(
-            lookup(escaped, r"Software\Freetrack\FreeTrackClient", "Path"),
+            lookup(&escaped, FT, "Path"),
             Lookup::Text("C:\\tobii-bridge".to_string()),
             "wine decodes the name; so must this"
         );
 
         // And a name this parser cannot decode is refused, never skipped: an
         // undecodable name in our own section may be the one being asked for.
-        let bad = b"[Software\\\\Freetrack\\\\FreeTrackClient]\n\"P\\q\"=\"C:\\\\x\"\n";
+        let bad = ft_file("\"P\\q\"=\"C:\\\\x\"\n");
         assert!(
-            matches!(
-                lookup(bad, r"Software\Freetrack\FreeTrackClient", "Path"),
-                Lookup::Rejected(_)
-            ),
+            matches!(lookup(&bad, FT, "Path"), Lookup::Rejected(_)),
             "a name that cannot be read is not proof the value is absent"
         );
     }
@@ -664,44 +782,35 @@ mod tests {
     /// registration we never made.
     #[test]
     fn an_unreadable_header_does_not_leave_the_previous_section_open() {
-        let text =
-            b"[Software\\\\Freetrack\\\\FreeTrackClient] 1\n[\xff\xfe] 2\n\"Path\"=\"EVIL\"\n";
-        assert_eq!(lookup(text, FT, "Path"), Lookup::Absent);
+        let text = ft_bytes(b"[\xff\xfe] 2\n\"Path\"=\"EVIL\"\n");
+        assert_eq!(lookup(&text, FT, "Path"), Lookup::Absent);
     }
 
     /// The same, for a header whose escaping this parser refuses.
     #[test]
     fn a_header_with_an_escape_we_do_not_know_closes_the_section_too() {
-        let text = concat!(
-            "[Software\\\\Freetrack\\\\FreeTrackClient] 1\n",
-            "[Software\\\\T\\q] 2\n",
-            "\"Path\"=\"EVIL\"\n"
-        );
-        assert_eq!(lookup(text.as_bytes(), FT, "Path"), Lookup::Absent);
+        let text = ft_file("[Software\\\\T\\q] 2\n\"Path\"=\"EVIL\"\n");
+        assert_eq!(lookup(&text, FT, "Path"), Lookup::Absent);
     }
 
     /// A value name is matched whole. `PathX` is not `Path`, and a name
     /// carrying an escaped quote does not end where that quote is.
     #[test]
     fn a_value_name_is_matched_whole() {
-        let text = concat!(
-            "[Software\\\\Freetrack\\\\FreeTrackClient] 1\n",
+        let text = ft_file(concat!(
             "\"PathX\"=\"NO\"\n",
             "\"Pa\\\"th\"=\"NO\"\n",
             "\"Path\"=\"YES\"\n"
-        );
-        assert_eq!(
-            lookup(text.as_bytes(), FT, "Path"),
-            Lookup::Text("YES".to_string())
-        );
+        ));
+        assert_eq!(lookup(&text, FT, "Path"), Lookup::Text("YES".to_string()));
     }
 
     /// Bytes that are not text cannot be turned into a value, and must not be
     /// turned into an absence either.
     #[test]
     fn a_value_line_that_is_not_text_is_refused() {
-        let text = b"[Software\\\\Freetrack\\\\FreeTrackClient] 1\n\"Path\"=\"\xff\xfe\"\n";
-        assert!(matches!(lookup(text, FT, "Path"), Lookup::Rejected(_)));
+        let text = ft_bytes(b"\"Path\"=\"\xff\xfe\"\n");
+        assert!(matches!(lookup(&text, FT, "Path"), Lookup::Rejected(_)));
     }
 
     /// An escape this parser does not know is refused rather than guessed at.
@@ -710,10 +819,9 @@ mod tests {
     #[test]
     fn an_unknown_escape_is_refused() {
         for body in [r"C:\q", r"C:\", r"C:\x"] {
-            let text =
-                format!("[Software\\\\Freetrack\\\\FreeTrackClient] 1\n\"Path\"=\"{body}\"\n");
+            let text = ft_file(&format!("\"Path\"=\"{body}\"\n"));
             assert!(
-                matches!(lookup(text.as_bytes(), FT, "Path"), Lookup::Rejected(_)),
+                matches!(lookup(&text, FT, "Path"), Lookup::Rejected(_)),
                 "{body} was not refused"
             );
         }
@@ -723,43 +831,201 @@ mod tests {
     /// `str(N)` is a type this installer never writes.
     #[test]
     fn a_string_written_the_long_way_is_still_a_string() {
-        let text = "[Software\\\\Freetrack\\\\FreeTrackClient] 1\n\"Path\"=str(1):\"C:\\\\x\"\n";
-        assert_eq!(
-            lookup(text.as_bytes(), FT, "Path"),
-            Lookup::Text(r"C:\x".to_string())
-        );
+        let text = ft_file("\"Path\"=str(1):\"C:\\\\x\"\n");
+        assert_eq!(lookup(&text, FT, "Path"), Lookup::Text(r"C:\x".to_string()));
     }
 
     /// Anything after the closing quote means the line is not the shape this
     /// parser proved against wine, and which half is the value is then a guess.
     #[test]
     fn a_line_with_something_after_the_value_is_refused() {
-        let text = "[Software\\\\Freetrack\\\\FreeTrackClient] 1\n\"Path\"=\"C:\\\\x\" junk\n";
-        assert!(matches!(
-            lookup(text.as_bytes(), FT, "Path"),
-            Lookup::Rejected(_)
-        ));
+        let text = ft_file("\"Path\"=\"C:\\\\x\" junk\n");
+        assert!(matches!(lookup(&text, FT, "Path"), Lookup::Rejected(_)));
     }
 
     /// CRLF line ends, which a file copied off a Windows filesystem has.
     #[test]
     fn carriage_returns_at_the_ends_of_lines_are_not_part_of_anything() {
-        let text = "[Software\\\\Freetrack\\\\FreeTrackClient] 1\r\n\"Path\"=\"C:\\\\x\"\r\n";
+        let text = format!(
+            "{FILE_HEADER}\r\n[Software\\\\Freetrack\\\\FreeTrackClient] 1\r\n\"Path\"=\"C:\\\\x\"\r\n"
+        );
         assert_eq!(
             lookup(text.as_bytes(), FT, "Path"),
             Lookup::Text(r"C:\x".to_string())
         );
     }
 
-    /// An empty file, and a prefix whose `user.reg` holds only its header, are
-    /// absences and not failures: a booted prefix nothing has registered in
-    /// really does hold nothing under these keys.
+    /// A prefix whose `user.reg` holds only its header is an absence and not a
+    /// failure: a booted prefix nothing has registered in really does hold
+    /// nothing under these keys. Measured — wine answers "key not found" for
+    /// this file and says nothing about the file itself.
+    ///
+    /// An empty file is NOT that case, which is why it moved out of this test:
+    /// wine 11.18 prints `user.reg is not a valid registry file` for a
+    /// zero-byte one and loads no `HKCU` at all.
     #[test]
     fn a_file_with_no_sections_is_an_absence() {
-        assert_eq!(lookup(b"", FT, "Path"), Lookup::Absent);
         assert_eq!(
             lookup(b"WINE REGISTRY Version 2\n\n#arch=win64\n", FT, "Path"),
             Lookup::Absent
         );
+        // The same file with nothing after the header at all, not even a
+        // newline — wine reads that one too.
+        assert_eq!(lookup(FILE_HEADER.as_bytes(), FT, "Path"), Lookup::Absent);
+    }
+
+    /// Wine refuses a `user.reg` whose first line is not exactly
+    /// `WINE REGISTRY Version 2`: it loads no `HKCU`, so every key in the
+    /// prefix is gone, and `reg query` answers "key not found" for a
+    /// registration that is sitting right there in the file.
+    ///
+    /// Each of these is a file real wine 11.18 was pointed at, on a throwaway
+    /// prefix holding a genuine `[Software\\Freetrack\\FreeTrackClient]` /
+    /// `"Path"="C:\\tobii-bridge"` — every one printed `user.reg is not a
+    /// valid registry file` and exited 1, and wine did not rewrite any of them.
+    /// Reading straight past the line made `tobii bridge status` print the path
+    /// and "registered by this installer" for all of them.
+    #[test]
+    fn a_file_wine_will_not_load_is_not_a_registration() {
+        let good = format!(
+            "{FILE_HEADER}\n\n[{}] 1\n\"Path\"=\"C:\\\\tobii-bridge\"\n",
+            FT.replace('\\', r"\\")
+        );
+        // The control: the same bytes, read.
+        assert_eq!(
+            lookup(good.as_bytes(), FT, "Path"),
+            Lookup::Text(r"C:\tobii-bridge".to_string())
+        );
+        let body = good.split_once('\n').expect("a second line").1;
+        for (what, text) in [
+            (
+                "a UTF-8 BOM in front of the line",
+                format!("\u{feff}{good}"),
+            ),
+            ("no header line at all", body.to_string()),
+            ("a blank line before it", format!("\n{good}")),
+            ("one leading space", format!(" {good}")),
+            ("one trailing space", format!("{FILE_HEADER} \n{body}")),
+            (
+                "the wrong version",
+                format!("WINE REGISTRY Version 1\n{body}"),
+            ),
+            (
+                "the words in lower case",
+                format!("wine registry version 2\n{body}"),
+            ),
+            ("no bytes at all", String::new()),
+        ] {
+            match lookup(text.as_bytes(), FT, "Path") {
+                Lookup::Rejected(why) => assert!(
+                    why.contains(FILE_HEADER),
+                    "{what}: the refusal has to name the line — {why}"
+                ),
+                other => panic!("{what} was read as {other:?}"),
+            }
+        }
+    }
+
+    /// Wine ignores ONE empty component at the end of a key name, so a header
+    /// spelled with a trailing key separator names the same key. Measured: with
+    /// `[Software\\Freetrack\\FreeTrackClient\\]` in a real prefix's user.reg,
+    /// `wine reg query HKCU\Software\Freetrack\FreeTrackClient /v Path`
+    /// answered `C:\sep`, while a whole-string compare called it absent — the
+    /// one answer this module must never get wrong.
+    #[test]
+    fn a_header_with_a_trailing_key_separator_names_the_same_key() {
+        let text = file(
+            b"[Software\\\\Freetrack\\\\FreeTrackClient\\\\] 1790444400\n\"Path\"=\"C:\\\\sep\"\n",
+        );
+        assert_eq!(
+            lookup(&text, FT, "Path"),
+            Lookup::Text(r"C:\sep".to_string())
+        );
+
+        // And nothing more forgiving than that one. A leading separator, a
+        // doubled one and two trailing ones each killed the wineserver outright
+        // when they were put in a real prefix (`wine client error:0: recvmsg:
+        // connection reset`), so nothing can be read out of such a file at all
+        // and a parser that matched them would be answering for a registry no
+        // process can open.
+        for header in [
+            r"[\\Software\\Freetrack\\FreeTrackClient] 1",
+            r"[Software\\\\Freetrack\\FreeTrackClient] 1",
+            r"[Software\\Freetrack\\FreeTrackClient\\\\] 1",
+        ] {
+            let text = file(format!("{header}\n\"Path\"=\"C:\\\\no\"\n").as_bytes());
+            assert_eq!(lookup(&text, FT, "Path"), Lookup::Absent, "{header}");
+        }
+    }
+
+    /// Wine's loader applies the file top to bottom into one tree, so the LAST
+    /// spelling of a key or a value is the one left in memory. All four of
+    /// these were put in a real prefix and answered `C:\SECOND`; this parser,
+    /// returning at its first match, answered `C:\FIRST` — a path the game
+    /// never sees, and an ownership verdict drawn from the wrong one.
+    #[test]
+    fn a_key_or_a_value_written_twice_reads_the_way_wine_reads_it() {
+        let hdr = format!("[{}] 1", FT.replace('\\', r"\\"));
+        for (what, body) in [
+            (
+                "the section repeated",
+                format!("{hdr}\n\"Path\"=\"C:\\\\FIRST\"\n\n{hdr}\n\"Path\"=\"C:\\\\SECOND\"\n"),
+            ),
+            (
+                "the section respelled in another case",
+                format!(
+                    "{hdr}\n\"Path\"=\"C:\\\\FIRST\"\n\n\
+                     [SOFTWARE\\\\FREETRACK\\\\FREETRACKCLIENT] 2\n\"Path\"=\"C:\\\\SECOND\"\n"
+                ),
+            ),
+            (
+                "the value repeated",
+                format!("{hdr}\n\"Path\"=\"C:\\\\FIRST\"\n\"Path\"=\"C:\\\\SECOND\"\n"),
+            ),
+            (
+                "the value respelled in another case",
+                format!("{hdr}\n\"Path\"=\"C:\\\\FIRST\"\n\"PATH\"=\"C:\\\\SECOND\"\n"),
+            ),
+        ] {
+            assert_eq!(
+                lookup(&file(body.as_bytes()), FT, "Path"),
+                Lookup::Text(r"C:\SECOND".to_string()),
+                "{what}"
+            );
+        }
+    }
+
+    /// Wine tolerates whitespace around the `=` and after the closing quote,
+    /// and this parser did not. Every one of these six was read back as its
+    /// path by real wine 11.18, while this answered "a value line this
+    /// installer cannot read" — about a key that may hold, byte for byte, this
+    /// installer's own directory, and that `uninstall` reads perfectly well
+    /// because it goes through wine.
+    #[test]
+    fn whitespace_around_the_assignment_is_read_the_way_wine_reads_it() {
+        for (line, want) in [
+            ("\"Path\" = \"C:\\\\spaced\"\n", r"C:\spaced"),
+            ("\"Path\"= \"C:\\\\y\"\n", r"C:\y"),
+            ("\"Path\" =\"C:\\\\z\"\n", r"C:\z"),
+            ("\"Path\"\t=\t\"C:\\\\tabbed\"\n", r"C:\tabbed"),
+            ("\"Path\"=\"C:\\\\x\"   \n", r"C:\x"),
+            ("\"Path\"=\"C:\\\\w\"\t\n", r"C:\w"),
+        ] {
+            assert_eq!(
+                lookup(&ft_file(line), FT, "Path"),
+                Lookup::Text(want.to_string()),
+                "{line:?}"
+            );
+        }
+
+        // The refusal this keeps is the one its comment is actually about:
+        // something that is not whitespace after the closing quote, where which
+        // half is the value would be a guess. Covered by
+        // `a_line_with_something_after_the_value_is_refused`; asserted here too
+        // because the whitespace rule is what could erode it.
+        assert!(matches!(
+            lookup(&ft_file("\"Path\"=\"C:\\\\x\" junk\n"), FT, "Path"),
+            Lookup::Rejected(_)
+        ));
     }
 }
