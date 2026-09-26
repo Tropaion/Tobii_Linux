@@ -168,6 +168,10 @@ fn find_installed_npclient() -> Option<PathBuf> {
         .find(|d| d.join("NPClient64.dll").is_file())
 }
 
+/// The one artifact without which there is no installation — also what
+/// [`artifact_dir`] recognises a build directory by.
+const REQUIRED_ARTIFACT: &str = "freetrackclient64.dll";
+
 /// What `install` copies, and whether its absence is fatal.
 ///
 /// The DLLs are the product. `tobii-bridge.exe` used to be required, because it
@@ -183,10 +187,6 @@ fn find_installed_npclient() -> Option<PathBuf> {
 /// Closing it means building the two client crates for `i686-pc-windows-gnu` as
 /// well and adding them here; the registry key and install directory are shared,
 /// so nothing else changes.
-/// The one artifact without which there is no installation — also what
-/// [`artifact_dir`] recognises a build directory by.
-const REQUIRED_ARTIFACT: &str = "freetrackclient64.dll";
-
 const ARTIFACTS: [(&str, bool); 3] = [
     ("tobii-bridge.exe", false),
     ("freetrackclient64.dll", true),
@@ -233,20 +233,19 @@ pub fn choose_wine(
         // is the only thing that can call an explicit binary the prefix's own:
         // it is corroborated when it IS what the prefix records, and merely
         // used when the prefix records nothing or records something else.
-        let expected = launch_script.clone().or_else(|| runners.first().cloned());
-        let origin = if expected.as_deref() == Some(w.as_path()) {
-            WineOrigin::Prefix
-        } else {
-            WineOrigin::Unverified
-        };
-        let warning = match expected {
-            Some(e) if e != w => Some(format!(
-                "using {} but this prefix's own runner is {} — if the game sees no \
-                 tracking, that mismatch is why (two wineservers, two namespaces)",
-                w.display(),
-                e.display()
-            )),
-            _ => None,
+        let expected = launch_script.or_else(|| runners.first().cloned());
+        let (origin, warning) = match expected {
+            Some(e) if e == w => (WineOrigin::Prefix, None),
+            Some(e) => (
+                WineOrigin::Unverified,
+                Some(format!(
+                    "using {} but this prefix's own runner is {} — if the game sees no \
+                     tracking, that mismatch is why (two wineservers, two namespaces)",
+                    w.display(),
+                    e.display()
+                )),
+            ),
+            None => (WineOrigin::Unverified, None),
         };
         return Ok((w, origin, warning));
     }
@@ -274,6 +273,15 @@ pub fn choose_wine(
 ///
 /// That script records the runner in `export wine_path="..."`, which is the most
 /// authoritative answer available: it is literally what launches the game.
+///
+/// Every line that is not that assignment is skipped, not treated as the end of
+/// the file. Giving up at the first one used to end the scan on line 1 of every
+/// real script: `sc-launch.sh` opens with a shebang, a blank line is enough on
+/// its own, and the upstream helper carries a couple of dozen other statements
+/// before this assignment. So the tier that exists for the LUG layout never
+/// fired, and resolution fell through to the system wine — which then runs
+/// `wineboot -u` against a prefix it does not own, the upgrade this module is
+/// organised around preventing.
 fn wine_from_launch_script(prefix: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(prefix.join("sc-launch.sh")).ok()?;
     for line in text.lines() {
@@ -281,7 +289,9 @@ fn wine_from_launch_script(prefix: &Path) -> Option<PathBuf> {
         if line.starts_with('#') {
             continue;
         }
-        let rest = line.strip_prefix("export wine_path=")?;
+        let Some(rest) = line.strip_prefix("export wine_path=") else {
+            continue;
+        };
         let dir = rest.trim().trim_matches('"').trim_matches('\'');
         let candidate = PathBuf::from(dir).join("wine");
         if candidate.is_file() {
@@ -718,17 +728,39 @@ impl Reading {
 /// we did not write: the two negative answers are not interchangeable, and only
 /// one of them is safe to be wrong about.
 fn reg_query_path(stdout: &[u8]) -> Reading {
-    // Wine terminates every line it prints with CRLF, so a chunk that arrived
-    // without its CR did not end where the split did: the break came from
-    // inside the value itself. What we would hold is a fragment, and a fragment
-    // must never be compared — it can equal our own computed path and then be
-    // removed as ours. The last chunk is exempt: it is what follows the final
-    // newline, and is empty on well-formed output.
+    // Wine prints the value's line and then one blank line, and stops. So the
+    // `Path` line of a value we can read whole is the last line of the output,
+    // and whatever follows it is the remainder of a value that carried a line
+    // break of its own. That is what is checked, rather than the shape of the
+    // matched chunk alone.
+    //
+    // The chunk alone is not enough. A chunk that arrived without its CR is
+    // certainly a fragment — the break came from inside the value — but a chunk
+    // that ends WITH a CR can be one too, because the break inside the value
+    // can itself be a CRLF: a `Path` holding `C:\tobii-bridge<CR><LF>EVIL`
+    // splits into a first chunk ending in CR that is byte for byte our own
+    // computed path. A fragment must never be compared. That one would have
+    // read as ours twice over — install would take the key as its own and
+    // overwrite a value it never wrote, and uninstall would delete a
+    // registration this program never made.
+    //
+    // Checked against wine 11.18, the three tails are distinguishable and only
+    // here: a clean value leaves exactly `\r\n` behind its line, a value with an
+    // embedded CRLF leaves `EVIL\r\n\r\n`, and one *ending* in CRLF leaves
+    // `\r\n\r\n` — that last one also a fragment, and also caught.
     let chunks: Vec<&[u8]> = stdout.split(|b| *b == b'\n').collect();
     let last = chunks.len().saturating_sub(1);
+    // How far this chunk and the newline that ended it reach, so the tail can
+    // be looked at whole instead of chunk by chunk. The last chunk ends no
+    // newline: it is what followed the final one.
+    let mut after = 0usize;
     for (i, line) in chunks.iter().enumerate() {
         let line = *line;
-        let whole_line = i == last || line.ends_with(b"\r");
+        after += line.len() + usize::from(i != last);
+        let rest = &stdout[after..];
+        // Empty as well as `\r\n`, because output captured without its closing
+        // blank line is still output whose value line ended where the split did.
+        let whole_line = rest.is_empty() || rest == b"\r\n";
         // Everything up to the value — the name, the whitespace, the type — is
         // ASCII whatever codepage wine chose, so the line is parsed as ASCII up
         // to the first byte that is not one, and only the value itself raises
@@ -737,9 +769,13 @@ fn reg_query_path(stdout: &[u8]) -> Reading {
             .iter()
             .position(|b| !b.is_ascii())
             .unwrap_or(line.len())];
-        let Ok(head) = std::str::from_utf8(ascii) else {
-            continue;
-        };
+        // Infallible, and written as a total decode to say so: `ascii` stops at
+        // the first byte that is not ASCII, and every ASCII byte is valid UTF-8.
+        // A fallible decode here spent a dead arm on a `continue`, and this
+        // function's safety argument is read off its control flow — every
+        // `continue` in it has to mean "not the Path line", or a reader has to
+        // prove an unreachable branch cannot manufacture an `Absent`.
+        let head = std::str::from_utf8(ascii).unwrap_or_default();
         // Exactly one CR, which is wine's. `trim_end_matches` took every one
         // of them, so a value whose own last byte is a CR came back a byte
         // short and then failed to match itself.
@@ -893,12 +929,29 @@ fn parse_record(text: &str) -> Vec<(String, String)> {
         if name.is_empty() || wrote.is_empty() {
             continue;
         }
-        match out.iter_mut().find(|(n, _)| n == name) {
-            Some(slot) => slot.1 = wrote.to_string(),
-            None => out.push((name.to_string(), wrote.to_string())),
-        }
+        upsert(&mut out, name, wrote.to_string());
     }
     out
+}
+
+/// What the record says this installer wrote into the key called `name`.
+fn recorded<'a>(record: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    record
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, w)| w.as_str())
+}
+
+/// Put `value` in the record's line for `name`, adding the line if there is
+/// none.
+///
+/// The last line wins rather than the first, which is what makes a record with
+/// a key named twice read the same as one written afresh.
+fn upsert(record: &mut Vec<(String, String)>, name: &str, value: String) {
+    match record.iter_mut().find(|(n, _)| n == name) {
+        Some(slot) => slot.1 = value,
+        None => record.push((name.to_string(), value)),
+    }
 }
 
 /// The record kept in `dir`, empty when there is none.
@@ -906,14 +959,23 @@ fn read_record(dir: &Path) -> Vec<(String, String)> {
     parse_record(&std::fs::read_to_string(dir.join(RECORD_FILE)).unwrap_or_default())
 }
 
-/// The name the record is staged under before the rename that publishes it.
+/// The name a file is staged under before the rename that publishes it.
 ///
-/// Per process, not one fixed name. The rename is atomic; the write into the
-/// staging file is not, so two installs into one prefix sharing a staging name
-/// interleave their writes and then rename a torn record into place — the very
-/// thing the rename is here to prevent.
-fn staging_name(pid: u32) -> String {
-    format!(".{RECORD_FILE}.{pid}.new")
+/// Per process, not one fixed name per file. The rename is atomic; the write
+/// into the staging file is not, so two installs into one prefix sharing a
+/// staging name interleave their writes and then rename a torn file into place
+/// — the very thing the rename is here to prevent.
+///
+/// The record and the DLLs both go through here. The DLLs used to stage under
+/// one fixed `.<name>.new` each, and the hazard was worse there than for the
+/// record: two `tobii bridge install --prefix P` runs with different
+/// `--artifacts` directories (a rebuild in one terminal, a packaged binary in
+/// the other) both `fs::copy` into the same staging file, one renames the
+/// mixture onto the DLL the game loads — and the loser, whose descriptor now
+/// points at the published file, goes on writing into the live DLL with no
+/// staging left between it and the target.
+fn staging_name(name: &str, pid: u32) -> String {
+    format!(".{name}.{pid}.new")
 }
 
 /// Write down what this run put in the keys.
@@ -926,7 +988,7 @@ fn staging_name(pid: u32) -> String {
 /// wrote that key", whose action on the way out is to leave it alone.
 fn write_record(dir: &Path, entries: &[(&str, &str)]) -> Result<(), String> {
     let path = dir.join(RECORD_FILE);
-    let staged = dir.join(staging_name(std::process::id()));
+    let staged = dir.join(staging_name(RECORD_FILE, std::process::id()));
     std::fs::write(&staged, render_record(entries))
         .and_then(|()| std::fs::rename(&staged, &path))
         .map_err(|e| {
@@ -956,18 +1018,36 @@ fn write_record(dir: &Path, entries: &[(&str, &str)]) -> Result<(), String> {
 /// program's registration. Install would then refuse over its own work, and
 /// uninstall would leave it behind for good.
 ///
+/// A line break is the second such character and it arrived later. A Linux
+/// directory name may hold one, `is_ascii()` accepts it because LF *is* ASCII,
+/// and wine stores and prints it back raw — so [`reg_query_path`] splits the
+/// output on it and answers [`Reading::Other`], "a value with a line break in
+/// it". From then on the key is unrecognisable in exactly the way above: every
+/// later install refuses over its own work, and uninstall orphans it for good.
+///
+/// A CR goes with it, though a lone one does read back whole today. This guard
+/// is deliberately wider than the demonstrated failure, exactly as the ASCII
+/// half is — most non-ASCII paths would survive a round trip too, and it
+/// refuses them all. A CR is the byte wine terminates its lines with, so a rule
+/// that admitted one would have to reason about which half of a break arrived,
+/// and reasoning about which half arrived is what was wrong with the reader's
+/// own guard before this. There is no cost: no real client directory is spelled
+/// with either, and the refusal names the flag that gets past it.
+///
 /// So it is refused before anything is created, rather than written and
 /// regretted.
 fn registrable_path(dir: &Path) -> Result<String, String> {
     let win = wine_path_for(dir);
-    if !win.is_ascii() {
+    if !win.is_ascii() || win.contains(['\r', '\n']) {
         return Err(format!(
             "{} cannot be registered: wine prints the registry in the console's own \
-             codepage rather than UTF-8, so a path with a character outside ASCII \
-             does not read back the way it was written — and a value this installer \
-             cannot read back is one it could never tell from another program's.\n\
-             Move the client somewhere spelled in ASCII, or pass `--npclient ours` \
-             to register our own DLL instead.",
+             codepage rather than UTF-8, so a path with a character outside ASCII — \
+             or one carrying a line break, which wine prints raw and this installer \
+             then cannot read back whole — does not read back the way it was written, \
+             and a value this installer cannot read back is one it could never tell \
+             from another program's.\n\
+             Move the client somewhere spelled in plain ASCII on one line, or pass \
+             `--npclient ours` to register our own DLL instead.",
             dir.display()
         ));
     }
@@ -995,21 +1075,27 @@ struct Taken {
 }
 
 impl Taken {
-    /// Why this key is not ours to write — the same two answers [`undo_for`]
-    /// gives on the way out, because they rest on the same two facts.
-    ///
-    /// Naming another program is a claim, and the record is the only evidence
-    /// for it: it says this installer wrote something else here, so somebody
-    /// changed the key since. With no record there is no such evidence. Every
-    /// prefix installed before the record existed arrives here with none, and
-    /// telling those users another program took their key is an accusation
-    /// about a value this program itself wrote.
+    /// Why this key is not ours to write.
     fn whose(&self) -> &'static str {
-        if self.recorded {
-            "it no longer holds what this install wrote, so it is another program's now"
-        } else {
-            "nothing here records what this install wrote, so there is no telling whose it is"
-        }
+        whose(self.recorded)
+    }
+}
+
+/// Whose a key holding something we did not write is — said once, because
+/// install on the way in and [`undo_for`] on the way out give the same two
+/// answers and rest on the same two facts.
+///
+/// Naming another program is a claim, and the record is the only evidence for
+/// it: it says this installer wrote something else here, so somebody changed
+/// the key since. With no record there is no such evidence. Every prefix
+/// installed before the record existed arrives here with none, and telling
+/// those users another program took their key is an accusation about a value
+/// this program itself wrote.
+fn whose(recorded: bool) -> &'static str {
+    if recorded {
+        "it no longer holds what this install wrote, so it is another program's now"
+    } else {
+        "nothing here records what this install wrote, so there is no telling whose it is"
     }
 }
 
@@ -1138,10 +1224,7 @@ fn install(args: &[String]) -> CmdResult {
     let record = read_record(&dest);
     let mut taken: Vec<Taken> = Vec::new();
     for (name, key, abi) in KEYS {
-        let wrote = record
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, w)| w.as_str());
+        let wrote = recorded(&record, name);
         let want = want_for(key);
         let current = read_key(&wine, &prefix, key)?;
         if current == Reading::Absent || is_ours(&current, wrote) {
@@ -1193,8 +1276,12 @@ fn install(args: &[String]) -> CmdResult {
         // fails outright or, if the loader lets it through, leaves a torn file
         // that the next launch loads. `rename` within one directory is atomic,
         // so the old DLL stays whole until the instant the new one replaces it.
+        //
+        // Under a per-process name, for the reason [`staging_name`] gives: a
+        // fixed one puts two concurrent installs in the same staging file and
+        // hands the game the mixture.
         let target = dest.join(name);
-        let staged = dest.join(format!(".{name}.new"));
+        let staged = dest.join(staging_name(name, std::process::id()));
         std::fs::copy(&from, &staged)?;
         if let Err(e) = std::fs::rename(&staged, &target) {
             let _ = std::fs::remove_file(&staged);
@@ -1234,11 +1321,7 @@ fn install(args: &[String]) -> CmdResult {
         if !landed(key) {
             continue;
         }
-        let wrote = want_for(key).to_string();
-        match kept.iter_mut().find(|(n, _)| n == name) {
-            Some(slot) => slot.1 = wrote,
-            None => kept.push((name.to_string(), wrote)),
-        }
+        upsert(&mut kept, name, want_for(key).to_string());
     }
     if ft_landed || np_landed {
         let entries: Vec<(&str, &str)> =
@@ -1428,15 +1511,14 @@ enum Undo {
 /// says what we wrote belongs to somebody else, and the only safe thing to do
 /// with it is nothing.
 ///
-/// "Nothing was recorded" is asked before "it is not what we wrote", because
-/// they are different facts and the second is a false account of the first.
-/// Every prefix installed before this record existed arrives here with no
-/// record at all, and telling those users a key "no longer holds what this
-/// install wrote" claims a comparison that never happened. Their own pointer at
-/// `C:\tobii-bridge` is still recognised — [`is_ours`] knows that directory
-/// without any record — so what reaches this arm is a third-party client path
-/// an old install merely pointed at, which may have been that program's own
-/// registration all along.
+/// Which of the two [`whose`] answers a left key gets turns on whether there is
+/// a record at all, and that matters most here: every prefix installed before
+/// this record existed arrives with none, and telling those users a key "no
+/// longer holds what this install wrote" claims a comparison that never
+/// happened. Their own pointer at `C:\tobii-bridge` is still recognised —
+/// [`is_ours`] knows that directory without any record — so what reaches the
+/// no-record answer is a third-party client path an old install merely pointed
+/// at, which may have been that program's own registration all along.
 fn undo_for(current: &Reading, wrote: Option<&str>) -> Undo {
     if *current == Reading::Absent {
         return Undo::Nothing;
@@ -1444,12 +1526,7 @@ fn undo_for(current: &Reading, wrote: Option<&str>) -> Undo {
     if is_ours(current, wrote) {
         return Undo::Remove;
     }
-    if wrote.is_none() {
-        return Undo::Leave(
-            "nothing here records what this install wrote, so there is no telling whose it is",
-        );
-    }
-    Undo::Leave("it no longer holds what this install wrote, so it is another program's now")
+    Undo::Leave(whose(wrote.is_some()))
 }
 
 /// What uninstall did to one key.
@@ -1528,10 +1605,7 @@ fn undo_keys(
 ) -> Result<(Vec<KeyOutcome>, Option<String>), String> {
     let mut outcomes: Vec<KeyOutcome> = Vec::new();
     for (name, key, abi) in KEYS {
-        let wrote = record
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, w)| w.as_str());
+        let wrote = recorded(record, name);
         let current = match read_key(wine, prefix, key) {
             Ok(c) => c,
             Err(e) => return Ok((outcomes, Some(e))),
@@ -1748,6 +1822,60 @@ mod tests {
         );
     }
 
+    /// The prefix may name no runner at all — a plain `WINEPREFIX` with no
+    /// launch script and no bundled runners. Then there is nothing to
+    /// corroborate `--wine` against, and nothing to contradict it either: it is
+    /// used, it is not called the prefix's own, and the user is told nothing,
+    /// because there is nothing established to tell them.
+    #[test]
+    fn an_explicit_wine_the_prefix_says_nothing_about_is_used_without_comment() {
+        let (w, origin, warn) =
+            choose_wine(Some(p("/usr/bin/wine")), None, &[], None).expect("resolves");
+        assert_eq!(w, p("/usr/bin/wine"));
+        assert_eq!(
+            origin,
+            WineOrigin::Unverified,
+            "nothing here established whose prefix it owns"
+        );
+        assert_eq!(warn, None, "a mismatch warning needs something to mismatch");
+    }
+
+    /// The tier that exists for the LUG Star Citizen layout has to survive the
+    /// shape of a real script: a shebang, blank lines, and other statements
+    /// before the one it wants. Giving up at the first line that was not the
+    /// assignment gave up on line 1 of every one of them, so the most
+    /// authoritative answer available — literally what launches the game — was
+    /// never consulted, and resolution fell through towards the system wine.
+    #[test]
+    fn the_launch_script_is_read_past_its_shebang_and_blank_lines() {
+        let root = std::env::temp_dir().join(format!("tobii-launch-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let bin = root.join("runners/tkg-11.7/bin");
+        std::fs::create_dir_all(&bin).expect("runner dir");
+        std::fs::write(bin.join("wine"), b"#!/bin/sh\n").expect("wine");
+        std::fs::write(
+            root.join("sc-launch.sh"),
+            format!(
+                "#!/usr/bin/env bash\n\
+                 \n\
+                 # Configure the prefix\n\
+                 export WINEPREFIX=\"$HOME/Games/star-citizen\"\n\
+                 export wine_path=\"{}\"\n",
+                bin.display()
+            ),
+        )
+        .expect("launch script");
+        assert_eq!(
+            wine_from_launch_script(&root),
+            Some(bin.join("wine")),
+            "the assignment is never the first line of a real script"
+        );
+        // A script that names no runner is still no answer, not a wrong one.
+        std::fs::write(root.join("sc-launch.sh"), "#!/bin/sh\n\necho hello\n").expect("script");
+        assert_eq!(wine_from_launch_script(&root), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn no_wine_anywhere_is_an_error_naming_the_flag() {
         let err = choose_wine(None, None, &[], None).expect_err("must fail");
@@ -1769,12 +1897,10 @@ mod tests {
             .filter(|(_, req)| *req)
             .map(|(n, _)| *n)
             .collect();
+        // Exactly one entry is required and it is that name — which is also
+        // what `artifact_dir` recognises a build directory by, so a directory
+        // holding a complete installation is always found.
         assert_eq!(required, vec![REQUIRED_ARTIFACT]);
-        // `artifact_dir` recognises a build directory by this same file, so a
-        // directory holding a complete installation is always found.
-        assert!(ARTIFACTS
-            .iter()
-            .any(|(n, req)| *n == REQUIRED_ARTIFACT && *req));
         for optional in ["tobii-bridge.exe", "NPClient64.dll"] {
             assert!(
                 ARTIFACTS.iter().any(|(n, req)| *n == optional && !req),
@@ -2139,15 +2265,41 @@ exit 0
     /// that happens to equal our own computed path would be read as ours and
     /// removed by uninstall, destroying a registration we never made. Neither
     /// half may be returned as a value.
+    /// Both terminators, because the fragment a CRLF leaves is the dangerous
+    /// one: it ends in the CR that wine ends its own lines with, so a guard
+    /// that only asks whether the chunk kept its CR reads
+    /// `C:\tobii-bridge<CR><LF>EVIL` as `C:\tobii-bridge` — byte for byte our
+    /// own computed path, and `is_ours` then says yes. Install would overwrite
+    /// a value it never wrote without the `--force` it never asked for, and
+    /// uninstall would `reg delete` a registration this program never made:
+    /// both safety properties failing in one read.
+    ///
+    /// The third case is a value that merely *ends* in CRLF. Nothing follows it
+    /// but wine's own blank line, so the tail looks almost right — and what
+    /// would be returned is still a fragment.
+    ///
+    /// Byte shapes checked against wine 11.18 rather than invented: `reg add
+    /// /d $'C:\tobii-bridge\r\nEVIL'` prints its value back raw, breaks and all.
     #[test]
     fn a_value_broken_across_lines_is_not_read_as_its_first_half() {
-        let out = b"\r\n    Path    REG_SZ    C:\\tobii-bridge\nEVIL\r\n\r\n";
-        match reg_query_path(out) {
-            Reading::Other(why) => assert!(
-                why.contains("line break"),
-                "a fragment must say why it is unreadable, got {why:?}"
-            ),
-            other => panic!("a fragment must never be a value or an absence: {other:?}"),
+        for out in [
+            &b"\r\n    Path    REG_SZ    C:\\tobii-bridge\nEVIL\r\n\r\n"[..],
+            &b"\r\n    Path    REG_SZ    C:\\tobii-bridge\r\nEVIL\r\n\r\n"[..],
+            &b"\r\n    Path    REG_SZ    C:\\tobii-bridge\r\n\r\n\r\n"[..],
+        ] {
+            match reg_query_path(out) {
+                Reading::Other(why) => assert!(
+                    why.contains("line break"),
+                    "a fragment must say why it is unreadable, got {why:?}"
+                ),
+                other => panic!("a fragment must never be a value or an absence: {other:?}"),
+            }
+            // And the whole point of refusing it: it must not pass for ours.
+            assert!(!is_ours(&reg_query_path(out), Some(INSTALL_WIN_DIR)));
+            assert_eq!(
+                undo_for(&reg_query_path(out), None),
+                Undo::Leave(whose(false))
+            );
         }
     }
 
@@ -2356,13 +2508,58 @@ exit 0
         );
     }
 
-    /// The rename that publishes the record is atomic; the write into the
-    /// staging file is not. Two installs into one prefix sharing a staging name
-    /// interleave their writes and rename a torn record into place.
+    /// The rename that publishes a file is atomic; the write into the staging
+    /// file is not. Two installs into one prefix sharing a staging name
+    /// interleave their writes and rename a torn file into place.
+    ///
+    /// The DLLs are in here as well as the record, and they are the worse half:
+    /// the record staged per process while `freetrackclient64.dll` still staged
+    /// under one fixed `.<name>.new`, so two installs with different
+    /// `--artifacts` directories handed the game a DLL made of both — and the
+    /// loser, holding a descriptor the winner's rename turned into the
+    /// published file, went on writing into the live DLL with nothing staged
+    /// between it and the target.
     #[test]
-    fn two_installers_do_not_stage_the_record_over_each_other() {
-        assert_ne!(staging_name(11), staging_name(12));
-        assert_ne!(staging_name(11), RECORD_FILE);
+    fn two_installers_do_not_stage_over_each_other() {
+        assert_ne!(staging_name(RECORD_FILE, 11), staging_name(RECORD_FILE, 12));
+        assert_ne!(staging_name(RECORD_FILE, 11), RECORD_FILE);
+        for (name, _) in ARTIFACTS {
+            assert_ne!(
+                staging_name(name, 11),
+                staging_name(name, 12),
+                "{name} must stage per process, like the record"
+            );
+            assert_ne!(staging_name(name, 11), name, "{name}");
+        }
+    }
+
+    /// And the copy loop must actually stage under that name, which is the half
+    /// the record's fix left behind.
+    ///
+    /// Planted here is what another install has open mid-copy: a staging file
+    /// under the fixed `.<name>.new` the DLLs used. Writing through it is the
+    /// whole failure — both runs `fs::copy` into the one file, one renames the
+    /// mixture onto the DLL the game loads, and the other is left writing into
+    /// the published file itself, its staging gone out from under it.
+    #[test]
+    fn another_installs_staging_file_is_not_written_through() {
+        let w = FakeWine::new("staging");
+        std::fs::create_dir_all(w.dest()).expect("install dir");
+        let theirs = w.dest().join(format!(".{REQUIRED_ARTIFACT}.new"));
+        std::fs::write(&theirs, b"half of another install's DLL").expect("their staging file");
+        install(&w.args("install", &[])).expect("installs");
+        assert_eq!(
+            std::fs::read(&theirs).ok().as_deref(),
+            Some(&b"half of another install's DLL"[..]),
+            "their staging file was copied into, and then renamed away as ours"
+        );
+        assert_eq!(
+            std::fs::read(w.dest().join(REQUIRED_ARTIFACT))
+                .ok()
+                .as_deref(),
+            Some(&b"dll"[..]),
+            "and this install's own DLL still landed"
+        );
     }
 
     /// The symmetry the refusals rest on: a value we could not read back is one
@@ -2379,6 +2576,42 @@ exit 0
             err.contains("--npclient ours"),
             "must say what to do: {err}"
         );
+    }
+
+    /// The same symmetry, one input class later. A Linux directory name may
+    /// hold a newline, and `is_ascii()` accepts it because LF *is* ASCII — so
+    /// `--npclient` pointing at one registered a value that
+    /// [`reg_query_path`] then answered "a value with a line break in it"
+    /// forever after: every later install refused over its own work and
+    /// uninstall left the key behind for good, the exact outcome this refusal
+    /// exists to prevent.
+    #[test]
+    fn a_client_path_carrying_a_line_break_is_refused() {
+        for dir in ["/opt/my\nclient", "/opt/client\n", "/opt/my\rclient"] {
+            let win = wine_path_for(Path::new(dir));
+            assert!(
+                win.is_ascii(),
+                "the point of this one is that the ASCII guard lets it through: {win:?}"
+            );
+            let err = registrable_path(Path::new(dir))
+                .expect_err("must refuse a path we could not read back");
+            assert!(err.contains("line break"), "{err}");
+            assert!(
+                err.contains("--npclient ours"),
+                "must say what to do: {err}"
+            );
+        }
+        // The LF is the one that demonstrably cannot be read back: wine prints
+        // it raw, and what comes back is a value with a break in it.
+        let win = wine_path_for(Path::new("/opt/my\nclient"));
+        assert!(
+            matches!(
+                reg_query_path(format!("\r\n    Path    REG_SZ    {win}\r\n\r\n").as_bytes()),
+                Reading::Other(why) if why.contains("line break")
+            ),
+            "a value we could never read back: {win:?}"
+        );
+        // And an ordinary client directory still registers.
         assert_eq!(
             registrable_path(Path::new("/usr/libexec/opentrack")).as_deref(),
             Ok(r"Z:\usr\libexec\opentrack")
