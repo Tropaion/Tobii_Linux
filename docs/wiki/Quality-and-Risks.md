@@ -881,6 +881,55 @@ built for the purpose.
   real prefix; no user reported any of them**, on the one command in this
   project that writes into somebody else's Wine prefix.
 
+### 11.3h The shortened cards and the F1 help window (unreleased, after v0.4.1)
+
+Four card descriptions were shortened, two were removed from the card
+altogether, and a help window was added to hold what they gave up. The window
+is the load-bearing part: **GTK4 shows a tooltip on pointer hover and on
+nothing else** — there is no focus trigger and no touch trigger — so a fact
+that lives only in a tooltip cannot be read with a keyboard or on a
+touchscreen, and two cards' guidance is now in exactly that position.
+
+- **The window has to stay discoverable.** F1 is not discovery. The "?" button
+  beside the cogwheel is the only door a touch user has, and the cogwheel's
+  Help row is the one people look for. Dropping either as clutter would put the
+  eyes-card and preview-card guidance out of reach in practice, which is the
+  silent fact-dropping this change exists to avoid.
+- **F1 is scoped to the hub window** — a controller, deliberately not an
+  application accel, because an accel fires inside the fullscreen calibration
+  too and a window over the stimulus dot spoils every sample while still
+  reporting success. The cost is real: F1 does nothing in the setup and
+  calibration flows, which is where a confused user often is. Those flows need
+  their own in-flow text, not this window over the top of them.
+- **The help window is not in the `REFIT` path.** Changing the text size from
+  the cogwheel re-fits the hub and not this; its labels do grow (same CSS
+  classes) so nothing clips, but the window scrolls more instead of growing.
+  Someone will report that as a bug.
+- **A transient window over a hidden parent is the compositor's guess.**
+  `destroy_with_parent` does not cover a parent that is merely hidden, which is
+  what closing to the tray does, so the hub closes the help window from its own
+  unmap handler — tested with an asserted window count, but not against the
+  several compositors where this project's other layout surprises came from.
+  Minimising deliberately leaves it open, since a minimised hub is one click
+  away.
+- **The description budget is this machine's.** "About 48 characters" was
+  measured at the default font and text scale 1.0; a user at 150% wraps
+  earlier. Nothing clips — the window measures its content and re-fits — the
+  card simply grows a line. The test states the claim in a form that travels
+  (no description may be taller at the width the window opens at than with room
+  to spare) rather than as a pixel count that does not.
+- **Two cards are now titled "Head tracking" and "Head tracking for games"**,
+  and only the second keeps a description. That is deliberate and fragile: a
+  later pass that cuts the games line for another 26px would leave the pair
+  genuinely ambiguous. Rename the first card instead.
+- **What is measured:** the whole window, end to end on the real `build_hub`,
+  748px natural height before and 692px after at an unchanged natural width of
+  1241px; cards 142/142/96/194/94/204 against 180/161/141/213/120/204. A
+  headless test asserts every tooltip-sourced constant is in `help::topics`,
+  and a display test walks the real hub's six cards and requires every tooltip
+  it finds, paragraph by paragraph, in the help text. Sixteen control runs
+  reverted each behaviour in turn and watched the test fail.
+
 ### 11.4 Environmental
 
 - **Glyph clipping at fractional display scale.** Tops of tall glyphs appear
