@@ -2377,9 +2377,16 @@ fn render_status(s: &Status) -> String {
                 o.push_str(&format!("             {why}\n"));
             }
             KeyState::Absent => o.push_str("             nothing is registered here\n"),
+            // Not "leaves it alone", which is only half of it and the
+            // reassuring half: `uninstall` does leave it alone, but `is_ours`
+            // is false for everything that is not a plain string, so `install`
+            // stops the whole command over it rather than writing past it.
             KeyState::Unreadable(why) => {
                 o.push_str(&format!("             {why}\n"));
-                o.push_str("             so this installer leaves it alone\n");
+                o.push_str(
+                    "             so `uninstall` leaves it alone and `install` refuses\n\
+                     \x20            over it rather than overwrite what it could not read\n",
+                );
             }
         }
     }
@@ -2399,14 +2406,30 @@ fn render_status(s: &Status) -> String {
     }
 
     o.push_str(&format!("\n{STATUS_CAVEAT}"));
-    // Only when there is nothing to undo. A report whose one command is
-    // `uninstall`, printed to a user whose prefix holds nothing of ours, names
-    // the wrong half of the pair — and the state that most often brings someone
-    // to this command is exactly that one.
+    // Which of the two commands this report hands back, and whether it may
+    // promise the one it names will go through.
+    //
+    // Three cases and not two, for the reason every other answer in this file
+    // is three-valued. This used to ask `anything_of_ours` alone, which folded
+    // `Theirs` and `Unreadable` into "nothing": a prefix whose FreeTrack key
+    // holds a stranger's path was told "Nothing of ours is in this prefix. To
+    // put it there: tobii bridge install …" — the one line in the report whose
+    // whole job is to be pasted back — over a command that then refuses,
+    // because of the very key this report had just classified two paragraphs
+    // above. The classification was right; the line that acted on it was not.
     let anything_of_ours = s.dir_present != Presence::No
         || s.keys
             .iter()
             .any(|(_, _, k)| matches!(k, KeyState::Ours(_)));
+    // Exactly the states `install` stops on: [`is_ours`] answers false for
+    // anything that is not a plain string this run wrote, so a value another
+    // program holds and a value that could not be read both reach the refusal.
+    let in_the_way: Vec<&str> = s
+        .keys
+        .iter()
+        .filter(|(_, _, k)| matches!(k, KeyState::Theirs(..) | KeyState::Unreadable(_)))
+        .map(|(_, key, _)| *key)
+        .collect();
     // Spelled with this run's own flags, and quoted: it is the one line in the
     // report whose entire job is to be pasted back.
     let how = format!(
@@ -2427,6 +2450,35 @@ fn render_status(s: &Status) -> String {
              tobii bridge uninstall{how}\n\
              It takes out only the values it still recognises as its own, and names\n\
              anything it leaves alone.\n"
+        ));
+    } else if !in_the_way.is_empty() {
+        o.push_str(
+            "\nNothing of ours is in this prefix, and `install` will not put it there\n\
+             while these hold something this installer did not write:\n",
+        );
+        for key in &in_the_way {
+            o.push_str(&format!("  {key}\n"));
+        }
+        o.push_str(&format!(
+            "It refuses over them rather than overwrite them — the same rule this\n\
+             report classified them by — and spells out the command that clears one,\n\
+             if it is stale. Or go ahead anyway with:\n  \
+             tobii bridge install{how} --force\n\
+             which promises nothing about putting back what is there now.\n"
+        ));
+    } else if s.unreadable.is_some() {
+        // Not "nothing is in this prefix": the section above has just said
+        // neither key could be read, and that this is not the same as their
+        // holding nothing. Three lines later asserting it anyway made one
+        // report contradict itself.
+        o.push_str(&format!(
+            "\nNothing of ours was found in this prefix — though neither key could be\n\
+             read, so that is not the same as nothing being in them. To put ours\n\
+             there:\n  \
+             tobii bridge install{how}\n\
+             It reads both keys itself before writing either, and stops if one holds\n\
+             something it did not write.\n\
+             To take it out again afterwards, the same line with `uninstall`.\n"
         ));
     } else {
         o.push_str(&format!(
@@ -4899,7 +4951,60 @@ exit 0
             !out.contains("nothing is registered here\n             registered"),
             "{out}"
         );
-        assert!(out.contains("so this installer leaves it alone"), "{out}");
+        assert!(out.contains("`uninstall` leaves it alone"), "{out}");
+        // And not the half-truth it used to print here: `install` does not
+        // leave this key alone, it stops the whole command over it.
+        assert!(out.contains("`install` refuses"), "{out}");
+    }
+
+    /// The one line in the report whose whole job is to be pasted back must
+    /// not be a command that then refuses.
+    ///
+    /// `docs/wiki/Tools.md` promises the report decides "by exactly the rules
+    /// `install` and `uninstall` act on". The classification did; this line did
+    /// not — it asked only whether anything was ours, which folds a stranger's
+    /// key and an unreadable one into "nothing". So a prefix whose FreeTrack
+    /// key holds somebody else's path was told, three paragraphs under the
+    /// report naming that very key, "Nothing of ours is in this prefix. To put
+    /// it there: tobii bridge install …", over a command that answers "these
+    /// head-tracking discovery keys hold something this install did not write".
+    #[test]
+    fn status_does_not_hand_back_an_install_that_would_refuse() {
+        let fw = FakeWine::new("status-blocked");
+        fw.registered_in_file("ft", r"C:\Program Files\opentrack");
+        let out = render_status(&gather_status(&fw.status_args(&[])).expect("status"));
+        assert!(
+            !out.contains("Nothing of ours is in this prefix. To put it there"),
+            "{out}"
+        );
+        assert!(out.contains("will not put it there"), "{out}");
+        assert!(
+            out.contains(FT_KEY),
+            "and must name what is in the way: {out}"
+        );
+        // And the report is right about that: the command it withheld is the
+        // one that refuses. Asserted here rather than taken on trust, because
+        // the whole defect was a line that had stopped agreeing with it.
+        install(&fw.args("install", &[])).expect_err("install refuses over that key");
+    }
+
+    /// The other direction, and the same line: a report that has just said
+    /// neither key could be read must not assert four lines later that there
+    /// is nothing in them. Only one of those two sentences can be true, and
+    /// the section above is the one that knows.
+    #[test]
+    fn status_does_not_contradict_itself_about_keys_it_could_not_read() {
+        let fw = FakeWine::new("status-blocked-unreadable");
+        // A directory where the file should be: `read` fails with EISDIR for
+        // everyone, including CI's root.
+        std::fs::remove_file(fw.user_reg()).expect("remove");
+        std::fs::create_dir(fw.user_reg()).expect("dir in its place");
+        let out = render_status(&gather_status(&fw.status_args(&[])).expect("status"));
+        assert!(out.contains("neither key could be read"), "{out}");
+        assert!(!out.contains("Nothing of ours is in this prefix."), "{out}");
+        // It still hands back `install`, which is the right command here —
+        // what it may not do is claim to know the keys are empty.
+        assert!(out.contains("tobii bridge install"), "{out}");
     }
 
     /// A prefix whose `user.reg` cannot be read is not an empty prefix, and
