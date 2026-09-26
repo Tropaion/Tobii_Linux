@@ -492,11 +492,19 @@ tobii bridge install --prefix /path/to/prefix   # anything not Steam
 tobii bridge status --steam elite        # what is in that prefix right now
 ```
 
-`tobii bridge status` reads and changes nothing: which prefix and which wine it
-resolved, whether the DLLs are there, what each of the two discovery keys holds
-and whether it is ours, and whether a wineserver is serving the prefix. It is
-short on purpose — it is meant to be pasted into an issue. It reports what is
-registered; it does not predict what a game will do with it.
+`tobii bridge status` **runs nothing and changes nothing** — it reads three
+files and asks the kernel one question, and never starts `wine`, which matters
+because starting `wine` against a prefix initialises or upgrades it. It reports
+which prefix and which wine it resolved, whether the DLLs are there, what each
+of the two discovery keys holds and whether it is ours, and whether a
+wineserver is serving the prefix. It is short on purpose — it is meant to be
+pasted into an issue, though unlike `tobii debug` it does not fold your home
+path away, so read it before you post it. It reports what is registered; it
+does not predict what a game will do with it.
+
+The registry half is read out of the prefix's own `user.reg`, so while a game
+is running its most recent registry writes may not be in the file yet — the
+report says so when it finds a live wineserver.
 
 **Nothing has to be left running.** The client DLL the game loads receives the
 tracking itself, in a background thread inside the game's own process, and

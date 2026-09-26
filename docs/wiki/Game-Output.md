@@ -425,13 +425,37 @@ tobii bridge status --steam elite       # what is in that prefix right now
 tobii bridge uninstall --steam elite    # take out what the install put in
 ```
 
-`status` is read-only and is the first thing to run when a game gets nothing:
-it names the prefix and the wine it resolved, lists which of the three
-artifacts are in `drive_c/tobii-bridge`, says what each discovery key holds and
-whether this installer wrote it, and says whether a wineserver is serving the
-prefix. It reports **what is registered, not whether a game will accept it** —
-the only title ever measured against NaturalPoint's signature check is Star
-Citizen.
+`status` is the first thing to run when a game gets nothing: it names the
+prefix and the wine it resolved, lists which of the three artifacts are in
+`drive_c/tobii-bridge`, says what each discovery key holds and whether this
+installer wrote it, and says whether a wineserver is serving the prefix. It
+reports **what is registered, not whether a game will accept it** — the only
+title ever measured against NaturalPoint's signature check is Star Citizen.
+
+**It starts no process at all**, which is the difference between it and every
+other subcommand here. `install`, `uninstall` and `run` take the resolved
+`wine` and run it against the prefix, and wine initialises or upgrades whatever
+prefix it is pointed at: measured with wine 11.18 on throwaway prefixes, one
+`wine reg query` created 5510 paths under a prefix that held only `drive_c`,
+and on a complete prefix with a stale `.update-timestamp` — which is what a
+Proton prefix looks like to the host's wine — it rewrote 2745 lines of
+`system.reg` and stamped the prefix as its own. That is the upgrade the
+`--wine` warnings on this page are about, and a command you run *because*
+something is already wrong must not be the thing that changes it. So `status`
+reads the two discovery keys out of the prefix's own `user.reg` instead, which
+also means the answer does not depend on which `wine` it resolved.
+
+The cost of that, which the report states where the values are: `user.reg` is
+the registry as it was last written back, and a prefix writes its registry back
+when the last process on it exits. While a game is running, a key registered
+since it started is not in the file yet. The report says so whenever it finds a
+live wineserver — and says nothing of the sort when it does not, because then
+the file *is* the registry.
+
+The report names the prefix as it is spelled on your machine — login name and
+all — because the undo command it ends with is only any use spelled exactly.
+`tobii debug`, the other half of what an issue wants, folds those paths away;
+this one cannot. Read it through before you paste it.
 
 Nothing has to be left running. The client DLL the game loads **receives the
 tracking itself**, in a background thread inside the game's own process, and

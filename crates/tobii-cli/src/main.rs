@@ -17,6 +17,7 @@ type CmdResult = Result<(), Box<dyn std::error::Error>>;
 
 mod bridge;
 mod uninstall;
+mod userreg;
 mod wineserver;
 
 fn main() -> ExitCode {

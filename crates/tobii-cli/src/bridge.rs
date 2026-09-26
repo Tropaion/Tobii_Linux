@@ -569,7 +569,7 @@ impl PrefixSource {
     /// How this prefix came to be the one in hand, as a line under it.
     fn describe(&self) -> String {
         match self {
-            PrefixSource::Steam(w) => format!("Steam, from `--steam {w}`"),
+            PrefixSource::Steam(w) => format!("Steam, from `--steam {}`", quoted(w)),
             PrefixSource::Given => "given with --prefix".to_string(),
             PrefixSource::Environment => "from $WINEPREFIX".to_string(),
             PrefixSource::Default => {
@@ -613,21 +613,39 @@ fn resolve_prefix(args: &[String]) -> Result<(PathBuf, PrefixSource), String> {
     Ok((raw, source))
 }
 
-/// Resolve the wine binary for `prefix`, reporting any warning to stderr.
+/// Resolve the wine binary for `prefix`, and hand the caller any warning
+/// rather than printing it.
 ///
 /// The [`WineOrigin`] comes back with it because a caller that quotes the
 /// binary at the user has to know whether it is the prefix's own — see the
 /// enum for what goes wrong when that is assumed.
-fn resolve_wine(prefix: &Path, args: &[String]) -> Result<(PathBuf, WineOrigin), String> {
+///
+/// The warning is returned rather than printed because of where it ends up.
+/// `choose_wine`'s mismatch sentence — *using X but this prefix's own runner is
+/// Y; if the game sees no tracking, that mismatch is why* — is the single most
+/// diagnostic line this module produces, and on stderr it is absent from a
+/// report the user redirected to a file and pasted into an issue. [`status`]
+/// puts it in the report; every other command still prints it to stderr, where
+/// it belongs among their progress lines.
+fn resolve_wine_reporting(
+    prefix: &Path,
+    args: &[String],
+) -> Result<(PathBuf, WineOrigin, Option<String>), String> {
     // Proton's own build first among the non-explicit sources: it is the only
     // one that is *recorded* as belonging to this prefix rather than inferred,
     // and using any other would upgrade the prefix.
-    let (wine, origin, warning) = choose_wine(
+    choose_wine(
         crate::flag_value(args, "--wine").map(PathBuf::from),
         wine_from_steam_config_info(prefix).or_else(|| wine_from_launch_script(prefix)),
         &wines_from_runners(prefix),
         on_path("wine"),
-    )?;
+    )
+}
+
+/// The same, for the commands whose output is a running commentary: the
+/// warning goes to stderr.
+fn resolve_wine(prefix: &Path, args: &[String]) -> Result<(PathBuf, WineOrigin), String> {
+    let (wine, origin, warning) = resolve_wine_reporting(prefix, args)?;
     if let Some(w) = warning {
         eprintln!("warning: {w}");
     }
@@ -896,6 +914,98 @@ fn read_key(wine: &Path, prefix: &Path, key: &str) -> Result<Reading, String> {
     ))
 }
 
+/// Strip the root off one of [`KEYS`], for a reader that works inside one hive.
+///
+/// Both of them are `HKCU`, which is the whole reason [`read_keys_read_only`]
+/// can exist: one hive, one file. A key that was not would come back `None`
+/// rather than be looked for in the wrong file and reported absent — see
+/// `both_discovery_keys_live_in_user_reg`, which is the test that stops a
+/// future `HKLM` key from silently reading as "nothing is registered here".
+fn hkcu_path(key: &str) -> Option<&str> {
+    key.strip_prefix(r"HKCU\")
+}
+
+/// Everything [`KEYS`] holds, read out of the prefix's own `user.reg`.
+///
+/// **This runs no wine, and that is the point.** `wine reg query` is still
+/// `wine`: it initialises the prefix it is pointed at before it runs anything,
+/// and against a prefix whose `.update-timestamp` is stale — which is what a
+/// Proton prefix looks like to the host's wine — it runs the `wineboot -u` that
+/// [`WineOrigin`] exists to warn about, rewriting thousands of lines of
+/// `system.reg` and stamping the prefix as its own. Measured: 2744 lines, and
+/// on a prefix holding only `drive_c`, 5510 paths created. A command a user
+/// runs to find out what is wrong must not be the thing that changes it, and
+/// `status` is the command we are about to tell a user with a Proton flight-sim
+/// prefix to run first.
+///
+/// Both keys are `HKCU` and a prefix keeps `HKCU` in `user.reg`, so the answer
+/// is in one plain-text file — which also makes it independent of which wine
+/// [`resolve_wine`] happened to pick.
+///
+/// **What it costs:** `user.reg` is the registry as last written back, and a
+/// live wineserver holds changes in memory until the last process on the prefix
+/// exits. So this can lag, and only when something is serving the prefix. The
+/// report says so — see [`staleness`] — because a stale reading presented as
+/// the current one would be a new way to mislead, which is the fault this
+/// change is here to remove and not to relocate.
+///
+/// One `Err` for the whole file rather than one per key: there is one file, and
+/// a failure to read it is a failure to answer either question. The keys that
+/// *were* answered are still returned alongside it — nothing here is
+/// `Reading::Absent` that was not read as absent.
+#[allow(clippy::type_complexity)]
+fn read_keys_read_only(
+    prefix: &Path,
+) -> (
+    Vec<((&'static str, &'static str, &'static str), Reading)>,
+    Option<String>,
+) {
+    let file = prefix.join(crate::userreg::FILE);
+    let text = match std::fs::read(&file) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "could not read {}: {e}\n\
+                     That file is where a prefix keeps its HKEY_CURRENT_USER keys, so\n\
+                     without it this report cannot say what these two hold — which is\n\
+                     not the same as nothing being registered in them. A prefix that\n\
+                     has never been started has no {} yet.",
+                    file.display(),
+                    crate::userreg::FILE
+                )),
+            );
+        }
+    };
+    let mut out = Vec::new();
+    for entry in KEYS {
+        let (_, key, _) = entry;
+        let Some(path) = hkcu_path(key) else {
+            // Unreachable while both keys are HKCU, and a refusal rather than a
+            // guess if one ever is not: the answer this must never invent is
+            // "nothing is registered here".
+            return (
+                out,
+                Some(format!(
+                    "{key} is not under HKCU, so it is not in {} and this report\n\
+                     cannot say what it holds.",
+                    file.display()
+                )),
+            );
+        };
+        out.push((
+            entry,
+            match crate::userreg::lookup(&text, path, "Path") {
+                crate::userreg::Lookup::Absent => Reading::Absent,
+                crate::userreg::Lookup::Text(v) => Reading::Plain(v),
+                crate::userreg::Lookup::Rejected(why) => Reading::Other(why),
+            },
+        ));
+    }
+    (out, None)
+}
+
 /// Is this the value this installer put in the key?
 ///
 /// Two ways to be ours and no third. `C:\tobii-bridge` names a directory inside
@@ -1099,7 +1209,20 @@ fn registrable_path(dir: &Path) -> Result<String, String> {
 
 /// A path, quoted for the shell the user is going to paste it into.
 fn shell_quoted(p: &Path) -> String {
-    format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
+    quoted(&p.display().to_string())
+}
+
+/// Anything else that goes into a command line we hand the user to paste.
+///
+/// Every argument of such a command, not just the paths. `--steam "Microsoft
+/// Flight Simulator 2024"` was interpolated bare, so the undo line came out as
+/// `tobii bridge uninstall --steam Microsoft Flight Simulator 2024 …` — which
+/// pasted back answers `"Microsoft" matches more than one game`, the trailing
+/// words having been silently dropped as positionals. The one line in the
+/// report whose entire job is to survive a round trip through the clipboard has
+/// to survive a title with a space in it, and Steam titles have spaces.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// One key install will not write into, and everything the refusal is allowed
@@ -1881,6 +2004,39 @@ fn key_state(current: &Reading, wrote: Option<&str>) -> KeyState {
     }
 }
 
+/// Whether something is where it should be, when "could not tell" is a real
+/// third answer.
+///
+/// Three cases because `Path::is_file` has two and answers the wrong one:
+/// it folds *every* error into `false`, so an install directory this user
+/// cannot read reports all three artifacts as absent. Measured on a
+/// `drive_c/tobii-bridge` holding all three with its mode set to `000`:
+/// `freetrackclient64.dll  MISSING — nothing can load without it`, with the
+/// file sitting right there. A report that asserts three files are gone when
+/// they are present is the one failure class this command exists to prevent,
+/// and it sends the user to `install` — which would then refuse, for a reason
+/// nothing in the report named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Presence {
+    Yes,
+    /// Nothing of that name is there. `ENOENT` and nothing else: the only
+    /// error that actually means absence.
+    No,
+    /// The question could not be answered, in the words the answer came back
+    /// in.
+    Unknown(String),
+}
+
+/// Ask whether `p` is there and is the kind of thing `wanted` names.
+fn presence(p: &Path, ok: fn(&std::fs::Metadata) -> bool, wanted: &str) -> Presence {
+    match std::fs::metadata(p) {
+        Ok(m) if ok(&m) => Presence::Yes,
+        Ok(_) => Presence::Unknown(format!("there is something here that is not {wanted}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Presence::No,
+        Err(e) => Presence::Unknown(format!("{e}")),
+    }
+}
+
 /// Everything `tobii bridge status` found, before any of it is worded.
 ///
 /// Gathered and rendered in two halves so that the wording is testable without
@@ -1899,7 +2055,18 @@ struct Status {
     /// — so handing them a command without it hands them the failure they
     /// already worked around.
     wine_given: bool,
+    /// [`choose_wine`]'s own warning about that choice, when it had one.
+    ///
+    /// In the report rather than on stderr: it is the sentence that most often
+    /// explains "the game sees nothing", and a user who redirected this report
+    /// to a file to paste it would otherwise send us everything except the
+    /// answer.
+    wine_warning: Option<String>,
     server: crate::wineserver::Lock,
+    /// The file the registry half was read out of, named in the report because
+    /// the report's honesty depends on it: it says what was last *written
+    /// back*, not what a running wineserver holds.
+    registry_file: PathBuf,
     dir: PathBuf,
     /// Whether the install directory is there at all.
     ///
@@ -1909,14 +2076,23 @@ struct Status {
     /// reported the second as the first — which sends the user to `install`
     /// instead of showing them the one file whose absence explains the
     /// silence.
-    dir_present: bool,
+    dir_present: Presence,
     /// One entry per [`ARTIFACTS`] name: the name, whether it is required,
     /// whether it is there.
-    artifacts: Vec<(&'static str, bool, bool)>,
+    artifacts: Vec<(&'static str, bool, Presence)>,
+    /// Why [`RECORD_FILE`] could not be read, when it is there and could not
+    /// be.
+    ///
+    /// [`read_record`] answers "no record" to a record it failed to read, which
+    /// is the safe answer for install and uninstall — the action it leads to is
+    /// to leave the key alone. For a report it is a lie with a consequence:
+    /// without the record, a key this installer pointed at a third-party client
+    /// is indistinguishable from that program's own registration, and the
+    /// report below calls it a stranger's.
+    record_unreadable: Option<String>,
     /// One entry per [`KEYS`] entry, in that order: ABI, key, what it holds.
     keys: Vec<(&'static str, &'static str, KeyState)>,
-    /// Why the registry could not be read at all, when it could not — `keys`
-    /// is then as far as the reading got.
+    /// Why the registry could not be read at all, when it could not.
     unreadable: Option<String>,
 }
 
@@ -1962,6 +2138,53 @@ fn server_line(lock: &crate::wineserver::Lock) -> String {
     }
 }
 
+/// What the same lock says about how current the registry half of this report
+/// is, when it says anything.
+///
+/// The one trade this change makes, stated where the user reads the values it
+/// applies to. The registry is read out of `user.reg` rather than by running
+/// `wine reg query`, because running wine against a prefix initialises or
+/// upgrades it — and `user.reg` is the registry as it was last written back. A
+/// wineserver holds changes in memory and flushes them when the last process on
+/// the prefix exits, so while one is alive a value written since it started is
+/// not in the file yet.
+///
+/// Said only when it can be true. [`crate::wineserver::Lock::Free`] means
+/// nothing has the prefix open, so the file is what the registry is, and a
+/// caveat printed there would teach the user to discount a report that is
+/// exactly right.
+fn staleness(lock: &crate::wineserver::Lock) -> Option<&'static str> {
+    match lock {
+        crate::wineserver::Lock::Free => None,
+        crate::wineserver::Lock::Held(_) => Some(
+            "  a wine process is alive on this prefix, and a prefix's registry is\n  \
+             written back when the last one exits — so anything registered since\n  \
+             that process started is not in the file yet, and is not below.\n",
+        ),
+        crate::wineserver::Lock::Unknown(_) => Some(
+            "  whether anything is serving this prefix could not be determined (see\n  \
+             above), and a prefix's registry is written back only when the last\n  \
+             process on it exits — so whether this is current could not be\n  \
+             determined either.\n",
+        ),
+    }
+}
+
+/// How one artifact's [`Presence`] reads in the report.
+///
+/// The third answer never wears the second's words. "missing" is a claim about
+/// the prefix; "could not tell" is a claim about this program's own reach, and
+/// the next step differs — the first is fixed by `install`, the second by
+/// looking at why the file could not be reached.
+fn artifact_line(required: bool, present: &Presence) -> String {
+    match (present, required) {
+        (Presence::Yes, _) => "present".to_string(),
+        (Presence::No, true) => "MISSING — nothing can load without it".to_string(),
+        (Presence::No, false) => "missing (optional)".to_string(),
+        (Presence::Unknown(why), _) => format!("could not tell whether it is here — {why}"),
+    }
+}
+
 /// Word what [`gather_status`] found.
 ///
 /// Pure. Every sentence that could be wrong about a user's prefix is in here,
@@ -1980,23 +2203,60 @@ fn render_status(s: &Status) -> String {
                  it is the build this prefix belongs to",
         }
     ));
+    // Said plainly, because it is the difference between this report and the
+    // one before it: nothing here ran that binary. It is named because
+    // `install` and `uninstall` will run it against this prefix, and because
+    // which build that is decides whether they upgrade the prefix.
+    o.push_str(
+        "           nothing here ran it — it is named because `install` and\n           \
+         `uninstall` would use it on this prefix\n",
+    );
+    if let Some(w) = &s.wine_warning {
+        for line in w.lines() {
+            o.push_str(&format!("           {line}\n"));
+        }
+    }
     o.push_str(&format!("wineserver {}\n", server_line(&s.server)));
 
     o.push_str(&format!("\nfiles      {}\n", s.dir.display()));
-    if !s.dir_present {
-        o.push_str("  nothing of ours is installed here — there is no such directory\n");
-    } else {
-        for (name, required, present) in &s.artifacts {
-            let what = match (present, required) {
-                (true, _) => "present",
-                (false, true) => "MISSING — nothing can load without it",
-                (false, false) => "missing (optional)",
-            };
-            o.push_str(&format!("  {name:<22} {what}\n"));
+    match &s.dir_present {
+        Presence::No => {
+            o.push_str("  nothing of ours is installed here — there is no such directory\n");
+        }
+        Presence::Unknown(why) => {
+            o.push_str(&format!(
+                "  could not tell what is installed here — {why}\n  \
+                 so this report says nothing about these files, which is not the\n  \
+                 same as their being absent\n"
+            ));
+        }
+        Presence::Yes => {
+            for (name, required, present) in &s.artifacts {
+                o.push_str(&format!(
+                    "  {name:<22} {}\n",
+                    artifact_line(*required, present)
+                ));
+            }
+            if let Some(why) = &s.record_unreadable {
+                o.push_str(&format!(
+                    "  the note of what this installer registered here could not be read\n  \
+                     ({why}), so a key it pointed at a third-party client is reported\n  \
+                     below as a stranger's\n"
+                ));
+            }
         }
     }
 
-    o.push_str("\nregistry\n");
+    // Named, because what follows is the registry as last written back rather
+    // than the registry as some running process has it — and because naming the
+    // file is how the report says it did not run wine to find out.
+    o.push_str(&format!(
+        "\nregistry   read from {}, with no wine run against this prefix\n",
+        s.registry_file.display()
+    ));
+    if let Some(caveat) = staleness(&s.server) {
+        o.push_str(caveat);
+    }
     for (abi, key, state) in &s.keys {
         o.push_str(&format!("  {abi:<10} {key}\n"));
         match state {
@@ -2023,31 +2283,34 @@ fn render_status(s: &Status) -> String {
     }
     // Said under the heading, before the reason, because an empty `registry`
     // section followed by a paragraph reads as "there is nothing in these
-    // keys" — the one thing this answer is not. Which keys went unread is part
-    // of it: the loop stops at the first failure, so one of them may already
-    // have been reported above.
+    // keys" — the one thing this answer is not. Both keys, and not "the
+    // remaining one": there is one file and either it was read or it was not,
+    // so there is no half-answer left to name.
     if let Some(why) = &s.unreadable {
-        o.push_str(if s.keys.is_empty() {
+        o.push_str(
             "  neither key could be read, so this report says nothing about what\n  \
-             they hold:\n"
-        } else {
-            "  the remaining key could not be read:\n"
-        });
-        o.push_str(&format!("\n{why}\n"));
+             they hold — which is not the same as their holding nothing:\n\n",
+        );
+        for line in why.lines() {
+            o.push_str(&format!("  {line}\n"));
+        }
     }
 
     o.push_str(&format!("\n{STATUS_CAVEAT}"));
-    o.push_str(&format!(
-        "\nTo undo everything this installer put here:\n  \
-         tobii bridge uninstall{}{}\n\
-         It takes out only the values it still recognises as its own, and names\n\
-         anything it leaves alone.\n\
-         \n\
-         If something is wrong, paste this report and the output of `tobii debug`\n\
-         into https://github.com/Tropaion/Tobii_Linux/issues — between them they say\n\
-         what state the prefix and the tracker are actually in.\n",
+    // Only when there is nothing to undo. A report whose one command is
+    // `uninstall`, printed to a user whose prefix holds nothing of ours, names
+    // the wrong half of the pair — and the state that most often brings someone
+    // to this command is exactly that one.
+    let anything_of_ours = s.dir_present != Presence::No
+        || s.keys
+            .iter()
+            .any(|(_, _, k)| matches!(k, KeyState::Ours(_)));
+    // Spelled with this run's own flags, and quoted: it is the one line in the
+    // report whose entire job is to be pasted back.
+    let how = format!(
+        "{}{}",
         match &s.source {
-            PrefixSource::Steam(w) => format!(" --steam {w}"),
+            PrefixSource::Steam(w) => format!(" --steam {}", quoted(w)),
             _ => format!(" --prefix {}", shell_quoted(&s.prefix)),
         },
         if s.wine_given {
@@ -2055,21 +2318,60 @@ fn render_status(s: &Status) -> String {
         } else {
             String::new()
         }
-    ));
+    );
+    if anything_of_ours {
+        o.push_str(&format!(
+            "\nTo undo everything this installer put here:\n  \
+             tobii bridge uninstall{how}\n\
+             It takes out only the values it still recognises as its own, and names\n\
+             anything it leaves alone.\n"
+        ));
+    } else {
+        o.push_str(&format!(
+            "\nNothing of ours is in this prefix. To put it there:\n  \
+             tobii bridge install{how}\n\
+             To take it out again afterwards, the same line with `uninstall`.\n"
+        ));
+    }
+    // Said because the sentence above it tells the user to post this publicly,
+    // and because the other half of that sentence promises the opposite:
+    // `tobii debug` spends two documented bug fixes folding the home path,
+    // login name and hostname away and signs off saying so. This report cannot
+    // do the same — the prefix it read and the command it hands back are only
+    // any use spelled exactly — so it says which of the two they are pasting.
+    o.push_str(
+        "\n\
+         If something is wrong, paste this report and the output of `tobii debug`\n\
+         into https://github.com/Tropaion/Tobii_Linux/issues — between them they say\n\
+         what state the prefix and the tracker are actually in. Read it through\n\
+         first: unlike `tobii debug`, which folds your home path away, this report\n\
+         names paths as they are spelled on your machine, login name and all.\n",
+    );
     o
 }
 
-/// Read a prefix and say what is in it. Writes nothing, creates nothing.
+/// Read a prefix and say what is in it. Runs nothing, writes nothing, creates
+/// nothing.
 ///
-/// Every read here is one install or uninstall already does — `reg query`
-/// through [`read_key`], the record through [`read_record`], the lock through
-/// `F_GETLK`, which reports what a lock attempt *would* hit and takes nothing.
-/// That is the whole contract: a user running this to find out what is wrong
-/// must not change what is wrong, and must not find that asking the question
-/// created the directory the answer was about.
+/// **No process is spawned here at all.** That is not tidiness: `wine reg
+/// query` was how this read the registry, and wine initialises or upgrades
+/// whatever prefix it is pointed at before it runs anything — 5510 paths
+/// created under a prefix holding only `drive_c`, and 2744 lines of
+/// `system.reg` rewritten plus `.update-timestamp` overwritten on a complete
+/// prefix whose stamp was stale, which is what a Proton prefix looks like to
+/// the host's wine. All three reads are now plain file reads:
+/// [`read_keys_read_only`] for the registry, [`read_record`] for the record,
+/// and `F_GETLK` for the lock, which reports what a lock attempt *would* hit
+/// and takes nothing. A user running this to find out what is wrong must not
+/// change what is wrong, and must not find that asking the question upgraded
+/// the prefix the answer was about.
+///
+/// The lock is asked first and stays first, so that a holder this report names
+/// can never be one of ours — there is now nothing of ours that could become
+/// one, and the ordering keeps it that way if that ever changes.
 fn gather_status(args: &[String]) -> Result<Status, String> {
     let (prefix, source) = resolve_prefix(args)?;
-    let (wine, origin) = resolve_wine(&prefix, args)?;
+    let (wine, origin, wine_warning) = resolve_wine_reporting(&prefix, args)?;
     let dir = prefix.join(INSTALL_SUBDIR);
 
     let server = match crate::wineserver::lock_for(&prefix) {
@@ -2079,40 +2381,48 @@ fn gather_status(args: &[String]) -> Result<Status, String> {
 
     let artifacts = ARTIFACTS
         .iter()
-        .map(|(name, required)| (*name, *required, dir.join(name).is_file()))
+        .map(|(name, required)| {
+            (
+                *name,
+                *required,
+                presence(&dir.join(name), std::fs::Metadata::is_file, "a file"),
+            )
+        })
         .collect();
 
     // The record first, for the reason install reads it first: without it our
     // own registration of a third-party client is indistinguishable from that
-    // program's own, and this report would call it a stranger's.
-    let record = read_record(&dir);
-    let mut keys = Vec::new();
-    let mut unreadable = None;
-    for (name, key, abi) in KEYS {
-        match read_key(&wine, &prefix, key) {
-            Ok(current) => keys.push((abi, key, key_state(&current, recorded(&record, name)))),
-            // Reported, not returned. This is the answer the user most needs
-            // printed — a wine that cannot serve the prefix is why nothing
-            // works — and the lines gathered above it are exactly what says
-            // which wine was tried and where it came from. Returning `Err`
-            // here would throw all of that away and print one sentence.
-            Err(e) => {
-                unreadable = Some(e);
-                break;
-            }
-        }
-    }
+    // program's own, and this report would call it a stranger's. Read here
+    // rather than through `read_record`, which folds a failure into "no
+    // record": that is the right answer for a command whose next move is to
+    // leave a key alone, and the wrong one for a report, which would then state
+    // the consequence as a fact about somebody else's prefix.
+    let (record, record_unreadable) = match std::fs::read_to_string(dir.join(RECORD_FILE)) {
+        Ok(t) => (parse_record(&t), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+        Err(e) => (Vec::new(), Some(format!("{e}"))),
+    };
+    let (readings, unreadable) = read_keys_read_only(&prefix);
+    let keys = readings
+        .iter()
+        .map(|((name, key, abi), current)| {
+            (*abi, *key, key_state(current, recorded(&record, name)))
+        })
+        .collect();
 
     Ok(Status {
-        prefix,
+        prefix: prefix.clone(),
         source,
         wine,
         origin,
         wine_given: crate::flag_value(args, "--wine").is_some(),
+        wine_warning,
         server,
-        dir_present: dir.is_dir(),
+        registry_file: prefix.join(crate::userreg::FILE),
+        dir_present: presence(&dir, std::fs::Metadata::is_dir, "a directory"),
         dir,
         artifacts,
+        record_unreadable,
         keys,
         unreadable,
     })
@@ -2661,20 +2971,47 @@ mod tests {
     /// It takes its state directory from `WINEPREFIX`, which the code under
     /// test sets, so one script serves every test. That is not tidiness: see
     /// [`fake_wine`].
+    /// It keeps the prefix's `user.reg` in step with those two values, in
+    /// wine's own on-disk spelling, because that is what wine does and because
+    /// [`status`] now reads the file instead of asking wine — see
+    /// [`read_keys_read_only`]. A fake that wrote only its canned query output
+    /// would leave `install` and `status` testable only in separate halves,
+    /// which is precisely where a discrepancy between the writer and the reader
+    /// would hide.
     const FAKE_WINE: &str = r#"#!/bin/sh
 root=$(dirname "$WINEPREFIX")
 { for a in "$@"; do printf '[%s]' "$a"; done; printf '\n'; } >> "$root/argv"
 if [ -f "$root/fail-wine" ]; then exit 1; fi
 if [ -f "$root/fail-after-delete" ] && [ -f "$root/deleted" ]; then exit 1; fi
 case "$3" in
-  *NaturalPoint*) reply="$root/np.reply" ;;
-  *)              reply="$root/ft.reply" ;;
+  *NaturalPoint*) reply="$root/np.reply"; section='Software\\NaturalPoint\\NATURALPOINT\\NPClient Location' ;;
+  *)              reply="$root/ft.reply"; section='Software\\Freetrack\\FreeTrackClient' ;;
+esac
+write_user_reg() {
+  {
+    printf 'WINE REGISTRY Version 2\n'
+    printf ';; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win64\n\n'
+    if [ -f "$root/ft.userreg" ]; then
+      printf '[Software\\\\Freetrack\\\\FreeTrackClient] 1790444400\n#time=1dd4dde0e4c32d6\n'
+      cat "$root/ft.userreg"
+      printf '\n'
+    fi
+    if [ -f "$root/np.userreg" ]; then
+      printf '[Software\\\\NaturalPoint\\\\NATURALPOINT\\\\NPClient Location] 1790444400\n#time=1dd4dde0e5bceee\n'
+      cat "$root/np.userreg"
+      printf '\n'
+    fi
+  } > "$WINEPREFIX/user.reg"
+}
+case "$section" in
+  *NaturalPoint*) userreg="$root/np.userreg" ;;
+  *)              userreg="$root/ft.userreg" ;;
 esac
 if [ "$1" = reg ] && [ "$2" = query ]; then
   if [ "$3" = 'HKCU\Software' ]; then exit 0; fi
   if [ -f "$reply" ]; then
     cat "$reply"
-    if [ -f "$root/vanish" ]; then rm -f "$reply"; fi
+    if [ -f "$root/vanish" ]; then rm -f "$reply"; rm -f "$userreg"; write_user_reg; fi
     exit 0
   fi
   echo 'reg: the specified registry key was not found' >&2
@@ -2683,12 +3020,16 @@ fi
 if [ "$1" = reg ] && [ "$2" = add ]; then
   if [ -f "$root/fail-add" ]; then exit 1; fi
   printf '\r\nHKEY_CURRENT_USER\\Whatever\r\n    Path    %s    %s\r\n\r\n' "$7" "$9" > "$reply"
+  printf '"Path"="%s"\n' "$(printf '%s' "$9" | sed 's/\\/\\\\/g; s/"/\\"/g')" > "$userreg"
+  write_user_reg
   exit 0
 fi
 if [ "$1" = reg ] && [ "$2" = delete ]; then
   if [ -f "$root/fail-add" ]; then exit 1; fi
   if [ ! -f "$reply" ]; then exit 1; fi
   rm -f "$reply"
+  rm -f "$userreg"
+  write_user_reg
   : > "$root/deleted"
   exit 0
 fi
@@ -2753,7 +3094,60 @@ exit 0
             std::fs::create_dir_all(root.join("prefix/drive_c")).expect("prefix");
             std::fs::create_dir_all(root.join("artifacts")).expect("artifact dir");
             std::fs::write(root.join("artifacts").join(REQUIRED_ARTIFACT), b"dll").expect("dll");
-            Self { root }
+            let fw = Self { root };
+            // A booted prefix with nothing of ours in it, which is the state
+            // every one of these tests starts from — and a booted prefix HAS a
+            // `user.reg`. Without it "nothing is registered here" would be
+            // reached through the file-missing path, and the tests would never
+            // exercise the one that actually reads a registry.
+            fw.write_user_reg();
+            fw
+        }
+
+        /// Where the prefix keeps its `HKEY_CURRENT_USER` keys.
+        fn user_reg(&self) -> PathBuf {
+            self.prefix().join(crate::userreg::FILE)
+        }
+
+        /// Rebuild `user.reg` from whatever the two keys hold, the way wine
+        /// writes it out.
+        fn write_user_reg(&self) {
+            let mut out = String::from(
+                "WINE REGISTRY Version 2\n\
+                 ;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win64\n\n",
+            );
+            for (name, key, _) in KEYS {
+                let Ok(assignment) =
+                    std::fs::read_to_string(self.root.join(format!("{name}.userreg")))
+                else {
+                    continue;
+                };
+                let path = hkcu_path(key).expect("both discovery keys are HKCU");
+                out.push_str(&format!(
+                    "[{}] 1790444400\n#time=1dd4dde0e4c32d6\n{assignment}\n",
+                    path.replace('\\', r"\\")
+                ));
+            }
+            std::fs::write(self.user_reg(), out).expect("user.reg");
+        }
+
+        /// Put a `REG_SZ` in one key, on disk, escaped the way wine escapes it.
+        fn registered_in_file(&self, which: &str, value: &str) {
+            self.assigned_in_file(
+                which,
+                &format!(
+                    "\"Path\"=\"{}\"",
+                    value.replace('\\', r"\\").replace('"', "\\\"")
+                ),
+            );
+        }
+
+        /// The same, for a whole assignment written by hand — the only way to
+        /// put a type or an escaping into the file that this installer would
+        /// never write itself.
+        fn assigned_in_file(&self, which: &str, assignment: &str) {
+            std::fs::write(self.root.join(format!("{which}.userreg")), assignment).expect("seed");
+            self.write_user_reg();
         }
 
         fn prefix(&self) -> PathBuf {
@@ -4135,7 +4529,7 @@ exit 0
     #[test]
     fn status_reports_a_third_party_registration_as_not_ours() {
         let fw = FakeWine::new("status-theirs");
-        fw.registered("np", r"Z:\usr\libexec\opentrack");
+        fw.registered_in_file("np", r"Z:\usr\libexec\opentrack");
         let s = gather_status(&fw.status_args(&[])).expect("status");
         let out = render_status(&s);
         assert!(
@@ -4195,7 +4589,9 @@ exit 0
     #[test]
     fn status_reports_a_value_it_cannot_read_as_unreadable() {
         let fw = FakeWine::new("status-unreadable");
-        fw.registered_as("ft", "REG_EXPAND_SZ", r"%ProgramFiles%\opentrack");
+        // `%ProgramFiles%\opentrack` is the natural spelling for an installer
+        // script and legal for this key, and wine stores it as `str(2)`.
+        fw.assigned_in_file("ft", r#""Path"=str(2):"%ProgramFiles%\\opentrack""#);
         let s = gather_status(&fw.status_args(&[])).expect("status");
         let out = render_status(&s);
         assert!(
@@ -4211,61 +4607,328 @@ exit 0
         assert!(out.contains("so this installer leaves it alone"), "{out}");
     }
 
-    /// A wine that cannot serve the prefix is the commonest reason a Steam
-    /// title gets nothing, and it must not cost the user the rest of the
-    /// report: the prefix line and the wine line above it are precisely what
-    /// say *which* wine was tried, which is the next thing anybody asks.
+    /// A prefix whose `user.reg` cannot be read is not an empty prefix, and
+    /// saying so must not cost the user the rest of the report: the prefix
+    /// line, the wine line and the files above it are precisely what somebody
+    /// answering the issue needs, and they are all still known.
     #[test]
     fn a_registry_that_cannot_be_read_is_reported_without_losing_the_report() {
-        let fw = FakeWine::new("status-dead-wine");
-        fw.fail_wine();
+        let fw = FakeWine::new("status-unreadable-file");
+        // A directory where the file should be: `read` fails with EISDIR for
+        // everyone, including CI's root, where a mode has no effect at all.
+        std::fs::remove_file(fw.user_reg()).expect("remove");
+        std::fs::create_dir(fw.user_reg()).expect("dir in its place");
         let s = gather_status(&fw.status_args(&[])).expect("a failed read is not a failed report");
         let out = render_status(&s);
         assert!(s.unreadable.is_some(), "{out}");
         assert!(
-            out.contains(&fake_wine().display().to_string()),
-            "the wine that could not read it must still be named: {out}"
+            out.contains(&fw.prefix().display().to_string()),
+            "the prefix must still be named: {out}"
         );
         assert!(
-            out.contains("not \"nothing is registered\""),
-            "the reason must be the one read_key gives: {out}"
+            out.contains(&fake_wine().display().to_string()),
+            "the wine uninstall would use must still be named: {out}"
+        );
+        assert!(
+            out.contains("not the same as nothing being registered in them"),
+            "the two answers must be kept apart in so many words: {out}"
         );
         assert!(
             !out.contains("nothing is registered here"),
-            "a prefix we could not read is not an empty prefix: {out}"
+            "a registry we could not read is not an empty registry: {out}"
         );
         // And the section must say so where the keys would have been: a
         // `registry` heading with nothing under it reads as an empty registry,
         // which is exactly the answer this one is not.
         assert!(
-            out.contains("registry\n  neither key could be read"),
+            out.contains("  neither key could be read"),
             "the empty section must be accounted for: {out}"
         );
     }
 
-    /// The command exists to be run by somebody whose setup is already broken.
-    /// It may not touch a single thing on the way through: no key written, no
-    /// value deleted, no install directory conjured up — a diagnostic that
-    /// creates `drive_c/tobii-bridge` makes its own next answer wrong.
+    /// The whole read-without-wine path rests on one fact about these two
+    /// keys: they are both under `HKCU`, and a prefix keeps `HKCU` in one file.
+    /// A third key added under `HKLM` would be looked for in `user.reg`, not
+    /// found, and reported as "nothing is registered here" — an absence
+    /// manufactured out of looking in the wrong place, which is the one answer
+    /// this module is not allowed to invent.
     #[test]
-    fn status_writes_nothing_and_creates_nothing() {
+    fn both_discovery_keys_live_in_user_reg() {
+        for (_, key, abi) in KEYS {
+            assert!(
+                hkcu_path(key).is_some(),
+                "{abi} ({key}) is not under HKCU, so it is not in user.reg"
+            );
+        }
+    }
+
+    /// An artifact this program cannot reach is not an artifact that is gone.
+    ///
+    /// `Path::is_file` folds every error into `false`, so an install directory
+    /// the user cannot read reported all three files as missing — measured with
+    /// mode `000` on a directory holding all three. "MISSING — nothing can load
+    /// without it" about a file that is right there is the one failure class
+    /// this command exists to prevent, and it sends the user to `install`.
+    ///
+    /// Reached here through a symlink that points at itself, which fails with
+    /// `ELOOP` for every user including CI's root — a mode would not, since
+    /// root ignores them.
+    #[test]
+    fn an_artifact_that_cannot_be_reached_is_not_reported_as_missing() {
+        let fw = FakeWine::new("status-artifact-unreachable");
+        install(&fw.args("install", &[])).expect("install");
+        let stuck = fw.dest().join(REQUIRED_ARTIFACT);
+        std::fs::remove_file(&stuck).expect("remove");
+        std::os::unix::fs::symlink(REQUIRED_ARTIFACT, &stuck).expect("loop");
+        let s = gather_status(&fw.status_args(&[])).expect("status");
+        let out = render_status(&s);
+        assert!(
+            matches!(
+                s.artifacts
+                    .iter()
+                    .find(|(n, _, _)| *n == REQUIRED_ARTIFACT)
+                    .map(|(_, _, p)| p),
+                Some(Presence::Unknown(_))
+            ),
+            "{:?}",
+            s.artifacts
+        );
+        assert!(out.contains("could not tell whether it is here"), "{out}");
+        assert!(
+            !out.contains("MISSING — nothing can load without it"),
+            "a file this program could not reach was reported as absent: {out}"
+        );
+    }
+
+    /// A record that is there and unreadable is not "no record".
+    ///
+    /// [`read_record`] answers "no record" to a read that failed, which is the
+    /// right answer for install and uninstall — it leads them to leave the key
+    /// alone. For a report it changes what is said about somebody else's
+    /// prefix: with no record, a TrackIR key this installer pointed at a
+    /// third-party client is indistinguishable from that program's own, and the
+    /// report calls it a stranger's. The report has to say which of the two
+    /// happened.
+    #[test]
+    fn a_record_that_cannot_be_read_is_not_reported_as_no_record() {
+        let fw = FakeWine::new("status-record-unreadable");
+        let dir = fw.npclient_dir();
+        install(&fw.args("install", &["--npclient", &dir.display().to_string()])).expect("install");
+        let record = fw.dest().join(RECORD_FILE);
+        std::fs::remove_file(&record).expect("remove");
+        std::fs::create_dir(&record).expect("dir in its place");
+        let s = gather_status(&fw.status_args(&[])).expect("status");
+        let out = render_status(&s);
+        assert!(s.record_unreadable.is_some(), "{out}");
+        assert!(
+            out.contains("could not be read"),
+            "the report must say the record was unreadable: {out}"
+        );
+        // And it must say what that costs, because the line below it now calls
+        // our own registration a stranger's.
+        assert!(
+            out.contains("is reported\n  below as a stranger's"),
+            "{out}"
+        );
+    }
+
+    /// The cost of reading `user.reg` instead of running wine, said out loud.
+    ///
+    /// A prefix's registry is written back when the last process on it exits,
+    /// so while a wineserver is alive the file can lag. That is a real trade
+    /// against the old path, which was accurate and destructive, and a stale
+    /// reading printed as the current one would be a new way to mislead — which
+    /// is the fault this change removes, not one it may relocate. Said only
+    /// when it can be true: with nothing serving the prefix the file *is* the
+    /// registry, and a caveat there teaches the user to discount a report that
+    /// is exactly right.
+    #[test]
+    fn a_live_wineserver_makes_the_report_say_the_registry_may_lag() {
+        assert_eq!(staleness(&crate::wineserver::Lock::Free), None);
+        let held = staleness(&crate::wineserver::Lock::Held(4242)).unwrap_or_default();
+        assert!(
+            held.contains("a wine process is alive on this prefix"),
+            "{held}"
+        );
+        assert!(held.contains("not in the file yet"), "{held}");
+        let unknown =
+            staleness(&crate::wineserver::Lock::Unknown("EACCES".into())).unwrap_or_default();
+        assert!(unknown.contains("could not be\n  determined"), "{unknown}");
+
+        let mut s = steam_status("2537590");
+        s.server = crate::wineserver::Lock::Held(4242);
+        let out = render_status(&s);
+        assert!(out.contains("not in the file yet"), "{out}");
+        // Under the registry heading, where the values it applies to are — not
+        // in a footnote after them.
+        let reg = out.find("\nregistry").expect("a registry heading");
+        let caveat = out.find("not in the file yet").expect("the caveat");
+        let first_key = out.find(FT_KEY).expect("the first key");
+        assert!(reg < caveat && caveat < first_key, "{out}");
+
+        s.server = crate::wineserver::Lock::Free;
+        assert!(
+            !render_status(&s).contains("not in the file yet"),
+            "nothing is serving the prefix, so the file is the registry"
+        );
+    }
+
+    /// `choose_wine`'s mismatch sentence is the line that most often explains
+    /// "the game sees nothing", and it went to stderr — so a user who ran
+    /// `tobii bridge status … > report.txt` and pasted the file sent us
+    /// everything except the answer. It belongs in the report, which is the
+    /// thing designed to be pasted.
+    #[test]
+    fn the_wine_mismatch_warning_is_in_the_report_and_not_only_on_stderr() {
+        // The warning `choose_wine` actually produces, rather than one invented
+        // here: an explicit `--wine` over a prefix that records its own.
+        let (_, origin, warning) = choose_wine(
+            Some(PathBuf::from("/usr/bin/wine")),
+            Some(PathBuf::from("/games/Proton/files/bin/wine")),
+            &[],
+            None,
+        )
+        .expect("a choice");
+        assert_eq!(origin, WineOrigin::Unverified);
+        let warning = warning.expect("choose_wine warns about this one");
+
+        let mut s = steam_status("2537590");
+        s.wine_warning = Some(warning.clone());
+        let out = render_status(&s);
+        for line in warning.lines() {
+            assert!(out.contains(line.trim()), "missing `{line}` from {out}");
+        }
+        // And it sits with the wine it is about, above the files and the
+        // registry, not appended somewhere after them.
+        let first = warning.lines().next().expect("a warning has a line").trim();
+        let at = out.find(first).expect("the warning is in the report");
+        let files = out.find("\nfiles").expect("a files section");
+        assert!(at < files, "{out}");
+    }
+
+    /// **The fault this command shipped with.** It claimed to read and change
+    /// nothing, and it read the registry by running `wine reg query` — and wine
+    /// initialises or upgrades whatever prefix it is pointed at. Measured on
+    /// throwaway prefixes with wine 11.18: 5510 paths created under a prefix
+    /// holding only `drive_c`, and on a complete prefix with a stale
+    /// `.update-timestamp` — which is what a Proton prefix looks like to the
+    /// host's wine — 2744 lines of `system.reg` rewritten and the stamp
+    /// overwritten. That is the prefix upgrade [`WineOrigin`] exists to warn
+    /// about, performed by the command we tell a user to run first.
+    ///
+    /// **The old test could not see it, and this one has to.** It asserted
+    /// against a fake wine that is a shell script doing nothing, so it was a
+    /// true statement about our own code and a false one about the command.
+    /// Two things make this one able to fail for the real reason:
+    ///
+    /// * the whole prefix tree is compared before and after — every path, its
+    ///   size, its mtime to the nanosecond and a hash of its bytes — so
+    ///   anything wine would have done to it shows up whether or not this file
+    ///   was the thing that did it;
+    /// * the `wine` handed to the command is a script that *wrecks* the prefix
+    ///   when it runs. Running it is the failure. A fake that merely declines
+    ///   to write can only prove that this particular fake wrote nothing.
+    #[test]
+    fn status_runs_no_wine_and_leaves_the_prefix_byte_for_byte_as_it_was() {
         let fw = FakeWine::new("status-readonly");
-        fw.registered("np", r"Z:\usr\libexec\opentrack");
-        let before = fw.current("np");
-        fw.forget_argv();
-        render_status(&gather_status(&fw.status_args(&[])).expect("status"));
+        fw.registered_in_file("np", r"Z:\usr\libexec\opentrack");
+        // A prefix that looks lived-in, so there is something to damage.
+        std::fs::create_dir_all(fw.prefix().join("drive_c/windows/system32")).expect("windows");
+        std::fs::write(fw.prefix().join("system.reg"), "WINE REGISTRY Version 2\n").expect("hklm");
+        std::fs::write(fw.prefix().join(".update-timestamp"), "1234567890\n").expect("stamp");
+
+        let wrecker = fw.root.join("wrecking-wine.sh");
+        std::fs::write(
+            &wrecker,
+            "#!/bin/sh\nrm -rf \"$WINEPREFIX/drive_c/windows\"\n\
+             echo wrecked > \"$WINEPREFIX/system.reg\"\n\
+             echo wrecked > \"$WINEPREFIX/.update-timestamp\"\n\
+             echo wrecked > \"$WINEPREFIX/user.reg\"\nexit 0\n",
+        )
+        .expect("wrecker");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrecker, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let before = snapshot(&fw.prefix());
+        let args: Vec<String> = [
+            "tobii",
+            "bridge",
+            "status",
+            "--prefix",
+            &fw.prefix().display().to_string(),
+            "--wine",
+            &wrecker.display().to_string(),
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let out = render_status(&gather_status(&args).expect("status"));
+
+        assert_eq!(
+            snapshot(&fw.prefix()),
+            before,
+            "the prefix changed while being asked what was in it"
+        );
         assert!(
             !fw.dest().exists(),
             "asking the question created {}",
             fw.dest().display()
         );
-        assert_eq!(fw.current("np"), before, "the registry changed");
-        let argv = fw.argv();
+        // And it did read the registry, out of the file: a command that
+        // answered nothing would also leave the prefix alone.
+        assert!(out.contains(r"Z:\usr\libexec\opentrack"), "{out}");
         assert!(
-            !argv.contains("[add]") && !argv.contains("[delete]"),
-            "only reads are allowed, got {argv}"
+            out.contains(&fw.user_reg().display().to_string()),
+            "the report must name the file it read: {out}"
         );
-        assert!(argv.contains("[query]"), "it did read the registry: {argv}");
+    }
+
+    /// Every path under `root`, with everything about it that a wine run would
+    /// disturb: its type, its size, its mtime to the nanosecond, and a digest
+    /// of its bytes.
+    ///
+    /// Sorted, so two snapshots compare as text. The mtime matters as much as
+    /// the content: wine rewrites `system.reg` with the same first lines, and a
+    /// comparison of sizes alone called that untouched.
+    fn snapshot(root: &Path) -> String {
+        fn walk(dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                let Ok(md) = std::fs::symlink_metadata(&p) else {
+                    continue;
+                };
+                use std::os::unix::fs::MetadataExt;
+                let digest = std::fs::read(&p).map(|b| {
+                    // Enough to catch a rewrite: length, and a rolling sum that
+                    // order matters to.
+                    b.iter()
+                        .fold(1469598103934665603u64, |h, x| {
+                            (h ^ u64::from(*x)).wrapping_mul(1099511628211)
+                        })
+                        .to_string()
+                });
+                out.push(format!(
+                    "{} dir={} len={} mtime={}.{} mode={:o} {}",
+                    p.display(),
+                    md.is_dir(),
+                    md.len(),
+                    md.mtime(),
+                    md.mtime_nsec(),
+                    md.mode(),
+                    digest.unwrap_or_default()
+                ));
+                if md.is_dir() {
+                    walk(&p, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out.join("\n")
     }
 
     /// Whether a game accepts our DLL is unknown to this project — one title
@@ -4297,6 +4960,7 @@ exit 0
     #[test]
     fn status_ends_with_the_way_out_and_the_other_report_to_send() {
         let fw = FakeWine::new("status-what-next");
+        install(&fw.args("install", &[])).expect("install");
         let out = render_status(&gather_status(&fw.status_args(&[])).expect("status"));
         assert!(
             out.contains(&format!(
@@ -4378,26 +5042,12 @@ exit 0
     /// to check before pasting, over a prefix they never chose by name.
     #[test]
     fn a_steam_prefix_is_reported_and_undone_by_the_name_the_user_gave() {
-        let s = Status {
-            prefix: PathBuf::from("/games/steamapps/compatdata/2537590/pfx"),
-            source: PrefixSource::Steam("2537590".to_string()),
-            wine: PathBuf::from("/games/Proton/files/bin/wine"),
-            origin: WineOrigin::Prefix,
-            wine_given: false,
-            server: crate::wineserver::Lock::Free,
-            dir: PathBuf::from("/games/steamapps/compatdata/2537590/pfx/drive_c/tobii-bridge"),
-            dir_present: false,
-            artifacts: ARTIFACTS
-                .iter()
-                .map(|(name, required)| (*name, *required, false))
-                .collect(),
-            keys: vec![("FreeTrack", FT_KEY, KeyState::Absent)],
-            unreadable: None,
-        };
+        let mut s = steam_status("2537590");
+        s.dir_present = Presence::Yes;
         let out = render_status(&s);
-        assert!(out.contains("Steam, from `--steam 2537590`"), "{out}");
+        assert!(out.contains("Steam, from `--steam '2537590'`"), "{out}");
         assert!(
-            out.contains("tobii bridge uninstall --steam 2537590"),
+            out.contains("tobii bridge uninstall --steam '2537590'"),
             "{out}"
         );
         assert!(
@@ -4410,6 +5060,112 @@ exit 0
             out.contains("the build this prefix itself records"),
             "{out}"
         );
+    }
+
+    /// The undo line's entire job is to survive a round trip through the
+    /// clipboard, and a Steam title is a name with spaces in it.
+    ///
+    /// Unquoted, `--steam "Microsoft Flight Simulator 2024"` came out as
+    /// `tobii bridge uninstall --steam Microsoft Flight Simulator 2024 …`,
+    /// which pasted back answers `"Microsoft" matches more than one game` —
+    /// the trailing words silently dropped, because the flag gate ignores
+    /// positionals by design. The app-id case could never catch it: `2537590`
+    /// is one token.
+    ///
+    /// Checked by splitting the printed line the way a shell would rather than
+    /// by looking for quotes, because what is being asserted is that the name
+    /// arrives at `uninstall` as one argument.
+    #[test]
+    fn the_undo_line_survives_a_steam_title_with_spaces_in_it() {
+        let title = "Microsoft Flight Simulator 2024";
+        let mut s = steam_status(title);
+        s.dir_present = Presence::Yes;
+        let out = render_status(&s);
+        let line = out
+            .lines()
+            .find(|l| l.contains("tobii bridge uninstall"))
+            .unwrap_or_else(|| panic!("no undo line in {out}"))
+            .trim();
+        assert_eq!(
+            shell_words(line),
+            vec!["tobii", "bridge", "uninstall", "--steam", title],
+            "the undo line does not paste back as the command it names: {line}"
+        );
+        // And the prose above it names the same title the same way.
+        assert!(out.contains(&format!("`--steam '{title}'`")), "{out}");
+    }
+
+    /// A prefix with nothing of ours in it is handed `install`, not `uninstall`.
+    ///
+    /// That state is the one that most often brings somebody to this command —
+    /// a game gets nothing because the bridge was never put in its prefix — and
+    /// a report whose only command undoes an installation that does not exist
+    /// names the wrong half of the pair.
+    #[test]
+    fn an_empty_prefix_is_handed_the_command_that_fills_it() {
+        let out = render_status(&steam_status("2537590"));
+        assert!(
+            out.contains("tobii bridge install --steam '2537590'"),
+            "{out}"
+        );
+        assert!(!out.contains("bridge uninstall --steam"), "{out}");
+    }
+
+    /// Split a command line the way a POSIX shell would, for asserting that a
+    /// line we print pastes back as the arguments it means. Single quotes and
+    /// spaces only: that is all [`quoted`] produces.
+    fn shell_words(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut started = false;
+        let mut quoting = false;
+        for c in line.chars() {
+            match c {
+                '\'' => {
+                    quoting = !quoting;
+                    started = true;
+                }
+                c if c.is_whitespace() && !quoting => {
+                    if started {
+                        out.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// A report about a Steam prefix named `wanted`, with nothing installed in
+    /// it — the starting point every rendering test varies one field of.
+    fn steam_status(wanted: &str) -> Status {
+        let prefix = PathBuf::from("/games/steamapps/compatdata/2537590/pfx");
+        Status {
+            dir: prefix.join(INSTALL_SUBDIR),
+            registry_file: prefix.join(crate::userreg::FILE),
+            prefix,
+            source: PrefixSource::Steam(wanted.to_string()),
+            wine: PathBuf::from("/games/Proton/files/bin/wine"),
+            origin: WineOrigin::Prefix,
+            wine_given: false,
+            wine_warning: None,
+            server: crate::wineserver::Lock::Free,
+            dir_present: Presence::No,
+            artifacts: ARTIFACTS
+                .iter()
+                .map(|(name, required)| (*name, *required, Presence::No))
+                .collect(),
+            record_unreadable: None,
+            keys: vec![("FreeTrack", FT_KEY, KeyState::Absent)],
+            unreadable: None,
+        }
     }
 
     /// The lock says a wine process is alive on this prefix, and that is all it
