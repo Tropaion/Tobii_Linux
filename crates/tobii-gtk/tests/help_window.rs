@@ -89,14 +89,131 @@ fn button_with_tooltip(root: &gtk::Widget, tip: &str) -> gtk::Button {
         .unwrap_or_else(|| panic!("no button with the tooltip {tip:?}"))
 }
 
+/// The one widget carrying `name`, which `help.rs` sets on each of its parts.
+///
+/// `widget_name` falls back to the type name when nothing set it, so this
+/// cannot match a widget that was never named.
+fn named(root: &gtk::Widget, name: &str) -> gtk::Widget {
+    all(root)
+        .into_iter()
+        .find(|w| w.widget_name() == name)
+        .unwrap_or_else(|| panic!("no widget named {name:?}"))
+}
+
+/// The body label of one topic page — the selectable one Tab has to reach.
+fn body_label(page: &gtk::Widget) -> gtk::Label {
+    all(page)
+        .into_iter()
+        .find_map(|w| {
+            let l = w.downcast::<gtk::Label>().ok()?;
+            l.has_css_class("section-desc").then_some(l)
+        })
+        .expect("every topic page has a body label")
+}
+
+fn row_title(row: &gtk::ListBoxRow) -> String {
+    row.child()
+        .and_downcast::<gtk::Label>()
+        .map(|l| l.text().to_string())
+        .unwrap_or_default()
+}
+
+/// A focused widget, as a line a failure message can be read off.
+fn describe(w: &gtk::Widget) -> String {
+    let kind = w.type_().to_string();
+    let text = if let Some(l) = w.downcast_ref::<gtk::Label>() {
+        l.text().to_string()
+    } else if let Some(r) = w.downcast_ref::<gtk::ListBoxRow>() {
+        row_title(r)
+    } else if let Some(b) = w.downcast_ref::<gtk::Button>() {
+        // `widget::button` puts a GtkLabel inside rather than setting the
+        // button's own label, so `label()` is None for every button this
+        // program builds and the caption has to be looked for inside.
+        b.label().map(|s| s.to_string()).unwrap_or_else(|| {
+            all(b.upcast_ref())
+                .into_iter()
+                .find_map(|x| x.downcast::<gtk::Label>().ok())
+                .map(|l| l.text().to_string())
+                .unwrap_or_default()
+        })
+    } else {
+        String::new()
+    };
+    let text: String = text
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(24)
+        .collect();
+    if text.is_empty() {
+        kind
+    } else {
+        format!("{kind}({text})")
+    }
+}
+
+/// The topics the filter is currently letting through, in list order.
+///
+/// `is_child_visible`, because that is how `GtkListBox` filters: it leaves the
+/// row's own `visible` property alone, so `is_visible` answers true for every
+/// row whatever is typed.
+fn visible_rows(list: &gtk::ListBox) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(row) = list.row_at_index(i) {
+        if row.is_child_visible() {
+            out.push(row_title(&row));
+        }
+        i += 1;
+    }
+    out
+}
+
+fn the_list(root: &gtk::Widget) -> gtk::ListBox {
+    named(root, tobii_gtk::help::LIST_NAME)
+        .downcast::<gtk::ListBox>()
+        .expect("the topic list")
+}
+
+fn the_search(root: &gtk::Widget) -> gtk::SearchEntry {
+    named(root, tobii_gtk::help::SEARCH_NAME)
+        .downcast::<gtk::SearchEntry>()
+        .expect("the search box")
+}
+
+fn the_stack(root: &gtk::Widget) -> gtk::Stack {
+    named(root, tobii_gtk::help::STACK_NAME)
+        .downcast::<gtk::Stack>()
+        .expect("the topic stack")
+}
+
+/// Which page the topic pane is showing.
+fn showing(root: &gtk::Widget) -> String {
+    the_stack(root)
+        .visible_child_name()
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
 /// Press a key at `win`'s own key controllers.
 ///
 /// The signal is emitted on the controller rather than synthesised as a device
 /// event: a test cannot make a compositor deliver a key press, and what is
 /// under test is the handler and its wiring, not GTK's own dispatch.
 fn press(win: &gtk::Window, key: gtk::gdk::Key) -> bool {
+    press_with(win, key, gtk::gdk::ModifierType::empty())
+}
+
+/// The same, at any widget's own controllers — which is how a key that a
+/// widget in the middle of the tree handles for itself is driven.
+fn press_with(
+    win: &impl IsA<gtk::Widget>,
+    key: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+) -> bool {
     let mut handled = false;
-    let controllers = win.observe_controllers();
+    let controllers = win.as_ref().observe_controllers();
     for i in 0..controllers.n_items() {
         let Some(keys) = controllers
             .item(i)
@@ -104,10 +221,7 @@ fn press(win: &gtk::Window, key: gtk::gdk::Key) -> bool {
         else {
             continue;
         };
-        handled |= keys.emit_by_name::<bool>(
-            "key-pressed",
-            &[&key.into_glib(), &0u32, &gtk::gdk::ModifierType::empty()],
-        );
+        handled |= keys.emit_by_name::<bool>("key-pressed", &[&key.into_glib(), &0u32, &state]);
     }
     handled
 }
@@ -187,11 +301,53 @@ struct Seen {
     /// One entry per door and per exit: how many help windows were open after.
     opened: Vec<(&'static str, usize)>,
     closed: Vec<(&'static str, usize)>,
-    /// Focusable topic bodies and the focused widget the window opens with.
-    focusable_bodies: usize,
-    topic_bodies: usize,
+    /// One entry per topic page the window built: page name, the body text on
+    /// it, and whether that body is focusable. Walked through the stack by the
+    /// names `help.rs` gives the pages, so a topic the model has and the window
+    /// never built is a missing entry rather than a silently shorter list.
+    pages: Vec<(String, String, bool)>,
     scroller_focusable: bool,
     focus_on_open: Option<String>,
+    /// Whether that focus is inside the search box.
+    focus_in_search_on_open: bool,
+    /// The Tab chain from the state the window opens in, focus by focus, as
+    /// GTK's own focus walk produces it.
+    tab_order: Vec<String>,
+    /// Where Tab and Shift+Tab go when the list handles them itself — which
+    /// `child_focus` cannot show, because it moves focus without dispatching a
+    /// key at all.
+    tab_from_list: (String, String),
+    /// Walking the topic list with the Down arrow — GTK's own `move-cursor`,
+    /// which is the action the arrow key resolves to: the row that took the
+    /// focus, and the page the pane switched to because of it.
+    by_arrow: Vec<(String, String)>,
+    /// At the width the window opens at: sidebar width, topic pane width,
+    /// sidebar shown, "Topics" button shown. And the window's own minimum.
+    at_620: (i32, i32, bool, bool),
+    min_width: i32,
+    /// Typing one word: the rows left in the list, and the page shown.
+    search_rows: Vec<String>,
+    search_page: String,
+    /// Typing a word that is in no topic at all.
+    no_match_rows: Vec<String>,
+    no_match_page: String,
+    no_match_text: String,
+    no_match_placeholder: Option<String>,
+    /// The page showing after the search box is cleared again.
+    cleared_page: String,
+    /// Narrowed below the breakpoint: sidebar shown, "Topics" button shown,
+    /// and the width it was actually allocated (a resize a compositor refuses
+    /// would otherwise look like a breakpoint that never fired).
+    at_420: (bool, bool, i32),
+    /// Ctrl+F while narrow: sidebar shown afterwards, and where the focus went.
+    ctrl_f: (bool, String),
+    /// Widened again: sidebar shown, "Topics" button shown.
+    back_at_620: (bool, bool),
+    /// Escape inside the search box — how many help windows were left.
+    left_after_stop_search: Option<usize>,
+    /// The topic showing when the window was closed, and the topic showing
+    /// when it was opened again.
+    resume: (String, String),
     /// Characters of topic text selected when the window opens. A selectable
     /// label selects all of itself the moment focus touches it, and focus
     /// passes through the first topic on its way to the scroller — so without
@@ -260,28 +416,77 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                         s.borrow_mut().opened.push(("F1", wins.len()));
                         s.borrow_mut().reasons_while_open = d.reasons();
                         let Some(help) = wins.first() else { return };
-                        // Keyboard reachability, measured on the real window: a
-                        // selectable GtkLabel is focusable, which is what lets
-                        // Tab walk the topics at all.
+                        let root = help.clone().upcast::<gtk::Widget>();
                         let mut s = s.borrow_mut();
-                        for w in all(help.upcast_ref()) {
+
+                        // One page per topic, asked for by the name `help.rs`
+                        // gives it, and each body focusable — a selectable
+                        // GtkLabel is, which is what lets Tab into a topic at
+                        // all. This is the widget half of the coverage
+                        // contract: the model is asserted over in `help.rs`,
+                        // and this is what stops the window quietly building
+                        // fewer pages than the model has topics.
+                        let stack = the_stack(&root);
+                        for (i, t) in tobii_gtk::help::topics().iter().enumerate() {
+                            let name = format!("t{i}");
+                            let page = stack.child_by_name(&name).unwrap_or_else(|| {
+                                panic!("the window built no page {name:?} for {:?}", t.title)
+                            });
+                            let l = body_label(&page);
+                            s.pages.push((name, l.text().to_string(), l.is_focusable()));
+                        }
+                        // The scroller Page Up and Page Down drive.
+                        s.scroller_focusable =
+                            named(&root, tobii_gtk::help::BODY_SCROLL_NAME).is_focusable();
+                        // Selection, over every body in the window including
+                        // the no-match page's.
+                        for w in all(&root) {
                             if let Some(l) = w.downcast_ref::<gtk::Label>() {
                                 if l.has_css_class("section-desc") {
-                                    s.topic_bodies += 1;
-                                    if l.is_focusable() {
-                                        s.focusable_bodies += 1;
-                                    }
                                     if let Some((a, b)) = l.selection_bounds() {
                                         s.selected_on_open += b - a;
                                     }
                                 }
                             }
-                            if w.downcast_ref::<gtk::ScrolledWindow>().is_some() {
-                                s.scroller_focusable = w.is_focusable();
-                            }
                         }
-                        s.focus_on_open =
-                            gtk::prelude::GtkWindowExt::focus(help).map(|w| w.type_().to_string());
+                        let focus = gtk::prelude::GtkWindowExt::focus(help);
+                        s.focus_on_open = focus.as_ref().map(describe);
+                        // GtkSearchEntry hands its focus to the GtkText inside
+                        // it, so "is it the search box" is an ancestor question
+                        // and not a type comparison.
+                        s.focus_in_search_on_open = focus.as_ref().is_some_and(|w| {
+                            w.widget_name() == tobii_gtk::help::SEARCH_NAME
+                                || w.ancestor(gtk::SearchEntry::static_type())
+                                    .is_some_and(|a| {
+                                        a.widget_name() == tobii_gtk::help::SEARCH_NAME
+                                    })
+                        });
+                        // The Tab chain, from exactly the state the window
+                        // opens in. `child_focus` is what a Tab press resolves
+                        // to, so this is the path and not a model of it.
+                        if let Some(f) = focus.as_ref() {
+                            s.tab_order.push(describe(f));
+                        }
+                        // One full cycle: the chain wraps back to the search
+                        // box, and walking past that would count every row
+                        // twice. Worth knowing while reading the result: GTK
+                        // selects a list row when the focus lands on it, so
+                        // Tab-ing through the list changes the topic as it
+                        // goes, and the body this chain arrives at is the topic
+                        // it last passed through.
+                        for _ in 0..24 {
+                            if !help.child_focus(gtk::DirectionType::TabForward) {
+                                break;
+                            }
+                            let Some(w) = gtk::prelude::GtkWindowExt::focus(help) else {
+                                break;
+                            };
+                            let d = describe(&w);
+                            if Some(&d) == s.tab_order.first() {
+                                break;
+                            }
+                            s.tab_order.push(d);
+                        }
                     }),
                 );
             }
@@ -459,8 +664,316 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                 let h = hub.clone();
                 at(4600, Box::new(move || h.present()));
             }
+
+            // --- the sidebar, the search, and what the window does when it is
+            // --- made too narrow to hold both
+            //
+            // All of it on this one timeline and not in a second `#[test]`:
+            // cargo runs tests in threads, and two GTK main loops in one
+            // process is not a thing that works.
+            {
+                let h = hub.clone();
+                at(
+                    4800,
+                    Box::new(move || {
+                        assert!(
+                            press(h.upcast_ref(), gtk::gdk::Key::F1),
+                            "F1 did not reopen the help window for the sidebar phase"
+                        );
+                    }),
+                );
+            }
+            // At the width it opens at: who got how much, and what the whole
+            // window's minimum is. Then the topic list walked with the arrow
+            // key — GTK's own `move-cursor`, which is the action Down resolves
+            // to — one press per topic, checking the pane follows.
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    5000,
+                    Box::new(move || {
+                        let help = help_windows(&a).remove(0);
+                        let root = help.clone().upcast::<gtk::Widget>();
+                        let list = the_list(&root);
+                        let sidebar = named(&root, tobii_gtk::help::SIDEBAR_NAME);
+                        let pane = named(&root, tobii_gtk::help::BODY_SCROLL_NAME);
+                        let toggle = named(&root, tobii_gtk::help::TOGGLE_NAME);
+                        {
+                            let mut s = s.borrow_mut();
+                            s.at_620 = (
+                                sidebar.width(),
+                                pane.width(),
+                                sidebar.is_visible(),
+                                toggle.is_visible(),
+                            );
+                            s.min_width = help.measure(gtk::Orientation::Horizontal, -1).0;
+                        }
+                        // Start the cursor on the first row, which is what Down
+                        // out of the search box does, then walk.
+                        // Both: `grab_focus` sets the cursor row that
+                        // `move-cursor` walks from, and `select_row` is what
+                        // the reading below asks about. The window resumed on
+                        // whichever topic the Tab chain above left it on, which
+                        // is the resume behaviour working, not a stray state.
+                        if let Some(first) = list.row_at_index(0) {
+                            list.select_row(Some(&first));
+                            first.grab_focus();
+                        }
+                        for _ in 0..tobii_gtk::help::topics().len() {
+                            let title = list
+                                .selected_row()
+                                .map(|r| row_title(&r))
+                                .unwrap_or_default();
+                            s.borrow_mut().by_arrow.push((title, showing(&root)));
+                            list.emit_move_cursor(gtk::MovementStep::DisplayLines, 1, false, false);
+                        }
+
+                        // Tab and Shift+Tab as the LIST handles them. Emitted
+                        // at its own controller for the reason `press` gives:
+                        // a test cannot make a compositor deliver a key, and
+                        // what is under test is the handler and its wiring.
+                        // `child_focus` above cannot show this at all — it
+                        // moves focus without dispatching a key — which is why
+                        // both are measured and both are asserted.
+                        let focused = |root: &gtk::Widget| {
+                            root.root()
+                                .and_downcast::<gtk::Window>()
+                                .and_then(|w| gtk::prelude::GtkWindowExt::focus(&w))
+                                .map(|w| {
+                                    if w.widget_name() == tobii_gtk::help::BODY_SCROLL_NAME {
+                                        "the topic pane".to_string()
+                                    } else if w.widget_name() == tobii_gtk::help::SEARCH_NAME
+                                        || w.ancestor(gtk::SearchEntry::static_type()).is_some_and(
+                                            |x| x.widget_name() == tobii_gtk::help::SEARCH_NAME,
+                                        )
+                                    {
+                                        "the search box".to_string()
+                                    } else {
+                                        describe(&w)
+                                    }
+                                })
+                                .unwrap_or_default()
+                        };
+                        if let Some(row) = list.row_at_index(3) {
+                            row.grab_focus();
+                        }
+                        press_with(&list, gtk::gdk::Key::Tab, gtk::gdk::ModifierType::empty());
+                        s.borrow_mut().tab_from_list.0 = focused(&root);
+                        if let Some(row) = list.row_at_index(3) {
+                            row.grab_focus();
+                        }
+                        press_with(
+                            &list,
+                            gtk::gdk::Key::Tab,
+                            gtk::gdk::ModifierType::SHIFT_MASK,
+                        );
+                        s.borrow_mut().tab_from_list.1 = focused(&root);
+                        // Put the selection back where the arrow walk left it,
+                        // so the phases after this start from a known topic.
+                        if let Some(row) = list.row_at_index(0) {
+                            list.select_row(Some(&row));
+                        }
+                    }),
+                );
+            }
+            // One word into the search box. `GtkSearchEntry` debounces
+            // `search-changed`, so every reading below is taken a clear 400 ms
+            // after the typing that causes it.
+            {
+                let a = app.clone();
+                at(
+                    5200,
+                    Box::new(move || {
+                        let help = help_windows(&a).remove(0);
+                        the_search(&help.upcast()).set_text("joystick");
+                    }),
+                );
+            }
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    5600,
+                    Box::new(move || {
+                        let root = help_windows(&a).remove(0).upcast::<gtk::Widget>();
+                        let mut s = s.borrow_mut();
+                        s.search_rows = visible_rows(&the_list(&root));
+                        s.search_page = showing(&root);
+                    }),
+                );
+            }
+            // And a word that is in no topic at all: an empty window with no
+            // explanation is the bug this page exists to prevent.
+            {
+                let a = app.clone();
+                at(
+                    5800,
+                    Box::new(move || {
+                        let help = help_windows(&a).remove(0);
+                        the_search(&help.upcast()).set_text("xyzzyplughquux");
+                    }),
+                );
+            }
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    6200,
+                    Box::new(move || {
+                        let root = help_windows(&a).remove(0).upcast::<gtk::Widget>();
+                        let stack = the_stack(&root);
+                        let mut s = s.borrow_mut();
+                        s.no_match_rows = visible_rows(&the_list(&root));
+                        s.no_match_page = showing(&root);
+                        if let Some(page) = stack.child_by_name(tobii_gtk::help::NO_MATCH_PAGE) {
+                            s.no_match_text = body_label(&page).text().to_string();
+                        }
+                        // The sidebar's half of the same promise: GtkListBox
+                        // shows its placeholder when the filter leaves nothing.
+                        // GtkListBox parents its placeholder to itself and
+                        // shows it by child visibility, exactly as it hides a
+                        // filtered row — so it is found the same way, and the
+                        // rows' own labels carry no `section-desc` class.
+                        s.no_match_placeholder = all(&the_list(&root).upcast::<gtk::Widget>())
+                            .into_iter()
+                            .find_map(|w| {
+                                let l = w.downcast::<gtk::Label>().ok()?;
+                                (l.has_css_class("section-desc") && l.is_child_visible())
+                                    .then(|| l.text().to_string())
+                            });
+                    }),
+                );
+            }
+            // Now make it too narrow to hold a sidebar and a topic.
+            {
+                let a = app.clone();
+                at(
+                    6400,
+                    Box::new(move || {
+                        let help = help_windows(&a).remove(0);
+                        the_search(&help.clone().upcast()).set_text("");
+                        help.set_default_size(420, 660);
+                    }),
+                );
+            }
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    6900,
+                    Box::new(move || {
+                        let help = help_windows(&a).remove(0);
+                        let root = help.clone().upcast::<gtk::Widget>();
+                        {
+                            let mut s = s.borrow_mut();
+                            s.cleared_page = showing(&root);
+                            s.at_420 = (
+                                named(&root, tobii_gtk::help::SIDEBAR_NAME).is_visible(),
+                                named(&root, tobii_gtk::help::TOGGLE_NAME).is_visible(),
+                                help.width(),
+                            );
+                        }
+                        // Ctrl+F has to reach the search box from here, which
+                        // means unfolding the sidebar it lives in first.
+                        assert!(
+                            press_with(
+                                &help,
+                                gtk::gdk::Key::f,
+                                gtk::gdk::ModifierType::CONTROL_MASK
+                            ),
+                            "Ctrl+F was not handled by the help window"
+                        );
+                    }),
+                );
+            }
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    7100,
+                    Box::new(move || {
+                        let help = help_windows(&a).remove(0);
+                        let root = help.clone().upcast::<gtk::Widget>();
+                        let focus = gtk::prelude::GtkWindowExt::focus(&help);
+                        s.borrow_mut().ctrl_f = (
+                            named(&root, tobii_gtk::help::SIDEBAR_NAME).is_visible(),
+                            focus
+                                .as_ref()
+                                .map(|w| {
+                                    if w.widget_name() == tobii_gtk::help::SEARCH_NAME
+                                        || w.ancestor(gtk::SearchEntry::static_type()).is_some_and(
+                                            |x| x.widget_name() == tobii_gtk::help::SEARCH_NAME,
+                                        )
+                                    {
+                                        "the search box".to_string()
+                                    } else {
+                                        describe(w)
+                                    }
+                                })
+                                .unwrap_or_default(),
+                        );
+                        help.set_default_size(620, 660);
+                    }),
+                );
+            }
+            // Wide again, then Escape from inside the search box — which
+            // GtkSearchEntry turns into `stop-search` and swallows, so it is
+            // the one place Escape could silently stop closing the window.
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    7500,
+                    Box::new(move || {
+                        let help = help_windows(&a).remove(0);
+                        let root = help.clone().upcast::<gtk::Widget>();
+                        let list = the_list(&root);
+                        {
+                            let mut s = s.borrow_mut();
+                            s.back_at_620 = (
+                                named(&root, tobii_gtk::help::SIDEBAR_NAME).is_visible(),
+                                named(&root, tobii_gtk::help::TOGGLE_NAME).is_visible(),
+                            );
+                        }
+                        // Leave it on a topic that is neither the first nor the
+                        // last, so "it resumed" cannot be confused with "it
+                        // always opens at the top".
+                        if let Some(row) = list.row_at_index(5) {
+                            list.select_row(Some(&row));
+                        }
+                        s.borrow_mut().resume.0 = showing(&root);
+                        the_search(&root).emit_by_name::<()>("stop-search", &[]);
+                    }),
+                );
+            }
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    7700,
+                    Box::new(move || {
+                        s.borrow_mut().left_after_stop_search = Some(help_windows(&a).len());
+                    }),
+                );
+            }
+            {
+                let h = hub.clone();
+                at(
+                    7900,
+                    Box::new(move || {
+                        press(h.upcast_ref(), gtk::gdk::Key::F1);
+                    }),
+                );
+            }
+            {
+                let (a, s) = (app.clone(), seen.clone());
+                at(
+                    8100,
+                    Box::new(move || {
+                        let Some(help) = help_windows(&a).first().cloned() else {
+                            return;
+                        };
+                        s.borrow_mut().resume.1 = showing(&help.upcast());
+                    }),
+                );
+            }
+
             let a = app.clone();
-            at(4800, Box::new(move || a.quit()));
+            at(8400, Box::new(move || a.quit()));
         });
     }
     app.run_with_args::<&str>(&[]);
@@ -501,31 +1014,273 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
     }
 
     // --- everything in it is reachable by keyboard alone ---
+    //
+    // The window builds a page for every topic the model has, and every one of
+    // those pages carries that topic's whole text on a focusable label. This is
+    // the widget half of the coverage contract; the model half is `help.rs`'s
+    // own unit test, which is where the tooltip strings are compared. Split
+    // that way on purpose: the search filters ROWS, so a test that read the
+    // visible widgets could be made to pass by a query, and a test that read
+    // only the model could not see the window build eight pages for nine
+    // topics.
+    let model = tobii_gtk::help::topics();
     assert_eq!(
-        seen.topic_bodies,
-        seen.focusable_bodies,
-        "{} of {} topic bodies are not focusable, so Tab cannot reach them — and a \
-         window nothing can enter is not a substitute for a visible label",
-        seen.topic_bodies - seen.focusable_bodies,
-        seen.topic_bodies
+        seen.pages.len(),
+        model.len(),
+        "the window built {} pages for {} topics",
+        seen.pages.len(),
+        model.len()
     );
-    assert_eq!(
-        seen.topic_bodies,
-        tobii_gtk::help::topics().len(),
-        "every topic must have a body label in the window"
-    );
+    for (i, (name, text, focusable)) in seen.pages.iter().enumerate() {
+        assert_eq!(
+            text, &model[i].body,
+            "page {name:?} does not carry the text of {:?}",
+            model[i].title
+        );
+        assert!(
+            focusable,
+            "the body of {:?} is not focusable, so Tab cannot reach it — and a \
+             window nothing can enter is not a substitute for a visible label",
+            model[i].title
+        );
+    }
     assert!(
         seen.scroller_focusable,
-        "the scroller must be focusable, or `grab_focus` has nothing to give the \
-         focus to"
+        "the topic scroller must be focusable, or Page Up and Page Down have \
+         nothing to scroll"
     );
-    // And it must be what has the focus when the window opens, so Page Up/Down
-    // and the arrows scroll straight away. Without the `grab_focus`, the first
-    // Tab lands in the first topic instead and the keys do nothing until then.
+    // The focus on open is the search box. That is the whole bet this shape
+    // makes: a user presses F1 with a question about the control in front of
+    // them, and the fastest honest answer is a box they can type its name into.
+    // GtkSearchEntry delegates its focus to the GtkText inside it, hence the
+    // ancestor test rather than a type comparison.
+    assert!(
+        seen.focus_in_search_on_open,
+        "the help window must open with the search box focused, and the focus was \
+         on {:?}",
+        seen.focus_on_open
+    );
+    // And the Tab chain out of it reaches the list, the topic and Close —
+    // measured with `child_focus`, which is the action a Tab press resolves to.
+    // The exact path, stated as a claim rather than a snapshot, because the
+    // window's own "Keyboard" topic promises it to the user.
+    let chain = seen.tab_order.join(" -> ");
+    let reached = |what: &str| seen.tab_order.iter().any(|x| x.contains(what));
+    assert!(
+        reached("GtkListBoxRow"),
+        "Tab out of the search box must reach the topic list: {chain}"
+    );
+    assert!(
+        reached("GtkLabel"),
+        "Tab must go on to reach a topic's own text, which is the only thing in \
+         this window that can be selected and copied: {chain}"
+    );
+    assert!(reached("Close"), "Tab must reach the Close button: {chain}");
+    let list_at = seen
+        .tab_order
+        .iter()
+        .position(|x| x.contains("GtkListBoxRow"));
+    let label_at = seen
+        .tab_order
+        .iter()
+        .position(|x| x.contains("GtkLabel") && !x.contains("Close"));
+    assert!(
+        list_at < label_at,
+        "the list must come before the topic on the Tab chain — the window reads \
+         left to right and so must the keyboard: {chain}"
+    );
+    // Every row is on that chain, which is GTK's own behaviour for a
+    // `GtkListBox` of focusable rows and is what makes the claim above
+    // "reachable by Tab alone" rather than "reachable if a handler works".
+    let rows_on_chain = seen
+        .tab_order
+        .iter()
+        .filter(|x| x.contains("GtkListBoxRow"))
+        .count();
     assert_eq!(
-        seen.focus_on_open.as_deref(),
-        Some("GtkScrolledWindow"),
-        "the help window must open with the scroller focused"
+        rows_on_chain,
+        model.len(),
+        "GTK's own focus walk must pass through every topic row, so that the \
+         keyboard reaches the list even with nothing of ours in the way: {chain}"
+    );
+
+    // And the shortcut that makes that chain bearable: nine rows between the
+    // search box and the topic you are already looking at is a Tab trap, so the
+    // list answers Tab itself. Driven at the list's own controller, because
+    // `child_focus` moves focus without dispatching a key and so can never see
+    // a key handler at all.
+    assert_eq!(
+        seen.tab_from_list.0, "the topic pane",
+        "Tab from the topic list must go to the topic pane, and it went to {:?} — \
+         without this it walks the eight rows after this one first",
+        seen.tab_from_list.0
+    );
+    assert_eq!(
+        seen.tab_from_list.1, "the search box",
+        "Shift+Tab from the topic list must go back to the search box, and it \
+         went to {:?}",
+        seen.tab_from_list.1
+    );
+
+    // --- the arrow key walks every topic, and the pane follows ---
+    assert_eq!(
+        seen.by_arrow.len(),
+        model.len(),
+        "the arrow walk did not visit every topic"
+    );
+    for (i, (title, page)) in seen.by_arrow.iter().enumerate() {
+        assert_eq!(
+            title, model[i].title,
+            "the {i}th Down press selected {title:?}, not {:?}",
+            model[i].title
+        );
+        assert_eq!(
+            page,
+            &format!("t{i}"),
+            "selecting {title:?} left the pane showing {page:?}: a topic list \
+             whose selection does not change the topic is decoration"
+        );
+    }
+
+    // --- the search ---
+    assert!(
+        seen.search_rows
+            .contains(&"Head tracking for games".to_string()),
+        "searching for \"joystick\" — a word on the hub's own switch, and one that \
+         is in no heading at all — must leave the topic that explains it: {:?}",
+        seen.search_rows
+    );
+    assert!(
+        seen.search_rows.len() < model.len(),
+        "searching for \"joystick\" left every topic in the list, so the filter is \
+         not filtering: {:?}",
+        seen.search_rows
+    );
+    assert_eq!(
+        seen.search_page, "t6",
+        "the pane must follow the search to the topic that answers it, and it \
+         showed {:?}",
+        seen.search_page
+    );
+
+    // --- and a search that answers nothing has to SAY so ---
+    assert!(
+        seen.no_match_rows.is_empty(),
+        "this query matches no topic, so no row may survive it: {:?}",
+        seen.no_match_rows
+    );
+    assert_eq!(
+        seen.no_match_page,
+        tobii_gtk::help::NO_MATCH_PAGE,
+        "a query that matches nothing must land on the page that explains that, \
+         and it landed on {:?} — an empty window with no explanation is the bug \
+         this page exists to prevent",
+        seen.no_match_page
+    );
+    assert!(
+        seen.no_match_text.contains("xyzzyplughquux"),
+        "the no-match page must quote what was actually searched for: {:?}",
+        seen.no_match_text
+    );
+    assert!(
+        seen.no_match_text.contains("Clear the box"),
+        "the no-match page must say how to get back: {:?}",
+        seen.no_match_text
+    );
+    assert_eq!(
+        seen.no_match_placeholder.as_deref(),
+        Some("No topic matches."),
+        "the emptied list must say why it is empty too, or the sidebar is the \
+         blank half of the same bug"
+    );
+
+    // --- and clearing the box brings the topics back ---
+    //
+    // The case this catches: a query that matched nothing leaves the previously
+    // selected row selected, so clearing the box picks that same row again and
+    // `row-selected` — which fires on a CHANGE — stays silent. The window then
+    // sits on "Nothing found" with all nine topics listed beside it, which is a
+    // worse state than the one the no-match page exists to prevent.
+    assert!(
+        !seen.cleared_page.is_empty() && seen.cleared_page != tobii_gtk::help::NO_MATCH_PAGE,
+        "clearing the search box left the pane on {:?}: the list came back and the \
+         topic did not",
+        seen.cleared_page
+    );
+
+    // --- narrow ---
+    //
+    // The window opens wide enough for both panes; dragged below the
+    // breakpoint, the sidebar folds away and a "Topics" button takes its place,
+    // because a 184px sidebar beside a 200px column of prose is a sidebar that
+    // has become the window. The allocated width is asserted first: a
+    // compositor that refused the resize would otherwise read as a breakpoint
+    // that never fired.
+    let (side_w, pane_w, side_shown, toggle_shown) = seen.at_620;
+    assert!(
+        side_shown && !toggle_shown,
+        "at the width it opens at, the sidebar is shown and the Topics button is \
+         not: sidebar {side_shown}, button {toggle_shown}"
+    );
+    assert!(
+        pane_w > side_w,
+        "at the width it opens at the topic must have more room than the list of \
+         topics: sidebar {side_w}px, topic pane {pane_w}px"
+    );
+    assert!(
+        seen.min_width > 0 && seen.min_width <= 620,
+        "the window must be able to be made narrower than it opens, and its \
+         minimum measured {}px",
+        seen.min_width
+    );
+    let (side_420, toggle_420, w_420) = seen.at_420;
+    assert!(
+        w_420 < 520,
+        "the resize to 420 was not granted (the window is {w_420}px wide), so \
+         nothing below this proves anything about narrow windows"
+    );
+    assert!(
+        !side_420 && toggle_420,
+        "below the breakpoint the sidebar must fold away and the Topics button \
+         must appear: sidebar {side_420}, button {toggle_420}"
+    );
+    let (unfolded, focus_after) = &seen.ctrl_f;
+    assert!(
+        *unfolded,
+        "Ctrl+F while the sidebar is folded away must unfold it, or it focuses \
+         something that is not on screen"
+    );
+    assert_eq!(
+        focus_after, "the search box",
+        "Ctrl+F must put the cursor in the search box, and it went to {focus_after:?}"
+    );
+    assert_eq!(
+        seen.back_at_620,
+        (true, false),
+        "widening the window again must bring the sidebar back and take the \
+         Topics button away"
+    );
+
+    // --- Escape, from the one widget that eats it ---
+    assert_eq!(
+        seen.left_after_stop_search,
+        Some(0),
+        "Escape inside the search box must close the window like Escape anywhere \
+         else in it. GtkSearchEntry binds Escape to its own `stop-search` and \
+         consumes the key, so without a handler for it Escape would silently \
+         stop working for the widget the window opens focused"
+    );
+
+    // --- and it reopens where it was left ---
+    assert_eq!(
+        seen.resume.0, "t5",
+        "the test meant to leave the window on the sixth topic"
+    );
+    assert_eq!(
+        seen.resume.1, seen.resume.0,
+        "reopening the help window must resume on the topic it was closed on: a \
+         user who reads a paragraph, tries the control and presses F1 again is \
+         asking about the same control"
     );
 
     // --- and the contract the shortened cards rest on ---

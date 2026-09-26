@@ -69,6 +69,10 @@ window { background-color: #0d1013; color: #e8ecef; }
 .surface { background-color: #161a1f; border: 1px solid #232a32; border-radius: 12px; }
 .panel-pad { padding: 16px; }
 .hairline { background-color: #232a32; min-height: 1px; }
+/* The same rule stood on end, for the help window's sidebar divider. A
+   separate class because `.hairline` states a MINIMUM HEIGHT, and a box that
+   is one pixel tall is not a box that is one pixel wide. */
+.hairline-v { background-color: #232a32; min-width: 1px; }
 
 /* --- type --------------------------------------------------------------- */
 .app-title { font-size: 20px; font-weight: bold; letter-spacing: 0.01em; }
@@ -172,6 +176,29 @@ scrollbar slider { min-width: 8px; min-height: 8px; }
 .readout-name { font-size: 11px; color: #79838d; letter-spacing: 0.05em; }
 .readout-value { font-size: 13px; color: #e8ecef; font-family: monospace; }
 .readout-alert { color: #f2b134; font-weight: bold; }
+
+/* --- the help window's sidebar ------------------------------------------- */
+/* GTK draws `list` and `entry` from the system theme, which on most desktops
+   here is a light one — the same trap the popover above fell into. Both are
+   stated explicitly, scoped to classes this window sets, so nothing else in
+   the app changes colour.
+
+   Selection is the accent, the same `button:checked` already uses for \"this is
+   the one that is on\", rather than a left bar or a border: a border that
+   appears on selection changes the row's size, and a list that shifts by a
+   pixel as you arrow through it reads as a bug. */
+.topic-list { background-color: transparent; color: #c9d1d8; }
+.topic-list > row { border-radius: 8px; padding: 7px 10px; font-size: 13px; }
+.topic-list > row:hover { background-color: #1e242b; color: #e8ecef; }
+.topic-list > row:selected { background-color: #14696b; color: #ffffff; }
+.topic-list > row:focus-visible { outline: 1px solid #1f9ea0; outline-offset: -1px; }
+entry.topic-search { background-image: none; background-color: #12161a;
+                     border: 1px solid #2b333c; border-radius: 9px;
+                     padding: 5px 8px; color: #e8ecef; }
+entry.topic-search:focus-within { border-color: #1f9ea0; }
+entry.topic-search > text { color: #e8ecef; }
+entry.topic-search > text > placeholder { color: #6f7982; }
+entry.topic-search > image { color: #79838d; }
 
 /* --- banner -------------------------------------------------------------- */
 .banner { background-color: #2a2313; border: 1px solid #4a3d1a; border-radius: 10px;
