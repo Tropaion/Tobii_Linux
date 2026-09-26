@@ -52,7 +52,13 @@ const STRENGTHS: [(&str, f64, f64); 3] = [
 /// It goes on the box around the three, which is what a pointer anywhere in
 /// that row resolves to: none of the radios or their labels carry one of their
 /// own, so the query walks up to it.
-const STRENGTH_TOOLTIP: &str = "How far the view swings when you look at the edge of the screen";
+///
+/// `pub(crate)` because the help window quotes it rather than copying it:
+/// a tooltip is invisible to a keyboard and to a touch user, so the same
+/// sentence has to be somewhere they can read it, and two copies of it are
+/// two sentences that will one day disagree. See [`crate::help`].
+pub(crate) const STRENGTH_TOOLTIP: &str =
+    "How far the view swings when you look at the edge of the screen";
 
 /// Whether simply starting opentrack is enough to switch the tracker on.
 ///
@@ -252,7 +258,12 @@ fn sentence(s: &str) -> String {
 /// game output off, is from the first paint. So the button carries it while it
 /// is pressable, and the row around the button carries it the rest of the
 /// time, where the hover does land. See [`recentre_tooltip`].
-const RECENTRE_TOOLTIP: &str =
+///
+/// `pub(crate)` because the help window quotes it rather than copying it:
+/// a tooltip is invisible to a keyboard and to a touch user, so the same
+/// sentence has to be somewhere they can read it, and two copies of it are
+/// two sentences that will one day disagree. See [`crate::help`].
+pub(crate) const RECENTRE_TOOLTIP: &str =
     "Sit the way you play, look at the centre of the screen, and press this: \
      the head angle you are holding becomes straight ahead in the game. Hold \
      still for a second while it measures. Games with their own centring key \
@@ -265,7 +276,12 @@ const RECENTRE_TOOLTIP: &str =
 /// checkbox, because a tooltip query walks up from a child that has none. The
 /// checkbox is the thing the sentence is about, and it is now sharing its row
 /// with a button that carries a tooltip of its own.
-const JOYSTICK_TOOLTIP: &str =
+///
+/// `pub(crate)` because the help window quotes it rather than copying it:
+/// a tooltip is invisible to a keyboard and to a touch user, so the same
+/// sentence has to be somewhere they can read it, and two copies of it are
+/// two sentences that will one day disagree. See [`crate::help`].
+pub(crate) const JOYSTICK_TOOLTIP: &str =
     "Present head pose and gaze as a game controller, for games with no \
      head-tracking support. Works in native and Proton games without Wine \
      or opentrack.";
@@ -292,7 +308,12 @@ fn recentre_tooltip(decision: &Result<(), String>) -> String {
 /// construction, it claimed the hold to everyone, including the user who had
 /// just turned `wake_for_joystick` off — so it is put back in step from
 /// [`GamesRow::refresh`], like every other control on this row.
-fn switch_tooltip(cfg: &OutputConfig) -> String {
+///
+/// `pub(crate)` because the help window quotes it rather than copying it:
+/// a tooltip is invisible to a keyboard and to a touch user, so the same
+/// sentence has to be somewhere they can read it, and two copies of it are
+/// two sentences that will one day disagree. See [`crate::help`].
+pub(crate) fn switch_tooltip(cfg: &OutputConfig) -> String {
     let mut tip = "Send head tracking and gaze to games — to a virtual joystick, to \
                    opentrack, or over the Wine bridge."
         .to_string();

@@ -190,9 +190,19 @@ three-column width, so reaching the narrower ones takes a tiling compositor or a
 screen smaller than the hub.
 
 The **cogwheel** beside the connection status holds what is about the program
-rather than the tracker: start at login, check for updates, **text size**
-(80–160%, for the whole program), saving or copying the diagnostics report, and
-*Quit*.
+rather than the tracker: keeping the tracker awake, start at login, check for
+updates, **text size** (80–160%, for the whole program), saving or copying the
+diagnostics report, *Help*, and *Quit*.
+
+**Help is a window, opened with F1**, with the **?** beside the cogwheel, or
+from the cogwheel itself. It explains every card and every control, including
+the ones that only explain themselves when you hover — the strength presets,
+the virtual joystick, and why *Recentre view* is greyed out. That is not a
+nicety: GTK4 shows a tooltip on pointer hover and on nothing else, so anything
+that lives only in a tooltip is unreachable by keyboard and by touch, and the
+help window is where those sentences are reachable. Esc, F1 again or the Close
+button put it away; the topics are selectable text, so Tab walks them and they
+can be copied into a bug report.
 
 **Select eyes to detect** — both, left only, or right only — is a real device
 setting and lives on its own card.

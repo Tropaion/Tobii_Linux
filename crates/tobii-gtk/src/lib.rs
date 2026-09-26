@@ -15,6 +15,7 @@ pub mod eyeview;
 pub mod focus;
 pub mod games;
 pub mod head_model;
+pub mod help;
 pub mod outputs;
 pub mod overlay;
 pub mod particles;
@@ -591,6 +592,33 @@ thread_local! {
 /// whatever a justify added on top — made the rows visibly unevenly spaced.
 const CARD_GAP: i32 = 16;
 
+/// What the gaze preview draws.
+///
+/// One const with two readers — the switch's tooltip and the help window's
+/// "Preview my gaze" topic — because this card has no visible description any
+/// more, and a copy is how the two would start disagreeing.
+///
+/// It says *a dot*, and that is checked against `overlay.rs`, which draws
+/// exactly one 24px circle at the current gaze point per frame: an arc, filled
+/// and stroked, with no history and no fade. The card used to say "a visual
+/// trail of your gaze", which was not a shorter way of saying this — it was a
+/// different, untrue claim. If the overlay ever does draw a trail, this const
+/// and that code have to change together.
+pub(crate) const PREVIEW_HELP: &str = "Show a dot on screen where you're looking";
+
+/// Who the per-eye setting is for.
+///
+/// The card's own sentence, moved into a tooltip: the title plus three radios
+/// labelled Both eyes / Left eye only / Right eye only say completely what the
+/// control *does*, and this says who should want it — advice, which a returning
+/// user re-reads on every launch for nothing.
+///
+/// One const, two readers, for the reason [`PREVIEW_HELP`] is one: a tooltip is
+/// invisible to a keyboard and to a touch user, so the same sentence has to be
+/// in the help window, and the two must be the same sentence.
+pub(crate) const EYES_HELP: &str = "If you typically squint or have poor sight in one eye, you \
+                                    can make the eye tracker detect one eye only.";
+
 /// How wide a control column is.
 ///
 /// All three share it, so they read as one rack that happens to be split
@@ -1071,7 +1099,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
 
     let sw_preview = Switch::new();
     sw_preview.set_valign(Align::Center);
-    sw_preview.set_tooltip_text(Some("Show a dot on screen where you're looking"));
+    sw_preview.set_tooltip_text(Some(PREVIEW_HELP));
     {
         let app = app.clone();
         let state = state.clone();
@@ -1136,6 +1164,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     eyes_ctl.append(&box_both);
     eyes_ctl.append(&box_left);
     eyes_ctl.append(&box_right);
+    // On the box, not on the radios: none of the three carries a tooltip of its
+    // own, so a query from anywhere in the row walks up to this one — the same
+    // placement `games.rs` uses for the strength radios. The same sentence is in
+    // the help window, which is the only way a keyboard or touch user can read
+    // it; see [`help`].
+    eyes_ctl.set_tooltip_text(Some(EYES_HELP));
 
     // Selecting a radio pushes the choice to the device (unless we're seeding).
     for (cb, eye) in [
@@ -1203,20 +1237,44 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     //
     // They pack from the top and every gap is `CARD_GAP`. Stretching the gaps
     // to level the bottoms — which is what this did while the columns were
-    // badly unbalanced — is no longer worth it: with 357/370/358 (the pairs
-    // above, plus the `CARD_GAP` between them) the levelling buys at most 13px,
-    // and it costs a gap inside a column that visibly differs from the gap
-    // between the rows.
+    // badly unbalanced — is no longer worth it: the levelling buys at most a
+    // dozen pixels, and it costs a gap inside a column that visibly differs
+    // from the gap between the rows.
+    //
+    // Re-measured after the descriptions were shortened, two of them moved to a
+    // tooltip and the help window, and none of the controls touched: the cards
+    // are 142/142/96/194/94/204 (they were 180/161/141/213/120/204), so the
+    // columns are 300/306/314 where they were 357/370/340 and the row is 314
+    // where it was 370. The whole window: 748px natural height before, 692px
+    // after, both at its natural width of 1241px. The grouping still holds —
+    // the three columns are within 14px of each other — and the tallest column
+    // is now the games pair rather than the pair that had the most prose.
     let col_calib = control_column();
     col_calib.append(&section(
         "Improve my calibration",
-        "If the light conditions change or if you experience less tracker precision, you might \
-         benefit from improving your calibration.",
+        // WHEN, which is the whole payload: the title and the button both
+        // already say "improve calibration", and nothing on screen reports how
+        // well the tracker is doing, so the trigger is the one fact a user
+        // cannot derive from the hub. All three claims of the sentence this
+        // replaces survive it — "you might benefit" → "Helps", "light
+        // conditions change" → "the light changed", "less tracker precision" →
+        // "precision dropped" — and the full sentence is in the help window.
+        //
+        // "Helps", not "Redo": `b_cal` passes seed = true, so this refines the
+        // calibration that is already there.
+        //
+        // 48 characters, one line at the 360px column minimum — see `section`
+        // for why that is the width to measure at and not 380.
+        "Helps if the light changed or precision dropped.",
         &b_cal,
     ));
     col_calib.append(&section(
         "Change screen",
-        "If you move the sensor to a different monitor, you'll need to set up the new display.",
+        // Same shape: the trigger is the content, and nothing in the hub says
+        // which monitor is configured. "you'll need to set up the new display"
+        // is already carried by the button directly beneath, which reads "Set
+        // up display". 46 characters.
+        "Needed if the sensor moves to another monitor.",
         &b_setup,
     ));
 
@@ -1275,13 +1333,25 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let col_display = control_column();
     col_display.append(&section(
         "Select eyes to detect",
-        "If you typically squint or have poor sight in one eye, you can make the eye tracker \
-         detect one eye only.",
+        // No description: the title and three radios labelled Both eyes / Left
+        // eye only / Right eye only say what the control does, and the advice
+        // about who wants it is in `EYES_HELP` — on this box as a tooltip, and
+        // in the help window for everyone a tooltip cannot reach. The biggest
+        // single saving in the rack: 141 → 96px, which is what takes this
+        // column from the tallest to the middle one.
+        "",
         &eyes_ctl,
     ));
     col_display.append(&section(
         "Head tracking",
-        "Sends your head position and angle to games and apps, over opentrack.",
+        // Kept, because it is the only thing on this card that says what head
+        // tracking IS: the control beneath it is about the head MODEL, so with
+        // the sentence gone the card reads as a downloader with no stated
+        // purpose. "your head" is the only redundancy dropped — the card is
+        // titled Head tracking and sits under a picture of the user's head —
+        // and "to games and apps" and "over opentrack", the searchable keyword,
+        // both stay.
+        "Sends position and angle to games and apps, over opentrack.",
         &head_model::control(state.clone(), cmd_tx.clone()),
     ));
 
@@ -1289,7 +1359,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let col_games = control_column();
     col_games.append(&section(
         "Preview my gaze",
-        "Shows you a visual trail of your gaze.",
+        // No description, and this one is a correction rather than a cut. It
+        // said "Shows you a visual trail of your gaze", and there is no trail:
+        // `overlay.rs` draws one 24px circle at the current gaze point per
+        // frame, with no history. The true sentence is `PREVIEW_HELP`, which
+        // the switch has carried as its tooltip all along, and the help window
+        // adds the fact neither has room for — that starting a calibration
+        // switches this off.
+        "",
         &sw_preview,
     ));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
@@ -1408,6 +1485,24 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     title.set_hexpand(true);
     header.append(&title);
     header.append(&status_bar);
+    // The help window's visible door, and the only one a touch user has: F1 is
+    // not discoverable, and a pointer is not the only way people use this. It
+    // matters more than it looks — two cards gave their sentence to a tooltip,
+    // and a tooltip is unreachable without a pointer, so if this button is ever
+    // dropped as clutter that guidance becomes unreachable in practice. Left of
+    // the cogwheel, because help is read before settings are changed.
+    //
+    // Nothing is captured: the window and the application are both found from
+    // the button at click time, so this handler cannot be part of a cycle.
+    let help_btn = icon_button("help-about-symbolic", "?", "Help (F1)");
+    help_btn.connect_clicked(|b| {
+        if let Some(w) = b.root().and_downcast::<gtk::Window>() {
+            if let Some(app) = w.application() {
+                help::open(&app, &w);
+            }
+        }
+    });
+    header.append(&help_btn);
     // The keep-awake switch comes back out with the button that holds it: the
     // popover's widget tree is built once, here, and is never rebuilt, so
     // something outside it has to put the switch back in step with the file.
@@ -1456,6 +1551,41 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         .default_height(natural_height)
         .build();
     window.set_child(Some(&scroller));
+
+    // F1 opens the help window.
+    //
+    // A controller on THIS window rather than an application accel
+    // (`app.set_accels_for_action("app.help", &["F1"])`), and that is a
+    // deliberate limit: an accel would live inside the fullscreen calibration
+    // and display-setup flows too, and a window appearing over the stimulus dot
+    // spoils every sample while still reporting success — which is exactly what
+    // `b_cal` already switches the gaze overlay off to prevent. Scoped here, F1
+    // cannot reach a running flow. The cost is that F1 does nothing inside the
+    // flows, where a confused user often is; if those ever need help, they need
+    // their own text in the flow, not this window over the top of it.
+    //
+    // `Capture`, so the key is seen before any focused child can swallow it.
+    //
+    // Weak, like `add_escape_to_close`: the controller belongs to this window,
+    // and a strong reference here is a cycle the window never survives — see
+    // `hold_while_open` for what that cost last time.
+    {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let target = window.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk::gdk::Key::F1 {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(w) = target.upgrade() {
+                if let Some(app) = w.application() {
+                    help::open(&app, &w);
+                }
+            }
+            glib::Propagation::Stop
+        });
+        window.add_controller(keys);
+    }
 
     // The window follows its content from here on.
     //
@@ -1870,6 +2000,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             // has to release it here — which it does at the moment of hiding
             // rather than a frame or two later.
             *unmap_focus.borrow_mut() = None;
+            // And the help window, if one is open. It is transient for this
+            // window, and `destroy_with_parent` does not cover a parent that is
+            // merely HIDDEN — which is what closing to the tray does — so it
+            // would be left to the compositor, floating alone on an empty
+            // desktop with no hub to go back to. Unmap rather than the close
+            // handler on purpose: minimising leaves this window mapped, and a
+            // minimised hub is one click away, so help may stay up beside it.
+            help::close();
         });
     }
 
@@ -2277,15 +2415,27 @@ fn settings_list() -> (gtk::Box, KeepAwakeSwitch) {
     list.set_margin_start(6);
     list.set_margin_end(6);
 
-    // First, and it is the only row here that is about the tracker rather than
-    // about this program. It is here because there is nowhere better: the games
-    // card is at its height budget and this is not a game-output setting
-    // anyway, and a rack card of its own would give the hub's most-regretted
-    // setting the same weight as calibration. What makes a popover an
-    // acceptable home for it is that its on-state does not stay in the popover
-    // — see `awake_pill` in `build_hub`. The switch itself is handed back to
-    // the caller as well as appended here, so the hub tick can keep it in step
-    // with the file; the popover is built once and never rebuilt.
+    // The third door to the help window, after F1 and the "?" beside this
+    // cogwheel — because a cogwheel is the other place people look for help,
+    // and a window whose content two cards now depend on cannot have too few
+    // ways in. It is first so it is not hunted for.
+    //
+    // Nothing captured here either: the window and the application come from
+    // the button at click time. The popover is dismissed first, or it would
+    // stay open behind a window that is not its parent.
+    list.append(&help_row());
+    list.append(&hairline());
+
+    // First of the settings, and it is the only row here that is about the
+    // tracker rather than about this program. It is here because there is
+    // nowhere better: the games card is at its height budget and this is not a
+    // game-output setting anyway, and a rack card of its own would give the
+    // hub's most-regretted setting the same weight as calibration. What makes
+    // a popover an acceptable home for it is that its on-state does not stay in
+    // the popover — see `awake_pill` in `build_hub`. The switch itself is
+    // handed back to the caller as well as appended here, so the hub tick can
+    // keep it in step with the file; the popover is built once and never
+    // rebuilt.
     let awake = KeepAwakeSwitch::new();
     list.append(&settings_row(
         "Keep the tracker awake",
@@ -2330,6 +2480,37 @@ fn settings_list() -> (gtk::Box, KeepAwakeSwitch) {
     list.append(&quit_row());
 
     (list, awake)
+}
+
+/// The cogwheel's way into the help window.
+///
+/// The description names F1 as well, because this row is where somebody who
+/// did not know the key will find out there is one.
+fn help_row() -> gtk::Box {
+    let btn = crate::widget::button("Help");
+    btn.add_css_class("quiet");
+    btn.connect_clicked(|b| {
+        // Dismiss the popover before opening the window: it is anchored to the
+        // cogwheel, and a popover left up under a window it did not open reads
+        // as the click having missed.
+        if let Some(p) = b
+            .ancestor(gtk::Popover::static_type())
+            .and_downcast::<gtk::Popover>()
+        {
+            p.popdown();
+        }
+        if let Some(w) = b.root().and_downcast::<gtk::Window>() {
+            if let Some(app) = w.application() {
+                help::open(&app, &w);
+            }
+        }
+    });
+    settings_row(
+        "Help",
+        "What every card and control on this window does, including the ones \
+         that only explain themselves when you hover. F1 opens it too.",
+        &btn,
+    )
 }
 
 /// The way out, since the window's own X no longer is one.
@@ -2790,6 +2971,29 @@ fn update_check_switch() -> Switch {
 /// A card rather than a bare stack because the hub holds five co-equal
 /// settings; stacked headings alone left the eye no boundary between them, so
 /// the column read as one long paragraph with buttons in it.
+///
+/// # How long a description may be
+///
+/// **Measure at 360px, not at 380.** The window opens at the three-column
+/// layout's minimum width, and at that width the first column gets exactly
+/// [`COLUMN_WIDTH`] — 326px inside a card's 16px padding and 1px border. A
+/// sentence that fits on one line at 380 and wraps at 360 costs a line of card
+/// in the layout the window actually opens in: the first draft of the
+/// shortening below lost 38 of its 56 promised pixels exactly that way. The
+/// budget is about **48 characters** at the default font and text scale 1.0 —
+/// which is a measurement of this machine, not a constant: a larger text scale
+/// or a different default font wraps earlier. Nothing clips when it does (the
+/// window re-fits to its content, see `REFIT`); the card simply grows a line.
+///
+/// # No description
+///
+/// An empty `desc` appends no label at all, rather than an empty one — an empty
+/// wrapping label still takes a line's height and the 6px above it. It means
+/// the card's title and its control say everything the card has to say, and
+/// what is left over has gone to a tooltip and to [`help`]. Two cards are in
+/// that shape: "Select eyes to detect" (whose sentence was advice, not
+/// operation) and "Preview my gaze" (whose sentence was wrong). Anything that
+/// moves out this way MUST be in the help window — see [`help`] for why.
 fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Box {
     let b = gtk::Box::new(Orientation::Vertical, 6);
     b.add_css_class("surface");
@@ -2799,19 +3003,21 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
     t.set_halign(Align::Start);
     t.set_xalign(0.0);
     t.set_wrap(true);
-    let d = Label::new(Some(desc));
-    d.add_css_class("section-desc");
-    d.set_halign(Align::Start);
-    d.set_xalign(0.0);
-    d.set_wrap(true);
-    // A wrapping label reports its UNWRAPPED width as natural, so without a cap
-    // the longest sentence in the column sets the column's width — and the
-    // control rack grew until it crowded the instrument beside it.
-    d.set_max_width_chars(44);
+    b.append(&t);
+    if !desc.is_empty() {
+        let d = Label::new(Some(desc));
+        d.add_css_class("section-desc");
+        d.set_halign(Align::Start);
+        d.set_xalign(0.0);
+        d.set_wrap(true);
+        // A wrapping label reports its UNWRAPPED width as natural, so without a
+        // cap the longest sentence in the column sets the column's width — and
+        // the control rack grew until it crowded the instrument beside it.
+        d.set_max_width_chars(44);
+        b.append(&d);
+    }
     control.set_halign(Align::Start);
     control.set_margin_top(6);
-    b.append(&t);
-    b.append(&d);
     b.append(control);
     b
 }
