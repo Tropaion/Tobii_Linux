@@ -204,6 +204,17 @@ help window is where those sentences are reachable. Esc, F1 again or the Close
 button put it away; the topics are selectable text, so Tab walks them and they
 can be copied into a bug report.
 
+It is nine topics in a list, with a **search box** the window opens focused, so
+you can type the question rather than find it: the search reads every heading
+and the whole of every topic, and a word off the control in front of you —
+"joystick", "cogwheel", "pitch" — is usually enough. Every word you type has to
+appear in the same topic, so a second word narrows rather than widens, and a
+query nothing answers says so rather than going blank. **Down** moves from the
+box into the list and the arrow keys walk it, with the topic beside it changing
+as you go; **Ctrl+F** comes back to the box from anywhere in the window. Narrow
+the window and the list folds away behind a **Topics** button, so the topic you
+are reading gets the whole width.
+
 **Select eyes to detect** — both, left only, or right only — is a real device
 setting and lives on its own card.
 
@@ -492,12 +503,12 @@ tobii bridge install --prefix /path/to/prefix   # anything not Steam
 tobii bridge status --steam elite        # what is in that prefix right now
 ```
 
-`tobii bridge status` **runs nothing and changes nothing** — it reads three
-files and asks the kernel one question, and never starts `wine`, which matters
-because starting `wine` against a prefix initialises or upgrades it. It reports
-which prefix and which wine it resolved, whether the DLLs are there, what each
-of the two discovery keys holds and whether it is ours, and whether a
-wineserver is serving the prefix. It is short on purpose — it is meant to be
+`tobii bridge status` **runs nothing and changes nothing** — it reads the
+prefix's own files and asks the kernel who holds the prefix's wineserver lock,
+and never starts `wine`, which matters because starting `wine` against a prefix
+initialises or upgrades it. It reports which prefix and which wine it resolved,
+whether the DLLs are there, what each of the two discovery keys holds and
+whether it is ours, and whether a wineserver is serving the prefix. It is short on purpose — it is meant to be
 pasted into an issue, though unlike `tobii debug` it does not fold your home
 path away, so read it before you post it. It reports what is registered; it
 does not predict what a game will do with it.
@@ -509,9 +520,12 @@ report says so when it finds a live wineserver.
 **Nothing has to be left running.** The client DLL the game loads receives the
 tracking itself, in a background thread inside the game's own process, and
 publishes it into `FT_SharedMem` where the game reads it. A second executable
-would have to run inside the game's own wineserver session, which for a Steam
-game means reproducing Proton's entire launch environment; the DLL is already
-in there.
+would have to run inside the game's own wineserver session — and that, for a
+Steam game, is taken to mean reproducing Proton's entire launch environment.
+That second half is this project's working assumption and not a measurement,
+and is written up as open in [Game-Output](docs/wiki/Game-Output.md). The DLL
+is already in there either way, which is why nothing here depends on the
+answer.
 
 **64-bit games only.** A 32-bit game asks for `freetrackclient.dll` without the
 `64` and finds nothing — see
@@ -563,6 +577,38 @@ gone. `uninstall` is the other half of the same rule: it deletes a key only
 while it still holds our own install directory or exactly the value the record
 says this installer wrote, and leaves anything else alone and named, so it
 cannot take opentrack's registration with it on the way out.
+
+**A refusal costs the prefix nothing, as long as nothing is serving it.**
+Reading the keys through `wine reg query` is itself a wine run, so an install
+that refused — and an uninstall with nothing of ours to take out — used to
+upgrade the prefix it had just declined to touch. Both now read the prefix's
+own `user.reg` first, exactly as `status` does, and start `wine` only once the
+run has decided it is going to write. Measured on a throwaway prefix with a
+`wine` that wrecks it if it runs at all: the prefix comes out byte for byte as
+it went in, and nothing was spawned. That holds while the prefix's wineserver
+lock is free. With a wineserver alive — the game running, which is exactly when
+you might try this — `user.reg` is the registry as last written back and can
+lag, so the decision is taken through `wine` instead and a refusal does touch
+the prefix. Correctness wins there on purpose: a stale file that reported a key
+empty would let the install overwrite the registration the refusal exists to
+protect. `tobii bridge status` never falls through this way, because it only
+reports.
+
+**Every `tobii bridge` subcommand refuses what it does not read**, before it
+resolves a prefix, creates a directory or writes a key: an unknown flag, `-h`,
+`--prefix=PATH`, a flag with nothing after it — and a bare path. `tobii bridge
+install /games/pfx` used to drop the path on the floor and install into
+`$WINEPREFIX` or `~/.wine` instead, saying so nowhere.
+
+**If you do need `tobii bridge run`** — the one case that still needs something
+running, where TrackIR is pointed at a third-party client DLL that only *reads*
+the shared memory ours create — **start the game first.** While it runs it is a
+wine process on that prefix, and Steam runs `wineserver -w` before it spawns a
+Proton game, which waits for every wine process on the prefix to exit: a bridge
+started first leaves the launch sitting there doing nothing. The command says
+that before it starts, names the lock, and stops itself if something does start
+waiting behind it. Late is not too late — a client DLL picks up the shared
+mapping when it appears.
 
 `tobii bridge uninstall --prefix PATH` removes it again.
 </details>
@@ -1270,6 +1316,17 @@ not a missing test: the checksums are an integrity check, not a signature.
   writing — exercised against a stateful fake wine and against live wine 11.18
   in throwaway prefixes, never against a game's Proton prefix with a Windows
   opentrack registered inside it.
+- **Whether any game accepts our own `NPClient64.dll` is unknown.** One title
+  has ever been measured against NaturalPoint's signature check, and it
+  *rejected* it: on 2026-08-15 Star Citizen called `NP_GetSignature`, got
+  nothing it recognised from a clean-room DLL, and never asked for data again.
+  That is why `install` points TrackIR at an already-installed client instead,
+  and it is the whole of the evidence in either direction — `--npclient ours`
+  is offered for a game that does not check, and no such game has been
+  measured. FreeTrack is the verified route (Elite Dangerous, above); the
+  registry work, the `status` report and the wineserver yield are all about
+  what is *registered* and what does not break a launch, and none of them says
+  a game will use the data.
 - **A pitch calibration and a `tobii headpose` started during it do not
   cooperate.** The measurement holds the hub's device thread for about 13
   seconds without declaring itself exclusive, so the hub grants the lease,
@@ -1279,7 +1336,8 @@ not a missing test: the checksums are an integrity check, not a signature.
 
 The full list, per release, is in
 [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1,
-§11.3f and §11.3g for v0.4.1.
+§11.3f and §11.3g for v0.4.1, and §11.3h–§11.3j for the help window, the
+wineserver lock and the prefix reads that no longer run wine.
 
 **Reporting a problem:** `tobii debug` prints the report an issue asks for, and
 the hub's cogwheel can copy or save it. Since v0.4.1 it carries a **game

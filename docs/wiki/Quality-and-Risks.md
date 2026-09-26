@@ -883,11 +883,15 @@ built for the purpose.
 
 ### 11.3h The shortened cards and the F1 help window (unreleased, after v0.4.1)
 
-Four card descriptions were shortened, two were removed from the card
-altogether, and a help window was added to hold what they gave up. The window
-is the load-bearing part: **GTK4 shows a tooltip on pointer hover and on
-nothing else** — there is no focus trigger and no touch trigger — so a fact
-that lives only in a tooltip cannot be read with a keyboard or on a
+Three card descriptions were shortened and two were removed from the card
+altogether — five of the six cards; "Head tracking for games" was already one
+line at v0.4.1 and was not touched. One of the two removals is a correction
+rather than a cut: "Preview my gaze" said "Shows you a visual trail of your
+gaze", and `overlay.rs` draws one circle at the current gaze point per frame
+with no history at all. A help window was added to hold what the rest gave
+up. The window is the load-bearing part: **GTK4 shows a tooltip on pointer
+hover and on nothing else** — there is no focus trigger and no touch trigger —
+so a fact that lives only in a tooltip cannot be read with a keyboard or on a
 touchscreen, and two cards' guidance is now in exactly that position.
 
 - **The window has to stay discoverable.** F1 is not discovery. The "?" button
@@ -919,16 +923,66 @@ touchscreen, and two cards' guidance is now in exactly that position.
   (no description may be taller at the width the window opens at than with room
   to spare) rather than as a pixel count that does not.
 - **Two cards are now titled "Head tracking" and "Head tracking for games"**,
-  and only the second keeps a description. That is deliberate and fragile: a
-  later pass that cuts the games line for another 26px would leave the pair
-  genuinely ambiguous. Rename the first card instead.
+  and the pair is told apart by their descriptions as much as by their titles:
+  "Sends position and angle to games and apps, over opentrack."
+  (`crates/tobii-gtk/src/lib.rs:1373-1381`) against "Sends head tracking and
+  gaze to a game." (`lib.rs:1403-1410`). Both were deliberately kept — the
+  first carries a comment saying why — and a later pass that cut *either* of
+  them for another 26px would leave two cards whose titles differ only by "for
+  games". The test that would notice is `tests/help_window.rs:1560-1572`, which
+  requires the set of cards with no description to be exactly
+  `["Select eyes to detect", "Preview my gaze"]`.
+- **The window is a topic list, a search box and one topic at a time**, not
+  the 2464px scroll it started as. The search is the load-bearing half: it
+  opens focused, reads every heading and every body, and requires every word
+  typed to appear in the same topic, so a second word narrows
+  (`crates/tobii-gtk/src/help.rs:338-373`). The risk it carries is that this
+  page is built from the hub's own strings, so it answers for the words those
+  strings happen to contain and for no others — a promise nothing enforces.
+- **One control's own word is known not to find it.** The three strength
+  presets are captioned `Subtle`, `Normal` and `Strong` (`games::STRENGTHS`,
+  `crates/tobii-gtk/src/games.rs:41-45`), their row carries no caption, and
+  none of the three words is in any topic — so typing `Subtle` or `Strong`
+  lands on the no-match page, and `Normal` matches only by accident, through
+  the word "normally" in a topic about something else. It is written down in
+  `help.rs:1189-1196` as a known gap rather than asserted, because closing it
+  means naming the presets FROM that constant instead of retyping them. The
+  test beside it does hold the line for the words the window advertises: the
+  four the "Keyboard" topic tells a user to try, and six words printed on the
+  hub, each of which must open a topic that really contains it.
+- **The folding sidebar leaked the entire window, twice.** Below 520px the
+  topic list folds behind a "Topics" button; pressing it and picking a topic
+  left 80 of 87 widgets and 127 of 143 event controllers alive after the window
+  closed, accumulating linearly for as long as the hub ran — and the retainer
+  was not a reference cycle in the handlers but GTK's focus bookkeeping over a
+  pane hidden, shown and hidden again with the focus never put back into it.
+  The fix is to hand the focus to whichever pane has just come on screen. What
+  makes this a standing risk rather than a closed one is that **the guard has
+  to be taken through the sequence that leaks**: the first leak census in this
+  file ran over a window that was only ever wide and reported zero. There are
+  now two, and the narrow one asserts it weak-ref'd at least 40 widgets before
+  it asserts none survived (`tests/help_window.rs:1125-1155`).
 - **What is measured:** the whole window, end to end on the real `build_hub`,
   748px natural height before and 692px after at an unchanged natural width of
   1241px; cards 142/142/96/194/94/204 against 180/161/141/213/120/204. A
   headless test asserts every tooltip-sourced constant is in `help::topics`,
   and a display test walks the real hub's six cards and requires every tooltip
-  it finds, paragraph by paragraph, in the help text. Sixteen control runs
-  reverted each behaviour in turn and watched the test fail.
+  it finds, paragraph by paragraph, in the help text; it also drives the real
+  window's focus-on-open, its Tab chain, the arrow walk down the topic list,
+  Ctrl+F, the breakpoint at 520px and both leak censuses, with GTK's own
+  `child_focus` and `move-cursor` rather than with a sentence about them.
+  Sixteen control runs reverted each behaviour in turn and watched the test
+  fail.
+- **What is NOT measured: any of that, in CI.** Every one of those window
+  assertions lives in a test marked `#[ignore = "needs a display"]` — five of
+  them in `tobii-gtk`, four being whole integration tests — and `ci.yml` runs
+  `cargo test --workspace` on a machine with no display and no `xvfb`, so it
+  runs none of them. What runs everywhere is the headless half: every
+  tooltip-sourced constant is somewhere in `help::topics`, which can see the
+  model and never the window built from it. The display test also needs the
+  compositor to make its window ACTIVE, which it checks and says so about
+  rather than blaming Tab.
+
 ### 11.3i The wineserver lock, and what yielding to it does not prove (unreleased, after v0.4.1)
 
 `tobii bridge run` now probes the prefix's wineserver lock before it starts and
@@ -960,6 +1014,26 @@ means for a real game is not.
   (`bridge/core/src/lib.rs`). The change stops a second process breaking the
   launch. That is its entire claim, and the messages are worded to claim no
   more.
+- **The device in `/proc/locks` is not the device `stat` reports, and getting
+  that wrong disabled the whole stand-down on this machine's filesystem.**
+  `/proc/locks` prints the *superblock's* device; `btrfs_getattr` hands `stat`
+  the subvolume's anonymous device instead. Measured here: `/`, `/home` and
+  `/var/tmp` are three subvolumes of one btrfs reporting `st_dev` 31, 53 and
+  57, while `/proc/locks` says `00:1d` — device 29 — for a lock on any of them.
+  The comparison is now made against the device
+  `/proc/self/mountinfo` gives for the mount the lock file is on
+  (`crates/tobii-cli/src/wineserver.rs:315-370`). The failure it fixes is the
+  worst shape available to this feature: silent, filesystem-dependent, and a
+  launch left sitting there having been promised in so many words that it would
+  not be.
+- **A `SIGTERM` aimed at `tobii` alone orphans the wine child.** `run` installs
+  no signal handler; the only thing that kills the child is the yield path
+  (`stop`, `crates/tobii-cli/src/bridge.rs:1774-1789`). The child is
+  deliberately left in this process's group so that a Ctrl-C at the terminal
+  reaches wine too, which is the case a user is actually in — but a `kill
+  <tobii pid>`, or a supervisor that signals one pid, leaves a wine process
+  alive on the prefix holding exactly the lock this feature exists to get out
+  of the way of. Read out of the code, not measured.
 - **The watch loop's own I/O is untested.** `blocked_waiter` is a pure function
   checked against the measured `/proc/locks` text and five negatives, and
   `supervise` is checked against a real child with an injected waiter — but the
@@ -976,6 +1050,103 @@ means for a real game is not.
   start, and `--register` overwrote it. What *is* tested from the root
   workspace is that `tobii bridge run` passes `--no-register`
   (`bridge.rs`, `run_starts_the_provider_with_the_registry_write_turned_off`).
+
+### 11.3j `bridge status`, and the reads that no longer run wine (unreleased, after v0.4.1)
+
+`tobii bridge status` is new, and with it a rule the other subcommands now keep
+too: **a `tobii bridge` command that ends up writing nothing must not have
+started `wine` to find that out.** `wine reg query` is `wine`, and wine
+initialises or upgrades whatever prefix it is pointed at before it answers —
+measured with wine 11.18 on throwaway prefixes: 5510 paths created under a
+directory holding only `drive_c`, and on a complete prefix whose
+`.update-timestamp` was stale (what a Proton prefix looks like to the host's
+wine) 2744 lines of `system.reg` rewritten and the stamp overwritten. So
+`status` reads the prefix's own `user.reg`
+(`crates/tobii-cli/src/userreg.rs`), and an install that refuses or an
+uninstall with nothing of ours to remove decides from the same file whenever
+the wineserver lock says nothing is serving the prefix (`settled_keys`,
+`crates/tobii-cli/src/bridge.rs:1032-1086`). The design is in [[Game-Output]];
+what belongs here is how much of it is measured and how much is reasoning.
+
+- **What is measured, and how.** Three tests hand the command a `wine` that
+  *wrecks* the prefix if it runs at all — `.update-timestamp` and `system.reg`
+  overwritten, `drive_c/windows` deleted (`WRECKING_WINE`,
+  `bridge.rs:3253-3269`) — and compare the whole prefix tree before and after,
+  every path with its size, its mtime to the nanosecond and a digest of its
+  bytes (`status_runs_no_wine_and_leaves_the_prefix_byte_for_byte_as_it_was`,
+  `a_refused_install_runs_no_wine_and_leaves_the_prefix_as_it_was`,
+  `an_uninstall_with_nothing_to_remove_runs_no_wine`). Each then runs the
+  wrecking wine itself and asserts the prefix *did* change, so a script that
+  could not be executed at all cannot pass the test by silence. All three were
+  re-run against throwaway prefixes on the binary built from this tree while
+  this section was written: the prefix hashes identically before and after and
+  the fake wine's log stays empty. The figures 2744/5510, and the refusal's own
+  2764, came from live wine 11.18 on throwaway prefixes rather than from the
+  fakes.
+- **What is measured about the reader.** `userreg.rs` is a second
+  implementation of wine's own registry reader, and every rule it keeps was
+  checked against wine 11.18 one case at a time rather than inferred: the
+  header line wine refuses a file over, last-match-wins for a duplicated key or
+  value, a header with one trailing separator naming the same key (and the
+  three sharper separators that kill the wineserver instead), indented lines,
+  whitespace around the `=`, and the `\x` padding rule that makes an escape
+  decodable. 22 tests in that file, 88 in `bridge.rs`, 25 in `wineserver.rs`.
+- **The reimplementation is the risk, and it has already bitten seven times.**
+  Everything above is agreement with **one build on one machine**. Nothing
+  re-checks it when wine changes, and the whole surface exists to answer a
+  question the authoritative reader would answer for us. **Seven shapes where
+  the parser and wine disagreed were found after it was written, every one of
+  them by review rather than by use**: three in `f6a0e4f` (an indented header,
+  an indented value line, an escaped value name) and four in `be75f1d` (the
+  header line wine refuses the whole file over, last-match-wins, a trailing key
+  separator, whitespace around the `=`). Most of them had the parser reporting
+  "nothing is registered here" about a value wine hands the game — the one
+  answer whose next move is to write. Two went the other way and are worth
+  telling apart: the missing header made `status` print a registration no
+  process in that prefix could see, and last-match-wins made it print the wrong
+  one of two. The design contains the damage rather than preventing it: **a
+  value that cannot be read exactly is never reported as absent**, so the
+  failure mode this surface fails towards is a refusal to act on a key, not a
+  clobbered registration.
+- **The lag is real and disclosed, not removed.** `user.reg` is the registry as
+  last written back; a wineserver holds changes in memory until the last
+  process on the prefix exits. `status` says so whenever it finds a live
+  wineserver and says nothing of the sort when it does not, since the file is
+  then the registry (`staleness`, `bridge.rs:2256-2286`). The commands that
+  *act* do not get that luxury and fall through to wine in the same case. The
+  window between the lock probe and the write is not closed by any of this —
+  it exists for the wine read too, and nothing here holds the prefix.
+- **What is NOT exercised: a Proton prefix belonging to a running game.** Every
+  live run was a throwaway prefix made for the run, and no real third-party
+  registration — a Windows opentrack installed inside a game's prefix — has
+  been through the refusal, `--force`, the uninstall rule or this report. The
+  stateful fake wine holds a foreign value and proves the branch, not the
+  registry it would meet. §11.3g's `is_ours` limitation is unchanged by any of
+  this work.
+- **And none of it says a game will use the data.** The report is worded to
+  describe the prefix and never to predict the title, and a test forbids the
+  words "ready", "working", "will work" and "you are all set" in its output
+  (`status_never_predicts_what_the_game_will_do`). The reason is one
+  measurement: on 2026-08-15 Star Citizen called `NP_GetSignature`, got nothing
+  it recognised from our clean-room `NPClient64.dll`, and never asked for data
+  again (`NpSource::Installed`, `bridge.rs:127-142`). That is the only title
+  ever measured against NaturalPoint's check, and it is a **rejection**;
+  whether any game accepts our NPClient is unknown, and nothing in `status`,
+  in the refusals or in the `--wine` warnings may be read as evidence either
+  way. The verified route is still FreeTrack, on a real Elite Dangerous Proton
+  prefix — see [[Game-Output]].
+- **The flag gate now also refuses a bare positional**, before anything is
+  resolved or written (`reject_unknown_flags`, `bridge.rs:2679-2706`, driven
+  from the one `SUBS` table at `bridge.rs:2720-2742` so a subcommand cannot be
+  checked against one list of flags and run by another). `tobii bridge install
+  /games/pfx` used to drop the path and install into `$WINEPREFIX` or
+  `~/.wine`, saying so nowhere. This is the fifth hole found in that one gate
+  — after `--help` itself, `-h`, `--prefix=PATH` and a valueless `--prefix` —
+  and, like the other four, it was found by a reviewer rather than reported by
+  a user, on the one command in this project that writes into somebody else's
+  Wine prefix. Checked on the built binary: every spelling above is refused,
+  for every subcommand, and `games`, which reads no flags at all, refuses them
+  too.
 
 ### 11.4 Environmental
 

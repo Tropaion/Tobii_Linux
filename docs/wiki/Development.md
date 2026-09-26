@@ -92,12 +92,12 @@ pinned; see [[Architecture-Decisions]] §18.
 | `tobii-headpose` | 112 (+7 ignored) | The ignored ones need the 13 MB model |
 | `tobii-update` | 104 | 96 unit + 8 install end-to-end |
 | `tobii-diagnostics` | 28 | The report and the log; a test fails if it leaks a home path |
-| `tobii-cli` | 141 | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, and the Wine-bridge registry against a fake `wine` |
+| `tobii-cli` | 219 | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, the Wine-bridge registry against a stateful fake `wine` (and, for the commands that must not run one at all, against a `wine` that wrecks the prefix if it runs), the `user.reg` reader against files real wine wrote, and the wineserver lock's `/proc/locks` parsing |
 | `tobii-ipc` | 42 | 33 unit + 9 in `tests/roundtrip.rs` |
 | `tobii-output` | 142 (+1 ignored) | Unit |
-| `tobii-gtk` | 302 (+4 ignored) | Inline; pure logic split out from widget code. The ignored four need a display |
+| `tobii-gtk` | 308 (+5 ignored) | Inline; pure logic split out from widget code. The ignored five need a display — four of them whole integration tests (`tests/`), including the one that drives the real hub and the real help window |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
-| **Total** | **1027 (+11 ignored)** | |
+| **Total** | **1193 (+13 ignored)** | |
 
 Counted with `cargo test -p <crate>`, not from memory: this table said "41 unit
 + 6 replay" for `tobii-usb` long after both numbers had moved, which is the
@@ -280,6 +280,26 @@ Collected from the source and from bugs that actually happened.
   handle. `--background` is filtered out of argv, so it *does* fire.
 
 ---
+
+## Before you verify anything by hand
+
+`cargo test` does not rebuild `target/debug/tobii`, so a manual check can run a
+binary older than the fix you are checking. That has bitten this project three
+times, each time writing into the maintainer's real `~/.wine`: the last one ran
+a build from before the gate that refuses `tobii bridge install <path>`, so the
+positional was dropped and the install went to the default prefix — the exact
+bug the gate closes, missed because the gate was not in the binary.
+
+Build first, then verify:
+
+```sh
+cargo build --release          # or -p tobii-cli for the CLI alone
+./target/release/tobii ...
+```
+
+And point every Wine experiment at a throwaway prefix (`--prefix`, or
+`WINEPREFIX=`), never the default one: with neither given, the bridge commands
+resolve `~/.wine`.
 
 ## Releasing
 

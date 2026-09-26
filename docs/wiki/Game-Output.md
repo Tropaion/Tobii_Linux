@@ -432,18 +432,17 @@ installer wrote it, and says whether a wineserver is serving the prefix. It
 reports **what is registered, not whether a game will accept it** — the only
 title ever measured against NaturalPoint's signature check is Star Citizen.
 
-**It starts no process at all**, which is the difference between it and every
-other subcommand here. `install`, `uninstall` and `run` take the resolved
-`wine` and run it against the prefix, and wine initialises or upgrades whatever
-prefix it is pointed at: measured with wine 11.18 on throwaway prefixes, one
-`wine reg query` created 5510 paths under a prefix that held only `drive_c`,
-and on a complete prefix with a stale `.update-timestamp` — which is what a
-Proton prefix looks like to the host's wine — it rewrote 2745 lines of
-`system.reg` and stamped the prefix as its own. That is the upgrade the
-`--wine` warnings on this page are about, and a command you run *because*
-something is already wrong must not be the thing that changes it. So `status`
-reads the two discovery keys out of the prefix's own `user.reg` instead, which
-also means the answer does not depend on which `wine` it resolved.
+**It starts no process at all.** `wine reg query` is still `wine`, and wine
+initialises or upgrades whatever prefix it is pointed at before it answers
+anything: measured with wine 11.18 on throwaway prefixes, one `wine reg query`
+created 5510 paths under a prefix that held only `drive_c`, and on a complete
+prefix with a stale `.update-timestamp` — which is what a Proton prefix looks
+like to the host's wine — it rewrote 2744 lines of `system.reg` and stamped the
+prefix as its own. That is the upgrade the `--wine` warnings on this page are
+about, and a command you run *because* something is already wrong must not be
+the thing that changes it. So `status` reads the two discovery keys out of the
+prefix's own `user.reg` instead, which also means the answer does not depend on
+which `wine` it resolved.
 
 The cost of that, which the report states where the values are: `user.reg` is
 the registry as it was last written back, and a prefix writes its registry back
@@ -456,6 +455,83 @@ The report names the prefix as it is spelled on your machine — login name and
 all — because the undo command it ends with is only any use spelled exactly.
 `tobii debug`, the other half of what an issue wants, folds those paths away;
 this one cannot. Read it through before you paste it.
+
+**The two commands that can end without writing read the same file first.** An
+`install` that refuses, and an `uninstall` with nothing of ours to remove, used
+to reach for `wine reg query` to find that out — and so upgraded the prefix they
+had just declined to touch (measured the same way: the refusal created no
+directory and wrote no key, and still moved `.update-timestamp` and rewrote 2764
+lines of `system.reg`). Both now decide from `user.reg` whenever the wineserver
+lock says nothing is serving the prefix, which is the case where the file *is*
+the registry; wine is started only once the run has decided it is going to write
+— something it was going to do anyway (`settled_keys`,
+`crates/tobii-cli/src/bridge.rs:1032-1086`). Measured on the merged tree, with a
+`wine` that wrecks the prefix if it runs at all: a refused install and a no-op
+uninstall leave the prefix byte-for-byte as it was and never spawn it
+(`a_refused_install_runs_no_wine_and_leaves_the_prefix_as_it_was`,
+`an_uninstall_with_nothing_to_remove_runs_no_wine`). An install that goes
+through still runs wine to write the keys, and `run` is a wine process by
+definition.
+
+The file is not consulted where it could not answer safely: a `user.reg` that
+cannot be read whole, or a prefix something is serving — where a wineserver is
+holding registry changes in memory — falls through to wine, because a command
+that *acts* cannot hand the lag to the reader the way the report does.
+
+### Reading `user.reg` is a second implementation of wine's reader
+
+`crates/tobii-cli/src/userreg.rs` is the whole of it: one function that finds
+one value under one key in the bytes of a `user.reg`. It exists because the
+accurate way to ask — `wine reg query` — costs the prefix, and it is a
+reimplementation, so the rule it is written to is that **a value it cannot read
+exactly is never reported as an absence**. "Nothing is registered here" is the
+answer whose next move is to write; "there is something here I cannot read" is
+the answer that makes `install` refuse and `uninstall` keep its hands off. Every
+shape it does not fully decode comes back as the second.
+
+What it agrees with wine about was measured against wine 11.18 one case at a
+time, not inferred from the format:
+
+* The first line must be exactly `WINE REGISTRY Version 2`. With that line
+  missing, BOM'd, indented, lower-cased or renumbered, wine loads **no `HKCU`
+  at all** and answers every query in that prefix with "key not found" — so a
+  parser that skipped to the sections read a registration no process in that
+  prefix could see (`userreg.rs:100-110`, checked in `lookup` at
+  `userreg.rs:126-143`).
+* Wine's loader applies the file top to bottom, so a key or a value spelled
+  twice leaves the **last** one in memory. Measured four ways — section
+  repeated, section re-cased, value repeated, value re-cased — all four answer
+  the second value (`userreg.rs:146-153`).
+* A section header written with one trailing `\` names the same key; a leading
+  one, a doubled one or two trailing ones kill the wineserver outright, so
+  nothing at all can be read out of such a prefix (`userreg.rs:264-284`).
+* Wine reads indented headers and values, and tolerates whitespace on either
+  side of the `=`, though its own writer produces neither
+  (`userreg.rs:157-169`, `userreg.rs:296-310`).
+* Names and values are unescaped the way wine writes them, including the rule
+  that makes the escapes decodable at all: a `\x` escape is padded to four hex
+  digits when the next character is itself a hex digit (`userreg.rs:54-61`).
+
+One thing this reads that `wine reg query` could not: a path with characters
+outside ASCII. `reg.exe` prints in the console's OEM codepage, so those bytes
+were a guess and the old path refused them; `user.reg` names the code point, so
+the character is decoded exactly and shown.
+
+### Every subcommand refuses what it does not read
+
+`tobii bridge install --help` used to ignore the flag and perform a real install
+into `$WINEPREFIX` or `~/.wine`, writing both discovery keys. Each subcommand
+now names the flags it reads, and anything else stops the command before a
+prefix is resolved, a directory created or a key written (`reject_unknown_flags`
+and `SUBS`, `crates/tobii-cli/src/bridge.rs:2679-2706` and `:2720-2742`).
+Refused, checked on the built binary: an unknown `--flag`; `-h` and every other
+single-dash token; `--prefix=PATH`, which would pass a name check and then be
+ignored because every reader compares whole tokens; a flag with nothing after it; and **a bare
+positional** — `tobii bridge install /games/pfx`, the most natural spelling of
+all, which used to be dropped on the floor while the install went into
+`$WINEPREFIX` or `~/.wine` and said so nowhere. A positional is refused rather
+than read as a prefix path because the commonest way to produce one is not a
+forgotten flag: `--steam Star Citizen` leaves `Citizen` standing alone.
 
 Nothing has to be left running. The client DLL the game loads **receives the
 tracking itself**, in a background thread inside the game's own process, and
@@ -649,7 +725,16 @@ Two things enforce the rule rather than only documenting it
 * **While it runs**, `run` watches `/proc/locks` for a blocked waiter on that
   same lock file — the shape, measured, is a second line on the same inode with
   a `->` prefix naming the waiter's pid. On seeing one it stops, so the launch
-  goes through, and says to start it again once the game is up.
+  goes through, and says to start it again once the game is up. Matching that
+  line needs the device `/proc/locks` prints, which is the *superblock's* and
+  not the one `stat` reports: on btrfs `btrfs_getattr` hands `stat` the
+  subvolume's anonymous device instead, and measured here `/`, `/home` and
+  `/var/tmp` report `st_dev` 31, 53 and 57 while `/proc/locks` says `00:1d` for
+  a lock on any of them. The device is therefore taken from
+  `/proc/self/mountinfo` for the mount the lock file is on
+  (`crates/tobii-cli/src/wineserver.rs:315-370`); comparing `st_dev` against
+  that text missed every waiter on such a filesystem, silently, and the
+  stand-down never fired.
 
 Verified end to end on a throwaway prefix on 2026-09-26: with the bridge
 running, a real `wineserver -w` blocked on the lock, the bridge saw the waiter,
