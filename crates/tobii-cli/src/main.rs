@@ -78,6 +78,7 @@ fn main() -> ExitCode {
                  tobii game -- <command> [args...]\n  \
                  tobii games [set KEY VALUE]\n  \
                  tobii bridge install --prefix PATH\n  \
+                 tobii bridge status --prefix PATH\n  \
                  tobii bridge run --prefix PATH\n  \
                  tobii headpose [--udp ADDR] [--rate HZ] [--model auto|off|FILE] [--recenter]\n  \
                  tobii headpose --check [--calibrate-pitch [SECS]]\n  \

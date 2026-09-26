@@ -489,7 +489,14 @@ scripts/build-bridge.sh                  # needs mingw-w64 + the rust win target
 tobii bridge games                       # what is installed, and what has a prefix
 tobii bridge install --steam elite       # by name, or by app id
 tobii bridge install --prefix /path/to/prefix   # anything not Steam
+tobii bridge status --steam elite        # what is in that prefix right now
 ```
+
+`tobii bridge status` reads and changes nothing: which prefix and which wine it
+resolved, whether the DLLs are there, what each of the two discovery keys holds
+and whether it is ours, and whether a wineserver is serving the prefix. It is
+short on purpose — it is meant to be pasted into an issue. It reports what is
+registered; it does not predict what a game will do with it.
 
 **Nothing has to be left running.** The client DLL the game loads receives the
 tracking itself, in a background thread inside the game's own process, and

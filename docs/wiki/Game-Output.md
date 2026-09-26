@@ -421,7 +421,17 @@ above.
 tobii bridge games                      # what is installed, and what has a prefix
 tobii bridge install --steam elite      # by name, or by app id
 tobii bridge install --prefix /path/to/prefix   # anything not Steam
+tobii bridge status --steam elite       # what is in that prefix right now
+tobii bridge uninstall --steam elite    # take out what the install put in
 ```
+
+`status` is read-only and is the first thing to run when a game gets nothing:
+it names the prefix and the wine it resolved, lists which of the three
+artifacts are in `drive_c/tobii-bridge`, says what each discovery key holds and
+whether this installer wrote it, and says whether a wineserver is serving the
+prefix. It reports **what is registered, not whether a game will accept it** —
+the only title ever measured against NaturalPoint's signature check is Star
+Citizen.
 
 Nothing has to be left running. The client DLL the game loads **receives the
 tracking itself**, in a background thread inside the game's own process, and
