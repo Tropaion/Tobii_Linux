@@ -271,15 +271,32 @@ pub fn choose_wine(
         return Ok((w.clone(), WineOrigin::Prefix, None));
     }
     match on_path {
-        Some(w) => Ok((
-            w,
-            WineOrigin::Unverified,
-            Some(
-                "no runner found inside the prefix, falling back to the system wine — \
-                 if the game sees no tracking, pass --wine with the runner the game uses"
-                    .to_string(),
-            ),
-        )),
+        Some(w) => {
+            // The consequence this names is the one that actually happens, and
+            // it took a measurement to notice it was the wrong one. This said
+            // "if the game sees no tracking, pass --wine…", which is a warning
+            // about an outcome the user can undo by trying again. What a
+            // fallback to the system wine really costs is in this module's own
+            // header and in [`refusal`]: wine upgrades a prefix it does not own
+            // before it does anything else. Measured on a Proton-shaped
+            // throwaway prefix — `.update-timestamp` taken over, thousands of
+            // lines of `system.reg` rewritten, `wineboot`, `explorer`,
+            // `rundll32` and `control` spawned — by an `install` whose only
+            // printed warning was about tracking.
+            // Broken into lines because [`render_status`] prints this one
+            // indented under the `wine` heading, a line at a time.
+            let warning = format!(
+                "no runner found inside the prefix, falling back to the system\n\
+                 wine ({}). A wine that is not the build a prefix was made with\n\
+                 runs `wineboot -u` against it before it does anything else and\n\
+                 upgrades it: the prefix's stamp taken over and its `system.reg`\n\
+                 rewritten. For a game's own prefix that is a rewrite out from\n\
+                 under the game, and nothing here puts it back. Pass --wine with\n\
+                 the runner the game uses.",
+                w.display()
+            );
+            Ok((w, WineOrigin::Unverified, Some(warning)))
+        }
         None => Err("no wine binary found; pass --wine PATH".into()),
     }
 }
@@ -702,10 +719,10 @@ fn artifact_dir(args: &[String]) -> Result<PathBuf, String> {
 
 /// A wine invocation against `prefix`, built but not started.
 ///
-/// One builder for all three ways this module starts wine — [`wine_run`],
-/// [`wine_output`] and the provider spawn in [`run`] — because the environment
-/// is the part that must not drift. `WINEPREFIX` is which prefix gets touched,
-/// and a call that forgot it would reach `~/.wine` instead.
+/// One builder for both ways this module starts wine — [`wine_output`] and the
+/// provider spawn in [`run`] — because the environment is the part that must
+/// not drift. `WINEPREFIX` is which prefix gets touched, and a call that forgot
+/// it would reach `~/.wine` instead.
 fn wine_cmd(wine: &Path, prefix: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(wine);
     cmd.env("WINEPREFIX", prefix)
@@ -715,20 +732,15 @@ fn wine_cmd(wine: &Path, prefix: &Path) -> std::process::Command {
     cmd
 }
 
-/// Run a wine command against `prefix`, returning its exit status.
-fn wine_run(
-    wine: &Path,
-    prefix: &Path,
-    args: &[&str],
-) -> std::io::Result<std::process::ExitStatus> {
-    wine_cmd(wine, prefix).args(args).status()
-}
-
 /// Run a wine command against `prefix` and capture what it printed.
 ///
-/// Separate from [`wine_run`] because reading the registry needs the output,
-/// and because `reg query`'s own chatter would otherwise land in the middle of
-/// the installer's lines.
+/// Every `reg` command goes through here, reads and writes alike. There used to
+/// be a second one that inherited stdio, and the two writes used it: `reg
+/// query`'s chatter was kept out of the installer's lines while `reg add`'s and
+/// `reg delete`'s landed in the middle of them — wine's own localised success
+/// message, twice, between "copied 3 file(s)" and "registered …". What a failed
+/// write said is printed by [`wine_said`], where it is the only thing that
+/// explains the failure.
 fn wine_output(wine: &Path, prefix: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     wine_cmd(wine, prefix).args(args).output()
 }
@@ -744,7 +756,14 @@ const PROBE_KEY: &str = r"HKCU\Software";
 /// used a wine that cannot serve this prefix, and for a Steam title the one
 /// that can is recorded inside the prefix itself. Written once so the three
 /// cannot drift into saying different things about the same fix.
-const WRONG_WINE_HINT: &str = "For a Steam title that must be the Proton build the \
+///
+/// It carries its own subject, because only two of the three sites supply one.
+/// `install` and `uninstall` precede it with a sentence naming the wine ("The
+/// wine used was X."), and folding this hint into a shared const while it still
+/// opened with a bare "that" left [`read_key`]'s copy — whose previous sentence
+/// is "Refusing to touch keys whose current value could not be read." — with
+/// nothing for the pronoun to attach to but "a Steam title".
+const WRONG_WINE_HINT: &str = "For a Steam title the wine must be the Proton build the \
      prefix records; pass --wine explicitly if this one is wrong for it.";
 
 /// What `reg query <key> /v Path` said.
@@ -1123,6 +1142,51 @@ fn is_ours(current: &Reading, wrote: Option<&str>) -> bool {
     v.eq_ignore_ascii_case(INSTALL_WIN_DIR) || wrote.is_some_and(|w| v.eq_ignore_ascii_case(w))
 }
 
+/// **Does `install` stop on this key?**
+///
+/// The question itself, in one function, because two commands act on the
+/// answer: `install`'s own loop, which refuses over every key this says yes
+/// to, and `status`, whose closing line tells the user whether `install` will
+/// go through. They used to ask it separately — `install` here, `status` by
+/// reading its own [`KeyState`] classification — and the two drifted apart at
+/// the one state the classification cannot see.
+///
+/// That state is the third arm below. A key holding, byte for byte, what this
+/// run would write, with nothing recorded either way, is not refused over; and
+/// what "what this run would write" *is* depends on `--npclient`, which the
+/// report had no way to know. So a prefix where opentrack had registered its
+/// own client — the configuration this project recommends for TrackIR, and the
+/// state v0.4.0 leaves behind — was told "`install` will not put it there
+/// while these hold something this installer did not write", over an install
+/// that then walked straight past the same key. The report and the command
+/// disagreed about the same prefix, and the report is the half a user pastes
+/// into an issue.
+///
+/// Sharing the function is what stops that recurring: there is no second copy
+/// to fall behind, and `status` now reads `--npclient` so it can supply the
+/// same `want`.
+fn stops_install(current: &Reading, wrote: Option<&str>, want: &str) -> bool {
+    if *current == Reading::Absent || is_ours(current, wrote) {
+        return false;
+    }
+    // Nothing here to refuse over: the key already holds, byte for byte, what
+    // this run would put in it, and nothing records this installer ever
+    // putting anything else there. That is precisely the state v0.4.0 leaves
+    // behind on a machine with opentrack installed — it registered the
+    // third-party path and kept no record of doing so — so refusing here
+    // refuses the upgrade path itself, over a write that would change nothing,
+    // in a sentence blaming another program for a value this program wrote.
+    //
+    // A record naming a *different* value is a different fact and is still
+    // refused, identical value or not: that is positive evidence the key
+    // changed hands since we wrote it, which makes the match a reason to leave
+    // it alone rather than to proceed — somebody else put it there.
+    if wrote.is_none() && matches!(current, Reading::Plain(v) if v.eq_ignore_ascii_case(want)) {
+        return false;
+    }
+    true
+}
+
 /// Render the record: one `<key> wrote <path>` line per key.
 ///
 /// The value is the rest of the line and is never quoted or escaped, so a path
@@ -1288,6 +1352,46 @@ fn registrable_path(dir: &Path) -> Result<String, String> {
     Ok(win)
 }
 
+/// Which TrackIR client this run would register, and the value that puts in
+/// [`NP_KEY`].
+///
+/// Settled from the arguments alone, before the registry is looked at, so that
+/// a path we could not read back is refused before anything exists.
+///
+/// Asked by `install`, which writes it, and by `status`, which reports whether
+/// `install` would go through — and that report is only true of the install
+/// the same flags describe. Which is why `status` reads `--npclient` at all:
+/// without it the report had to guess what the TrackIR key would be compared
+/// against, and guessed the one value that makes the answer wrong.
+fn np_target_for(args: &[String]) -> Result<(NpSource, String), String> {
+    let np_source = choose_npclient(
+        crate::flag_value(args, "--npclient"),
+        find_installed_npclient(),
+    )?;
+    let target = match &np_source {
+        // FreeTrack always gets our own DLL: that ABI has no signature check,
+        // so nothing stands between it and our data.
+        NpSource::Ours => INSTALL_WIN_DIR.to_string(),
+        NpSource::Installed(dir) => registrable_path(dir)?,
+    };
+    Ok((np_source, target))
+}
+
+/// What this run would write into `key`, given the TrackIR client it settled
+/// on.
+///
+/// One key varies and one does not, and both halves live here rather than
+/// inlined at each caller: it is the value [`stops_install`] compares against,
+/// so a second spelling of it is a second answer to the question that defect
+/// was about.
+fn want_for<'a>(key: &str, np_target: &'a str) -> &'a str {
+    if key == NP_KEY {
+        np_target
+    } else {
+        INSTALL_WIN_DIR
+    }
+}
+
 /// A path, quoted for the shell the user is going to paste it into.
 fn shell_quoted(p: &Path) -> String {
     quoted(&p.display().to_string())
@@ -1427,10 +1531,82 @@ fn replaced(taken: &[Taken]) -> String {
     out
 }
 
+/// A `--steam` prefix whose own runner could not be resolved, about to be
+/// written by whatever `wine` is on `$PATH`: refuse, and say what would have
+/// happened.
+///
+/// # Why this one is refused and not merely warned about
+///
+/// [`choose_wine`]'s last tier is the system wine, and for a `--steam` prefix
+/// that tier is not a fallback but a known-wrong answer. The prefix was found
+/// through Steam's `compatdata`, so it was made by a Proton build by
+/// construction, and the host's wine is by construction not that build.
+/// Running it is not the risk that the game may see no tracking; it is
+/// `wineboot -u` rewriting the game's prefix — measured: the stamp taken over,
+/// `system.reg` replaced, four Windows processes spawned, and nine minutes of
+/// silence before the run was killed. Nothing puts that back, and what the
+/// command wanted was to write two registry values.
+///
+/// # Why only here
+///
+/// Refusing an `install` costs the user nothing: nothing of ours is in the
+/// prefix yet, so stopping leaves it exactly as it was, and both ways past are
+/// one flag. The same refusal on `uninstall` would strand somebody trying to
+/// take our files back *out* of their own prefix, which is the one direction
+/// where stopping leaves it worse than proceeding; and `run` is a user asking
+/// in so many words to start wine on that prefix. Those two print
+/// [`choose_wine`]'s warning, which now names this same damage, and go on.
+///
+/// An explicit `--wine` is never refused: the user named the binary, and this
+/// function knows nothing they do not.
+fn refuse_unverified_wine_for_steam(
+    source: &PrefixSource,
+    origin: WineOrigin,
+    wine: &Path,
+    args: &[String],
+) -> Result<(), String> {
+    let PrefixSource::Steam(title) = source else {
+        return Ok(());
+    };
+    if origin == WineOrigin::Prefix
+        || crate::flag_value(args, "--wine").is_some()
+        || args.iter().any(|a| a == "--force")
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "this is a Proton prefix — Steam found it for `--steam {t}` — but which \
+         Proton build made it could not be read out of it, so the only wine left \
+         is {w}.\n\
+         Refusing to run that one. A wine that is not the build a prefix was made \
+         with runs `wineboot -u` against it before it does anything else and \
+         upgrades it: the prefix's stamp taken over and its `system.reg` rewritten, \
+         out from under the game that owns it. Nothing here puts that back, and the \
+         two registry values this command came to write are not worth it.\n\
+         Name the build the game uses:\n  \
+         tobii bridge install --steam {t} --wine <Proton>/files/bin/wine\n\
+         `tobii bridge status --steam {t}` runs nothing and names the prefix; the \
+         Proton build is the one Steam lists under the title's compatibility \
+         setting, under `steamapps/common`.\n\
+         Or pass --force to go ahead with {w} anyway, knowing it will upgrade the \
+         prefix first.",
+        t = quoted(title),
+        w = wine.display()
+    ))
+}
+
 /// `tobii bridge install` — copy the artifacts in and register them.
 fn install(args: &[String]) -> CmdResult {
-    let (prefix, _) = resolve_prefix(args)?;
-    let (wine, wine_origin) = resolve_wine(&prefix, args)?;
+    let (prefix, source) = resolve_prefix(args)?;
+    // [`resolve_wine_reporting`] rather than [`resolve_wine`], only so the
+    // refusal below can come *instead of* the warning rather than after it:
+    // both say the same thing about the same binary, and printing the milder
+    // one first teaches the reader to skip the one that stopped the command.
+    let (wine, wine_origin, wine_warning) = resolve_wine_reporting(&prefix, args)?;
+    refuse_unverified_wine_for_steam(&source, wine_origin, &wine, args)?;
+    if let Some(w) = wine_warning {
+        eprintln!("warning: {w}");
+    }
     let src = artifact_dir(args)?;
     let dest = prefix.join(INSTALL_SUBDIR);
 
@@ -1439,20 +1615,7 @@ fn install(args: &[String]) -> CmdResult {
     // writing it — and refused here, before anything exists, if it is a path we
     // could not read back.
     let explicit_np = crate::flag_value(args, "--npclient");
-    let np_source = choose_npclient(explicit_np, find_installed_npclient())?;
-    // FreeTrack always gets our own DLL: that ABI has no signature check, so
-    // nothing stands between it and our data.
-    let np_target = match &np_source {
-        NpSource::Ours => INSTALL_WIN_DIR.to_string(),
-        NpSource::Installed(dir) => registrable_path(dir)?,
-    };
-    let want_for = |key: &str| {
-        if key == NP_KEY {
-            np_target.as_str()
-        } else {
-            INSTALL_WIN_DIR
-        }
-    };
+    let (np_source, np_target) = np_target_for(args)?;
 
     // Read before write, and before anything is copied. A prefix that already
     // has a working head-tracking setup has to come out of a refusal exactly as
@@ -1481,24 +1644,11 @@ fn install(args: &[String]) -> CmdResult {
     for (entry, current) in &readings {
         let (name, key, abi) = *entry;
         let wrote = recorded(&record, name);
-        let want = want_for(key);
-        if *current == Reading::Absent || is_ours(current, wrote) {
-            continue;
-        }
-        // Nothing here to refuse over: the key already holds, byte for byte,
-        // what this run would put in it, and nothing records this installer
-        // ever putting anything else there. That is precisely the state v0.4.0
-        // leaves behind on a machine with opentrack installed — it registered
-        // the third-party path and kept no record of doing so — so refusing
-        // here refuses the upgrade path itself, over a write that would change
-        // nothing, in a sentence blaming another program for a value this
-        // program wrote.
-        //
-        // A record naming a *different* value is a different fact and is still
-        // refused, identical value or not: that is positive evidence the key
-        // changed hands since we wrote it, which makes the match a reason to
-        // leave it alone rather than to proceed — somebody else put it there.
-        if wrote.is_none() && matches!(current, Reading::Plain(v) if v.eq_ignore_ascii_case(want)) {
+        let want = want_for(key, &np_target);
+        // The one question, asked in the one place — see [`stops_install`].
+        // `status` asks that same function about the same key, which is what
+        // stops the report and this loop disagreeing again.
+        if !stops_install(current, wrote, want) {
             continue;
         }
         taken.push(Taken {
@@ -1575,7 +1725,7 @@ fn install(args: &[String]) -> CmdResult {
         if !landed(key) {
             continue;
         }
-        upsert(&mut kept, name, want_for(key).to_string());
+        upsert(&mut kept, name, want_for(key, &np_target).to_string());
     }
     if ft_landed || np_landed {
         let entries: Vec<(&str, &str)> =
@@ -1676,19 +1826,61 @@ fn install(args: &[String]) -> CmdResult {
 /// program computed. Nothing found in a key is ever written back, so no other
 /// type has to be spellable.
 fn set_key(wine: &Path, prefix: &Path, key: &str, dir: &str) -> Result<bool, String> {
-    let status = wine_run(
+    match reg_write(
         wine,
         prefix,
         &[
             "reg", "add", key, "/v", "Path", "/t", "REG_SZ", "/d", dir, "/f",
         ],
-    )
-    .map_err(|e| format!("{e}"))?;
-    if !status.success() {
-        eprintln!("warning: could not write {key}");
-        return Ok(false);
+    )? {
+        None => Ok(true),
+        Some(said) => {
+            eprintln!("warning: could not write {key}");
+            eprint!("{said}");
+            Ok(false)
+        }
     }
-    Ok(true)
+}
+
+/// Run one `reg` write, and say in wine's own words why it did not land.
+///
+/// `None` is a write that landed and had nothing to report. `Some(said)` is
+/// one that did not, carrying whatever wine printed.
+///
+/// Both writes go through here for the reason [`wine_output`] already existed
+/// for on the read side. They used to inherit this process's stdio, so a real
+/// install printed `WARNING: radv is not a conformant Vulkan implementation`
+/// and two copies of `reg: Der Vorgang wurde erfolgreich abgeschlossen` —
+/// wine's own success line, in the user's locale — in between "copied 3
+/// file(s) into …" and "registered C:\tobii-bridge for TrackIR and FreeTrack".
+/// This output is written to be pasted into an issue; untranslated noise
+/// between two of our own lines is noise a triager has to learn to skip.
+///
+/// Kept, rather than dropped, for the failure: then it is the only thing that
+/// says why, and the caller prints it under its own warning.
+fn reg_write(wine: &Path, prefix: &Path, args: &[&str]) -> Result<Option<String>, String> {
+    let out = wine_output(wine, prefix, args).map_err(|e| format!("{e}"))?;
+    if out.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(wine_said(&out)))
+}
+
+/// Everything a wine command printed, on both streams, indented.
+///
+/// Indented so it cannot be mistaken for one of our own lines, and blank lines
+/// dropped, because `reg.exe` frames its one sentence in them.
+fn wine_said(out: &std::process::Output) -> String {
+    let mut said = String::new();
+    for stream in [&out.stdout, &out.stderr] {
+        for line in String::from_utf8_lossy(stream).lines() {
+            let line = line.trim_end();
+            if !line.trim().is_empty() {
+                said.push_str(&format!("  {line}\n"));
+            }
+        }
+    }
+    said
 }
 
 /// Remove the `Path` value this installer added, and only that.
@@ -1706,15 +1898,14 @@ fn set_key(wine: &Path, prefix: &Path, key: &str, dir: &str) -> Result<bool, Str
 /// for. Re-read rather than assume: a delete that failed for any other reason
 /// still has to be reported.
 fn del_value(wine: &Path, prefix: &Path, key: &str) -> Result<bool, String> {
-    let status = wine_run(wine, prefix, &["reg", "delete", key, "/v", "Path", "/f"])
-        .map_err(|e| format!("{e}"))?;
-    if status.success() {
+    let Some(said) = reg_write(wine, prefix, &["reg", "delete", key, "/v", "Path", "/f"])? else {
         return Ok(true);
-    }
+    };
     if matches!(read_key(wine, prefix, key), Ok(Reading::Absent)) {
         return Ok(true);
     }
     eprintln!("warning: could not remove Path from {key}");
+    eprint!("{said}");
     Ok(false)
 }
 
@@ -2104,6 +2295,43 @@ fn key_state(current: &Reading, wrote: Option<&str>) -> KeyState {
     }
 }
 
+/// One discovery key as [`gather_status`] found it.
+///
+/// The three raw facts rather than a verdict, because the report asks two
+/// different questions of them and both have to be the ones the commands ask.
+/// [`key_state`] is the classification `uninstall` acts on, and
+/// [`stops_install`] is what `install` acts on — and the second needs `want`,
+/// which the first throws away. A `Status` holding only the classification had
+/// to re-derive the refusal from it, could not, and so predicted one over a
+/// key `install` walks straight past.
+#[derive(Debug)]
+struct KeyReport {
+    /// Whose key it is, in the name the user knows it by.
+    abi: &'static str,
+    key: &'static str,
+    /// What the key holds.
+    current: Reading,
+    /// What [`RECORD_FILE`] says this installer wrote here.
+    wrote: Option<String>,
+    /// What `install` would write here on a run spelled like this one — see
+    /// [`want_for`], and [`Status::npclient_given`] for why the report carries
+    /// the flag that decides it.
+    want: String,
+}
+
+impl KeyReport {
+    /// What it holds, in the terms `uninstall` uses.
+    fn state(&self) -> KeyState {
+        key_state(&self.current, self.wrote.as_deref())
+    }
+
+    /// Whether `install` would refuse over it — by the function `install`'s
+    /// own loop asks, not a paraphrase of it.
+    fn stops_install(&self) -> bool {
+        stops_install(&self.current, self.wrote.as_deref(), &self.want)
+    }
+}
+
 /// Whether something is where it should be, when "could not tell" is a real
 /// third answer.
 ///
@@ -2190,8 +2418,27 @@ struct Status {
     /// is indistinguishable from that program's own registration, and the
     /// report below calls it a stranger's.
     record_unreadable: Option<String>,
-    /// One entry per [`KEYS`] entry, in that order: ABI, key, what it holds.
-    keys: Vec<(&'static str, &'static str, KeyState)>,
+    /// One entry per [`KEYS`] entry, in that order.
+    keys: Vec<KeyReport>,
+    /// `--npclient`, as this run was spelled, when it was given.
+    ///
+    /// Carried for the same reason [`Status::wine_given`] is: the install
+    /// command this report hands back has to be the install this report
+    /// modelled. `--npclient` decides what the TrackIR key would be compared
+    /// against, so a report that answered for one value and printed a command
+    /// that would use another is answering about a different command.
+    ///
+    /// On the install lines only. `uninstall` does not read it, and a pasted
+    /// command carrying a flag the gate refuses is worse than no command.
+    npclient_given: Option<String>,
+    /// Whether game output is switched on for this machine.
+    ///
+    /// Not about this prefix at all, and in the report because the commonest
+    /// reason to run this command is "I installed it and the game does not
+    /// track" — for which this is the first thing to check and the one the
+    /// report used to leave out. Read from the same file `tobii games` writes;
+    /// a missing or damaged one reads as the default, which is off.
+    game_output_enabled: bool,
     /// Why the registry could not be read at all, when it could not.
     unreadable: Option<String>,
 }
@@ -2357,9 +2604,9 @@ fn render_status(s: &Status) -> String {
     if let Some(caveat) = staleness(&s.server) {
         o.push_str(caveat);
     }
-    for (abi, key, state) in &s.keys {
-        o.push_str(&format!("  {abi:<10} {key}\n"));
-        match state {
+    for k in &s.keys {
+        o.push_str(&format!("  {:<10} {}\n", k.abi, k.key));
+        match &k.state() {
             KeyState::Ours(v) => {
                 o.push_str(&format!("             {v}\n"));
                 o.push_str("             registered by this installer\n");
@@ -2418,15 +2665,17 @@ fn render_status(s: &Status) -> String {
     let anything_of_ours = s.dir_present != Presence::No
         || s.keys
             .iter()
-            .any(|(_, _, k)| matches!(k, KeyState::Ours(_)));
-    // Exactly the states `install` stops on: [`is_ours`] answers false for
-    // anything that is not a plain string this run wrote, so a value another
-    // program holds and a value that could not be read both reach the refusal.
+            .any(|k| matches!(k.state(), KeyState::Ours(_)));
+    // Not a list of states this report believes `install` stops on — the
+    // states `install` itself stops on, from [`stops_install`], the function
+    // `install`'s own loop calls. The paraphrase it replaces (`Theirs` or
+    // `Unreadable`) was right about three of the four cases and wrong about
+    // the fourth, which is the one a machine with opentrack installed is in.
     let in_the_way: Vec<&str> = s
         .keys
         .iter()
-        .filter(|(_, _, k)| matches!(k, KeyState::Theirs(..) | KeyState::Unreadable(_)))
-        .map(|(_, key, _)| *key)
+        .filter(|k| k.stops_install())
+        .map(|k| k.key)
         .collect();
     // Spelled with this run's own flags, and quoted: it is the one line in the
     // report whose entire job is to be pasted back.
@@ -2442,7 +2691,38 @@ fn render_status(s: &Status) -> String {
             String::new()
         }
     );
+    // Only on the install lines: see [`Status::npclient_given`]. It is what
+    // `in_the_way` was decided against, so an install line without it would be
+    // a different command from the one this report just answered for.
+    let np = match &s.npclient_given {
+        Some(v) => format!(" --npclient {}", quoted(v)),
+        None => String::new(),
+    };
     if anything_of_ours {
+        // The state a bug reporter is actually in, and the report used to
+        // answer it with one command: `uninstall`. Somebody whose game gets
+        // nothing was handed the way to remove what they have and nothing at
+        // all about how to proceed — while `install` prints both of the
+        // remaining conditions at the end of every successful run, where a
+        // user who installed last week never sees them again.
+        //
+        // Neither is about this prefix, which is why they are stated as what
+        // has to be true *as well* rather than folded in among the registry
+        // findings above.
+        o.push_str(
+            "\nThis prefix is only half of it. Two things outside it decide whether a\n\
+             game receives anything:\n",
+        );
+        o.push_str(if s.game_output_enabled {
+            "  game output is ON\n"
+        } else {
+            "  game output is OFF — nothing is sent to any game until it is on:\n    \
+             tobii games set enabled true        (or the hub's own switch)\n"
+        });
+        o.push_str(
+            "  the game has to be launched through the wrapper, so the tracker comes on:\n    \
+             tobii game -- %command%             (Steam: paste into Launch Options)\n",
+        );
         o.push_str(&format!(
             "\nTo undo everything this installer put here:\n  \
              tobii bridge uninstall{how}\n\
@@ -2461,7 +2741,7 @@ fn render_status(s: &Status) -> String {
             "It refuses over them rather than overwrite them — the same rule this\n\
              report classified them by — and spells out the command that clears one,\n\
              if it is stale. Or go ahead anyway with:\n  \
-             tobii bridge install{how} --force\n\
+             tobii bridge install{how}{np} --force\n\
              which promises nothing about putting back what is there now.\n"
         ));
     } else if s.unreadable.is_some() {
@@ -2473,7 +2753,7 @@ fn render_status(s: &Status) -> String {
             "\nNothing of ours was found in this prefix — though neither key could be\n\
              read, so that is not the same as nothing being in them. To put ours\n\
              there:\n  \
-             tobii bridge install{how}\n\
+             tobii bridge install{how}{np}\n\
              It reads both keys itself before writing either, and stops if one holds\n\
              something it did not write.\n\
              To take it out again afterwards, the same line with `uninstall`.\n"
@@ -2481,7 +2761,7 @@ fn render_status(s: &Status) -> String {
     } else {
         o.push_str(&format!(
             "\nNothing of ours is in this prefix. To put it there:\n  \
-             tobii bridge install{how}\n\
+             tobii bridge install{how}{np}\n\
              To take it out again afterwards, the same line with `uninstall`.\n"
         ));
     }
@@ -2555,10 +2835,18 @@ fn gather_status(args: &[String]) -> Result<Status, String> {
         Err(e) => (Vec::new(), Some(format!("{e}"))),
     };
     let (readings, unreadable) = read_keys_read_only(&prefix);
+    // The same answer `install` would settle on, from the same flags — and it
+    // fails here exactly where `install` would fail, with the same words, over
+    // an `--npclient` that names no client or a path that cannot be registered.
+    let (_, np_target) = np_target_for(args)?;
     let keys = readings
         .iter()
-        .map(|((name, key, abi), current)| {
-            (*abi, *key, key_state(current, recorded(&record, name)))
+        .map(|((name, key, abi), current)| KeyReport {
+            abi,
+            key,
+            current: current.clone(),
+            wrote: recorded(&record, name).map(str::to_string),
+            want: want_for(key, &np_target).to_string(),
         })
         .collect();
 
@@ -2576,6 +2864,8 @@ fn gather_status(args: &[String]) -> Result<Status, String> {
         artifacts,
         record_unreadable,
         keys,
+        npclient_given: crate::flag_value(args, "--npclient").map(str::to_string),
+        game_output_enabled: tobii_output::games::load_output_config().enabled,
         unreadable,
     })
 }
@@ -2685,8 +2975,10 @@ fn reject_unknown_flags(args: &[String], sub: &str, known: &[&str]) -> Result<()
         if a == "-" || !a.starts_with('-') {
             return Err(format!(
                 "`{a}` stands on its own, and this command reads no positional \
-                 arguments. A prefix is named with `--prefix {a}`; a `--steam` \
-                 title with spaces in it has to be quoted as one argument. {usage}"
+                 arguments. A `--steam` title with spaces in it has to be quoted \
+                 as one argument — `--steam 'Star Citizen'`, not `--steam Star \
+                 Citizen`, which leaves `Citizen` standing here. A prefix is named \
+                 with `--prefix PATH`. {usage}"
             ));
         }
         if let Some((name, _)) = a.split_once('=') {
@@ -2714,8 +3006,9 @@ fn reject_unknown_flags(args: &[String], sub: &str, known: &[&str]) -> Result<()
 /// rather than a hand-typed copy of them.
 ///
 /// Each list is spelled out in full rather than composed from a shared base.
-/// `status` is why: the flags are nearly the same four every time, and a base
-/// plus extras reads as though the odd one out were an oversight.
+/// `--artifacts` is why: the flags are nearly the same four every time, and a
+/// base plus extras reads as though every omission were an oversight — which
+/// is how three of these five came to advertise a flag none of them reads.
 #[allow(clippy::type_complexity)]
 const SUBS: [(&str, &[&str], fn(&[String]) -> CmdResult); 5] = [
     ("games", &[], |_| list_steam_games()),
@@ -2724,21 +3017,17 @@ const SUBS: [(&str, &[&str], fn(&[String]) -> CmdResult); 5] = [
         &["steam", "prefix", "wine", "artifacts", "npclient", "force"],
         install,
     ),
-    (
-        "run",
-        &["steam", "prefix", "wine", "artifacts", "port"],
-        run,
-    ),
-    // No `artifacts`: it names the *build* directory an install copies from,
-    // and this command never looks there — it reports what is in the prefix.
-    // Advertising a flag it would ignore is how a user ends up believing a
-    // report about a directory it never read.
-    ("status", &["steam", "prefix", "wine"], status),
-    (
-        "uninstall",
-        &["steam", "prefix", "wine", "artifacts"],
-        uninstall,
-    ),
+    // `--artifacts` names the *build* directory an install copies from, and
+    // [`artifact_dir`] is called from `install` and nowhere else. The three
+    // below never look there: `run` and `uninstall` derive their directory as
+    // `prefix.join(INSTALL_SUBDIR)`, and `status` reports what is in the
+    // prefix. They listed it anyway, inherited from one shared flag string, so
+    // `uninstall --artifacts /does/not/exist` was accepted and discarded and
+    // the usage line advertised it — which is how a user ends up believing a
+    // command read a directory it never opened.
+    ("run", &["steam", "prefix", "wine", "port"], run),
+    ("status", &["steam", "prefix", "wine", "npclient"], status),
+    ("uninstall", &["steam", "prefix", "wine"], uninstall),
 ];
 
 pub fn bridge(args: &[String]) -> CmdResult {
@@ -2845,7 +3134,22 @@ mod tests {
             err.contains(&typed.display().to_string()),
             "the message must name the argument it refused: {err}"
         );
-        assert!(err.contains("--prefix"), "and how to name a prefix: {err}");
+        assert!(
+            err.contains("--prefix PATH"),
+            "and how to name a prefix: {err}"
+        );
+        // The one remedy that must not be followed. `--steam Star Citizen`
+        // leaves `Citizen` standing alone, and the message used to open by
+        // offering `--prefix Citizen` — which is the same mistake one layer
+        // down, and the commit that added the refusal says so. The quoting
+        // hint is the real fix, so it leads.
+        assert!(
+            !err.contains(&format!("--prefix {}", typed.display())),
+            "the refused token must not come back as a suggested value: {err}"
+        );
+        let quoting = err.find("quoted").expect("the fix that works");
+        let flag = err.find("--prefix PATH").expect("the generic form");
+        assert!(quoting < flag, "the real fix leads: {err}");
         // Neither prefix: not the one that was typed, and not the one that
         // would have been used instead of it.
         assert!(!typed.join(INSTALL_SUBDIR).exists(), "{}", typed.display());
@@ -2853,11 +3157,133 @@ mod tests {
         assert!(w.argv().is_empty(), "and no wine ran at all: {}", w.argv());
     }
 
+    /// [`SUBS`]'s own doc says each list is every flag the subcommand reads.
+    /// For `--artifacts` that was false for three of the five.
+    ///
+    /// [`artifact_dir`] is called from `install` and nowhere else: `run` and
+    /// `uninstall` derive their directory as `prefix.join(INSTALL_SUBDIR)`.
+    /// Both listed the flag anyway, so `uninstall --artifacts
+    /// /does/not/exist` was accepted and the value dropped, and the usage line
+    /// offered it — a user then believes a command read a directory it never
+    /// opened.
+    #[test]
+    fn only_install_advertises_the_build_directory_it_copies_from() {
+        for (name, known, _) in SUBS {
+            let reads_it = name == "install";
+            assert_eq!(
+                known.contains(&"artifacts"),
+                reads_it,
+                "`{name}` and `--artifacts`"
+            );
+            assert_eq!(
+                usage_for(name, known).contains("--artifacts"),
+                reads_it,
+                "`{name}`'s usage line and `--artifacts`"
+            );
+        }
+        // Driven through [`bridge`] and not through the gate directly, because
+        // what can be wrong is the list the dispatch hands over.
+        let w = FakeWine::new("artifacts-gate");
+        for sub in ["uninstall", "run"] {
+            let mut args = w.args(sub, &[]);
+            args.push("--artifacts".to_string());
+            args.push(w.root.join("artifacts").display().to_string());
+            let err = bridge(&args)
+                .expect_err(&format!("`{sub}` does not read it, so it must refuse it"))
+                .to_string();
+            assert!(err.contains("--artifacts"), "{err}");
+            assert!(
+                !err.split_once(&format!("Usage: tobii bridge {sub}"))
+                    .expect("its own usage line")
+                    .1
+                    .contains("--artifacts"),
+                "and must not go on to advertise it: {err}"
+            );
+        }
+    }
+
+    /// [`WRONG_WINE_HINT`] is pasted after three different sentences, and two
+    /// of them end by naming the wine ("The wine used was X."). Folding
+    /// `read_key`'s own copy into the shared const while it still opened with a
+    /// bare "that" left the third site — whose previous sentence is "Refusing
+    /// to touch keys whose current value could not be read." — with nothing for
+    /// the pronoun but "a Steam title".
+    ///
+    /// Read at the site, not asserted about the const, because the const is not
+    /// what was wrong: the sentence it lands after is.
+    #[test]
+    fn the_wrong_wine_hint_carries_its_own_subject() {
+        let w = FakeWine::new("hint-subject");
+        w.fail_wine();
+        let err = read_key(fake_wine(), &w.prefix(), FT_KEY)
+            .expect_err("a wine that cannot serve the prefix must not read as an absence");
+        assert!(
+            err.contains("could not be read. For a Steam title the wine must be the Proton build"),
+            "the clause has to make sense after the sentence it follows: {err}"
+        );
+        assert!(
+            !err.contains("For a Steam title that must be"),
+            "a bare `that` attaches to `a Steam title` here: {err}"
+        );
+    }
+
+    /// Wine's own chatter is captured, not inherited into the installer's
+    /// output — and kept for the one case where it is the only explanation.
+    ///
+    /// A real install printed `WARNING: radv is not a conformant Vulkan
+    /// implementation` and two copies of `reg: Der Vorgang wurde erfolgreich
+    /// abgeschlossen`, wine's success line in the user's locale, between
+    /// "copied 3 file(s) into …" and "registered C:\tobii-bridge …". Only the
+    /// read path went through [`wine_output`]; both writes ran with this
+    /// process's stdio, so the one output written to be pasted into an issue
+    /// carried untranslated noise between two of its own lines.
+    #[test]
+    fn a_registry_write_keeps_wines_chatter_and_prints_it_only_when_it_failed() {
+        let w = FakeWine::new("write-chatter");
+        let add = [
+            "reg",
+            "add",
+            FT_KEY,
+            "/v",
+            "Path",
+            "/t",
+            "REG_SZ",
+            "/d",
+            INSTALL_WIN_DIR,
+            "/f",
+        ];
+
+        // The failure: wine's reason comes back, indented so it cannot be read
+        // as one of our own lines.
+        w.fail_writes();
+        let said = reg_write(fake_wine(), &w.prefix(), &add)
+            .expect("wine ran")
+            .expect("the write failed, so there is something to say");
+        assert!(said.contains("Zugriff verweigert"), "{said:?}");
+        assert!(
+            said.lines().all(|l| l.starts_with("  ")),
+            "indented, so it is visibly wine's and not ours: {said:?}"
+        );
+
+        // The success: the fake prints wine's own success line, exactly as the
+        // real one does, and nothing of it reaches the caller.
+        w.allow_writes();
+        assert_eq!(
+            reg_write(fake_wine(), &w.prefix(), &add).expect("wine ran"),
+            None,
+            "a write that landed has nothing to say, least of all in German"
+        );
+        assert!(
+            set_key(fake_wine(), &w.prefix(), FT_KEY, INSTALL_WIN_DIR).expect("wine ran"),
+            "and it really did write the key"
+        );
+    }
+
     /// A usage line that lists the flag it has just called unknown tells the
     /// reader the flag both is and is not accepted.
     #[test]
     fn the_usage_line_names_only_this_subcommands_flags() {
-        let u = usage_for("uninstall", &["steam", "prefix", "wine", "artifacts"]);
+        let u = usage_for("uninstall", &["steam", "prefix", "wine"]);
         assert!(u.contains("--prefix"), "{u}");
         assert!(!u.contains("--npclient"), "uninstall does not read it: {u}");
         assert!(!u.contains("--force"), "uninstall does not read it: {u}");
@@ -2940,7 +3366,84 @@ mod tests {
             choose_wine(None, None, &[], Some(p("/usr/bin/wine"))).expect("resolves");
         assert_eq!(w, p("/usr/bin/wine"));
         assert_eq!(origin, WineOrigin::Unverified);
-        assert!(warn.expect("a warning").contains("--wine"));
+        let warn = warn.expect("a warning");
+        assert!(warn.contains("--wine"), "{warn}");
+        assert!(warn.contains("/usr/bin/wine"), "and which binary: {warn}");
+        // The damage, not a different one. This used to say "if the game sees
+        // no tracking, pass --wine …" — a warning about something the user can
+        // retry — over a run that instead rewrites the prefix. Measured on a
+        // Proton-shaped throwaway: `wineboot -u`, the stamp taken over,
+        // `system.reg` replaced, and nothing put back.
+        assert!(
+            warn.contains("wineboot -u") && warn.contains("upgrades it"),
+            "the warning has to name what actually happens: {warn}"
+        );
+        assert!(
+            !warn.contains("sees no tracking"),
+            "a tracking failure is not what this costs: {warn}"
+        );
+    }
+
+    /// And for a `--steam` prefix that fallback is not a risk to warn about but
+    /// a known-wrong answer, so `install` refuses it outright.
+    ///
+    /// The prefix came out of Steam's `compatdata`, so a Proton build made it;
+    /// the host's wine is by construction not that build. Measured: `install
+    /// --steam 8888` with no runner resolvable ran /usr/bin/wine, which moved
+    /// the prefix's `.update-timestamp`, spawned `wineboot`, `explorer`,
+    /// `rundll32` and `control`, and printed nothing for the nine minutes
+    /// before it was killed — to write two registry values.
+    #[test]
+    fn a_steam_prefix_whose_runner_is_unknown_is_not_written_by_the_system_wine() {
+        let args: Vec<String> = ["tobii", "bridge", "install", "--steam", "8888"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let steam = PrefixSource::Steam("8888".to_string());
+        let sys = p("/usr/bin/wine");
+
+        let err = refuse_unverified_wine_for_steam(&steam, WineOrigin::Unverified, &sys, &args)
+            .expect_err("the system wine must not be turned loose on a Proton prefix");
+        assert!(
+            err.contains("wineboot -u") && err.contains("upgrades it"),
+            "it has to name the damage: {err}"
+        );
+        assert!(
+            !err.contains("sees no tracking"),
+            "which is not a tracking failure: {err}"
+        );
+        assert!(err.contains("--wine"), "and the way past it: {err}");
+        assert!(err.contains("--force"), "and the other one: {err}");
+        assert!(
+            err.contains("'8888'"),
+            "spelled with this run's own title: {err}"
+        );
+
+        // Never refused where the answer was established, or where the user
+        // supplied one: this function knows nothing they do not.
+        refuse_unverified_wine_for_steam(
+            &steam,
+            WineOrigin::Prefix,
+            &p("/games/Proton/files/bin/wine"),
+            &args,
+        )
+        .expect("the build the prefix records is the whole point");
+        for extra in [vec!["--wine", "/usr/bin/wine"], vec!["--force"]] {
+            let mut chosen = args.clone();
+            chosen.extend(extra.iter().map(|x| x.to_string()));
+            refuse_unverified_wine_for_steam(&steam, WineOrigin::Unverified, &sys, &chosen)
+                .expect("an explicit choice is the user's to make");
+        }
+        // And a prefix nobody called Steam's is not this rule's business: a
+        // plain `WINEPREFIX` is very often the system wine's own.
+        for source in [
+            PrefixSource::Given,
+            PrefixSource::Environment,
+            PrefixSource::Default,
+        ] {
+            refuse_unverified_wine_for_steam(&source, WineOrigin::Unverified, &sys, &args)
+                .expect("only a Proton prefix is known-wrong for the system wine");
+        }
     }
 
     /// An explicit choice is honoured — but if it disagrees with the prefix's
@@ -3232,15 +3735,17 @@ if [ "$1" = reg ] && [ "$2" = query ]; then
   exit 1
 fi
 if [ "$1" = reg ] && [ "$2" = add ]; then
-  if [ -f "$root/fail-add" ]; then exit 1; fi
+  if [ -f "$root/fail-add" ]; then echo 'reg: Zugriff verweigert' >&2; exit 1; fi
+  echo 'reg: Der Vorgang wurde erfolgreich abgeschlossen'
   printf '\r\nHKEY_CURRENT_USER\\Whatever\r\n    Path    %s    %s\r\n\r\n' "$7" "$9" > "$reply"
   printf '"Path"="%s"\n' "$(printf '%s' "$9" | sed 's/\\/\\\\/g; s/"/\\"/g')" > "$userreg"
   write_user_reg
   exit 0
 fi
 if [ "$1" = reg ] && [ "$2" = delete ]; then
-  if [ -f "$root/fail-add" ]; then exit 1; fi
+  if [ -f "$root/fail-add" ]; then echo 'reg: Zugriff verweigert' >&2; exit 1; fi
   if [ ! -f "$reply" ]; then exit 1; fi
+  echo 'reg: Der Vorgang wurde erfolgreich abgeschlossen'
   rm -f "$reply"
   rm -f "$userreg"
   write_user_reg
@@ -3582,8 +4087,14 @@ exit 0
         }
 
         /// `status`'s flags, which are neither `install`'s nor `run`'s: it
-        /// reads no `--artifacts` and no `--npclient`, and a helper that
-        /// passed them would test a command line the gate refuses.
+        /// reads no `--artifacts`, and a helper that passed one would test a
+        /// command line the gate refuses.
+        ///
+        /// `--npclient` is pinned here for the reason [`FakeWine::args`] pins
+        /// it: `status` reads it now — it is what the report's refusal
+        /// prediction is decided against — and left to the default it would
+        /// answer differently on a machine that happens to have opentrack
+        /// installed.
         fn status_args(&self, extra: &[&str]) -> Vec<String> {
             let mut v: Vec<String> = ["tobii", "bridge", "status"]
                 .iter()
@@ -3595,6 +4106,10 @@ exit 0
             ] {
                 v.push(flag.to_string());
                 v.push(value);
+            }
+            if !extra.contains(&"--npclient") {
+                v.push("--npclient".to_string());
+                v.push("ours".to_string());
             }
             v.extend(extra.iter().map(|s| (*s).to_string()));
             v
@@ -3614,18 +4129,22 @@ exit 0
             for (flag, value) in [
                 ("--prefix", self.prefix().display().to_string()),
                 ("--wine", wine.display().to_string()),
-                (
-                    "--artifacts",
-                    self.root.join("artifacts").display().to_string(),
-                ),
             ] {
                 v.push(flag.to_string());
                 v.push(value);
             }
+            // `install` is the only subcommand that reads it — see [`SUBS`] —
+            // so a helper that put it on every argv would be building command
+            // lines the gate refuses.
+            if sub == "install" {
+                v.push("--artifacts".to_string());
+                v.push(self.root.join("artifacts").display().to_string());
+            }
             // Pinned unless the test picks its own, so the outcome does not
             // depend on whether the machine running the test happens to have
-            // opentrack installed.
-            if !extra.contains(&"--npclient") {
+            // opentrack installed — and, like `--artifacts` above, only on the
+            // subcommand that reads it.
+            if sub == "install" && !extra.contains(&"--npclient") {
                 v.push("--npclient".to_string());
                 v.push("ours".to_string());
             }
@@ -4840,11 +5359,11 @@ exit 0
             2,
             "install wrote both keys, so both must read as ours: {out}"
         );
-        for (_, _, state) in &s.keys {
+        for k in &s.keys {
             assert_eq!(
-                *state,
+                k.state(),
                 KeyState::Ours(INSTALL_WIN_DIR.to_string()),
-                "{state:?}"
+                "{k:?}"
             );
         }
     }
@@ -4883,8 +5402,8 @@ exit 0
         let s = gather_status(&fw.status_args(&[])).expect("status");
         let out = render_status(&s);
         assert!(
-            s.keys.iter().any(|(abi, _, state)| *abi == "TrackIR"
-                && *state
+            s.keys.iter().any(|k| k.abi == "TrackIR"
+                && k.state()
                     == KeyState::Theirs(r"Z:\usr\libexec\opentrack".to_string(), whose(false))),
             "{:?}",
             s.keys
@@ -4915,7 +5434,7 @@ exit 0
         assert!(
             s.keys
                 .iter()
-                .any(|(abi, _, state)| *abi == "TrackIR" && *state == KeyState::Ours(want.clone())),
+                .any(|k| k.abi == "TrackIR" && k.state() == KeyState::Ours(want.clone())),
             "the record is what makes this one ours: {:?}",
             s.keys
         );
@@ -4925,8 +5444,10 @@ exit 0
         std::fs::remove_file(fw.dest().join(RECORD_FILE)).expect("record");
         let s = gather_status(&fw.status_args(&[])).expect("status");
         assert!(
-            s.keys.iter().any(|(abi, _, state)| *abi == "TrackIR"
-                && *state == KeyState::Theirs(want.clone(), whose(false))),
+            s.keys
+                .iter()
+                .any(|k| k.abi == "TrackIR"
+                    && k.state() == KeyState::Theirs(want.clone(), whose(false))),
             "without the record there is nothing to recognise it by: {:?}",
             s.keys
         );
@@ -4945,8 +5466,8 @@ exit 0
         let s = gather_status(&fw.status_args(&[])).expect("status");
         let out = render_status(&s);
         assert!(
-            s.keys.iter().any(|(abi, _, state)| *abi == "FreeTrack"
-                && matches!(state, KeyState::Unreadable(why) if why.contains("REG_EXPAND_SZ"))),
+            s.keys.iter().any(|k| k.abi == "FreeTrack"
+                && matches!(k.state(), KeyState::Unreadable(why) if why.contains("REG_EXPAND_SZ"))),
             "{:?}",
             s.keys
         );
@@ -4989,6 +5510,69 @@ exit 0
         // one that refuses. Asserted here rather than taken on trust, because
         // the whole defect was a line that had stopped agreeing with it.
         install(&fw.args("install", &[])).expect_err("install refuses over that key");
+    }
+
+    /// The same guard in the other direction, which is the one it could not
+    /// see.
+    ///
+    /// `install` has a fourth state the report's [`KeyState`] classification
+    /// cannot express: a key holding, byte for byte, what this run would
+    /// write, with nothing recorded either way, is installed straight past.
+    /// What "what this run would write" *is* depends on `--npclient` — so a
+    /// prefix where opentrack had registered its own client, which is the
+    /// configuration this project recommends for TrackIR, was told `install`
+    /// would refuse over that key, and then `install` did not.
+    ///
+    /// The previous test could never catch it: [`FakeWine::args`] pins
+    /// `--npclient ours`, and with that value the TrackIR key's want is
+    /// `INSTALL_WIN_DIR`, which `is_ours` already recognises — so the fourth
+    /// state is unreachable. This one supplies the value that reaches it.
+    #[test]
+    fn the_report_and_install_agree_about_a_client_already_registered_at_our_target() {
+        let fw = FakeWine::new("status-agrees-np");
+        let dir = fw.npclient_dir();
+        let np = dir.display().to_string();
+        // Exactly what opentrack leaves behind on a prefix we have never
+        // touched: its own path in the TrackIR key, and no record of ours.
+        fw.registered_in_file("np", &wine_path_for(&dir));
+        assert_eq!(fw.record(), "", "nothing of ours has been here");
+
+        let out =
+            render_status(&gather_status(&fw.status_args(&["--npclient", &np])).expect("status"))
+                .to_string();
+        assert!(
+            !out.contains("will not put it there"),
+            "install walks straight past this key, so the report may not \
+             promise a refusal over it: {out}"
+        );
+        assert!(
+            out.contains("Nothing of ours is in this prefix. To put it there"),
+            "{out}"
+        );
+        // The command it hands back has to be the command it answered for: the
+        // whole question turns on `--npclient`, so an install line without it
+        // would describe a different run.
+        assert!(
+            out.contains(&format!(
+                "tobii bridge install --prefix {} --wine {} --npclient {}",
+                shell_quoted(&fw.prefix()),
+                shell_quoted(fake_wine()),
+                quoted(&np)
+            )),
+            "{out}"
+        );
+        // And it is right: that command goes through.
+        install(&fw.args("install", &["--npclient", &np])).expect("install goes through");
+
+        // The control, on the same prefix and the same key: pointed at OUR
+        // DLL instead, the value is not what this run would write, and both
+        // halves say so.
+        let fw = FakeWine::new("status-agrees-np-control");
+        fw.registered_in_file("np", &wine_path_for(&fw.npclient_dir()));
+        let out = render_status(&gather_status(&fw.status_args(&[])).expect("status"));
+        assert!(out.contains("will not put it there"), "{out}");
+        assert!(out.contains(NP_KEY), "{out}");
+        install(&fw.args("install", &[])).expect_err("and that one does refuse");
     }
 
     /// The other direction, and the same line: a report that has just said
@@ -5342,7 +5926,7 @@ exit 0
     /// this file has shipped three of, and the one thing that stops it is
     /// making the same test show the failure it claims to be watching for.
     fn assert_wrecker_wrecks(w: &FakeWine, before: String) {
-        wine_run(wrecking_wine(), &w.prefix(), &["reg", "query", FT_KEY])
+        wine_output(wrecking_wine(), &w.prefix(), &["reg", "query", FT_KEY])
             .expect("the wrecking wine has to be runnable");
         assert_ne!(
             snapshot(&w.prefix()),
@@ -5454,11 +6038,66 @@ exit 0
         );
     }
 
+    /// The state a bug reporter is actually in — "I installed it and the game
+    /// does not track" — and the report's only actionable line used to be the
+    /// one that undoes the install.
+    ///
+    /// Two things outside this prefix still have to be true, `install` prints
+    /// both at the end of a successful run, and a user who installed last week
+    /// never sees that paragraph again. `status` is the command we tell them
+    /// to run instead, so it is the one that has to say it.
+    #[test]
+    fn the_report_says_what_still_has_to_be_true_for_a_game_to_receive_anything() {
+        let fw = FakeWine::new("status-next-steps");
+        install(&fw.args("install", &[])).expect("install");
+        let gathered = gather_status(&fw.status_args(&[])).expect("status");
+
+        let out = render_status(&Status {
+            game_output_enabled: false,
+            ..gathered
+        });
+        assert!(
+            out.contains("tobii games set enabled true"),
+            "game output is off, so the first thing to do is turn it on: {out}"
+        );
+        assert!(
+            out.contains("tobii game -- %command%"),
+            "and the game has to be launched through the wrapper: {out}"
+        );
+        let forward = out
+            .find("tobii game -- %command%")
+            .expect("the way forward");
+        let out_again = out
+            .find("tobii bridge uninstall")
+            .expect("the way out is still offered");
+        assert!(
+            forward < out_again,
+            "the way forward comes before the way out, not after it: {out}"
+        );
+
+        // With output already on, it says so and does not hand back a command
+        // that would change nothing — a report that tells a user to switch on
+        // what is already on sends them looking in the wrong place.
+        let out = render_status(&Status {
+            game_output_enabled: true,
+            ..gather_status(&fw.status_args(&[])).expect("status")
+        });
+        assert!(out.contains("game output is ON"), "{out}");
+        assert!(!out.contains("tobii games set enabled true"), "{out}");
+        assert!(out.contains("tobii game -- %command%"), "{out}");
+    }
+
     /// `reject_unknown_flags` gates every subcommand, and a new one wired into
     /// the dispatch without being wired into the gate is a command where
     /// `--help` performs the command. `status` reads no `--artifacts`, so the
     /// gate must refuse that too rather than have the usage line advertise a
     /// directory the command never looks in.
+    ///
+    /// `--npclient` is on the other side of that same line now: the report's
+    /// closing sentence is decided against what `install` would write into the
+    /// TrackIR key, and that is what `--npclient` picks. A `status` that
+    /// refused the flag could only answer for one spelling of the command
+    /// while printing another.
     ///
     /// Driven through [`bridge`] and not through [`reject_unknown_flags`]
     /// directly, because the thing that can be wrong is the *list the dispatch
@@ -5474,7 +6113,6 @@ exit 0
             vec!["-h"],
             vec!["--prefix=/x"],
             vec!["--artifacts", "/x"],
-            vec!["--npclient", "ours"],
             vec!["--force"],
         ] {
             let err = bridge(&fw.status_args(&bad))
@@ -5485,10 +6123,12 @@ exit 0
                 .unwrap_or_else(|| panic!("the refusal must show status's own usage: {err}"))
                 .1;
             assert!(
-                !usage.contains("--artifacts")
-                    && !usage.contains("--npclient")
-                    && !usage.contains("--force"),
+                !usage.contains("--artifacts") && !usage.contains("--force"),
                 "the usage line may not advertise a flag status ignores: {usage}"
+            );
+            assert!(
+                usage.contains("--npclient"),
+                "and must advertise the ones it reads: {usage}"
             );
         }
         // And the flags it does read get all the way through to a report.
@@ -5632,7 +6272,15 @@ exit 0
                 .map(|(name, required)| (*name, *required, Presence::No))
                 .collect(),
             record_unreadable: None,
-            keys: vec![("FreeTrack", FT_KEY, KeyState::Absent)],
+            keys: vec![KeyReport {
+                abi: "FreeTrack",
+                key: FT_KEY,
+                current: Reading::Absent,
+                wrote: None,
+                want: INSTALL_WIN_DIR.to_string(),
+            }],
+            npclient_given: None,
+            game_output_enabled: true,
             unreadable: None,
         }
     }
