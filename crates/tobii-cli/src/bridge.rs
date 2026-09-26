@@ -1708,12 +1708,67 @@ fn list_steam_games() -> CmdResult {
     Ok(())
 }
 
+/// Reject a flag no subcommand of `tobii bridge` reads.
+///
+/// Parsed strictly for the same reason `tobii record` is, and with more at
+/// stake: an unrecognised flag used to be IGNORED, so `tobii bridge install
+/// --help` did not print help — it performed a real install into the default
+/// Wine prefix, wrote both discovery keys and said nothing about the flag. A
+/// reviewer reached that by typing exactly what anyone would type first.
+///
+/// Values are skipped rather than inspected: `--steam Elite Dangerous` puts
+/// two bare words after the flag, and a path may legitimately begin with a
+/// dash after `--`.
+fn reject_unknown_flags(args: &[String], known: &[&str], usage: &str) -> Result<(), String> {
+    // Compared without the dashes, because that is how the name arrives here.
+    let takes_value = |f: &str| f != "force";
+    let mut it = args.iter().skip(3);
+    while let Some(a) = it.next() {
+        let Some(flag) = a.strip_prefix("--") else {
+            continue;
+        };
+        // `--flag=value` is not a spelling anything here accepts, but naming
+        // the flag rather than the whole token is what the reader needs.
+        let name = flag.split_once('=').map_or(flag, |(n, _)| n);
+        if !known.contains(&name) {
+            return Err(format!("unknown option `--{name}`. {usage}"));
+        }
+        if takes_value(name) && !flag.contains('=') {
+            it.next();
+        }
+    }
+    Ok(())
+}
+
 pub fn bridge(args: &[String]) -> CmdResult {
+    const USAGE: &str = "Usage: tobii bridge games|install|run|uninstall \
+         [--steam <app id or name> | --prefix PATH] [--wine PATH] \
+         [--artifacts DIR] [--npclient ours|DIR] [--force] [--port PORT]";
+    const COMMON: [&str; 4] = ["steam", "prefix", "wine", "artifacts"];
+    fn known<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        COMMON
+            .iter()
+            .copied()
+            .chain(extra.iter().copied())
+            .collect()
+    }
     match args.get(2).map(String::as_str) {
-        Some("games") => list_steam_games(),
-        Some("install") => install(args),
-        Some("run") => run(args),
-        Some("uninstall") => uninstall(args),
+        Some("games") => {
+            reject_unknown_flags(args, &[], USAGE)?;
+            list_steam_games()
+        }
+        Some("install") => {
+            reject_unknown_flags(args, &known(&["npclient", "force"]), USAGE)?;
+            install(args)
+        }
+        Some("run") => {
+            reject_unknown_flags(args, &known(&["port"]), USAGE)?;
+            run(args)
+        }
+        Some("uninstall") => {
+            reject_unknown_flags(args, &known(&[]), USAGE)?;
+            uninstall(args)
+        }
         other => Err(format!(
             "usage: tobii bridge games|install|run|uninstall \n  \
              [--steam <app id or name> | --prefix PATH] [--wine PATH] \
@@ -1733,6 +1788,54 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    /// `--help` is the first thing anybody types at an unfamiliar command, and
+    /// it used to be ignored — so it installed into the default Wine prefix and
+    /// wrote both discovery keys. A reviewer reached that by typing exactly
+    /// that. An unknown flag must stop the command before it touches anything.
+    #[test]
+    fn an_unknown_flag_stops_the_command_before_it_touches_a_prefix() {
+        let args: Vec<String> = ["tobii", "bridge", "install", "--help"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = reject_unknown_flags(&args, &["prefix", "force"], "USAGE")
+            .expect_err("--help is not a flag install reads");
+        assert!(err.contains("--help"), "name the flag: {err}");
+    }
+
+    /// A flag's VALUE is not a flag. `--steam Elite Dangerous` puts two bare
+    /// words after it, and a path may begin with a dash after `--`; mistaking
+    /// either for an option would refuse a command that is perfectly correct.
+    #[test]
+    fn a_flags_value_is_skipped_and_force_takes_none() {
+        let ok: Vec<String> = [
+            "tobii",
+            "bridge",
+            "install",
+            "--prefix",
+            "--odd-path",
+            "--force",
+            "--npclient",
+            "ours",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        reject_unknown_flags(&ok, &["prefix", "force", "npclient"], "USAGE")
+            .expect("a value is not an option, and --force takes no value");
+
+        // `--force` consuming a value would swallow the flag after it, so a
+        // typo behind it would go unnoticed.
+        let typo: Vec<String> = ["tobii", "bridge", "install", "--force", "--prefx", "/tmp/x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            reject_unknown_flags(&typo, &["prefix", "force"], "USAGE").is_err(),
+            "a typo after --force must still be caught"
+        );
     }
 
     /// The prefix's own launch script is the most authoritative answer — it is
