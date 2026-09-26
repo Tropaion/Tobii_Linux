@@ -25,6 +25,7 @@ pub mod update;
 pub mod widget;
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -1407,7 +1408,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     title.set_hexpand(true);
     header.append(&title);
     header.append(&status_bar);
-    header.append(&settings_button());
+    // The keep-awake switch comes back out with the button that holds it: the
+    // popover's widget tree is built once, here, and is never rebuilt, so
+    // something outside it has to put the switch back in step with the file.
+    // The hub tick does, below.
+    let (settings_btn, awake_switch) = settings_button();
+    header.append(&settings_btn);
 
     // One margin all round, so the frame of background around the content is
     // even. Anything else reads as a mistake at the corners.
@@ -1668,14 +1674,23 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             connected.set(conn);
             status_label.set_text(status_text(&snap.status));
             status_dot.queue_draw();
-            // Re-read from the file rather than remembered from the switch, for
-            // the same reason the games row re-reads `games.toml` on this tick:
-            // the CLI sets this too, and a badge that only believed the switch
-            // beside it would leave a hub that had been told from a terminal
-            // showing no notice at all. Below the visibility guard, so a hub
-            // hidden in the tray or minimised does no file I/O for a badge
-            // nobody can see.
-            awake_pill.set_visible(keep_awake::enabled());
+            // Re-read from `games.toml` rather than remembered from the switch,
+            // for the same reason the games row re-reads it on this tick: the
+            // CLI sets this too — `tobii games set keep_awake true` — and a
+            // badge that only believed the switch beside it would leave a hub
+            // that had been told from a terminal showing no notice at all.
+            // Below the visibility guard, so a hub hidden in the tray or
+            // minimised does no file I/O for a badge nobody can see.
+            //
+            // One read driving both halves of the one setting: the badge here
+            // in the header and the switch in the popover that sets it. The
+            // switch is built once, when the window is, and the popover reuses
+            // that same widget tree every time it opens — so this is the only
+            // thing standing between it and showing the answer it was seeded
+            // with for the life of the process.
+            let awake = keep_awake_enabled();
+            awake_pill.set_visible(awake);
+            awake_switch.refresh(awake);
             // Evaluate the calibration state machine once per fresh `Connected`
             // transition (reset on disconnect so a later reconnect — e.g. moved to
             // a different monitor — is re-evaluated). All branching logic lives in
@@ -2109,9 +2124,10 @@ fn show_recommend_banner(label: &Label, banner: &gtk::Box, reason: tobii_config:
 /// A `Popover`, not a second window: it is anchored to the button that opened
 /// it, it closes on click-away, and it needs no title bar, no size negotiation
 /// and no place in the window list for what is three rows of content.
-fn settings_button() -> gtk::MenuButton {
+fn settings_button() -> (gtk::MenuButton, KeepAwakeSwitch) {
     let popover = gtk::Popover::new();
-    popover.set_child(Some(&settings_list()));
+    let (list, awake) = settings_list();
+    popover.set_child(Some(&list));
     popover.set_position(gtk::PositionType::Bottom);
     popover.set_has_arrow(false);
     // Right edge flush with the cogwheel's, not centred under it. A popover is
@@ -2156,7 +2172,7 @@ fn settings_button() -> gtk::MenuButton {
             btn.set_child(Some(&label));
         }
     }
-    btn
+    (btn, awake)
 }
 
 /// One press of the text-size control, clamped to what the UI can render.
@@ -2248,7 +2264,7 @@ fn text_size_row() -> gtk::Box {
     )
 }
 
-fn settings_list() -> gtk::Box {
+fn settings_list() -> (gtk::Box, KeepAwakeSwitch) {
     let list = gtk::Box::new(Orientation::Vertical, 4);
     // An explicit width rather than one negotiated from the longest sentence.
     // `set_max_width_chars` is a hint about where a label may wrap, not a cap
@@ -2267,7 +2283,10 @@ fn settings_list() -> gtk::Box {
     // anyway, and a rack card of its own would give the hub's most-regretted
     // setting the same weight as calibration. What makes a popover an
     // acceptable home for it is that its on-state does not stay in the popover
-    // — see `awake_pill` in `build_hub`.
+    // — see `awake_pill` in `build_hub`. The switch itself is handed back to
+    // the caller as well as appended here, so the hub tick can keep it in step
+    // with the file; the popover is built once and never rebuilt.
+    let awake = KeepAwakeSwitch::new();
     list.append(&settings_row(
         "Keep the tracker awake",
         // The cost, not the benefit. What it gives is plain from its name;
@@ -2276,7 +2295,7 @@ fn settings_list() -> gtk::Box {
         // the switch's tooltip, one hover away, where advice belongs.
         "Switches standby off: the tracker stays on, illuminators lit, until \
          you turn this off — overnight too, if you forget.",
-        &keep_awake_switch(),
+        &awake.switch,
     ));
     list.append(&hairline());
     list.append(&settings_row(
@@ -2310,7 +2329,7 @@ fn settings_list() -> gtk::Box {
     list.append(&hairline());
     list.append(&quit_row());
 
-    list
+    (list, awake)
 }
 
 /// The way out, since the window's own X no longer is one.
@@ -2589,19 +2608,37 @@ fn autostart_switch() -> Switch {
 
 /// The user's standing answer to "never let the tracker go into standby".
 ///
-/// # Why it is a preference of this program and not a game-output setting
+/// # Why it lives in `games.toml`
 ///
-/// Everything in `games.toml` describes a pipeline — what is sent, how hard,
-/// and to whom. This describes the opposite: it says to stop asking whether
+/// It was argued the other way first, and the argument is not a silly one:
+/// everything else in `games.toml` describes a pipeline — what is sent, how
+/// hard, and to whom — while this says the opposite, stop asking whether
 /// anything wants data at all. It applies with game output off, with no sink
 /// configured, to the gaze overlay and to a `tobii headpose` in a terminal, so
-/// filing it under game output would put a global override inside the one
-/// feature it is least specific to.
+/// by subject matter it is a preference of this program rather than a
+/// game-output setting, and it was once kept as a one-line file beside
+/// `config.toml` on exactly that reasoning.
 ///
-/// A one-line file beside `config.toml`, in the same shape as the update-check
-/// preference, because that is what it is: one bit, set once, read by this
-/// window and by `tobii` in a terminal, and worth nothing if a parse error in
-/// an unrelated setting could take it with it.
+/// One fact outranks the subject matter: `games.toml` is the file the device
+/// thread reads. `GameSide::sync_keep_awake` takes the hold from
+/// `OutputConfig::keep_awake` and from nothing else, and `tobii games set
+/// keep_awake true` is the documented spelling. A tidier home for the same bit
+/// does not make the setting cleaner if the tracker never looks there — it
+/// makes this switch a no-op, which is what it was: the window wrote one
+/// store, the device thread read the other, so the header could say ALWAYS ON
+/// while the illuminators went dark three seconds after it lost focus, and the
+/// CLI could hold the tracker lit all night with nothing on screen admitting
+/// it. One bit, one file, whoever is setting it.
+///
+/// What the separate file was protecting — that a mistake in an unrelated
+/// setting must not carry this one with it — survives the move, because this
+/// parser never had the failure the argument assumed. `OutputConfig::from_toml`
+/// applies keys one at a time and `apply_key` refuses a bad value on its own,
+/// leaving the rest of the file alone; only a file that cannot be read at all
+/// falls back to the defaults, and the default here is off. Either way a
+/// damaged file cannot leave somebody's illuminators lit, which is the
+/// direction that matters and what
+/// `standby_is_only_switched_off_by_an_explicit_yes` pins.
 ///
 /// # It is a last resort, and the default says so
 ///
@@ -2614,64 +2651,109 @@ fn autostart_switch() -> Switch {
 /// with no listener to watch, opentrack on another machine, a game that cannot
 /// be wrapped. That is also why turning it on is not silent; see `awake_pill`
 /// in [`build_hub`].
-pub mod keep_awake {
-    use std::io;
-    use std::path::{Path, PathBuf};
-
-    /// The file, beside `config.toml`.
-    pub fn path() -> PathBuf {
-        tobii_config::config_path().with_file_name("keep_awake")
-    }
-
-    /// Whether the user has switched standby off.
-    pub fn enabled() -> bool {
-        enabled_at(&path())
-    }
-
-    /// [`enabled`] against a given path.
-    ///
-    /// Anything unreadable, missing or unexpected is the default, which is
-    /// off — a corrupt file must not be able to leave somebody's illuminators
-    /// lit, and off is the state they can always get back to by fixing it.
-    pub fn enabled_at(path: &Path) -> bool {
-        match std::fs::read_to_string(path) {
-            Ok(s) => s.trim() == "on",
-            Err(_) => false,
-        }
-    }
-
-    /// Persist the choice.
-    pub fn save(on: bool) -> io::Result<()> {
-        save_to(&path(), on)
-    }
-
-    /// [`save`] to a given path, for tests.
-    pub fn save_to(path: &Path, on: bool) -> io::Result<()> {
-        tobii_config::write_atomic(path, if on { b"on\n" } else { b"off\n" })
-    }
+fn keep_awake_enabled() -> bool {
+    keep_awake_at(&tobii_output::games::games_path())
 }
 
-/// The switch that turns standby off altogether.
+/// [`keep_awake_enabled`] against a given path.
+///
+/// Through `load_output_config_from` — the very function `GameSide::poll` uses
+/// before `sync_keep_awake` decides whether to hold the tracker — rather than
+/// by hunting for the key, so the window and the device thread cannot reach
+/// different conclusions about the same file. Anything missing, unreadable or
+/// unparseable is the default, which is off: a corrupt file must not be able
+/// to leave somebody's illuminators lit, and off is the state they can always
+/// get back to by fixing it.
+fn keep_awake_at(path: &Path) -> bool {
+    tobii_output::games::load_output_config_from(path).keep_awake
+}
+
+/// Persist the choice, leaving every other game-output setting as it was.
+fn save_keep_awake(on: bool) -> std::io::Result<()> {
+    save_keep_awake_to(&tobii_output::games::games_path(), on)
+}
+
+/// [`save_keep_awake`] to a given path, for tests.
+///
+/// Read, change, write back — the shape `crate::games::edit_config` uses, and
+/// for its reason: the games card, `tobii games` in a terminal and this switch
+/// all edit this one file, so a writer that saved a copy it had been holding
+/// would undo whichever change landed while it held it.
+fn save_keep_awake_to(path: &Path, on: bool) -> std::io::Result<()> {
+    let mut cfg = tobii_output::games::load_output_config_from(path);
+    cfg.keep_awake = on;
+    tobii_output::games::save_output_config_to(path, &cfg)
+}
+
+/// The switch that turns standby off altogether, and the handle that keeps it
+/// in step with the file.
 ///
 /// Its description says what it costs rather than what it gives, because what
 /// it gives is obvious from where it sits and what it costs is not: an infrared
 /// illuminator looks exactly the same lit as dark, so this is the one setting
 /// in the program whose consequence the user cannot see.
-fn keep_awake_switch() -> Switch {
-    let sw = Switch::new();
-    sw.set_valign(Align::Center);
-    sw.set_active(keep_awake::enabled());
-    sw.set_tooltip_text(Some(
-        "Only for setups nothing can detect. Everything else already wakes the \
-         tracker by itself.",
-    ));
-    sw.connect_state_set(|_, on| {
-        if let Err(e) = keep_awake::save(on) {
-            tobii_diagnostics::log::warn(&format!("could not save the keep-awake setting: {e}"));
+///
+/// Kept rather than built and forgotten because it is seeded once: the popover
+/// is constructed with the header and reuses that same widget tree every time
+/// it opens, so a switch nothing refreshes shows the state the file had when
+/// the window was built, for the life of the process. The badge beside it
+/// re-reads on every tick expressly so that `tobii games set keep_awake true`
+/// in a terminal is noticed; the switch a user opens to check has to be at
+/// least as honest as the badge that sent them looking.
+#[derive(Clone)]
+struct KeepAwakeSwitch {
+    switch: Switch,
+    /// True while [`KeepAwakeSwitch::refresh`] is driving the switch, so the
+    /// save handler can tell the file's own value coming back in from a user
+    /// asking for a change — the same guard the eye-selection radios use, for
+    /// the same reason. Without it the hub would answer a refresh by writing
+    /// back what it had just read.
+    seeding: Rc<Cell<bool>>,
+}
+
+impl KeepAwakeSwitch {
+    fn new() -> Self {
+        let switch = Switch::new();
+        let seeding = Rc::new(Cell::new(false));
+        switch.set_valign(Align::Center);
+        // Seeded before the handler is connected, so the seeding itself cannot
+        // be mistaken for a choice and written straight back out.
+        switch.set_active(keep_awake_enabled());
+        switch.set_tooltip_text(Some(
+            "Only for setups nothing can detect. Everything else already wakes the \
+             tracker by itself.",
+        ));
+        {
+            let seeding = seeding.clone();
+            switch.connect_state_set(move |_, on| {
+                if !seeding.get() {
+                    if let Err(e) = save_keep_awake(on) {
+                        tobii_diagnostics::log::warn(&format!(
+                            "could not save the keep-awake setting: {e}"
+                        ));
+                    }
+                }
+                glib::Propagation::Proceed
+            });
         }
-        glib::Propagation::Proceed
-    });
-    sw
+        Self { switch, seeding }
+    }
+
+    /// Put the switch back in step with the file.
+    ///
+    /// Compared before writing, which is what makes this safe to call from the
+    /// 33 ms hub tick — the same discipline `GamesRow::refresh` follows: GTK
+    /// emits `state-set` only on an actual change, so an equal write is silent
+    /// and cannot re-enter the save handler. `seeding` covers the change that
+    /// is not equal, which is the one this exists for.
+    fn refresh(&self, on: bool) {
+        if self.switch.is_active() == on {
+            return;
+        }
+        self.seeding.set(true);
+        self.switch.set_active(on);
+        self.seeding.set(false);
+    }
 }
 
 /// The switch that turns the launch-time release check on and off.
@@ -2736,6 +2818,73 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
 
 #[cfg(test)]
 mod tests {
+    /// The switch and the device thread must be the same bit.
+    ///
+    /// One round trip on purpose: it writes the way the cogwheel switch writes
+    /// and reads back the way the device thread reads. `GameSide::poll` calls
+    /// `tobii_output::games::load_output_config`, which is
+    /// `load_output_config_from(games_path())`, and `sync_keep_awake` then
+    /// branches on `cfg.keep_awake` and on nothing else — so asserting that
+    /// field is asserting the hold.
+    ///
+    /// This is written as one test because two tests are how the bug got in.
+    /// `keep_awake` briefly had two stores — a one-line file for the switch and
+    /// the badge, `games.toml` for the device thread — and each half had a
+    /// green test against its own store, so the switch shipped able to light an
+    /// ALWAYS ON badge over a tracker that still went dark after three seconds.
+    /// Neither test could fail, because neither one crossed the seam.
+    #[test]
+    fn the_switch_writes_the_bit_the_device_thread_reads() {
+        let dir = std::env::temp_dir().join(format!("tobii-keepawake-one-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let games = dir.join("games.toml");
+
+        // Somebody's existing settings, so the write has something to preserve.
+        let before = tobii_output::games::OutputConfig {
+            enabled: true,
+            rate_hz: 90.0,
+            opentrack: Some("127.0.0.1:4242".into()),
+            ..Default::default()
+        };
+        tobii_output::games::save_output_config_to(&games, &before).unwrap();
+
+        // The switch's own write path.
+        super::save_keep_awake_to(&games, true).unwrap();
+
+        // Read back the way the device thread does.
+        let cfg = tobii_output::games::load_output_config_from(&games);
+        assert!(
+            cfg.keep_awake,
+            "the switch must set the field `sync_keep_awake` takes the hold from"
+        );
+        // And the way the badge and the switch do, which has to be the same
+        // answer or the header is lying about the tracker again.
+        assert!(super::keep_awake_at(&games));
+
+        // Load-modify-save, not save-a-copy: the games card and `tobii games`
+        // edit this file too.
+        assert!(cfg.enabled, "game output was left on");
+        assert_eq!(cfg.rate_hz, 90.0);
+        assert_eq!(cfg.opentrack.as_deref(), Some("127.0.0.1:4242"));
+
+        // Off again, through the same path, and gone from the file rather than
+        // merely unread.
+        super::save_keep_awake_to(&games, false).unwrap();
+        assert!(!tobii_output::games::load_output_config_from(&games).keep_awake);
+        assert!(!super::keep_awake_at(&games));
+
+        // One store. A second file beside `games.toml` is what this collapsed,
+        // so nothing may write one.
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["games.toml".to_string()], "one bit, one file");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Standby may only be switched off by somebody actually asking for it.
     ///
     /// Every other preference in this program defaults to the helpful answer;
@@ -2745,30 +2894,46 @@ mod tests {
     /// mean off — the same rule the update check applies in the opposite
     /// direction, for the same reason: the default is whichever way round a
     /// corrupt file cannot hurt.
+    ///
+    /// This outlived the one-line flag file it was first written for. It is the
+    /// property that had to survive moving the setting into `games.toml`, where
+    /// it now rests on `load_output_config_from` answering a damaged file with
+    /// the defaults — so it is checked here, against the reader the switch and
+    /// the badge actually use.
     #[test]
     fn standby_is_only_switched_off_by_an_explicit_yes() {
         let dir = std::env::temp_dir().join(format!("tobii-keepawake-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("keep_awake");
+        let games = dir.join("games.toml");
 
-        assert!(!super::keep_awake::enabled_at(&path), "unset means off");
+        assert!(!super::keep_awake_at(&games), "no file at all means off");
 
-        super::keep_awake::save_to(&path, true).unwrap();
-        assert!(super::keep_awake::enabled_at(&path));
-        super::keep_awake::save_to(&path, false).unwrap();
-        assert!(!super::keep_awake::enabled_at(&path));
-
-        for junk in ["", "yes", "1", "ON", "\u{feff}on"] {
-            std::fs::write(&path, junk).unwrap();
+        // Every one of these carries the `[games]` header, so each is refused
+        // on the value rather than for sitting outside the section — which is
+        // the only refusal worth testing here.
+        for junk in [
+            "",
+            "[games]\n",
+            "[games]\nkeep_awake = yes\n",
+            "[games]\nkeep_awake = 1\n",
+            "[games]\nkeep_awake = True\n",
+            "[games]\nkeep_awake true\n",
+            "[games]\n\u{0}\u{1}not toml at all",
+            "[games]\nkeep_awake = false\n",
+            // Outside the section it is not this setting at all — the same
+            // answer, for the other reason.
+            "keep_awake = true\n",
+        ] {
+            std::fs::write(&games, junk).unwrap();
             assert!(
-                !super::keep_awake::enabled_at(&path),
+                !super::keep_awake_at(&games),
                 "{junk:?} is not a request to burn the illuminators"
             );
         }
-        // Trailing whitespace is what `save_to` itself writes, so it has to
-        // read back as the yes it was.
-        std::fs::write(&path, " on \n").unwrap();
-        assert!(super::keep_awake::enabled_at(&path));
+
+        // What the switch itself writes has to read back as the yes it was.
+        super::save_keep_awake_to(&games, true).unwrap();
+        assert!(super::keep_awake_at(&games));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
