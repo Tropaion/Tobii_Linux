@@ -230,6 +230,64 @@ fn must_wait(demand_active: bool, pending_empty: bool, lease_blocks: bool) -> bo
     (!demand_active && pending_empty) || lease_blocks
 }
 
+/// The hub has let go of the device: promote a requested lease to a held one.
+///
+/// That promotion is the whole signal — the socket thread will not answer the
+/// client until it has SEEN `Held`, because a client told "yes" before the
+/// libusb interface was actually released races the hub into `DeviceBusy` on an
+/// interface nobody has let go of yet. See [`Lease`].
+fn announce_release(lease: &Mutex<Lease>) {
+    let mut l = lease.lock().unwrap();
+    if let Lease::Requested { by, name } = &*l {
+        *l = Lease::Held {
+            by: *by,
+            name: name.clone(),
+        };
+    }
+}
+
+/// One pass of "is there anything to do": take what was queued, answer a lease
+/// the hub can already honour, and say whether to keep waiting.
+///
+/// The three belong together because they have to be evaluated together. This
+/// is a `while` condition, so it runs once before every session as well as once
+/// per idle tick — and each of the three was wrong when it did not.
+///
+/// * The queue used to be drained inside the loop BODY, which a hub holding a
+///   standby claim never enters: `must_wait`'s first term is false for the
+///   whole life of such a hub. A `PitchCalibrate` sent while the tracker was
+///   unreachable then sat in the channel undelivered, [`fail_queued_command`]
+///   could never run, and the dialog waiting on its token waited for ever.
+///   Draining in the condition drains before every attempt to open, whatever
+///   the demand is doing.
+/// * The body also used to `break` as soon as anything was queued — including
+///   while a lease was held, which opened the device under the process holding
+///   it. A queued command is a reason to open the session; it is not a reason
+///   to take the device off somebody. Leaving that to `must_wait`, whose lease
+///   term is an `||` for exactly this, keeps the command queued until the lease
+///   ends and applies it then.
+/// * [`announce_release`] is here because an idle hub never reaches
+///   [`device_session`], and that function's drop guard is the only other thing
+///   that answers a lease. A hub in standby holds no USB session, so it has
+///   already let go — but the client was left waiting for a release that had
+///   happened before it even asked.
+fn stand_by(
+    demand: &Demand,
+    rx: &Receiver<DeviceCommand>,
+    pending: &mut Vec<DeviceCommand>,
+    lease: &Mutex<Lease>,
+) -> bool {
+    while let Ok(cmd) = rx.try_recv() {
+        pending.push(cmd);
+    }
+    announce_release(lease);
+    must_wait(
+        demand.active(),
+        pending.is_empty(),
+        lease.lock().unwrap().hub_must_not_open(),
+    )
+}
+
 /// How long the session stays open after the last consumer lets go.
 ///
 /// Closing costs more than it looks: the ET5 reboots on session close, so the
@@ -992,17 +1050,7 @@ pub fn spawn() -> Session {
             // the USB device free for `tobii headpose`.
             // A lease is the inverse of a demand: something else has the
             // device, so the hub waits regardless of who wants it here.
-            while must_wait(
-                thread_demand.active(),
-                pending.is_empty(),
-                thread_lease.lock().unwrap().hub_must_not_open(),
-            ) {
-                while let Ok(cmd) = rx.try_recv() {
-                    pending.push(cmd);
-                }
-                if !pending.is_empty() {
-                    break;
-                }
+            while stand_by(&thread_demand, &rx, &mut pending, &thread_lease) {
                 {
                     let mut st = thread_state.lock().unwrap();
                     if !matches!(st.status, ConnStatus::Idle) {
@@ -1148,6 +1196,27 @@ fn wants_joystick_wake(cfg: &tobii_output::games::OutputConfig, have_device: boo
     have_device && cfg.wake_for_joystick && wants_joystick(cfg)
 }
 
+/// Take a claim on the tracker, or let one go, to match `want`.
+///
+/// One guard, kept rather than re-taken. Assigning a fresh `hold` every second
+/// would behave the same — but only because assignment drops the old guard
+/// *after* taking the new one, so the count never touches zero. The version of
+/// that which drops first closes and reopens the USB session once a second,
+/// which on this device means rebooting the tracker once a second. (The
+/// opentrack watch learned this the same way; see `crate::outputs::PortWatch`.)
+///
+/// A free function because the hub's two standing claims — the joystick's and
+/// `keep_awake`'s — differ only in what they are gated on and what they call
+/// themselves. The latch itself is one rule, and a second copy of it is a
+/// second place for that re-taking mistake to be made.
+fn latch(slot: &mut Option<DemandGuard>, demand: &Demand, want: bool, reason: &'static str) {
+    if want {
+        slot.get_or_insert_with(|| demand.hold(reason));
+    } else {
+        *slot = None;
+    }
+}
+
 /// How often the settings are re-read.
 const GAMES_POLL: Duration = Duration::from_secs(1);
 
@@ -1217,22 +1286,13 @@ impl GameSide {
     }
 
     /// Hold the tracker on for a joystick that really exists, or let go.
-    ///
-    /// One guard, kept rather than re-taken. Assigning a fresh `hold` every
-    /// second would behave the same — but only because assignment drops the old
-    /// guard *after* taking the new one, so the count never touches zero. The
-    /// version of that which drops first closes and reopens the USB session
-    /// once a second, which on this device means rebooting the tracker once a
-    /// second. (The opentrack watch learned this the same way; see
-    /// `crate::outputs::PortWatch`.)
     fn sync_wake(&mut self, cfg: &tobii_output::games::OutputConfig, have_device: bool) {
-        if wants_joystick_wake(cfg, have_device) {
-            let demand = &self.demand;
-            self.wake
-                .get_or_insert_with(|| demand.hold(JOYSTICK_REASON));
-        } else {
-            self.wake = None;
-        }
+        latch(
+            &mut self.wake,
+            &self.demand,
+            wants_joystick_wake(cfg, have_device),
+            JOYSTICK_REASON,
+        );
     }
 
     /// Hold the tracker on for as long as the hub runs, if the user asked for
@@ -1245,13 +1305,12 @@ impl GameSide {
     /// what it cannot work out, so the only thing it is gated on is them
     /// saying it.
     fn sync_keep_awake(&mut self, cfg: &tobii_output::games::OutputConfig) {
-        if cfg.keep_awake {
-            let demand = &self.demand;
-            self.awake
-                .get_or_insert_with(|| demand.hold(KEEP_AWAKE_REASON));
-        } else {
-            self.awake = None;
-        }
+        latch(
+            &mut self.awake,
+            &self.demand,
+            cfg.keep_awake,
+            KEEP_AWAKE_REASON,
+        );
     }
 
     /// Create or destroy the device to match the setting.
@@ -1386,13 +1445,7 @@ fn device_session(
     struct AnnounceRelease<'a>(&'a Arc<Mutex<Lease>>);
     impl Drop for AnnounceRelease<'_> {
         fn drop(&mut self) {
-            let mut l = self.0.lock().unwrap();
-            if let Lease::Requested { by, name } = &*l {
-                *l = Lease::Held {
-                    by: *by,
-                    name: name.clone(),
-                };
-            }
+            announce_release(self.0);
         }
     }
     let _announce = AnnounceRelease(lease);
@@ -1859,6 +1912,99 @@ mod tests {
         );
         assert_eq!(d.reasons().len(), 2, "premise: both are held");
         assert!(!wants_exclusive(&d.reasons()));
+    }
+
+    /// A hub in standby holds no USB session, so it has already let go — but
+    /// [`device_session`]'s drop guard is the only other thing that says so,
+    /// and an idle hub never reaches it. Without the answer from the idle wait,
+    /// every `tobii headpose` started against a dark hub waited out its whole
+    /// deadline for a release that had happened before it asked.
+    #[test]
+    fn a_lease_asked_of_an_idle_hub_is_answered_without_a_session() {
+        let (_tx, rx) = channel::<DeviceCommand>();
+        let mut pending: Vec<DeviceCommand> = Vec::new();
+        let lease = Mutex::new(Lease::Requested {
+            by: 7,
+            name: "tobii headpose".into(),
+        });
+
+        assert!(
+            stand_by(&Demand::new(), &rx, &mut pending, &lease),
+            "the hub must keep its hands off a device it has lent out"
+        );
+        assert_eq!(
+            *lease.lock().unwrap(),
+            Lease::Held {
+                by: 7,
+                name: "tobii headpose".into()
+            },
+            "and it has to SAY it has let go, or the client never opens the device"
+        );
+    }
+
+    /// A lease that was never asked for is not invented, and one already
+    /// confirmed is not confirmed twice.
+    #[test]
+    fn standing_by_answers_only_a_lease_that_was_asked_for() {
+        let (_tx, rx) = channel::<DeviceCommand>();
+        let mut pending: Vec<DeviceCommand> = Vec::new();
+        let free = Mutex::new(Lease::Free);
+        assert!(
+            stand_by(&Demand::new(), &rx, &mut pending, &free),
+            "nothing wants the tracker: stay dark"
+        );
+        assert_eq!(*free.lock().unwrap(), Lease::Free);
+    }
+
+    /// The claim that never ends is what makes this reachable: with
+    /// `keep_awake` or the joystick holding the tracker, `must_wait`'s first
+    /// term is false for the life of the hub, so the idle wait's BODY — where
+    /// the queue used to be drained — never runs. A `PitchCalibrate` queued
+    /// with the tracker unreachable then never reached `pending`,
+    /// `fail_queued_command` could never run, and the dialog watching for that
+    /// token watched for ever.
+    #[test]
+    fn a_command_queued_under_a_standby_claim_still_reaches_the_queue() {
+        let demand = Demand::new();
+        let _held = demand.hold(KEEP_AWAKE_REASON);
+        let (tx, rx) = channel::<DeviceCommand>();
+        let mut pending: Vec<DeviceCommand> = Vec::new();
+        let lease = Mutex::new(Lease::Free);
+        tx.send(DeviceCommand::PitchCalibrate { secs: 10, token: 3 })
+            .expect("queued");
+
+        assert!(
+            !stand_by(&demand, &rx, &mut pending, &lease),
+            "premise: a claim of the hub's own keeps the session open"
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "the command has to be in hand before the open is attempted, or \
+             nothing can fail it when the open fails"
+        );
+    }
+
+    /// A queued command is a reason to open the session; it is not a reason to
+    /// take the device off the process that leased it. The idle wait used to
+    /// break out on a non-empty queue whatever the lease said, which opened the
+    /// device under `tobii headpose` and failed both of them.
+    #[test]
+    fn a_queued_command_does_not_take_the_device_from_a_lease_holder() {
+        let (tx, rx) = channel::<DeviceCommand>();
+        let mut pending: Vec<DeviceCommand> = Vec::new();
+        let lease = Mutex::new(Lease::Held {
+            by: 7,
+            name: "tobii headpose".into(),
+        });
+        tx.send(DeviceCommand::SetEnabledEye(EnabledEye::Left))
+            .expect("queued");
+
+        assert!(
+            stand_by(&Demand::new(), &rx, &mut pending, &lease),
+            "the lease overrides: wait, and apply the command when it ends"
+        );
+        assert_eq!(pending.len(), 1, "and the command is kept, not dropped");
     }
 
     /// The claims above keep a session open for as long as the setting says,

@@ -2016,6 +2016,158 @@ fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
     }
 }
 
+/// How long to wait for the hub to answer a lease request.
+///
+/// The hub notices the request within its 50 ms socket tick, but it cannot
+/// answer until the device thread has actually dropped the USB session — and
+/// that thread can be parked in a `read_notifications` that blocks for up to a
+/// second. Three seconds is well clear of that and still short enough that a
+/// hub which is never going to answer does not read as a hang.
+const LEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// What the hub said when asked to let go of the tracker.
+#[derive(Debug, PartialEq, Eq)]
+enum StoodDown {
+    /// The hub has dropped its USB session; the device can be opened.
+    Yes,
+    /// The hub will not let go, and says why.
+    No(String),
+}
+
+/// Pick the lease reply out of one message the hub sent.
+///
+/// Anything that is not a `LeaseReply` is skipped rather than counted as an
+/// answer, and that is load-bearing rather than defensive: granting the lease
+/// is exactly what puts the hub into standby, and a status change is broadcast
+/// to every connected client — so the first message to arrive after the request
+/// is quite often the hub saying "nothing is asking for the tracker" rather
+/// than the reply. Treating that as no answer would fall through to an open
+/// that races the hub's own release.
+fn lease_answer(msg: &tobii_ipc::Msg) -> Option<StoodDown> {
+    match msg {
+        tobii_ipc::Msg::LeaseReply { ok: true, .. } => Some(StoodDown::Yes),
+        tobii_ipc::Msg::LeaseReply { ok: false, text } => Some(StoodDown::No(text.clone())),
+        _ => None,
+    }
+}
+
+/// The hub standing down, for as long as this lives.
+struct HubLease {
+    /// `None` when there was no hub to ask, or it never answered. The device is
+    /// opened either way — see [`lease_the_tracker`].
+    client: Option<tobii_ipc::Client>,
+}
+
+impl Drop for HubLease {
+    /// Give the tracker back.
+    ///
+    /// The hub takes a lease back from a client whose socket has gone anyway —
+    /// a dead socket is the truth and needs no timeout — so for a command that
+    /// holds the device until Ctrl-C this is the polite half rather than the
+    /// necessary one. It is here because the necessary half stops being enough
+    /// the moment anything holds one of these for less than the whole process:
+    /// `--check` and `--calibrate-pitch` both return, and the hub should have
+    /// its tracker back at that point rather than at exit.
+    fn drop(&mut self) {
+        if let Some(c) = self.client.as_mut() {
+            let _ = c.send(&tobii_ipc::Msg::Lease(tobii_ipc::LeaseAction::Release));
+        }
+    }
+}
+
+/// Ask a running hub to let go of the tracker, for as long as the returned
+/// value lives.
+///
+/// # Why this is not simply `UsbTransport::open`
+///
+/// libusb claims interface 0 exclusively, so exactly one process has the
+/// tracker. The hub takes it whenever something in it asks — and two of those
+/// asks never end by themselves: the virtual joystick's, and `keep_awake`.
+/// Both belong to a user who has turned game output on, which is the same user
+/// this command is for, so without this `tobii headpose` (and with it
+/// `--check` and `--calibrate-pitch`, the documented way to tell a gaze fault
+/// from a head-tracking one) could not be run at all while the hub was open.
+/// The hub already has the mechanism for handing the whole device over and
+/// already honours it; until now nothing asked.
+///
+/// # The three answers, and why each is what it is
+///
+/// * **No hub.** Connecting fails, which is the ordinary state for anyone who
+///   has not opened one. Nothing else holds the device, so this opens it
+///   directly: that is the standalone route and it has to keep working — a
+///   head-tracking command that needed a GUI running would be a worse program
+///   than the one that could not share.
+/// * **The hub refuses.** It is mid-calibration or mid-display-setup, or
+///   another client holds the lease already. All three mean something else has
+///   the device *and* is in a stateful conversation with it that handing it
+///   over would break, so this fails — with the hub's own sentence, which names
+///   what to wait for. Trying anyway would produce `DeviceBusy`, which names
+///   nothing.
+/// * **The hub does not answer.** Open it anyway. A hub that cannot answer
+///   within [`LEASE_WAIT`] is either wedged or too old to know the question,
+///   and in the commonest form of the second case — a hub sitting in standby —
+///   it holds no USB session at all and the open simply succeeds. Refusing here
+///   would make this command *less* usable than it was before it learned to
+///   ask.
+fn lease_the_tracker() -> Result<HubLease, Box<dyn std::error::Error>> {
+    lease_from(&tobii_ipc::socket_path())
+}
+
+/// [`lease_the_tracker`], against an explicit socket.
+///
+/// Split out for the same reason `outputs::PortWatch::poll` takes its inputs as
+/// arguments: the interesting behaviour is the conversation — ask, ignore the
+/// status broadcast that the grant itself causes, act on the reply — and a test
+/// can drive all of it against a socket of its own, while the real path keeps
+/// using the one the hub binds.
+fn lease_from(path: &std::path::Path) -> Result<HubLease, Box<dyn std::error::Error>> {
+    // Subscribed to nothing, deliberately. This wants the device, not the hub's
+    // frames, and the hub reads an empty subscription as "not a reason to run
+    // the tracker" — so asking for poses here would light the illuminators for
+    // a client that is about to take the device away.
+    let mut client = match tobii_ipc::Client::connect_at(path, 0, "tobii headpose") {
+        Ok(c) => c,
+        Err(_) => return Ok(HubLease { client: None }),
+    };
+    if client
+        .send(&tobii_ipc::Msg::Lease(tobii_ipc::LeaseAction::Acquire))
+        .is_err()
+    {
+        // The hub went away between the connect and the request: the same
+        // situation as there never having been one.
+        return Ok(HubLease { client: None });
+    }
+    let deadline = Instant::now() + LEASE_WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match client.recv_timeout(left).as_ref().and_then(lease_answer) {
+            Some(StoodDown::Yes) => {
+                eprintln!("the hub has let go of the tracker for this run");
+                return Ok(HubLease {
+                    client: Some(client),
+                });
+            }
+            Some(StoodDown::No(why)) => return Err(why.into()),
+            // Something else, or nothing. A hub that has gone away will never
+            // answer, and waiting out the deadline for it would add three
+            // seconds to a case that is already decided.
+            None => {
+                if !client.is_connected() {
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "the hub did not answer the request for the tracker within {}s; opening it anyway",
+        LEASE_WAIT.as_secs()
+    );
+    Ok(HubLease { client: None })
+}
+
 fn headpose(args: &[String]) -> CmdResult {
     // Settings come from games.toml; the flags override this run without
     // writing anything. That order matters: a user who has configured Extended
@@ -2112,6 +2264,14 @@ fn headpose(args: &[String]) -> CmdResult {
     }
 
     let mut model = open_model(&model_choice(args));
+
+    // Asked for here rather than at the top of the command, because a granted
+    // lease puts the hub's tracker out: loading the model can take seconds, and
+    // there is no reason for the illuminators to be dark through them. Held in
+    // a binding that lives to the end of this function — including across the
+    // early return into `calibrate_pitch_zero` — because dropping it is what
+    // gives the device back.
+    let _hub = lease_the_tracker()?;
 
     eprintln!("opening Tobii ET5...");
     let transport = UsbTransport::open()?;
@@ -2535,6 +2695,163 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- the lease ------------------------------------------------------
+    //
+    // `tobii headpose` and a running hub cannot both hold the tracker, and the
+    // hub's standby claims (the virtual joystick's and `keep_awake`) never end
+    // by themselves. The hub has always honoured a lease; until these, nothing
+    // in the shipped tree ever asked for one.
+
+    /// A hub stand-in that answers one lease request with `reply`.
+    ///
+    /// A `Status` is sent first, always, because the real hub sends one:
+    /// granting the lease is what puts it into standby, and the status change
+    /// is broadcast to every client. The reply is therefore NOT the first
+    /// message to arrive, and a client that assumed it was would open the
+    /// device while the hub was still letting go.
+    fn fake_hub(tag: &str, reply: tobii_ipc::Msg) -> (std::path::PathBuf, HubThread) {
+        let path = std::env::temp_dir().join(format!("tobii-lease-{tag}-{}.sock", unique()));
+        let _ = std::fs::remove_file(&path);
+        let server = tobii_ipc::Server::bind_at(&path).expect("bind the stand-in hub");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline
+                && !thread_stop.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                for msg in server.poll() {
+                    if matches!(msg.msg, tobii_ipc::Msg::Lease(_)) {
+                        server.send_to(
+                            msg.from,
+                            &tobii_ipc::Msg::Status {
+                                code: tobii_ipc::StatusCode::Idle,
+                                text: "nothing is asking for the tracker".into(),
+                            },
+                        );
+                        server.send_to(msg.from, &reply);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = std::fs::remove_file(server.path());
+        });
+        (path, HubThread { stop, handle })
+    }
+
+    /// Keeps the stand-in hub alive for as long as the test needs it, and shuts
+    /// it down afterwards rather than leaving a thread running under the rest
+    /// of the suite.
+    struct HubThread {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl HubThread {
+        fn shut_down(self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.handle.join();
+        }
+    }
+
+    /// Distinct per call, so two tests running at once cannot land on one
+    /// socket path. The pid alone is not enough: the whole suite shares one.
+    fn unique() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        (std::process::id() as u64) << 16 | N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The point of the whole thing: with a hub running, this command asks it
+    /// to stand down and waits for it to say it has, instead of opening the
+    /// device under it and failing with `DeviceBusy`.
+    ///
+    /// Without the request being sent, the hub answers nothing, the wait runs
+    /// out and this returns a lease holding no client — which is what every
+    /// `tobii headpose` did before, and what left the two standby tests in
+    /// `device.rs` guarding a path no user reached.
+    #[test]
+    fn asking_a_running_hub_to_stand_down_gets_the_device() {
+        let (path, hub) = fake_hub(
+            "granted",
+            tobii_ipc::Msg::LeaseReply {
+                ok: true,
+                text: String::new(),
+            },
+        );
+        let lease = lease_from(&path).expect("a granted lease is not an error");
+        assert!(
+            lease.client.is_some(),
+            "the hub said yes, so the lease is held — and held is what releases it on drop"
+        );
+        drop(lease);
+        hub.shut_down();
+    }
+
+    /// The hub refuses while it is mid-calibration or mid-display-setup, and
+    /// its sentence names what to wait for. Opening anyway would produce
+    /// `DeviceBusy`, which names nothing — so the refusal is the error, text
+    /// and all.
+    #[test]
+    fn a_hub_that_will_not_let_go_fails_the_command_in_its_own_words() {
+        let why = "the hub is busy with calibration — try again when it has finished";
+        let (path, hub) = fake_hub(
+            "refused",
+            tobii_ipc::Msg::LeaseReply {
+                ok: false,
+                text: why.into(),
+            },
+        );
+        let e = lease_from(&path)
+            .err()
+            .expect("a refusal must fail the command");
+        assert_eq!(e.to_string(), why);
+        hub.shut_down();
+    }
+
+    /// The standalone route. No hub is the ordinary state for anyone who has
+    /// not opened one, so it must not be an error: nothing else holds the
+    /// device and the command opens it directly, exactly as it always did.
+    #[test]
+    fn with_no_hub_to_ask_the_command_still_gets_to_open_the_device() {
+        let path = std::env::temp_dir().join(format!("tobii-lease-absent-{}.sock", unique()));
+        let _ = std::fs::remove_file(&path);
+        let lease = lease_from(&path).expect("no hub is not an error");
+        assert!(
+            lease.client.is_none(),
+            "nothing was leased, so there is nothing to give back"
+        );
+    }
+
+    /// The grant is what puts the hub into standby, so the status change it
+    /// broadcasts can arrive before the reply. Counting that as the answer
+    /// would have this open the device while the hub was still dropping its
+    /// own session — the `DeviceBusy` the hub's Requested/Held split exists to
+    /// prevent, arriving at the client that did everything right.
+    #[test]
+    fn a_status_broadcast_is_not_an_answer_to_a_lease_request() {
+        let status = tobii_ipc::Msg::Status {
+            code: tobii_ipc::StatusCode::Idle,
+            text: "nothing is asking for the tracker".into(),
+        };
+        assert_eq!(lease_answer(&status), None);
+        assert_eq!(lease_answer(&tobii_ipc::Msg::Recentre), None);
+        assert_eq!(
+            lease_answer(&tobii_ipc::Msg::LeaseReply {
+                ok: true,
+                text: String::new()
+            }),
+            Some(StoodDown::Yes)
+        );
+        assert_eq!(
+            lease_answer(&tobii_ipc::Msg::LeaseReply {
+                ok: false,
+                text: "no".into()
+            }),
+            Some(StoodDown::No("no".into()))
+        );
     }
 
     /// `--rate 1e-300` used to parse, then `1.0 / rate` overflowed the
