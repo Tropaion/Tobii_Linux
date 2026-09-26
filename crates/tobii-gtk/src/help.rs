@@ -32,9 +32,17 @@
 //! answer to that is a text box you can type the control's own word into.
 //!
 //! So the window opens with the focus **in the search box**, and the search
-//! reads every topic's heading and the whole of its text: the words on the
-//! hub's own controls are in that text, because this page is built from the
-//! hub's own strings. The topic list beside it is the second half of the same
+//! reads every topic's heading and the whole of its text. Most of the words on
+//! the hub's own controls are in that text, because this page is built from the
+//! hub's own strings — but only the ones those strings happen to contain, and
+//! that is not the same promise. The three strength presets are the standing
+//! exception: they are captioned `Subtle`, `Normal` and `Strong`, their row
+//! carries no caption of its own, only [`crate::games::STRENGTH_TOOLTIP`]
+//! explains them, and none of those three words is anywhere in here — so typing
+//! the word printed on that control lands on the no-match page. Closing it
+//! means naming the presets FROM `games::STRENGTHS`, the constant the radios
+//! are labelled from, rather than retyping them here. Not done yet.
+//! The topic list beside it is the second half of the same
 //! idea — nine topics is few enough that a list is not a necessity for finding
 //! anything, but it makes the shape of the whole window visible at a glance,
 //! which is what tells you whether your question is in here at all.
@@ -67,6 +75,20 @@ use gtk::{Align, Application, Label, Orientation};
 pub struct Topic {
     pub title: &'static str,
     pub body: String,
+}
+
+impl Topic {
+    /// The topic as the single blob the search reads: heading, then body.
+    ///
+    /// One spelling of it and not three, because three separate readers depend
+    /// on it having the same shape — [`matches`] searches it, this module's
+    /// coverage test asserts every tooltip string is somewhere in it, and
+    /// `tests/help_window.rs` checks the real rack's tooltips against it. Three
+    /// hand-written `format!`s that happened to agree is a coverage contract
+    /// held together by hand.
+    pub fn text(&self) -> String {
+        format!("{}\n{}", self.title, self.body)
+    }
 }
 
 /// The gap and margin the hub uses, so this window reads as the same panel.
@@ -241,8 +263,12 @@ pub fn topics() -> Vec<Topic> {
                  Strength — {strength}.\n\n\
                  Virtual joystick — {joystick}\n\n\
                  Recentre view — {recentre}\n\n\
-                 It is greyed out when it cannot be taken, and the reason is one of \
-                 these:\n{refusals}",
+                 It is greyed out when it cannot be taken, and the row's tooltip \
+                 says why. A reason reads like one of these:\n{refusals}\n\n\
+                 More than one thing can be holding the tracker at once, and then \
+                 the tooltip names them all in the same sentence rather than one \
+                 at a time — so what you read there may be a longer sentence than \
+                 any of these four.",
                 switch = switch,
                 strength = crate::games::STRENGTH_TOOLTIP,
                 joystick = crate::games::JOYSTICK_TOOLTIP,
@@ -310,8 +336,7 @@ pub fn topics() -> Vec<Topic> {
 /// be tested in CI and what keeps the coverage contract intact: hiding a row
 /// cannot remove a fact from a list this never touches.
 pub fn matches(topic: &Topic, query: &str) -> bool {
-    let hay = format!("{}\n{}", topic.title, topic.body).to_lowercase();
-    all_terms_in(&hay, query)
+    all_terms_in(&topic.text().to_lowercase(), query)
 }
 
 fn all_terms_in(hay: &str, query: &str) -> bool {
@@ -331,8 +356,13 @@ fn all_terms_in(hay: &str, query: &str) -> bool {
 /// pane. Failing that, the first match in the hub's order.
 ///
 /// `None` only when nothing matches at all, which is the no-match page.
-pub fn best_match(query: &str) -> Option<usize> {
-    let all = topics();
+///
+/// Takes the list rather than building its own. It returns an INDEX into that
+/// list, and it is called on every keystroke: a second copy built in here is a
+/// second thing that has to stay in the same order as the rows, the pages and
+/// the filter, and rebuilding all nine topics — every one of which interpolates
+/// somebody else's strings — to answer one keypress is work for nothing.
+pub fn best_match(all: &[Topic], query: &str) -> Option<usize> {
     let hits: Vec<usize> = (0..all.len())
         .filter(|&i| matches(&all[i], query))
         .collect();
@@ -394,7 +424,10 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
         return win;
     }
 
-    let all = topics();
+    // Built once, and shared with the two handlers that read it. The rows, the
+    // pages and the filter are all addressed by the same index, so a second
+    // copy anywhere is a second thing that has to be in the same order.
+    let all: Rc<Vec<Topic>> = Rc::new(topics());
 
     // --- the content: one card per topic, and one page for "nothing matched"
     //
@@ -476,7 +509,7 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
     list.set_widget_name(LIST_NAME);
     list.add_css_class("topic-list");
     list.set_selection_mode(gtk::SelectionMode::Single);
-    for t in &all {
+    for t in all.iter() {
         let row = gtk::ListBoxRow::new();
         let l = Label::new(Some(t.title));
         l.set_halign(Align::Start);
@@ -545,8 +578,9 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
     {
         let query = query.clone();
         // Data, not widgets: the filter asks `matches` about the same list the
-        // coverage test asserts over.
-        let model = topics();
+        // coverage test asserts over, and about the very same copy of it the
+        // rows and the pages were built from.
+        let model = all.clone();
         list.set_filter_func(move |row| {
             let q = query.borrow();
             model
@@ -556,9 +590,14 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
     }
     {
         let (q, l, st, nm) = (query.clone(), list.clone(), stack.clone(), no_match.clone());
+        let model = all.clone();
         let n = all.len();
         search.connect_search_changed(move |e| {
             let text = e.text().to_string();
+            // What was in the box before this keystroke: `q` still holds it
+            // until the line below. It is the whole difference between refining
+            // a query and starting one. See `keep`.
+            let refining = !q.borrow().trim().is_empty();
             *q.borrow_mut() = text.clone();
             l.invalidate_filter();
             // The content follows the search, so a one-word query usually
@@ -567,8 +606,21 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
             // away the paragraph being read), else `best_match`, else the page
             // that explains why there is nothing. `select_row` drives
             // `row-selected` below, which is what turns a row into a page.
-            let keep = l.selected_row().filter(|r| r.is_child_visible());
-            let pick = keep.or_else(|| best_match(&text).and_then(|i| l.row_at_index(i as i32)));
+            // "Still showing stays" is a rule about REFINING a query. The
+            // first one typed into a box that was empty is a question, and the
+            // topic on screen then was not chosen for it — it is whichever one
+            // the window resumed on, or the first. Letting that win meant the
+            // Keyboard topic, which advertises "joystick", "strength",
+            // "cogwheel" and "pitch" as words worth typing, quotes all four:
+            // read it, press F1 again, type one of them, and the list narrowed
+            // correctly while the pane stayed where it was.
+            let keep = if refining {
+                l.selected_row().filter(|r| r.is_child_visible())
+            } else {
+                None
+            };
+            let pick =
+                keep.or_else(|| best_match(&model, &text).and_then(|i| l.row_at_index(i as i32)));
             match pick {
                 Some(row) => {
                     // The page is set here and not left to `row-selected`.
@@ -623,14 +675,44 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
     {
         // `sidebar` WEAKLY: it is the parent of `list`, and `list` holds this
         // toggle through its row-activated handler, so a strong capture here
-        // closes sidebar -> list -> toggle -> sidebar.
-        let (sb, bs, rl) = (sidebar.downgrade(), body_scroll.clone(), rule.clone());
+        // closes sidebar -> list -> toggle -> sidebar. `search` weakly for the
+        // same reason one widget along: its own handlers hold `list`.
+        let (sb, se, bs, rl) = (
+            sidebar.downgrade(),
+            search.downgrade(),
+            body_scroll.clone(),
+            rule.clone(),
+        );
         toggle.connect_toggled(move |t| {
             let Some(sb) = sb.upgrade() else { return };
             if t.is_visible() {
                 sb.set_visible(t.is_active());
                 bs.set_visible(!t.is_active());
                 rl.set_visible(false);
+                // Hand the focus to the pane that has just come on screen.
+                //
+                // The keyboard reason is the obvious one: without this,
+                // pressing "Topics" unfolds a list that the keyboard cannot
+                // reach without a further Ctrl+F, which is the shortcut that
+                // already does exactly this by hand.
+                //
+                // The other reason is memory, and it is the one that was
+                // measured. GTK's focus bookkeeping keeps a hold on the
+                // subtree the focus was last inside, and folding a pane away
+                // while the focus is still in it never gives that hold back:
+                // the window frees on close and 80 of its 87 widgets and 127
+                // of its 143 event controllers do not — once per fold, for as
+                // long as the tray icon runs, accumulating exactly linearly.
+                // It is not a cycle in these closures; a window of the same
+                // shape with no handlers at all does it too. Asserted in
+                // `tests/help_window.rs`, over a census taken AFTER the fold —
+                // the one at 3100 ms runs before the narrow phase and passes
+                // straight over it.
+                if t.is_active() {
+                    if let Some(se) = se.upgrade() {
+                        se.grab_focus();
+                    }
+                }
             }
         });
     }
@@ -946,7 +1028,7 @@ mod tests {
     fn every_tooltip_only_fact_is_in_the_help_window() {
         let text = super::topics()
             .iter()
-            .map(|t| format!("{}\n{}", t.title, t.body))
+            .map(super::Topic::text)
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -1066,35 +1148,71 @@ mod tests {
         );
     }
 
-    /// A user arrives with the name of a control, so the control's name finds
-    /// its topic.
+    /// A user arrives with the name of a control, so the control's name opens
+    /// the topic that explains it.
     ///
-    /// This is the search's actual job, and it is asserted over the words that
-    /// are on the hub's own controls rather than over words picked to pass:
-    /// every one of these is a caption, a switch label or a readout name the
-    /// user can read off the window in front of them.
+    /// Over [`super::best_match`] and not over [`super::matches`]. `matches` is
+    /// the filter, and the filter is not what anybody reads — the pane is, and
+    /// `best_match` is what puts a topic in it. A guard that asks only whether
+    /// the right row survived the filter passes while the window is showing a
+    /// different topic altogether, which is exactly the state the search's pick
+    /// exists to prevent and so the state worth asserting.
+    ///
+    /// Two tables, because the words come from two different promises and only
+    /// one of them is a caption. The eight words this test used to carry were
+    /// all claimed as captions; three of them — `strength`, `cogwheel` and
+    /// `infrared` — are on no control anywhere in the hub.
     #[test]
-    fn the_word_on_the_control_finds_the_topic() {
+    fn the_word_on_the_control_opens_the_topic() {
         let all = super::topics();
+        let opened = |q: &str| super::best_match(&all, q).map(|i| all[i].title);
+
+        // Words the user can read off the hub: a check-button caption
+        // (`games::check_row`), a button caption, or a settings-row
+        // description, which `lib::settings_row` draws as a visible label. Each
+        // must open the one topic that is about that control.
         for (word, topic) in [
-            ("strength", "Head tracking for games"),
             ("joystick", "Head tracking for games"),
             ("recentre", "Head tracking for games"),
-            ("pitch", "Head tracking"),
-            ("cogwheel", "Settings, behind the cogwheel"),
             ("standby", "Eye position"),
-            ("infrared", "Eye position"),
             ("tray", "Settings, behind the cogwheel"),
         ] {
-            let hits: Vec<&str> = all
-                .iter()
-                .filter(|t| super::matches(t, word))
-                .map(|t| t.title)
-                .collect();
+            assert_eq!(
+                opened(word),
+                Some(topic),
+                "typing {word:?} — a word printed on the hub — must OPEN {topic:?}, \
+                 and the pane went to {:?}",
+                opened(word)
+            );
+        }
+
+        // KNOWN GAP, stated rather than asserted: the three strength presets
+        // are captioned `Subtle`, `Normal` and `Strong` (`games::STRENGTHS`),
+        // their row carries no caption of its own, and none of those three
+        // words appears in any topic — so typing the word printed on the very
+        // control you are asking about lands on the no-match page. Closing it
+        // means naming the presets in the topic FROM `STRENGTHS`, rather than
+        // retyping them here, and that needs the constant to be visible outside
+        // `games.rs`.
+
+        // The second promise: this window's own "Keyboard" topic names four
+        // words as the sort of thing to type, so those four have to work
+        // whatever else does. Which topic each opens is not fixed — "pitch" is
+        // answered by two of them, and the first says where to read the rest —
+        // but every one must open SOMETHING, and that something must be a topic
+        // the word is really in. `None` is the no-match page: the window
+        // telling a user that a word it advertised is not in it.
+        for word in ["joystick", "strength", "cogwheel", "pitch"] {
+            let i = super::best_match(&all, word).unwrap_or_else(|| {
+                panic!(
+                    "the Keyboard topic advertises {word:?} as a word worth typing, \
+                     and typing it lands on the no-match page"
+                )
+            });
             assert!(
-                hits.contains(&topic),
-                "typing {word:?} — a word the user can read off the hub — must find \
-                 {topic:?}, and instead found {hits:?}"
+                super::matches(&all[i], word),
+                "typing {word:?} opened {:?}, which does not contain it",
+                all[i].title
             );
         }
     }
@@ -1109,7 +1227,7 @@ mod tests {
     #[test]
     fn typing_a_heading_opens_that_heading() {
         let all = super::topics();
-        let opened = |q: &str| super::best_match(q).map(|i| all[i].title);
+        let opened = |q: &str| super::best_match(&all, q).map(|i| all[i].title);
 
         assert_eq!(opened("Change screen"), Some("Change screen"));
         assert_eq!(
@@ -1118,25 +1236,14 @@ mod tests {
         );
         // A word that is in no heading at all still opens the topic it is in.
         assert_eq!(opened("opentrack"), Some("Head tracking"));
-        // Nothing matched is the no-match page, and nothing else.
+        // Nothing matched is the no-match page, and nothing else. `best_match`
+        // collects the hits and falls back to the first of them, so it answers
+        // `None` if and only if no topic matches at all — which makes this also
+        // the assertion that the no-match page is reachable rather than dead
+        // code, since the widget side reads exactly this condition to swap to
+        // it.
         assert_eq!(opened("xyzzyplughquux"), None);
         // An empty box opens the first topic, which is what a first F1 does.
         assert_eq!(opened(""), Some(all[0].title));
-    }
-
-    /// A query with no answer has to be a state the window can render.
-    ///
-    /// The widget side reads exactly this condition to swap to its "Nothing
-    /// found" page; asserting it here is what stops that page being
-    /// unreachable dead code, and what states the condition in the place CI
-    /// can check it.
-    #[test]
-    fn a_query_with_no_answer_matches_no_topic_at_all() {
-        let all = super::topics();
-        let nothing = "xyzzyplughquux";
-        assert!(
-            !all.iter().any(|t| super::matches(t, nothing)),
-            "this query has to match nothing, or the no-match page is never shown"
-        );
     }
 }
