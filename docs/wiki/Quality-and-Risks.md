@@ -630,102 +630,256 @@ fault.
   lit for as long as the hub runs. With `wake_for_joystick` on (the default),
   they are lit for as long as game output is on — including overnight, if it is
   forgotten. Every other wake path ends on its own: a focused window loses
-  focus, a wrapped game exits, `wake_for_opentrack`'s hold ends when the program
-  holding that port does. These two end when a human ends them. The visibility
-  that pays for it — the header's **ALWAYS ON** badge, the switch's off-state
-  sentence, the `can wake it now` line in `tobii debug`, the close line in the
-  log — is therefore not decoration, and removing any of it re-opens the
-  bargain.
-- **What is measured.** The linger is **3.00 s**, timed, which is the "3 to 5
-  seconds" of the report. The joystick's uinput node **persists while the
-  tracker is dark**: `GameSide::poll` → `sync_joystick` runs from the device
-  thread's idle loop as well as from a session, so a game saw axes frozen at
-  centre rather than a disappearing controller — which is why gating a hold on
-  the handle really existing cannot deadlock. Reader detection was measured and
-  **rejected**: a faithful replica of our device was held open by
-  `joystickwake`, by Chrome probing gamepads on hotplug and by
-  `winedevice.exe` within 30 ms,
-  never had zero openers across 30 samples, and the kernel exports no open
-  count, so a real reader is one more identical row in `/proc/*/fd`. The hold's
-  placement was decided by reading `outputs::spawn`, which returns *before*
-  `std::thread::spawn` when `Server::bind()` fails — a waker parked on the
-  socket thread would be missing on precisely the second `tobii serve` — so it
-  lives on `GameSide`, which already polls at 1 Hz in both loops.
-- **What is not measured: nobody has run a tracker lit for eight hours.** There
-  is no soak test of either hold, no thermal measurement, and nothing is known
-  about what continuous illumination does to an ET5 over a night beyond the
-  obvious. The "overnight" case in every warning above is reasoned, not
-  observed.
-- **No real game has been watched reading unfrozen axes.** The hold is proven by
-  unit tests over `GameSide` (the claim exists exactly when the handle does,
-  released on the setting, on losing the device, and on game output going off)
-  and the lease behaviour by tests over `must_wait` and `EXCLUSIVE`. What has
-  not been done is: turn it on, start a game, alt-tab, and watch the view still
-  follow.
-- **The close line's emission site is untested.** `standby_notice`'s wording has
-  a test; the `log::info` call that emits it does not, because `device_session`
-  opens `UsbTransport` directly and is not generic over `Transport` the way
+  focus, a wrapped game exits, `wake_for_opentrack`'s hold ends when the
+  program holding that port does. These two end when a human ends them. The
+  visibility that pays for it — the header's **ALWAYS ON** badge, the switch's
+  off-state sentence, the `can wake it now` line in `tobii debug`, the close
+  line in the log — is therefore not decoration, and removing any of it
+  re-opens the bargain. - **What is measured.** The linger is **3.00 s**,
+  timed, which is the "3 to 5 seconds" of the report. The joystick's uinput
+  node **persists while the tracker is dark**: `GameSide::poll` →
+  `sync_joystick` runs from the device thread's idle loop as well as from a
+  session, so a game saw axes frozen at centre rather than a disappearing
+  controller — which is why gating a hold on the handle really existing cannot
+  deadlock. Reader detection was measured and **rejected**: a faithful replica
+  of our device was held open by `joystickwake`, by Chrome probing gamepads on
+  hotplug and by `winedevice.exe` within 30 ms, never had zero openers across
+  30 samples, and the kernel exports no open count, so a real reader is one
+  more identical row in `/proc/*/fd`. The hold's placement was decided by
+  reading `outputs::spawn`, which returns *before* `std::thread::spawn` when
+  `Server::bind()` fails — a waker parked on the socket thread would be missing
+  on precisely the second `tobii serve` — so it lives on `GameSide`, which
+  already polls at 1 Hz in both loops. - **What is not measured: nobody has run
+  a tracker lit for eight hours.** There is no soak test of either hold, no
+  thermal measurement, and nothing is known about what continuous illumination
+  does to an ET5 over a night beyond the obvious. The "overnight" case in every
+  warning above is reasoned, not observed. - **No real game has been watched
+  reading unfrozen axes.** The hold is proven by unit tests over `GameSide`
+  (the claim exists exactly when the handle does, released on the setting, on
+  losing the device, and on game output going off) and the lease behaviour by
+  tests over `must_wait` and `EXCLUSIVE`. What has not been done is: turn it
+  on, start a game, alt-tab, and watch the view still follow. - **The close
+  line's emission site is untested.** `standby_notice`'s wording has a test;
+  the `log::info` call that emits it does not, because `device_session` opens
+  `UsbTransport` directly and is not generic over `Transport` the way
   `device_tick` is. Making it generic was judged a larger change than the bug
-  needed.
-- **`keep_awake` lives in `games.toml`, which is the wrong-sounding file for
-  it.** It is there because that is the only config the hub re-reads once a
-  second, in the idle wait *and* in a session, so the GUI and the CLI both take
-  effect within a second in either state; `config.toml` is read once at connect
-  and is rewritten wholesale by `tobii setup`. The cost is that the file's name
-  undersells one of its keys, paid down in the file's header comment and in the
-  field's docs. The failure direction is at least the safe one: a `games.toml`
-  that cannot be read at all falls back to `OutputConfig::default()`, where
-  `keep_awake` is off — a corrupt file cannot leave somebody's illuminators lit.
-- **The GUI half is tested on both sides of the display line**, which it was not
-  when it briefly had a store of its own. Headless, in CI:
-  `the_switch_writes_the_bit_the_device_thread_reads` (`crates/tobii-gtk/src/lib.rs`)
-  writes through the switch's own save path and reads back through
-  `load_output_config_from` — the function `GameSide::poll` reads with — checks
-  the other settings survived the load-modify-save, and asserts the config
-  directory holds `games.toml` and no second file. The GTK wiring itself, which
-  is still unreachable without a display, is covered by
+  needed. - **`keep_awake` lives in `games.toml`, which is the wrong-sounding
+  file for it.** It is there because that is the only config the hub re-reads
+  once a second, in the idle wait *and* in a session, so the GUI and the CLI
+  both take effect within a second in either state; `config.toml` is read once
+  at connect and is rewritten wholesale by `tobii setup`. The cost is that the
+  file's name undersells one of its keys, paid down in the file's header
+  comment and in the field's docs. The failure direction is at least the safe
+  one: a `games.toml` that cannot be read at all falls back to
+  `OutputConfig::default()`, where `keep_awake` is off — a corrupt file cannot
+  leave somebody's illuminators lit. - **The GUI half is tested on both sides
+  of the display line**, which it was not when it briefly had a store of its
+  own. Headless, in CI: `the_switch_writes_the_bit_the_device_thread_reads`
+  (`crates/tobii-gtk/src/lib.rs`) writes through the switch's own save path and
+  reads back through `load_output_config_from` — the function `GameSide::poll`
+  reads with — checks the other settings survived the load-modify-save, and
+  asserts the config directory holds `games.toml` and no second file. The GTK
+  wiring itself, which is still unreachable without a display, is covered by
   `crates/tobii-gtk/tests/keep_awake_switch.rs`, `#[ignore]`d and run with
   `cargo test -p tobii-gtk --test keep_awake_switch -- --ignored`: it builds a
-  real hub, rewrites `games.toml` underneath it the way
-  `tobii games set keep_awake true` does, and checks that the switch and the
-  ALWAYS ON badge follow within the hub's tick; that the file is **byte
-  identical** afterwards, which is what proves a refresh does not re-enter the
-  save handler and write the hub's stale idea back; and that switching it off in
-  the hub lands in the field `sync_keep_awake` takes the hold from. It needs no
-  tracker. The header geometry is still the older, separate measurement:
-  `.measure()` on a replica header, 40 px with the badge hidden and 40 px shown
-  — no added height — and a clean `load_css()`.
-- **The settings popover now clips sooner.** Its natural height went from 814 px
-  to 942 px with the new row, and it has no `ScrolledWindow`. At the hub's text
-  size multiplier that already cut off the bottom row on a 1080p screen at about
-  1.3×; this makes a pre-existing bug roughly 128 px worse. Left alone rather
-  than redesigned inside a bug fix.
-- **The two permanent holds made `tobii headpose` unrunnable, and the fix ends
+  real hub, rewrites `games.toml` underneath it the way `tobii games set
+  keep_awake true` does, and checks that the switch and the ALWAYS ON badge
+  follow within the hub's tick; that the file is **byte identical** afterwards,
+  which is what proves a refresh does not re-enter the save handler and write
+  the hub's stale idea back; and that switching it off in the hub lands in the
+  field `sync_keep_awake` takes the hold from. It needs no tracker. The header
+  geometry is still the older, separate measurement: `.measure()` on a replica
+  header, 40 px with the badge hidden and 40 px shown — no added height — and a
+  clean `load_css()`. - **The settings popover now clips sooner.** Its natural
+  height went from 814 px to 942 px with the new row, and it has no
+  `ScrolledWindow`. At the hub's text size multiplier that already cut off the
+  bottom row on a 1080p screen at about 1.3×; this makes a pre-existing bug
+  roughly 128 px worse. Left alone rather than redesigned inside a bug fix. -
+  **The two permanent holds made `tobii headpose` unrunnable, and the fix ends
   in a three-second guess against an older hub.** `wake_for_joystick` ships on,
   so a user with game output on, **and a joystick device the hub could actually
-  create**, has the hub holding libusb interface 0 for its
-  whole lifetime — and `tobii headpose`, `--check` and `--calibrate-pitch`, the
-  documented way to tell a gaze fault from a head-tracking one, failed with
-  *already claimed by another process* for exactly those users. The CLI now
-  asks for the lease the hub has always honoured (`must_wait`'s third term is an
-  `||` for precisely this); it was the protocol's first client, since nothing
-  outside the tests had ever sent `Msg::Lease`. **Measured**, on the merged
-  tree with a real ET5: with `keep_awake` on the hub held one USB file
-  descriptor; `tobii headpose --check` printed *the hub has let go of the
-  tracker for this run*, opened the device, and the hub's count went to 0; about
-  three seconds after the command exited it was back to 1. With no hub running,
-  the same command opened the device directly and waited for nothing.
-  **Not measured:** the mixed-version case. A hub older than this build does not
-  know the message, so the CLI waits out `LEASE_WAIT = 3 s` and opens anyway —
-  which succeeds where that hub is in standby and fails with the same
-  `DeviceBusy` as before where it is not. No older hub has been run against this
-  CLI. Also not watched: what a **focused** hub shows while the lease is out.
-  The path is decided rather than observed — the lease term of `must_wait` is an
-  override and not a weighing, the idle wait sets `ConnStatus::Idle`, and the
-  eye-position panel renders a closed session as **tracker off** rather than
-  *not detected* — but it was read out of the code, not seen on a screen.
+  create**, has the hub holding libusb interface 0 for its whole lifetime — and
+  `tobii headpose`, `--check` and `--calibrate-pitch`, the documented way to
+  tell a gaze fault from a head-tracking one, failed with *already claimed by
+  another process* for exactly those users. The CLI now asks for the lease the
+  hub has always honoured (`must_wait`'s third term is an `||` for precisely
+  this); it was the protocol's first client, since nothing outside the tests
+  had ever sent `Msg::Lease`. **Measured**, on the merged tree with a real ET5:
+  with `keep_awake` on the hub held one USB file descriptor; `tobii headpose
+  --check` printed *the hub has let go of the tracker for this run*, opened the
+  device, and the hub's count went to 0; about three seconds after the command
+  exited it was back to 1. With no hub running, the same command opened the
+  device directly and waited for nothing. **Not measured:** the mixed-version
+  case. A hub older than this build does not know the message, so the CLI waits
+  out `LEASE_WAIT = 3 s` and opens anyway — which succeeds where that hub is in
+  standby and fails with the same `DeviceBusy` as before where it is not. No
+  older hub has been run against this CLI. Also not watched: what a **focused**
+  hub shows while the lease is out. The path is decided rather than observed —
+  the lease term of `must_wait` is an override and not a weighing, the idle
+  wait sets `ConnStatus::Idle`, and the eye-position panel renders a closed
+  session as **tracker off** rather than *not detected* — but it was read out
+  of the code, not seen on a screen. - **Three interactions between the lease
+  and the hub's own flows are known and are NOT fixed in this release.** All
+  three were found by reading the merged code in the pre-release check; none
+  was found by use, and none has been run on hardware. They are written down
+  rather than fixed because each wants a design answer (which flows are
+  exclusive, and what a blocked hub says) rather than a patch inside a release.
+  - *A pitch calibration holds the device thread for about 13 s and declares no
+  exclusive reason, so the hub grants a lease it cannot honour in time.*
+  `calibrate_pitch` (`crates/tobii-gtk/src/device.rs:888`) runs a 3 s settle
+  plus the 10 s the dialog asks for (`SECS`,
+  `crates/tobii-gtk/src/head_model.rs:329`), and its loop (`device.rs:937-958`)
+  tests only its own token, never `hub_must_not_open`. It is applied either
+  from `device_tick`'s own command drain (`device.rs:709-711`), which is where
+  a Start pressed at a hub that has the tracker lands, or from the queue drain
+  at the top of `device_session` (`device.rs:1515`) for a command queued while
+  the tracker was off. Both run the measurement to completion before the loop's
+  lease check (`device.rs:1556`) comes round again. The Pitch-zero dialog takes
+  no `Demand` hold at all — `hold_while_open` is called with "display setup",
+  "the gaze preview" and "calibration" only
+  (`crates/tobii-gtk/src/lib.rs:1063`, `1088`, `1185`, `1265`, `1714`, `1737`)
+  — so `wants_exclusive` is false, the refusal branch at
+  `crates/tobii-gtk/src/outputs.rs:309-319` is skipped and the lease is granted
+  at `outputs.rs:320-326`. Press **Start** in Pitch zero and run `tobii
+  headpose` within the next 13 s: the hub sets `Lease::Requested` and cannot
+  reach `announce_release`, the CLI's `LEASE_WAIT` of 3 s
+  (`crates/tobii-cli/src/main.rs:2026`) expires, and it prints *the hub did not
+  answer the request for the tracker within 3s; opening it anyway*
+  (`main.rs:2164-2167`) — a sentence whose premise is a wedged or older hub,
+  which this one is not — before failing with the same *already claimed by
+  another process* the lease was added to remove. - *A command queued while a
+  lease is out now waits silently instead of failing.* `stand_by` no longer
+  leaves the wait for a non-empty queue — `must_wait`'s third term is an `||`
+  (`device.rs:229-231`), which is the intended change, and it took with it the
+  only path that answered a queued command's token: the break used to reach
+  `device_session`, `UsbTransport::open()` returned `DeviceBusy`, and
+  `fail_queued_command` (`device.rs:1405-1416`, called at `device.rs:1608`) put
+  the error in `pitch_cal.result`. Now: run `tobii headpose`, then open Pitch
+  zero in the hub — the Start button has no connection gate — and press Start.
+  The command sits in `pending`, and the dialog's 200 ms poll replaces *Get
+  comfortable — starting in 3 seconds…* with *Hold still… 13s*
+  (`pitch_progress`, `head_model.rs:61-67`, off the `secs_left = SECS + 3` the
+  dialog set itself at `head_model.rs:429`) and then leaves that number frozen
+  for as long as the CLI runs — only `calibrate_pitch` ever counts it down —
+  with nothing saying why. It is not worse than that: Cancel works, and
+  `calibrate_pitch`'s `current(state, token)` check discards the stale command
+  rather than running it unobserved when the lease ends. - *With the hub
+  standing down, its virtual joystick stays present and the CLI's own is
+  suppressed.* The configuration the lease exists for is game output on with
+  `joystick = true` and `wake_for_joystick = true` — the one that gives the hub
+  its standing claim. `sync_joystick` creates the uinput device from
+  `wants_joystick(cfg)` alone (`device.rs:1317-1319`) and `GameSide::poll` runs
+  inside the idle wait (`device.rs:1047`, `1067`), so the hub keeps its
+  controller while it is in standby. `tobii headpose` therefore finds
+  `already_present()` and prints *not presenting a virtual joystick: one with
+  this name already exists — the hub owns it*
+  (`crates/tobii-cli/src/main.rs:2241-2251`), one line among the command's
+  other notes. The command now runs where it used to fail, but for that user
+  the joystick sink is dead on both sides: the hub composes no frames while it
+  holds no session, so a game bound to the hub's controller sees its axes
+  frozen. Only the opentrack and bridge routes carry head pose in that state.
 
 [issue #2]: https://github.com/Tropaion/Tobii_Linux/issues/2
+
+### 11.3g The Wine bridge's discovery keys, and the flags that reach them (new in v0.4.1)
+
+`tobii bridge install` used to write both head-tracking discovery keys blind —
+`reg add … /f`, with no read first — into a prefix whose registrations belong to
+whoever got there first. The six commits that fixed that (`2d394ac`, then
+`2e4dc20`, `1729622`, `e0b4723`, `95259c0` and `b9d0487`) are the bulk of this
+release: the non-test half of `crates/tobii-cli/src/bridge.rs` went from 781
+lines at v0.4.0 to 1821 at HEAD. The design is written up in [[Game-Output]];
+what belongs here is how little of it has been run against a prefix that was not
+built for the purpose.
+
+- **The three properties the design rests on**, so that a later change can be
+  told from a later mistake. `install` reads both keys before it writes, copies
+  or creates anything, and refuses rather than clobbering
+  (`crates/tobii-cli/src/bridge.rs:1224-1259`) — a refused prefix comes out
+  with nothing of ours in it: no directory created, no key touched. That is a
+  promise about this installer's writes and not about wine's: reading the keys
+  runs wine against the prefix, and wine will bootstrap a directory that is not
+  a prefix yet (`system.reg`, `user.reg`, `dosdevices/`, `.update-timestamp`)
+  before it can answer at all. `uninstall` deletes a key's `Path` value only
+  while it still holds what the record says this program put there, and
+  otherwise leaves it alone and names it (`undo_for`, `bridge.rs:1522-1530`,
+  driven from `undo_keys`, `bridge.rs:1601-1626`) — or our own install
+  directory, which counts as ours whatever the record says, the limitation two
+  bullets below. And the record holds **only values this program computed**: a
+  value read out of the registry is compared and dropped, never stored and
+  never written back (`render_record`'s own header says so in the file it
+  writes, `bridge.rs:897-905`). The third is what the other two are built on,
+  and it is the one that is easy to undo by accident. - **It took five rounds
+  of review to get there, and two of the fixes recreated the fault they were
+  sent after.** The first version (`2d394ac`) read before writing *and*
+  remembered the value it displaced so it could put it back; the first review
+  (`2e4dc20`) found that the restore path committed the same fault on the way
+  out — `uninstall` acted on the record alone and fired `reg delete` at a key
+  it had never looked at — and its repair kept the mechanism. The second review
+  found the same class again in the same mechanism (a value read through wine's
+  console codepage written back as the "restored" one; a stale prior
+  resurrected over a newer registration), and the answer was to **delete the
+  feature rather than repair it a third time** (`1729622`: `Prior`, `Existing`,
+  `classify`, the `/t` type round-trip, `Undo::Restore` and every message
+  promising to put something back — 284 lines). `--force` now says in those
+  words that it promises nothing about the old value. The three rounds after
+  that (`e0b4723`, `95259c0`, `b9d0487`) found no defect in that property and
+  four, two and four defects in the reading, the recording order and the
+  line-splitting underneath it. - **What was exercised.** 57 unit tests in
+  `bridge.rs`, 23 of them driving a *stateful* fake wine (`FAKE_WINE`,
+  `bridge.rs:2205-2237`): a shell script that keeps the two `Path` values in
+  files and applies `reg add` and `reg delete` to them, so a test can install,
+  let another program claim a key, and uninstall — the faults here all live in
+  the gap between what a key said at install and what it says at uninstall, and
+  canned answers cannot reach them. Two shapes in it are copied from live wine
+  11.18 rather than invented, because code depends on both: `reg delete` of an
+  absent value exits 1, and `reg query` of an absent key exits 1 while the
+  probe key still answers. Beyond the fakes, live wine 11.18 in throwaway
+  prefixes settled the byte-level questions and one end-to-end ordering bug —
+  the record written *before* the keys, so an install whose `reg add` failed
+  still recorded `np wrote <path>` and a later uninstall deleted a registration
+  another program had since made there (`e0b4723`). And, twice, by accident:
+  the maintainer's own `~/.wine`, which is the prefix `resolve_prefix` falls
+  back to when none is named (`bridge.rs:562`), and which is how the missing
+  flag gate was found at all. - **What was NOT exercised: a Proton prefix
+  belonging to a running game.** Every live run was a throwaway prefix made for
+  the run. No real third-party registration — a Windows opentrack installed
+  inside a game's prefix — has been through the refusal, the `--force` path or
+  the uninstall rule; the closest is the fake wine holding a foreign value,
+  which proves the branch and not the registry it would meet. The staged-rename
+  argument for the DLLs (`staging_name`, `bridge.rs:963-979`) is likewise
+  reasoned from `fs::rename` being atomic within a directory, not measured
+  against a game that has the DLL mapped. - **A key that already holds our own
+  path, with nothing recorded, is treated as ours — including when it is not.**
+  `is_ours` (`bridge.rs:885-890`) answers yes for `C:\tobii-bridge` whatever
+  the record says, and `install` skips a key it calls ours before it reaches
+  the identical-value test (`bridge.rs:1247-1249`). The [LIMITATION] block on
+  `is_ours` (`bridge.rs:871-884`) states the cost in both directions: a
+  third-party client that registers itself at the path we pointed a key at,
+  *after* we pointed it there, is indistinguishable from our own work and comes
+  out on our way out; and a registration another program made at our install
+  directory in a prefix we had never touched is adopted, recorded as ours, and
+  deleted by `uninstall`. Refusing instead would refuse every upgrade from
+  v0.4.0 — which wrote that value and recorded nothing — on every machine with
+  opentrack installed. Neither answer can tell the two apart, and this one
+  fails towards a prefix the user can re-register in one command. - **The flag
+  gate was added because the install had already written into a real prefix,
+  and three spellings still got past it afterwards.** `tobii bridge install
+  --help` did not print help: it ignored the flag and performed a real install
+  into the default Wine prefix, writing both discovery keys (`c3eaa4c`). After
+  the gate went in, the pre-release check found three ways through it, each
+  ending in that same install into the prefix the user did not name, and each
+  one keystroke from the bug the gate was closing: `-h` and every other
+  single-dash token, because the gate stripped only `--`; `--prefix=/path`,
+  which passed the name check and was then ignored, because every reader is
+  `flag_value` and that compares the whole token; and `--prefix` with nothing
+  after it, which falls back the same way. All three are refused at HEAD
+  (`reject_unknown_flags`, `bridge.rs:1756-1779`), checked on the built binary
+  against a throwaway prefix. The point for this register is not the fix: it is
+  that **all four holes — the original and these three — were found by
+  reviewers, and the first of them only by a reviewer running the command on a
+  real prefix; no user reported any of them**, on the one command in this
+  project that writes into somebody else's Wine prefix.
 
 ### 11.4 Environmental
 
@@ -761,20 +915,28 @@ fault.
 
 ## 12. Glossary
 
-| Term | Meaning |
-|---|---|
-| **TTP** | The device's framing: a 24-byte header (magic, seq, op) inside an 8-byte USB envelope. Note the envelope length field is asymmetric — outbound it excludes the envelope, inbound it includes it. |
-| **TLV** | Type-length-value payload encoding. Three variants exist in this codebase; see §11.2. |
-| **Q42** | Fixed-point: a signed 64-bit integer scaled by 2⁴². How the device sends reals. |
-| **XDS row/column** | The tagged table structure a gaze frame is built from — 39 columns. |
-| **Realm** | The device's authentication scope. Opening one may require an HMAC-MD5 response to a challenge; `realm_type == 0` means no auth. |
-| **Trackbox** | The volume in which the device can see eyes. Eye position within it is normalised `[0,1]` in x, y **and z** — z is normalised depth, *not* millimetres. |
-| **Display area** | The three tracker-space corners (TL, TR, BL) defining the screen. The fourth is implied. Wiped on every device reboot. |
-| **Demand** | The reference count on the USB session. While it is zero the tracker is off and the device is free for another process. |
-| **Linger** | The 3 s after the last `DemandGuard` drops before the session closes. |
-| **Present bit vs validity** | A present bit means the column was sent, **not** that the data is good. A no-eyes frame carries eye origins present and set to `[0,0,0]` with validity 4. Gate on both. |
-| **opentrack datagram** | **Six** little-endian `f64` (48 bytes): x, y, z in centimetres, then yaw, pitch, roll in degrees. |
-| **Capture** | A recorded USB session (`tobii record`) replayed in tests. A photograph, not a specification. |
+| Term | Meaning | |---|---| | **TTP** | The device's framing: a 24-byte header
+(magic, seq, op) inside an 8-byte USB envelope. Note the envelope length field
+is asymmetric — outbound it excludes the envelope, inbound it includes it. | |
+**TLV** | Type-length-value payload encoding. Three variants exist in this
+codebase; see §11.2. | | **Q42** | Fixed-point: a signed 64-bit integer scaled
+by 2⁴². How the device sends reals. | | **XDS row/column** | The tagged table
+structure a gaze frame is built from — 39 columns. | | **Realm** | The device's
+authentication scope. Opening one may require an HMAC-MD5 response to a
+challenge; `realm_type == 0` means no auth. | | **Trackbox** | The volume in
+which the device can see eyes. Eye position within it is normalised `[0,1]` in
+x, y **and z** — z is normalised depth, *not* millimetres. | | **Display area**
+| The three tracker-space corners (TL, TR, BL) defining the screen. The fourth
+is implied. Wiped on every device reboot. | | **Demand** | The reference count
+on the USB session. While it is zero the tracker is off and the device is free
+for another process. | | **Linger** | The 3 s after the last `DemandGuard`
+drops before the session closes. | | **Present bit vs validity** | A present
+bit means the column was sent, **not** that the data is good. A no-eyes frame
+carries eye origins present and set to `[0,0,0]` with validity 4. Gate on both.
+| | **opentrack datagram** | **Six** little-endian `f64` (48 bytes): x, y, z in
+centimetres, then yaw, pitch, roll in degrees. | | **Capture** | A recorded USB
+session (`tobii record`) replayed in tests. A photograph, not a specification.
+|
 
 ---
 

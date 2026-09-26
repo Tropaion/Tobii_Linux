@@ -516,17 +516,21 @@ through `FTGetData` as `yaw=0.1309, pitch=-0.0567, roll=0.0262` radians and
 `pos=(11.0, 22.0, 33.0)`, with `DataID` advancing.
 
 **`install` refuses rather than overwriting somebody else's registration.** The
-two discovery keys —
-`HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location` and
-`HKCU\Software\Freetrack\FreeTrackClient` — are how *any* head-tracking client
-is found in a prefix, not just ours. Install writes down what it put in them,
-and if a key holds something that record does not account for it stops, names
-the key and what it holds, and prints the `reg delete` line to clear it by hand
-if it is stale. It does not stop over a key that already holds, byte for byte,
-what this run would write **with nothing on record either way** — the prefix a
-v0.4.0 install left behind, where refusing would block a write that changes
-nothing. A record naming a different value is a different fact, and is refused
-whether or not the key currently matches.
+two discovery keys — `HKCU\Software\NaturalPoint\NATURALPOINT\NPClient
+Location` and `HKCU\Software\Freetrack\FreeTrackClient` — are how *any*
+head-tracking client is found in a prefix, not just ours. Install writes down
+what it put in them, and if a key holds something that record does not account
+for it stops, names the key and what it holds, and prints the `reg delete` line
+to clear it by hand if it is stale. It does not stop over a key that already
+holds, byte for byte, what this run would write **with nothing on record either
+way** — the prefix a v0.4.0 install left behind, where refusing would block a
+write that changes nothing. A record naming a different value is a different
+fact and is refused on its own — except for a key that already points at our
+own `C:\tobii-bridge`, which counts as ours whatever the record says and is
+therefore skipped rather than refused over. That exception is the same
+blindness as the sentence before it — a value-equality test cannot tell our own
+registration from another program's at the same path — and its cost is written
+up in [Quality and Risks](docs/wiki/Quality-and-Risks.md) §11.3g.
 
 `--force` goes ahead, and **promises nothing about putting the old value back**
 — the installer records only the values it wrote itself, so what was there is
@@ -604,10 +608,14 @@ one. The three answers are each decided rather than defaulted:
 - **The hub refuses.** It is mid-calibration, mid-display-setup, or another
   client already holds the lease — all three mean something is in a stateful
   conversation with the device that handing it over would break. The command
-  fails with the hub's own sentence. That sentence lists everything the hub is
-  currently holding, not only the part that refused, so it can name a standing
-  setting such as `keep_awake` alongside the calibration you are actually
-  waiting for.
+  fails with the hub's own sentence — and which sentence that is depends on
+  which of the three refused. Mid-calibration and mid-display-setup it is
+  `the hub is busy with …`, which lists everything the hub is currently holding
+  and not only the flow that refused, so it can name a standing setting beside
+  the calibration you are actually waiting for — in the hub's own words for it,
+  `standby turned off in the settings` rather than `keep_awake`. A device
+  already lent to another client refuses with `the tracker is leased by <the
+  other client's name>`, which names the holder and lists nothing else.
 
 A hub that gives none of those three answers within three seconds is wedged or
 older than this build; the device is opened anyway, which for the common case of
@@ -617,12 +625,13 @@ command *less* usable than it was before it learned to ask.
 That is what makes the standalone route work with the hub open, and it is what
 makes it work at all now that the joystick and `keep_awake` can ask for the
 tracker: both holds are open-ended and `wake_for_joystick` is on by default, so
-without the request the hub keeps libusb interface 0 for its whole lifetime and
-`tobii headpose`, `--check` and `--calibrate-pitch` fail for exactly the users
-those commands exist for. Measured here with `keep_awake` on: the hub held one
-USB file descriptor, `tobii headpose --check` printed the stand-down line and
-opened the device, the hub's count went to 0, and it was back to 1 about three
-seconds after the command exited.
+without the request a user with game output on **and a joystick device the hub
+could actually create** has the hub keeping libusb interface 0 for its whole
+lifetime, and `tobii headpose`, `--check` and `--calibrate-pitch` fail for
+exactly the users those commands exist for. Measured here with `keep_awake`
+on: the hub held one USB file descriptor, `tobii headpose --check` printed the
+stand-down line and opened the device, the hub's count went to 0, and it was
+back to 1 about three seconds after the command exited.
 
 ## Configuration
 
@@ -1230,9 +1239,22 @@ not a missing test: the checksums are an integrity check, not a signature.
   scene). There is no stereo depth to be had from this device.
 - The **tray has only ever been seen on KDE Plasma**, and `sudo ./install.sh
   --system` has not been run end to end under real sudo.
+- The bridge's registry rules have **never met a real third-party
+  registration.** `install` reads both discovery keys before it writes and
+  refuses rather than clobbering, and `uninstall` removes only what it recorded
+  writing — exercised against a stateful fake wine and against live wine 11.18
+  in throwaway prefixes, never against a game's Proton prefix with a Windows
+  opentrack registered inside it.
+- **A pitch calibration and a `tobii headpose` started during it do not
+  cooperate.** The measurement holds the hub's device thread for about 13
+  seconds without declaring itself exclusive, so the hub grants the lease,
+  cannot let go in time, and the command reports the hub as unresponsive before
+  failing the way it did before the lease existed. Two further lease
+  interactions are listed with it, none of them fixed in v0.4.1.
 
 The full list, per release, is in
-[Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1.
+[Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1,
+§11.3f and §11.3g for v0.4.1.
 
 **Reporting a problem:** `tobii debug` prints the report an issue asks for, and
 the hub's cogwheel can copy or save it. Since v0.4.1 it carries a **game
