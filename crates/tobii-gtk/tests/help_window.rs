@@ -192,6 +192,19 @@ struct Seen {
     topic_bodies: usize,
     scroller_focusable: bool,
     focus_on_open: Option<String>,
+    /// Characters of topic text selected when the window opens. A selectable
+    /// label selects all of itself the moment focus touches it, and focus
+    /// passes through the first topic on its way to the scroller — so without
+    /// clearing it the window opens as a block of highlight, which is what a
+    /// reviewer photographed on a real compositor.
+    ///
+    /// This assertion is a GUARD, not a proof: removing the `select_region`
+    /// that fixes it leaves this test passing. The harness is granted focus
+    /// (`focus_on_open` really is the scroller, and the nine bodies really are
+    /// focusable) and still reports nothing selected, so whatever routes focus
+    /// through the label first does not happen here. Kept because the
+    /// invariant is right and cheap to check, not because it caught anything.
+    selected_on_open: i32,
     /// Whether the last help window was still alive 800 ms after closing.
     alive_after_close: bool,
     /// The six cards of the real hub.
@@ -257,6 +270,9 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                                     s.topic_bodies += 1;
                                     if l.is_focusable() {
                                         s.focusable_bodies += 1;
+                                    }
+                                    if let Some((a, b)) = l.selection_bounds() {
+                                        s.selected_on_open += b - a;
                                     }
                                 }
                             }
@@ -604,5 +620,12 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
         "exactly these two cards carry no visible description: the eyes card \
          because its sentence was advice rather than operation, and the preview \
          card because its sentence was false"
+    );
+    assert_eq!(
+        seen.selected_on_open, 0,
+        "the window must not open with text selected: a selectable label selects \
+         all of itself when focus lands on it, and focus reaches the first topic \
+         on its way to the scroller, so {} characters came up highlighted",
+        seen.selected_on_open
     );
 }

@@ -10,8 +10,11 @@
 //! the Recentre button's only explanation is a tooltip, and so is the one
 //! sentence saying what the three strength names are three strengths *of*.
 //!
-//! That is the contract this module exists to keep: **every fact that lives in
-//! a tooltip is also in here**, where it is plain text, selectable, focusable
+//! That is the contract this module exists to keep: **every fact that a card in
+//! the rack states only in a tooltip is also in here**. It is the rack this
+//! window answers for, and the test is scoped the same way: the header and the
+//! cogwheel keep their own tooltips, each beside a control that already carries
+//! a visible description, where it is plain text, selectable, focusable
 //! and reachable with Tab alone. The strings are not copied — they are the same
 //! constants the tooltips are set from, and the same
 //! [`crate::outputs::recentre_decision`] the refusals come from, so the two
@@ -234,8 +237,11 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
     body.set_margin_bottom(PAGE_MARGIN);
     body.set_margin_start(PAGE_MARGIN);
     body.set_margin_end(PAGE_MARGIN);
+    let mut bodies = Vec::new();
     for t in topics() {
-        body.append(&card(t.title, &t.body));
+        let (w, label) = card(t.title, &t.body);
+        body.append(&w);
+        bodies.push(label);
     }
 
     let scroller = gtk::ScrolledWindow::new();
@@ -287,6 +293,13 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
     win.present();
     // Focus after `present`: before it, the window has no focus to give.
     scroller.grab_focus();
+    // A selectable GtkLabel selects all of its text the moment focus reaches
+    // it, and focus passes through the first topic on the way to the scroller —
+    // so the window opened with topic one as a solid block of selection
+    // highlight. Taking the focus away does not clear it; this does.
+    for body in &bodies {
+        body.select_region(0, 0);
+    }
 
     OPEN.with(|c| *c.borrow_mut() = win.downgrade());
     win
@@ -331,7 +344,7 @@ fn add_f1_to_close(win: &gtk::Window) {
 /// Tab walks the topics, a screen reader reads them, and the text can be copied
 /// into a bug report. Without it this window would be a wall of text no
 /// keyboard could enter — which is the exact failure it exists to prevent.
-fn card(title: &str, body: &str) -> gtk::Box {
+fn card(title: &str, body: &str) -> (gtk::Box, Label) {
     let b = gtk::Box::new(Orientation::Vertical, 6);
     b.add_css_class("surface");
     b.add_css_class("panel-pad");
@@ -351,7 +364,7 @@ fn card(title: &str, body: &str) -> gtk::Box {
     d.set_max_width_chars(80);
     b.append(&t);
     b.append(&d);
-    b
+    (b, d)
 }
 
 #[cfg(test)]

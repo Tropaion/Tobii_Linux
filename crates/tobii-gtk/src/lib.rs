@@ -1494,7 +1494,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     //
     // Nothing is captured: the window and the application are both found from
     // the button at click time, so this handler cannot be part of a cycle.
-    let help_btn = icon_button("help-about-symbolic", "?", "Help (F1)");
+    // `help-browser-symbolic` is the question mark; `help-about-symbolic` is an
+    // i-in-a-circle, which every desktop uses to mean About rather than Help.
+    let help_btn = icon_button("help-browser-symbolic", "?", "Help (F1)");
     help_btn.connect_clicked(|b| {
         if let Some(w) = b.root().and_downcast::<gtk::Window>() {
             if let Some(app) = w.application() {
