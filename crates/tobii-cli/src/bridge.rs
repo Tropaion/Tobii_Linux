@@ -700,19 +700,28 @@ fn artifact_dir(args: &[String]) -> Result<PathBuf, String> {
     )
 }
 
+/// A wine invocation against `prefix`, built but not started.
+///
+/// One builder for all three ways this module starts wine — [`wine_run`],
+/// [`wine_output`] and the provider spawn in [`run`] — because the environment
+/// is the part that must not drift. `WINEPREFIX` is which prefix gets touched,
+/// and a call that forgot it would reach `~/.wine` instead.
+fn wine_cmd(wine: &Path, prefix: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(wine);
+    cmd.env("WINEPREFIX", prefix)
+        // Wine is chatty and none of it is ours; the bridge's own output is
+        // what the user needs to see.
+        .env("WINEDEBUG", "-all");
+    cmd
+}
+
 /// Run a wine command against `prefix`, returning its exit status.
 fn wine_run(
     wine: &Path,
     prefix: &Path,
     args: &[&str],
 ) -> std::io::Result<std::process::ExitStatus> {
-    std::process::Command::new(wine)
-        .args(args)
-        .env("WINEPREFIX", prefix)
-        // Wine is chatty and none of it is ours; the bridge's own output is
-        // what the user needs to see.
-        .env("WINEDEBUG", "-all")
-        .status()
+    wine_cmd(wine, prefix).args(args).status()
 }
 
 /// Run a wine command against `prefix` and capture what it printed.
@@ -721,16 +730,22 @@ fn wine_run(
 /// and because `reg query`'s own chatter would otherwise land in the middle of
 /// the installer's lines.
 fn wine_output(wine: &Path, prefix: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(wine)
-        .args(args)
-        .env("WINEPREFIX", prefix)
-        .env("WINEDEBUG", "-all")
-        .output()
+    wine_cmd(wine, prefix).args(args).output()
 }
 
 /// A key every wine prefix has, used to tell "nothing is registered" apart
 /// from "this wine cannot read this prefix at all".
 const PROBE_KEY: &str = r"HKCU\Software";
+
+/// The sentence every failure that blames the wine ends with.
+///
+/// Three errors carry it — the unreadable registry, the failed install write
+/// and the failed uninstall removal — and all three are one situation: this run
+/// used a wine that cannot serve this prefix, and for a Steam title the one
+/// that can is recorded inside the prefix itself. Written once so the three
+/// cannot drift into saying different things about the same fix.
+const WRONG_WINE_HINT: &str = "For a Steam title that must be the Proton build the \
+     prefix records; pass --wine explicitly if this one is wrong for it.";
 
 /// What `reg query <key> /v Path` said.
 ///
@@ -922,8 +937,7 @@ fn read_key(wine: &Path, prefix: &Path, key: &str) -> Result<Reading, String> {
         "could not read the registry of {} with {}: `reg query {PROBE_KEY}` failed \
          too, so this is not \"nothing is registered\" but a prefix this wine \
          cannot serve.\nRefusing to touch keys whose current value could not be \
-         read. For a Steam title the wine must be the Proton build the prefix \
-         records; pass --wine explicitly if this one is wrong for it.",
+         read. {WRONG_WINE_HINT}",
         prefix.display(),
         wine.display()
     ))
@@ -1301,17 +1315,10 @@ struct Taken {
     /// What is there now — as much of it as could be read.
     what: String,
     /// What this run would have put there. Not always different from `what`:
-    /// see [`Taken::whose`].
+    /// see [`replaced`].
     want: String,
     /// Whether this prefix's record says this installer wrote this key.
     recorded: bool,
-}
-
-impl Taken {
-    /// Why this key is not ours to write.
-    fn whose(&self) -> &'static str {
-        whose(self.recorded)
-    }
 }
 
 /// Whose a key holding something we did not write is — said once, because
@@ -1362,7 +1369,7 @@ fn refusal(prefix: &Path, wine: &Path, origin: WineOrigin, taken: &[Taken]) -> S
             t.abi,
             t.key,
             t.what,
-            t.whose()
+            whose(t.recorded)
         ));
     }
     msg.push_str(
@@ -1619,9 +1626,7 @@ fn install(args: &[String]) -> CmdResult {
         return Err(format!(
             "the registry keys could not be written, so the DLLs are copied but \
              nothing will load them.\n\
-             The wine used was {}. For a Steam title that must be the Proton \
-             build the prefix records; pass --wine explicitly if this one is \
-             wrong for it.",
+             The wine used was {}. {WRONG_WINE_HINT}",
             wine.display()
         )
         .into());
@@ -1836,13 +1841,7 @@ fn run(args: &[String]) -> CmdResult {
         prefix.display()
     );
 
-    let mut child = std::process::Command::new(&wine)
-        .args(&wine_args)
-        .env("WINEPREFIX", &prefix)
-        // Wine is chatty and none of it is ours; the bridge's own output is
-        // what the user needs to see.
-        .env("WINEDEBUG", "-all")
-        .spawn()?;
+    let mut child = wine_cmd(&wine, &prefix).args(&wine_args).spawn()?;
 
     // Asked for again on every pass rather than once, because the usual case is
     // that the lock file does not exist yet: nothing has served this prefix, so
@@ -2061,9 +2060,8 @@ fn uninstall(args: &[String]) -> CmdResult {
     if failed {
         return Err(format!(
             "the registry still points at {}, so it was left in place.\n\
-             Run `tobii bridge uninstall` again once wine can serve this prefix \
-             (for a\nSteam title that means the Proton build it records; pass \
-             --wine explicitly if\nthis one is wrong for it).",
+             Run `tobii bridge uninstall` again once wine can serve this prefix. \
+             {WRONG_WINE_HINT}",
             dir.display()
         )
         .into());
@@ -2707,53 +2705,58 @@ fn reject_unknown_flags(args: &[String], sub: &str, known: &[&str]) -> Result<()
     Ok(())
 }
 
+/// Every `tobii bridge` subcommand: its name, every flag it reads, and what
+/// runs it.
+///
+/// One table, walked once — gate, then dispatch — so a subcommand cannot be
+/// checked against one list of flags and then run by another, and so the usage
+/// line a bare `tobii bridge` prints names exactly the subcommands that exist
+/// rather than a hand-typed copy of them.
+///
+/// Each list is spelled out in full rather than composed from a shared base.
+/// `status` is why: the flags are nearly the same four every time, and a base
+/// plus extras reads as though the odd one out were an oversight.
+#[allow(clippy::type_complexity)]
+const SUBS: [(&str, &[&str], fn(&[String]) -> CmdResult); 5] = [
+    ("games", &[], |_| list_steam_games()),
+    (
+        "install",
+        &["steam", "prefix", "wine", "artifacts", "npclient", "force"],
+        install,
+    ),
+    (
+        "run",
+        &["steam", "prefix", "wine", "artifacts", "port"],
+        run,
+    ),
+    // No `artifacts`: it names the *build* directory an install copies from,
+    // and this command never looks there — it reports what is in the prefix.
+    // Advertising a flag it would ignore is how a user ends up believing a
+    // report about a directory it never read.
+    ("status", &["steam", "prefix", "wine"], status),
+    (
+        "uninstall",
+        &["steam", "prefix", "wine", "artifacts"],
+        uninstall,
+    ),
+];
+
 pub fn bridge(args: &[String]) -> CmdResult {
-    const COMMON: [&str; 4] = ["steam", "prefix", "wine", "artifacts"];
-    fn known<'a>(extra: &[&'a str]) -> Vec<&'a str> {
-        COMMON
-            .iter()
-            .copied()
-            .chain(extra.iter().copied())
-            .collect()
-    }
     let sub = args.get(2).map(String::as_str);
-    match sub {
-        Some("games") => {
-            reject_unknown_flags(args, "games", &[])?;
-            list_steam_games()
-        }
-        Some("install") => {
-            let k = known(&["npclient", "force"]);
-            reject_unknown_flags(args, "install", &k)?;
-            install(args)
-        }
-        Some("run") => {
-            let k = known(&["port"]);
-            reject_unknown_flags(args, "run", &k)?;
-            run(args)
-        }
-        Some("uninstall") => {
-            let k = known(&[]);
-            reject_unknown_flags(args, "uninstall", &k)?;
-            uninstall(args)
-        }
-        // Not `known(&[])`: `--artifacts` names the *build* directory an
-        // install copies from, and this command never looks there — it reports
-        // what is in the prefix. Advertising a flag it would ignore is how a
-        // user ends up believing a report about a directory it never read.
-        Some("status") => {
-            reject_unknown_flags(args, "status", &["steam", "prefix", "wine"])?;
-            status(args)
-        }
-        other => Err(format!(
-            "usage: tobii bridge games|install|run|status|uninstall{}",
-            match other {
-                Some(o) => format!("\nunknown argument `{o}`"),
-                None => String::new(),
-            }
-        )
-        .into()),
+    if let Some((name, known, handler)) = SUBS.iter().find(|(n, _, _)| Some(*n) == sub) {
+        reject_unknown_flags(args, name, known)?;
+        return handler(args);
     }
+    let names: Vec<&str> = SUBS.iter().map(|(n, _, _)| *n).collect();
+    Err(format!(
+        "usage: tobii bridge {}{}",
+        names.join("|"),
+        match sub {
+            Some(o) => format!("\nunknown argument `{o}`"),
+            None => String::new(),
+        }
+    )
+    .into())
 }
 
 #[cfg(test)]

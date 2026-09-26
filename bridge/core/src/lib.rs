@@ -78,10 +78,3 @@ pub fn register(dir: &str) -> Result<(), String> {
     }
     Ok(())
 }
-
-/// Remove both registry keys.
-pub fn unregister() {
-    for key in [NP_KEY, FT_KEY] {
-        winapi::delete_hkcu_key(key);
-    }
-}

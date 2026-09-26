@@ -97,7 +97,6 @@ extern "system" {
         cbData: DWORD,
     ) -> LONG;
     pub fn RegCloseKey(hKey: HKEY) -> LONG;
-    pub fn RegDeleteKeyA(hKey: HKEY, lpSubKey: LPCSTR) -> LONG;
 }
 
 /// The `MUTEX_ALL_ACCESS` right, for opening an existing mutex.
@@ -166,12 +165,6 @@ pub fn set_hkcu_string(subkey: &str, value_name: &str, data: &str) -> Result<(),
         }
     }
     Ok(())
-}
-
-/// Delete a key under `HKEY_CURRENT_USER`. Missing is not an error.
-pub fn delete_hkcu_key(subkey: &str) {
-    let sub = cstr(subkey);
-    unsafe { RegDeleteKeyA(HKEY_CURRENT_USER, sub.as_ptr()) };
 }
 
 /// Take a reference on this DLL that is never released.
