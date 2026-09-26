@@ -115,6 +115,18 @@ pub fn lookup(text: &[u8], key_path: &str, value_name: &str) -> Lookup {
     let mut inside = false;
     for raw in text.split(|b| *b == b'\n') {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        // Wine writes headers and values hard against the left margin, but it
+        // READS them with leading space allowed — and a file may have been
+        // hand-edited or written by something else. Skipping an indented line
+        // reported "nothing is registered here" about a value wine hands the
+        // game, which is the one answer this parser must never give wrongly.
+        let line = {
+            let at = line
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .unwrap_or(line.len());
+            &line[at..]
+        };
         // A section header ends the previous section whatever else is true of
         // it. Asked on the bytes and before anything else, because a header
         // this parser cannot read is still a header: skipping it would leave
@@ -134,7 +146,21 @@ pub fn lookup(text: &[u8], key_path: &str, value_name: &str) -> Lookup {
         let Some((name, rest)) = split_quoted(&line[1..]) else {
             continue;
         };
-        if !name.eq_ignore_ascii_case(value_name.as_bytes()) {
+        // The name is escaped the same way a value is — wine reads
+        // `"P\x0061th"` as `Path` — so it is decoded before it is compared.
+        // A name in OUR section that cannot be decoded is refused rather than
+        // skipped: skipping it would report the value absent, and an
+        // undecodable name may well be the one being asked about.
+        let Ok(name_text) = std::str::from_utf8(name) else {
+            return Lookup::Rejected(
+                "a value whose name is not text this installer can read".to_string(),
+            );
+        };
+        let name_text = match unescape(name_text) {
+            Unescaped::Ok(t) => t,
+            Unescaped::Bad(why) => return Lookup::Rejected(format!("a value whose name {why}")),
+        };
+        if !name_text.eq_ignore_ascii_case(value_name) {
             continue;
         }
         let Ok(rest) = std::str::from_utf8(rest) else {
@@ -479,6 +505,48 @@ mod tests {
 
     /// The whole reason this module exists: a real prefix's real file, read
     /// without a wine anywhere near it.
+    /// Wine writes its own file hard against the left margin, but it READS a
+    /// leading space fine — and a `user.reg` may have been hand-edited or
+    /// written by something else. Reported by a reviewer who put real wine and
+    /// this parser side by side on the same file: wine answered
+    /// `Path REG_SZ C:\\tobii-bridge`, this said nothing was registered.
+    #[test]
+    fn an_indented_line_is_read_the_way_wine_reads_it() {
+        let indented =
+            b"  [Software\\\\Freetrack\\\\FreeTrackClient]\n  \"Path\"=\"C:\\\\tobii-bridge\"\n";
+        assert_eq!(
+            lookup(indented, r"Software\Freetrack\FreeTrackClient", "Path"),
+            Lookup::Text("C:\\tobii-bridge".to_string()),
+            "an indented header and value are still a header and a value"
+        );
+    }
+
+    /// A value's NAME carries the same escaping its contents do, so wine reads
+    /// `"P\x0061th"` as `Path`. Comparing the raw bytes called that absent —
+    /// and "absent" is the one answer that must never be wrong here, because
+    /// it is the answer that says nobody else has claimed the key.
+    #[test]
+    fn an_escaped_value_name_is_decoded_before_it_is_compared() {
+        let escaped =
+            b"[Software\\\\Freetrack\\\\FreeTrackClient]\n\"P\\x0061th\"=\"C:\\\\tobii-bridge\"\n";
+        assert_eq!(
+            lookup(escaped, r"Software\Freetrack\FreeTrackClient", "Path"),
+            Lookup::Text("C:\\tobii-bridge".to_string()),
+            "wine decodes the name; so must this"
+        );
+
+        // And a name this parser cannot decode is refused, never skipped: an
+        // undecodable name in our own section may be the one being asked for.
+        let bad = b"[Software\\\\Freetrack\\\\FreeTrackClient]\n\"P\\q\"=\"C:\\\\x\"\n";
+        assert!(
+            matches!(
+                lookup(bad, r"Software\Freetrack\FreeTrackClient", "Path"),
+                Lookup::Rejected(_)
+            ),
+            "a name that cannot be read is not proof the value is absent"
+        );
+    }
+
     #[test]
     fn both_discovery_keys_are_read_out_of_a_real_user_reg() {
         assert_eq!(look(FT), Lookup::Text(r"C:\tobii-bridge".to_string()));
