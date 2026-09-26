@@ -1708,42 +1708,77 @@ fn list_steam_games() -> CmdResult {
     Ok(())
 }
 
-/// Reject a flag no subcommand of `tobii bridge` reads.
+/// Every flag any `tobii bridge` subcommand reads, and how it is spelled in a
+/// usage line. One table so a usage line cannot advertise a flag the command
+/// refuses, which is what one shared string did.
+const FLAGS: [(&str, &str); 7] = [
+    ("steam", "--steam <app id or name>"),
+    ("prefix", "--prefix PATH"),
+    ("wine", "--wine PATH"),
+    ("artifacts", "--artifacts DIR"),
+    ("npclient", "--npclient ours|DIR"),
+    ("force", "--force"),
+    ("port", "--port PORT"),
+];
+
+/// `--force` is the only one that stands alone; every other flag names a value.
+fn takes_value(name: &str) -> bool {
+    name != "force"
+}
+
+fn usage_for(sub: &str, known: &[&str]) -> String {
+    let flags: Vec<&str> = FLAGS
+        .iter()
+        .filter(|(n, _)| known.contains(n))
+        .map(|(_, hint)| *hint)
+        .collect();
+    format!("Usage: tobii bridge {sub} {}", flags.join(" "))
+}
+
+/// Reject anything `tobii bridge <sub>` does not read, before it resolves,
+/// creates or writes a thing.
 ///
 /// Parsed strictly for the same reason `tobii record` is, and with more at
 /// stake: an unrecognised flag used to be IGNORED, so `tobii bridge install
 /// --help` did not print help — it performed a real install into the default
-/// Wine prefix, wrote both discovery keys and said nothing about the flag. A
-/// reviewer reached that by typing exactly what anyone would type first.
+/// Wine prefix and wrote both discovery keys. Three spellings reach that same
+/// outcome and all three are refused here:
 ///
-/// Values are skipped rather than inspected: `--steam Elite Dangerous` puts
-/// two bare words after the flag, and a path may legitimately begin with a
-/// dash after `--`.
-fn reject_unknown_flags(args: &[String], known: &[&str], usage: &str) -> Result<(), String> {
-    // Compared without the dashes, because that is how the name arrives here.
-    let takes_value = |f: &str| f != "force";
+///   * `-h`, and any other single-dash token. A gate that only looked at `--`
+///     left this one open, which is the whole bug one keystroke away.
+///   * `--prefix=PATH`. It would pass a name check and then be ignored, because
+///     every reader is `flag_value`, which compares the whole token — so the
+///     command would install into a prefix the user did not name.
+///   * `--prefix` with nothing after it, which falls back to the same default.
+///
+/// A flag's VALUE is not inspected: `--wine /opt/-odd/wine` is a real path, and
+/// refusing it for its leading dash would refuse a correct command.
+fn reject_unknown_flags(args: &[String], sub: &str, known: &[&str]) -> Result<(), String> {
+    let usage = usage_for(sub, known);
     let mut it = args.iter().skip(3);
     while let Some(a) = it.next() {
-        let Some(flag) = a.strip_prefix("--") else {
+        // A bare `-` is not a flag, and neither is a positional. This command
+        // has never read positionals; ignoring them is the behaviour it had.
+        if a == "-" || !a.starts_with('-') {
             continue;
-        };
-        // `--flag=value` is not a spelling anything here accepts, but naming
-        // the flag rather than the whole token is what the reader needs.
-        let name = flag.split_once('=').map_or(flag, |(n, _)| n);
-        if !known.contains(&name) {
-            return Err(format!("unknown option `--{name}`. {usage}"));
         }
-        if takes_value(name) && !flag.contains('=') {
-            it.next();
+        if let Some((name, _)) = a.split_once('=') {
+            return Err(format!(
+                "`{a}` is not a spelling this command reads — write `{name} VALUE`. {usage}"
+            ));
+        }
+        let name = a.trim_start_matches('-');
+        if !known.contains(&name) {
+            return Err(format!("unknown option `{a}`. {usage}"));
+        }
+        if takes_value(name) && it.next().is_none() {
+            return Err(format!("`{a}` needs a value after it. {usage}"));
         }
     }
     Ok(())
 }
 
 pub fn bridge(args: &[String]) -> CmdResult {
-    const USAGE: &str = "Usage: tobii bridge games|install|run|uninstall \
-         [--steam <app id or name> | --prefix PATH] [--wine PATH] \
-         [--artifacts DIR] [--npclient ours|DIR] [--force] [--port PORT]";
     const COMMON: [&str; 4] = ["steam", "prefix", "wine", "artifacts"];
     fn known<'a>(extra: &[&'a str]) -> Vec<&'a str> {
         COMMON
@@ -1752,27 +1787,29 @@ pub fn bridge(args: &[String]) -> CmdResult {
             .chain(extra.iter().copied())
             .collect()
     }
-    match args.get(2).map(String::as_str) {
+    let sub = args.get(2).map(String::as_str);
+    match sub {
         Some("games") => {
-            reject_unknown_flags(args, &[], USAGE)?;
+            reject_unknown_flags(args, "games", &[])?;
             list_steam_games()
         }
         Some("install") => {
-            reject_unknown_flags(args, &known(&["npclient", "force"]), USAGE)?;
+            let k = known(&["npclient", "force"]);
+            reject_unknown_flags(args, "install", &k)?;
             install(args)
         }
         Some("run") => {
-            reject_unknown_flags(args, &known(&["port"]), USAGE)?;
+            let k = known(&["port"]);
+            reject_unknown_flags(args, "run", &k)?;
             run(args)
         }
         Some("uninstall") => {
-            reject_unknown_flags(args, &known(&[]), USAGE)?;
+            let k = known(&[]);
+            reject_unknown_flags(args, "uninstall", &k)?;
             uninstall(args)
         }
         other => Err(format!(
-            "usage: tobii bridge games|install|run|uninstall \n  \
-             [--steam <app id or name> | --prefix PATH] [--wine PATH] \
-             [--artifacts DIR] [--port PORT]{}",
+            "usage: tobii bridge games|install|run|uninstall{}",
             match other {
                 Some(o) => format!("\nunknown argument `{o}`"),
                 None => String::new(),
@@ -1800,9 +1837,47 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let err = reject_unknown_flags(&args, &["prefix", "force"], "USAGE")
+        let err = reject_unknown_flags(&args, "install", &["prefix", "force"])
             .expect_err("--help is not a flag install reads");
         assert!(err.contains("--help"), "name the flag: {err}");
+    }
+
+    /// Three spellings that reached a real install into the default Wine
+    /// prefix, all found by a pre-release check of the gate that was supposed
+    /// to stop exactly this. `-h` is the one that matters most: a gate looking
+    /// only at `--` leaves the bug one keystroke away from where it was.
+    #[test]
+    fn every_spelling_that_reached_an_install_is_refused() {
+        let run = |tail: &[&str]| {
+            let mut v = vec!["tobii".to_string(), "bridge".into(), "install".into()];
+            v.extend(tail.iter().map(|s| s.to_string()));
+            reject_unknown_flags(&v, "install", &["prefix", "force"])
+        };
+        for tail in [
+            vec!["-h"],
+            vec!["-help"],
+            vec!["--prefix=/tmp/x"],
+            vec!["--prefix"],
+        ] {
+            let err = run(&tail).expect_err(&format!("{tail:?} must be refused"));
+            assert!(
+                err.contains(tail[0].trim_end_matches("=/tmp/x")),
+                "the message must name what was rejected: {err}"
+            );
+        }
+        // A bare `-` is not a flag, and a value may begin with one.
+        run(&["--prefix", "-odd-path"]).expect("a value that starts with a dash is still a value");
+        run(&["-"]).expect("a bare dash is not an option");
+    }
+
+    /// A usage line that lists the flag it has just called unknown tells the
+    /// reader the flag both is and is not accepted.
+    #[test]
+    fn the_usage_line_names_only_this_subcommands_flags() {
+        let u = usage_for("uninstall", &["steam", "prefix", "wine", "artifacts"]);
+        assert!(u.contains("--prefix"), "{u}");
+        assert!(!u.contains("--npclient"), "uninstall does not read it: {u}");
+        assert!(!u.contains("--force"), "uninstall does not read it: {u}");
     }
 
     /// A flag's VALUE is not a flag. `--steam Elite Dangerous` puts two bare
@@ -1823,7 +1898,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        reject_unknown_flags(&ok, &["prefix", "force", "npclient"], "USAGE")
+        reject_unknown_flags(&ok, "install", &["prefix", "force", "npclient"])
             .expect("a value is not an option, and --force takes no value");
 
         // `--force` consuming a value would swallow the flag after it, so a
@@ -1833,7 +1908,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(
-            reject_unknown_flags(&typo, &["prefix", "force"], "USAGE").is_err(),
+            reject_unknown_flags(&typo, "install", &["prefix", "force"]).is_err(),
             "a typo after --force must still be caught"
         );
     }
