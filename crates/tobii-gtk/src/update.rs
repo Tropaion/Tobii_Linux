@@ -74,6 +74,27 @@ pub fn headline(r: &Release) -> String {
     format!("Version {} is available.", r.version)
 }
 
+/// The same headline, plus the note `tobii update --install` already prints
+/// when the copy being replaced lives in a Cargo build directory.
+///
+/// The CLI has said this since the installer existed, and `tobii debug` reports
+/// the install as "build tree" — the hub was the one surface that offered the
+/// button without saying where it would land. Updating a checkout is not an
+/// error and is not refused: somebody may well want a release build in place.
+/// But the next `cargo build` silently reverts it, and finding that out later
+/// is worse than being told now.
+pub fn headline_for(r: &Release, dir: &std::path::Path) -> String {
+    let h = headline(r);
+    if tobii_update::install::is_build_tree(dir) {
+        format!(
+            "{h} Note: this copy is in a Cargo build directory, so the next \
+             `cargo build` will overwrite the update."
+        )
+    } else {
+        h
+    }
+}
+
 /// The changelog, or an honest stand-in when a release has none.
 pub fn changelog(r: &Release) -> String {
     let notes = r.notes.trim();
@@ -497,7 +518,8 @@ pub fn banner() -> gtk::Box {
                         wire_notes(&banner, &release);
                     }
                     Action::Update => {
-                        text.set_text(&headline(&release));
+                        let dir = placed.as_ref().map(|p| p.dir.clone()).unwrap_or_default();
+                        text.set_text(&headline_for(&release, &dir));
                         wire(&banner, *release);
                     }
                 }
@@ -930,6 +952,25 @@ mod tests {
             assets: vec![],
             html_url: "https://example.invalid/r".into(),
         }
+    }
+    /// `tobii update --install` has always printed this; `tobii debug` reports
+    /// the install as "build tree". The hub offered the button and said
+    /// nothing, so the one surface with a button was the one that did not warn.
+    #[test]
+    fn the_banner_says_when_an_update_would_land_in_a_build_tree() {
+        let r = release("");
+        let plain = headline_for(&r, std::path::Path::new("/usr/local/bin"));
+        assert_eq!(plain, headline(&r), "an ordinary install gets no note");
+
+        let build = headline_for(&r, std::path::Path::new("/home/u/proj/target/release"));
+        assert!(
+            build.starts_with(&headline(&r)),
+            "the note is added to the headline, not instead of it: {build}"
+        );
+        assert!(
+            build.contains("cargo build"),
+            "it has to name what reverts the update: {build}"
+        );
     }
 
     #[test]
