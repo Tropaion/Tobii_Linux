@@ -929,7 +929,7 @@ touchscreen, and two cards' guidance is now in exactly that position.
   and a display test walks the real hub's six cards and requires every tooltip
   it finds, paragraph by paragraph, in the help text. Sixteen control runs
   reverted each behaviour in turn and watched the test fail.
-### 11.3h The wineserver lock, and what yielding to it does not prove (new since v0.4.1)
+### 11.3i The wineserver lock, and what yielding to it does not prove (unreleased, after v0.4.1)
 
 `tobii bridge run` now probes the prefix's wineserver lock before it starts and
 watches `/proc/locks` for a blocked launch while it runs
