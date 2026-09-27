@@ -418,11 +418,22 @@ fn decode(raw: &str) -> Result<String, String> {
 }
 
 /// `#1234` or `#x04d2`, as a character.
+///
+/// The digits are checked before they are parsed, because Rust's integer
+/// parsers are the more permissive of the two: both accept a leading `+`, and
+/// XML's `CharRef` production has no sign in it. `x` is likewise the whole of
+/// what marks a hexadecimal reference — an uppercase `X` is a spelling XML
+/// does not define. Letting either through would answer `&#+65;` with an `A`,
+/// which is this reader handing back a value for a document no parser would
+/// have read.
 fn numeric(name: &str) -> Option<char> {
     let digits = name.strip_prefix('#')?;
-    let value = match digits.strip_prefix(['x', 'X']) {
-        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-        None => digits.parse::<u32>().ok()?,
+    let value = match digits.strip_prefix('x') {
+        Some(hex) if hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            u32::from_str_radix(hex, 16).ok()?
+        }
+        None if digits.bytes().all(|b| b.is_ascii_digit()) => digits.parse::<u32>().ok()?,
+        _ => return None,
     };
     char::from_u32(value)
 }
@@ -454,10 +465,11 @@ mod tests {
         assert_eq!(d.children[1].attribute("Value"), Lookup::Text("2".into()));
     }
 
-    /// The one that makes the depth limit worth having. Elite's `.binds` holds
-    /// dozens of `<Deadzone>` elements nested inside individual bindings; a
-    /// scanner that matched on name alone would find them when asked about a
-    /// setting of the same name, and could not tell which was which.
+    /// The one that makes the depth limit worth having. A preset document
+    /// repeats names like `Deadzone` inside its individual bindings — the
+    /// module docs say where that comes from — so a scanner that matched on
+    /// name alone would find those when asked about a setting of the same
+    /// name, and could not tell which was which.
     #[test]
     fn nested_elements_are_not_children() {
         let d = doc("<Root><Axis><Deadzone Value=\"0\"/></Axis><Deadzone Value=\"9\"/></Root>")
@@ -510,6 +522,32 @@ mod tests {
             Lookup::Rejected(why) => assert!(why.contains("&nbsp;"), "{why}"),
             other => panic!("an entity this reader cannot resolve is not a value: {other:?}"),
         }
+    }
+
+    /// A character reference XML does not define is not a character.
+    ///
+    /// Rust's integer parsers take a leading `+`, and an uppercase `X` is a
+    /// spelling XML has no production for. Either one let through answers with
+    /// a confident `A` off a document no parser would have read, which is the
+    /// shape the whole module is written against.
+    #[test]
+    fn a_character_reference_spelled_a_way_xml_does_not_define_is_refused() {
+        for bad in [
+            r#"<Root V="&#+65;"/>"#,
+            r#"<Root V="&#x+41;"/>"#,
+            r#"<Root V="&#X41;"/>"#,
+            r#"<Root V="&#-65;"/>"#,
+            r#"<Root V="&#6 5;"/>"#,
+        ] {
+            match doc(bad).expect("parses").root.attribute("V") {
+                Lookup::Rejected(why) => assert!(why.contains("cannot resolve"), "{why}"),
+                other => panic!("{bad} is not a value: {other:?}"),
+            }
+        }
+        // The two spellings XML does define still read, hexadecimal digits in
+        // either case.
+        let d = doc(r#"<Root V="&#65;&#x4a;&#x4A;"/>"#).expect("parses");
+        assert_eq!(d.root.attribute("V"), Lookup::Text("AJJ".into()));
     }
 
     /// Every shape the module docs promise to refuse, refused. The assertion
@@ -624,12 +662,19 @@ mod tests {
     /// example that takes it again, and this fails if a copy grows here.
     ///
     /// What it holds is the rule and not a list of wordings. A census is a
-    /// number about those files, so it is caught in whichever of the two
-    /// halves it is written: the module docs carry no digits at all beyond the
-    /// encodings they have to name, and no sentence anywhere in this file's
-    /// prose puts a number — digits or spelled out — next to a word for the
-    /// files Elite ships. A list of phrases would only ever catch the phrase
-    /// somebody already corrected.
+    /// number about those files, so it is caught wherever it is written: the
+    /// module docs carry no digits at all beyond the encodings they have to
+    /// name, and no sentence anywhere in this file's prose puts a number,
+    /// digits or spelled out, next to a word for the files Elite ships. A list
+    /// of phrases would only ever catch the phrase somebody already corrected.
+    ///
+    /// Anywhere means the whole file, these tests included. Cutting it at the
+    /// literal text `#[cfg(test)]` would be a rule any ordinary comment naming
+    /// the gate could switch off for everything under it, and it would leave
+    /// the tests free to restate a census the module above them may not. What
+    /// makes the whole file safe to scan is that this reads comments and not
+    /// code: the needles below are string literals, and a check that read
+    /// those would only ever find itself.
     #[test]
     fn the_shipped_preset_census_is_stated_somewhere_else() {
         /// Names for the set a census would be of.
@@ -672,10 +717,7 @@ mod tests {
         /// of encodings, which are names and not counts.
         const ENCODINGS: [&str; 3] = ["UTF-8", "UTF-16", "CP1252"];
 
-        // The shipped half only. The needles above are themselves in this
-        // file, and a check that read them would only ever find itself.
         let src = include_str!("xml.rs");
-        let src = src.split("#[cfg(test)]").next().unwrap_or(src);
 
         for line in src.lines() {
             let Some(doc) = line.trim_start().strip_prefix("//!") else {
@@ -692,10 +734,10 @@ mod tests {
         }
 
         // Sentences, because a census is a claim and a claim can be spread
-        // over as many lines as the wrapping takes. Each run of doc lines is
-        // its own text: joining across items would invent sentences neither
+        // over as many lines as the wrapping takes. Each run of comment lines
+        // is its own text: joining across items would invent sentences neither
         // of them says.
-        for sentence in doc_sentences(src) {
+        for sentence in prose_sentences(src) {
             let lower = sentence.to_ascii_lowercase();
             if !THE_SET.iter().any(|word| lower.contains(word)) {
                 continue;
@@ -714,16 +756,21 @@ mod tests {
         }
     }
 
-    /// Every sentence of every doc comment in `src`, one run of doc lines at a
+    /// Every sentence of every comment in `src`, one run of comment lines at a
     /// time.
-    fn doc_sentences(src: &str) -> Vec<String> {
+    ///
+    /// Ordinary `//` comments as well as doc comments: a census restated in
+    /// one is a second answer just the same, and a rule about a file's prose
+    /// that stopped at the third slash would be a rule about syntax.
+    fn prose_sentences(src: &str) -> Vec<String> {
         let mut blocks: Vec<String> = Vec::new();
         let mut open = false;
         for line in src.lines() {
             let line = line.trim_start();
             let doc = line
                 .strip_prefix("//!")
-                .or_else(|| line.strip_prefix("///"));
+                .or_else(|| line.strip_prefix("///"))
+                .or_else(|| line.strip_prefix("//"));
             match doc {
                 Some(text) => {
                     if !open {
