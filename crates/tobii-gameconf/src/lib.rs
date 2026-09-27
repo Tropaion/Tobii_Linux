@@ -11,14 +11,26 @@
 //! Dangerous' case — in a format its author can change in any patch. A wrong
 //! write costs somebody their bindings; a wrong read costs a confusing
 //! sentence. So nothing in this crate creates, opens for writing, renames or
-//! deletes anything, and `never_writes` in the tests below holds that to the
-//! source: it reads every line of this crate that ships, the modules and the
-//! example alike, and fails on the name of any call that could modify a file.
-//! Reading for names is only worth anything because of two other facts, which
-//! the tests beside it assert rather than assume: this crate has no
-//! dependencies, so `std` is the whole of what it can call, and it has no
+//! deletes anything.
+//!
+//! Two measurements are what that promise rests on, and they are different in
+//! kind from the test that guards it. A real Proton prefix was snapshotted
+//! whole — every path under it, with size, nanosecond mtime and content hash
+//! — before and after this crate read it, and came back identical. Then this
+//! crate's readers were run again under a shim that aborts the process on any
+//! of eighteen mutating syscalls, and not one of them fired. Those two say
+//! the code as it stands does not write.
+//!
+//! `never_writes` in the tests below is a smaller thing: a tripwire, not a
+//! proof. It reads the crate's shipping source and fails the build on the
+//! name of a call that could modify a file, so that the day somebody adds one
+//! the build says so instead of a maintainer remembering to re-measure. It
+//! leans on two facts the test beside it asserts rather than assumes — no
+//! dependencies, so `std` is the whole of what this crate can call, and no
 //! `unsafe`, so it cannot reach past `std` under a name that is in no Rust
-//! source at all.
+//! source at all — but those bound its vocabulary without completing its
+//! list. What a list of spellings cannot catch is said plainly where the list
+//! is.
 //!
 //! # A file that cannot be read is never a file that says nothing
 //!
@@ -135,7 +147,7 @@ pub(crate) fn read(path: &Path) -> Source<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A throwaway directory that is this process's alone.
@@ -159,17 +171,18 @@ mod tests {
         p
     }
 
-    /// Every line of this crate that ships, with the tests cut off.
-    ///
-    /// Cut at the first `#[cfg(test)]`, because the tests themselves write —
-    /// they build fixture directories, and they are the only code here that is
-    /// allowed to.
+    /// Every file this crate ships, as the scanners below read it.
     ///
     /// The example is in here with the modules. It is code this crate ships,
     /// it is the thing a maintainer points at real files to check something,
     /// and a guarantee that covered the library but not the program that
     /// exercises it would be a guarantee about the half nobody runs by hand.
-    fn shipped_source() -> Vec<(&'static str, &'static str)> {
+    ///
+    /// Whether this is all of them is not taken on trust:
+    /// [`nothing_can_be_called_that_is_not_in_std`] walks the directories
+    /// these files live in and fails on any `.rs` file that is not named
+    /// here.
+    fn shipped_source() -> Vec<(&'static str, String)> {
         [
             ("lib.rs", include_str!("lib.rs")),
             ("xml.rs", include_str!("xml.rs")),
@@ -178,55 +191,108 @@ mod tests {
             ("examples/read.rs", include_str!("../examples/read.rs")),
         ]
         .into_iter()
-        .map(|(name, src)| (name, src.split("#[cfg(test)]").next().unwrap_or(src)))
+        .map(|(name, src)| (name, shipped_code(src)))
         .collect()
     }
 
-    /// Source with the comment lines dropped, so that a rule can be *written
+    /// One file's shipping code: the comments taken out first, then
+    /// everything from the first `#[cfg(test)]` onwards.
+    ///
+    /// The tests are cut off because they themselves write — they build
+    /// fixture directories, and they are the only code here that is allowed
+    /// to.
+    ///
+    /// The order of the two steps is the whole of this function. Cutting the
+    /// raw source at that literal cuts it wherever the literal appears, and a
+    /// `//` line is the easiest place in a Rust file for it to appear: one
+    /// sentence about how the tests are gated, written in good faith above a
+    /// function, ended the scan for everything below it in that file. A
+    /// comment cannot end the scan if there are no comments left by the time
+    /// the cut is made.
+    fn shipped_code(src: &str) -> String {
+        let code = code_of(src);
+        code.split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Source with the comments taken out, so that a rule can be *written
     /// down* in the file it governs.
     ///
     /// `//` only: there are no block comments here, and a checker that
     /// pretended to understand Rust lexically would be a worse liar than one
-    /// that admits what it scans.
+    /// that admits what it scans. Where a line has a quote before its `//`
+    /// the line is kept whole, because that `//` may be inside a string
+    /// literal and the two mistakes are not worth the same: keeping a comment
+    /// can at worst make the scan complain about a word somebody wrote in
+    /// prose, while cutting a line of code hides whatever else was on it.
     fn code_of(src: &str) -> String {
         src.lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|line| match line.find("//") {
+                Some(at) if !line[..at].contains('"') => &line[..at],
+                _ => line,
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// The promise the crate docs open with, held to the source rather than to
-    /// a reviewer's memory.
+    /// Every identifier a `use` declaration in this code brings into scope,
+    /// read one statement at a time so that a declaration split over several
+    /// lines is read whole.
     ///
-    /// This is not a substitute for the measurement — a real prefix was
-    /// snapshotted whole, path by path with sizes, nanosecond mtimes and
-    /// content hashes, before and after a read, and came back identical — but
-    /// a measurement proves one afternoon and this fails the build.
-    ///
-    /// Scanning for names is a blunt instrument, and blunt in a particular
-    /// way: the check is exactly as complete as the list, and a list is a
-    /// thing somebody wrote from memory. What makes it sound here is not the
-    /// list, it is that the list can be *finished* —
-    /// [`nothing_can_be_called_that_is_not_in_std`] holds the two facts that
-    /// make it finite. `std` is the whole of what this crate can call, and
-    /// `std`'s file-modifying surface is a page of documentation somebody can
-    /// read to the end once and enumerate. Take those away and this becomes
-    /// theatre; so they are asserted next to it rather than remembered.
-    ///
-    /// The list must therefore be written against the surface and not against
-    /// the habits: three of the entries below are spellings that reach the
-    /// filesystem while naming none of the obvious ones. `File::options` opens
-    /// for writing without the word `OpenOptions` appearing, `DirBuilder`
-    /// creates a directory without the word `create_dir`, and `soft_link`
-    /// makes a symbolic link without the word `symlink`.
-    #[test]
-    fn never_writes() {
+    /// A glob comes back as `*` and a rename as `as`. Neither is a name to
+    /// look up; both are things to refuse, because each is a way for a call
+    /// to arrive under a spelling that appears nowhere for a scan to read.
+    fn imported_names(code: &str) -> Vec<String> {
+        let lines: Vec<&str> = code.lines().collect();
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < lines.len() {
+            let head = lines[at].trim_start();
+            let head = head
+                .strip_prefix("pub(crate) ")
+                .or_else(|| head.strip_prefix("pub "))
+                .unwrap_or(head);
+            if !head.starts_with("use ") {
+                at += 1;
+                continue;
+            }
+            let mut statement = String::new();
+            while at < lines.len() {
+                statement.push_str(lines[at]);
+                let ends_here = lines[at].contains(';');
+                at += 1;
+                if ends_here {
+                    break;
+                }
+            }
+            names.extend(
+                statement
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '*')
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        names
+    }
+
+    /// Everything in one file's shipping code that says this crate might
+    /// write, worded for the failure message.
+    fn forbidden_in(code: &str) -> Vec<String> {
         // Every `std` entry point that can create, modify, remove or relink
         // something on disk, each spelled the shortest way that still cannot
         // match anything else. Sub-spellings are covered by their prefixes:
         // `File::create` catches `create_new`, `create_dir` catches
         // `create_dir_all`, `remove_dir` catches `remove_dir_all`, and `chown`
         // catches `lchown` and `fchown`.
+        //
+        // The list is written against the surface and not against the habits:
+        // three of these are spellings that reach the filesystem while naming
+        // none of the obvious ones. `File::options` opens for writing without
+        // the word `OpenOptions`, `DirBuilder` creates a directory without the
+        // word `create_dir`, and `soft_link` makes a symbolic link without the
+        // word `symlink`.
         const FORBIDDEN: [&str; 21] = [
             "fs::write",
             "File::create",
@@ -250,87 +316,303 @@ mod tests {
             "chown",
             "Command",
         ];
-        for (name, src) in shipped_source() {
-            let code = code_of(src);
-            for bad in FORBIDDEN {
-                assert!(
-                    !code.contains(bad),
-                    "{name} names `{bad}`: this crate only ever reads"
-                );
+        // `fs::write`, `fs::copy` and `fs::rename` are the only entries above
+        // that carry a path, and a grouped import walks straight past all
+        // three: `use std::fs::{copy, metadata};` puts `copy` in scope, and
+        // the call site then spells no path at all. Their bare names cannot go
+        // in the list above — `write` is also `write!` and `fmt::Write`, and
+        // `copy` is also `copy_from_slice` — so they are refused where they
+        // enter instead. A `use` that pulls one of them into this crate is
+        // itself the thing to refuse.
+        //
+        // The rest of the list needs no entry here. `create_dir` and its kind
+        // are already unambiguous as bare words, so the scan above finds them
+        // in a `use` line as readily as at a call; and `File::create` and
+        // `File::options` are associated functions, which no `use` can name.
+        const MUTATING_IMPORTS: [&str; 3] = ["write", "copy", "rename"];
+
+        let mut found = Vec::new();
+        for bad in FORBIDDEN {
+            if code.contains(bad) {
+                found.push(format!("names `{bad}`"));
             }
         }
+        for name in imported_names(code) {
+            if name == "*" {
+                found.push(
+                    "imports a module whole with a glob, which puts names in scope that \
+                     appear nowhere for this scan to read"
+                        .to_string(),
+                );
+            } else if name == "as" {
+                found.push(
+                    "renames an import, which is how a call reaches the filesystem under a \
+                     spelling this scan was never written against"
+                        .to_string(),
+                );
+            } else if MUTATING_IMPORTS.contains(&name.as_str()) {
+                found.push(format!(
+                    "imports `{name}`, which modifies a file when it is called under no \
+                     path at all"
+                ));
+            }
+        }
+        found
     }
 
-    /// The preconditions that make [`never_writes`] a proof and not a gesture.
+    /// The dependency a manifest declares, if it declares one.
     ///
-    /// Each check here closes a way for code to run in this crate under a
-    /// name the scan has never read. A dependency brings its own vocabulary,
-    /// and no list written against `std` can cover it. `unsafe` reaches libc
-    /// directly, where the name on the call need not be a Rust name at all. A
-    /// module or an example the scan does not open is simply a file nobody
-    /// checked — which is why neither is listed twice: the modules are matched
-    /// against what `lib.rs` declares, and the examples against the directory
-    /// they live in.
-    #[test]
-    fn nothing_can_be_called_that_is_not_in_std() {
-        let manifest = include_str!("../Cargo.toml");
+    /// Cargo spells a dependency table three ways and only two of them end in
+    /// the word. `[dependencies]` and `[target.'cfg(unix)'.dependencies]` hold
+    /// a line per dependency; `[dependencies.quick-xml]` names its dependency
+    /// in the header and holds that one dependency's keys. A check that
+    /// recognised only the first kind read the third as a table about
+    /// something other than dependencies, and then read every key under it as
+    /// a line belonging to no table at all.
+    fn dependency_in(manifest: &str) -> Option<String> {
         let mut under_dependencies = false;
         for line in manifest.lines() {
             let line = line.split('#').next().unwrap_or_default().trim();
             if let Some(table) = line.strip_prefix('[') {
-                under_dependencies = table.trim_end_matches(']').ends_with("dependencies");
+                let name = table.trim_end_matches(']').trim_start_matches('[');
+                let segments: Vec<&str> = name.split('.').map(str::trim).collect();
+                let at = segments.iter().position(|s| s.ends_with("dependencies"));
+                under_dependencies = at.is_some();
+                if let Some(at) = at {
+                    let named = segments[at + 1..].join(".");
+                    if !named.is_empty() {
+                        return Some(named);
+                    }
+                }
                 continue;
             }
-            assert!(
-                !under_dependencies || line.is_empty(),
-                "a dependency — `{line}` — puts names under this crate that \
-                 `never_writes` was never written against"
-            );
+            if under_dependencies && !line.is_empty() {
+                return Some(line.to_string());
+            }
         }
-        let scanned: Vec<&str> = shipped_source().iter().map(|(name, _)| *name).collect();
-        let (lib, _) = shipped_source()
+        None
+    }
+
+    /// Every `.rs` file under a directory, named the way [`shipped_source`]
+    /// names them.
+    ///
+    /// It goes down, because `src/xml/scratchpad.rs` is a module of this
+    /// crate exactly as much as `src/xml.rs` is.
+    fn rust_files(root: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut todo = vec![root.to_path_buf()];
+        while let Some(dir) = todo.pop() {
+            let entries = std::fs::read_dir(&dir).expect("a directory of this crate's own source");
+            for entry in entries {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    todo.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let under = path
+                    .strip_prefix(root)
+                    .expect("a path under the root it was found beneath");
+                found.push(under.to_string_lossy().into_owned());
+            }
+        }
+        found
+    }
+
+    /// The `.rs` files a crate root ships that a list of scanned names does
+    /// not cover.
+    ///
+    /// The question is asked of the directories, not of what any one file
+    /// declares. A module or a program that ships here and is not scanned is
+    /// one nobody checked, and the way that happens is somebody adding one —
+    /// to `xml.rs` as readily as to `lib.rs`.
+    fn unscanned_files(scanned: &[&str], crate_root: &Path) -> Vec<String> {
+        let mut missing = Vec::new();
+        for (dir, prefix) in [("src", ""), ("examples", "examples/")] {
+            for name in rust_files(&crate_root.join(dir)) {
+                let shipped = format!("{prefix}{name}");
+                if !scanned.contains(&shipped.as_str()) {
+                    missing.push(shipped);
+                }
+            }
+        }
+        missing
+    }
+
+    /// A tripwire on the crate's shipping source, for the day somebody adds a
+    /// write by hand.
+    ///
+    /// This is not the proof that the crate does not write — the crate docs
+    /// say what is, and why a measurement and a test are different kinds of
+    /// thing. What this one has over a measurement is that it fails the
+    /// build, every build, and that is worth having on its own terms. What it
+    /// does not have is completeness.
+    ///
+    /// It checks spellings, so what it cannot catch is a call that reaches
+    /// the filesystem under a spelling nobody wrote into the list. Two ways
+    /// that has already happened are closed below, and neither was sabotage:
+    /// a `//` line naming the test gate used to end the scan for the rest of
+    /// its file, and a grouped `use` of `std::fs` used to put a mutating call
+    /// in scope under a bare name the list does not carry. Closing those does
+    /// not finish the list, and the class stays open — a `std` entry point
+    /// added after this was written, a macro that assembles the path out of
+    /// fragments, a `#[path]` or an `include!` naming a file outside the
+    /// directories walked here. Certainty comes from re-running the
+    /// measurements the crate docs describe. This is what notices in between.
+    #[test]
+    fn never_writes() {
+        let complaints: Vec<String> = shipped_source()
             .into_iter()
-            .find(|(name, _)| *name == "lib.rs")
-            .expect("lib.rs");
-        for line in code_of(lib).lines() {
-            let line = line.trim();
-            let Some(rest) = line
-                .strip_prefix("pub mod ")
-                .or_else(|| line.strip_prefix("pub(crate) mod "))
-                .or_else(|| line.strip_prefix("mod "))
-            else {
-                continue;
-            };
-            let Some(module) = rest.strip_suffix(';') else {
-                continue;
-            };
+            .flat_map(|(name, code)| {
+                forbidden_in(&code)
+                    .into_iter()
+                    .map(move |what| format!("{name} {what}"))
+            })
+            .collect();
+        assert!(
+            complaints.is_empty(),
+            "this crate only ever reads: {}",
+            complaints.join("; ")
+        );
+    }
+
+    /// The preconditions [`never_writes`] rests on.
+    ///
+    /// Each check here closes a way for code to run in this crate under a
+    /// name the scan has never read. A dependency brings its own vocabulary,
+    /// and no list written against `std` can cover it. `unsafe` reaches libc
+    /// directly, where the name on the call need not be a Rust name at all.
+    /// And a file the scan does not open is simply a file nobody checked,
+    /// which is why the question is asked of the directories: a module
+    /// declared in `xml.rs` ships exactly as much as one declared in
+    /// `lib.rs`, and reading only `lib.rs`'s declarations found neither the
+    /// file nor the hole.
+    ///
+    /// A file that scans to nothing is the last of them, and the cheapest to
+    /// miss: every hole found in this machinery so far has had the same
+    /// shape, a scan reading less than it looks like it is reading and
+    /// passing quietly for it. A file opened and cut down to nothing passes
+    /// [`never_writes`] exactly as a clean one does, so it is asked about
+    /// here instead.
+    #[test]
+    fn nothing_can_be_called_that_is_not_in_std() {
+        let dependency = dependency_in(include_str!("../Cargo.toml"));
+        assert!(
+            dependency.is_none(),
+            "a dependency — `{}` — puts names under this crate that `never_writes` \
+             was never written against",
+            dependency.unwrap_or_default()
+        );
+        let shipped = shipped_source();
+        let scanned: Vec<&str> = shipped.iter().map(|(name, _)| *name).collect();
+        let missing = unscanned_files(&scanned, Path::new(env!("CARGO_MANIFEST_DIR")));
+        assert!(
+            missing.is_empty(),
+            "these ship and are not scanned by `never_writes`: {}",
+            missing.join(", ")
+        );
+        for (name, code) in &shipped {
             assert!(
-                scanned.contains(&format!("{module}.rs").as_str()),
-                "module {module} is declared here and not scanned by `never_writes`"
+                !code.trim().is_empty(),
+                "{name} scanned down to nothing, so `never_writes` read none of it"
             );
-        }
-        // The same question of the examples, asked of the directory rather
-        // than of a second list: a program that ships here and is not scanned
-        // is a program nobody checked, and the way that happens is somebody
-        // adding one.
-        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
-        for entry in std::fs::read_dir(&examples).expect("the examples directory") {
-            let path = entry.expect("an entry").path();
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
             assert!(
-                scanned.contains(&format!("examples/{name}").as_str()),
-                "examples/{name} ships and is not scanned by `never_writes`"
-            );
-        }
-        for (name, src) in shipped_source() {
-            assert!(
-                !code_of(src).contains("unsafe"),
+                !code.contains("unsafe"),
                 "{name} names `unsafe`: past `std` there is no name to scan for"
             );
         }
+    }
+
+    /// A comment cannot end the scan — which it could, for as long as the cut
+    /// was made before the comments were taken out.
+    #[test]
+    fn a_comment_naming_the_test_gate_does_not_end_the_scan() {
+        for src in [
+            "// The tests below are gated on #[cfg(test)], as usual.\n\
+             fn stash(p: &Path) {\n    let _ = std::fs::write(p, b\"\");\n}\n",
+            "fn stash(p: &Path) { // gated on #[cfg(test)]\n    \
+             let _ = std::fs::write(p, b\"\");\n}\n",
+        ] {
+            assert!(
+                !forbidden_in(&shipped_code(src)).is_empty(),
+                "a comment naming the gate turned the scan off below it: {src}"
+            );
+        }
+        let gated = "fn read_it() {}\n#[cfg(test)]\nmod tests {\n    \
+                     fn fixture() { std::fs::remove_file(\"x\"); }\n}\n";
+        assert!(
+            forbidden_in(&shipped_code(gated)).is_empty(),
+            "the gate itself no longer cuts the tests off"
+        );
+    }
+
+    /// A mutating call can arrive under a bare name, and the `use` that put
+    /// it there is ordinary Rust rather than an evasion.
+    #[test]
+    fn a_use_declaration_cannot_walk_a_mutating_name_past_the_list() {
+        for src in [
+            "use std::fs::{copy, metadata};\nfn back_up(p: &Path) { let _ = copy(p, p); }\n",
+            "use std::fs::{metadata, rename};\nfn move_it(p: &Path) { let _ = rename(p, p); }\n",
+            "use std::fs::{\n    metadata,\n    write,\n};\n",
+            "use std::fs::*;\n",
+            "use std::fs::File as Handle;\n",
+        ] {
+            assert!(
+                !forbidden_in(&shipped_code(src)).is_empty(),
+                "a `use` put a mutating name in scope and the scan read past it: {src}"
+            );
+        }
+        let reading_only = "use std::path::{Path, PathBuf};\nuse crate::{xml, Lookup, Source};\n";
+        assert!(
+            forbidden_in(&shipped_code(reading_only)).is_empty(),
+            "an ordinary import of names that read nothing"
+        );
+    }
+
+    /// Cargo's spellings of a dependency table, one of which used to read as
+    /// no dependency table at all.
+    #[test]
+    fn a_dependency_is_found_however_its_table_is_spelled() {
+        assert_eq!(
+            dependency_in("[dependencies]\nquick-xml = \"x\"\n").as_deref(),
+            Some("quick-xml = \"x\"")
+        );
+        assert_eq!(
+            dependency_in("[dependencies.quick-xml]\npath = \"../quick-xml\"\n").as_deref(),
+            Some("quick-xml")
+        );
+        assert_eq!(
+            dependency_in("[dev-dependencies.tempfile]\nversion = \"x\"\n").as_deref(),
+            Some("tempfile")
+        );
+        assert_eq!(
+            dependency_in("[target.'cfg(unix)'.dependencies]\nlibc = \"x\"\n").as_deref(),
+            Some("libc = \"x\"")
+        );
+        assert_eq!(
+            dependency_in("[package]\nname = \"x\"\n\n[[bin]]\nname = \"y\"\n"),
+            None
+        );
+        assert_eq!(dependency_in(include_str!("../Cargo.toml")), None);
+    }
+
+    /// A module declared inside a module is a file that ships, so the walk
+    /// that looks for unscanned files has to go down.
+    #[test]
+    fn a_module_nested_under_another_is_still_asked_about() {
+        let root = scratch("nested-module");
+        std::fs::create_dir_all(root.join("src/xml")).expect("a nested module directory");
+        std::fs::create_dir_all(root.join("examples")).expect("an examples directory");
+        std::fs::write(root.join("src/lib.rs"), "pub mod xml;").expect("lib.rs");
+        std::fs::write(root.join("src/xml.rs"), "mod scratchpad;").expect("xml.rs");
+        std::fs::write(root.join("src/xml/scratchpad.rs"), "").expect("the nested module");
+        std::fs::write(root.join("examples/read.rs"), "").expect("the example");
+        assert_eq!(
+            unscanned_files(&["lib.rs", "xml.rs", "examples/read.rs"], &root),
+            ["xml/scratchpad.rs"]
+        );
     }
 
     /// [`Source::Unwritten`] answers for more than a path that is not there,
