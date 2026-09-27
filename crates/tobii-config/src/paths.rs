@@ -14,6 +14,26 @@
 //! breaks anything; it is a file `--purge` leaves behind and reports as
 //! "not written by this program". The test at the bottom checks the writers in
 //! this crate against the list.
+//!
+//! # Subdirectories, where the names are not knowable from here
+//!
+//! `CONFIG_FILES` is the files written *directly* into `config_dir`. Two
+//! subdirectories hold files whose names depend on what the user has rather
+//! than on what this program is — `MODELS_DIR` and `PROFILES_DIR` — and
+//! neither can be a list here. The directory's name is still named here, and
+//! the module that writes into it supplies the rest: `tobii-headpose` a list
+//! of its file names, [`crate::profiles`] a predicate over a name. The
+//! uninstaller asks that module rather than spelling anything itself, so the
+//! rule is unchanged where it matters — what `--purge` deletes is decided in
+//! one place per directory, and everything else is reported.
+//!
+//! It asks `tobii-headpose`. It does not yet ask [`crate::profiles`]: the
+//! predicate is here and `tobii uninstall` has not been taught to look in
+//! this directory at all. A `--purge` today walks past it and reports the
+//! directory itself as "not written by this program", which is the one
+//! sentence there that is untrue of it. Nothing is deleted that should not
+//! be — the failure is in the other direction — but it is a gap, not a
+//! policy, and it is the uninstaller's to close.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -53,6 +73,18 @@ pub const ACCURACY_CSV: &str = "accuracy.csv";
 pub const REPORT_SALT: &str = "report_salt";
 /// The head-pose model store's directory; `tobii-headpose` names its files.
 pub const MODELS_DIR: &str = "models";
+/// The per-game profiles directory; [`crate::profiles`] names its files.
+///
+/// A subdirectory rather than a name, for the same reason [`MODELS_DIR`] is:
+/// what is in it is one file per thing the user has, so it cannot be a list
+/// here. What that module contributes to the rule at the top of this file
+/// instead is [`crate::profiles::is_profile_file`], a predicate over a name —
+/// `<appid>.toml`, and the temporary an interrupted write leaves. A purge is
+/// to filter the directory through it and report whatever else is in there,
+/// so that an `<appid>.toml~` a text editor left survives exactly as a
+/// `config.toml.bak` beside the config does. See the module docs for what is
+/// wired and what is not.
+pub const PROFILES_DIR: &str = "profiles";
 
 /// Every file this program writes directly into [`config_dir`].
 pub const CONFIG_FILES: [&str; 11] = [
@@ -255,6 +287,31 @@ mod tests {
             assert!(CONFIG_FILES.contains(&name), "{name} is not listed");
             assert_eq!(p.parent(), Some(config_dir().as_path()));
         }
+    }
+
+    /// The profiles directory is a subdirectory of the config directory, and
+    /// its files are named for the game rather than from [`CONFIG_FILES`] —
+    /// so a purge has to reach them through the predicate, not the list.
+    #[test]
+    fn a_profile_is_a_named_file_in_a_named_subdirectory() {
+        let dir = crate::profiles::profiles_dir();
+        assert_eq!(dir, config_dir().join("profiles"));
+        // Spelled out rather than compared against the constant beside it,
+        // which would make this agree with whatever that constant said. It is
+        // a path a user is told to open, and the one thing it must not be is
+        // the other subdirectory: two writers with different rules about what
+        // belongs in one directory would leave `--purge` unable to decide.
+        assert_ne!(dir, config_dir().join(MODELS_DIR));
+
+        let p = crate::profiles::profile_path("1234567");
+        assert_eq!(p.parent(), Some(dir.as_path()));
+        let name = p.file_name().and_then(|n| n.to_str()).expect("a name");
+        assert_eq!(name, "1234567.toml");
+        assert!(!CONFIG_FILES.contains(&name), "not one of the fixed names");
+        assert!(crate::profiles::is_profile_file(name));
+        assert!(crate::profiles::is_profile_file(&format!(
+            "{name}{ATOMIC_TMP_SUFFIX}"
+        )));
     }
 
     #[test]

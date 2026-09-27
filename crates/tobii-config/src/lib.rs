@@ -19,6 +19,8 @@ mod calibration_state;
 mod edid;
 /// Every name this program writes, and the XDG directories they go in.
 pub mod paths;
+/// What this program knows about setting up one game, per game.
+pub mod profiles;
 mod setpm;
 mod setup;
 /// A dependency-free SHA-256.
