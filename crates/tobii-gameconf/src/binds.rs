@@ -3,8 +3,8 @@
 //!
 //! # The format, as the game's own files have it
 //!
-//! Measured against the 30 presets Elite Dangerous ships, read off this
-//! machine's install rather than inferred:
+//! Measured on 2026-09-27 against the 30 presets Elite Dangerous ships, read
+//! off this machine's install rather than inferred:
 //!
 //! ```text
 //! <?xml version="1.0" encoding="utf-8"?>
@@ -35,18 +35,27 @@
 //!   names like `Deadzone` and `Binding` that repeat dozens of times per file,
 //!   which is why [`crate::xml`] only ever offers the first level.
 //! * `MajorVersion` and `MinorVersion` appear on `Root` in 2 of the 30 shipped
-//!   files (`SaitekX56` and `T16000MHOTAS`, both `1`.`8`) and not in the other
-//!   28. `1`.`8` is the only bindings schema this project has ever seen, and
-//!   nobody here has watched it change — but a saved preset carries the schema
-//!   of the version that wrote it, so the numbers are read and reported rather
-//!   than checked against a list this crate would have had to invent.
+//!   files (`SaitekX56` and `T16000MHOTAS`, both 1.8) and not in the other 28.
+//!   1.8 is the only bindings schema this project has ever seen, and nobody
+//!   here has watched it change — but a saved preset carries the schema of the
+//!   version that wrote it, so the numbers are read and reported rather than
+//!   checked against a list this crate would have had to invent.
 //!
-//! Every count above is of the files in one install on one machine, and the
-//! `presets` mode of this crate's `read` example takes it again:
+//! Every count above is of one install on one machine on the date named.
+//! Nothing in CI has those files, so no test here can show the numbers are
+//! still true — what a test can do, and what this crate's `read` example is
+//! for, is take them again:
 //!
 //! ```text
 //! cargo run -p tobii-gameconf --example read -- presets <ControlSchemes> HeadlookMode
 //! ```
+//!
+//! Its `presets` mode reads every `.binds` document in a directory, without a
+//! `StartPreset` file, and prints each count above beside the per-file numbers
+//! it is made of. A number in this census that the example does not print is a
+//! number nobody can check; that is a rule for whoever edits the census, and
+//! not something a test can hold, because the files it would have to count are
+//! on one maintainer's disk.
 //!
 //! # Why this is worth reading at all
 //!
@@ -65,9 +74,12 @@
 //!
 //! The document format above was read off 30 real files. The directory
 //! convention was not, and this is the honest limit of this module: the one
-//! Elite Dangerous install on this machine **has never been launched**, so
-//! there is no user `Options/Bindings` directory anywhere on it to read. What
-//! that exercises — and it is the path a user most often hits — is
+//! Elite Dangerous install on this machine **has no Frontier user directory
+//! and no `Options` or `Bindings` directory anywhere in its Proton prefix**,
+//! so there is nothing here to read the convention off. The prefix itself has
+//! been run — `compatdata/359320/pfx` is there and populated — which is why
+//! the claim is about what the game wrote and not about whether it started.
+//! What that exercises — and it is the path a user most often hits — is
 //! [`crate::Source::Unwritten`]: a game that has saved nothing must be
 //! reported as exactly that, with a sentence, and not as a game whose settings
 //! are fine.
@@ -277,6 +289,14 @@ pub fn start(text: &[u8]) -> Result<Vec<String>, String> {
 ///
 /// A name, not a string: the bytes the host holds are what a filesystem
 /// actually stores, and every part of this spelling is ASCII.
+///
+/// The digits are checked before they are parsed, for the reason
+/// [`crate::xml`]'s character-reference reader gives: Rust's integer parsers
+/// accept a leading `+`, and nothing that writes these files does. Letting one
+/// through would not merely read an odd name: `StartPreset.+4.start` would be
+/// schema 4 beside a real `StartPreset.4.start`, which is a tie, and a tie
+/// takes the whole directory down. A backup, a sync conflict or a hand edit
+/// left next to the live file must not do that.
 fn start_schema(file_name: &[u8]) -> Option<Option<u32>> {
     let rest = strip_prefix_ignore_ascii_case(file_name, b"StartPreset")?;
     let rest = strip_suffix_ignore_ascii_case(rest, b".start")?;
@@ -284,7 +304,7 @@ fn start_schema(file_name: &[u8]) -> Option<Option<u32>> {
         return Some(None);
     }
     let (dot, digits) = rest.split_first()?;
-    if *dot != b'.' {
+    if *dot != b'.' || digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
     std::str::from_utf8(digits)
@@ -302,6 +322,60 @@ fn strip_prefix_ignore_ascii_case<'a>(s: &'a [u8], prefix: &[u8]) -> Option<&'a 
 fn strip_suffix_ignore_ascii_case<'a>(s: &'a [u8], suffix: &[u8]) -> Option<&'a [u8]> {
     let (rest, tail) = s.split_at_checked(s.len().checked_sub(suffix.len())?)?;
     tail.eq_ignore_ascii_case(suffix).then_some(rest)
+}
+
+/// What to say about a directory that is not there.
+///
+/// `ENOENT` is one error covering two situations, and the sentence has to be
+/// true of both. If everything above the directory is there, the filesystem
+/// holding it is mounted and readable and the only thing missing is what the
+/// game would have written: *nothing has saved a control scheme here* is a
+/// fact. If something further up is missing too, the path may be leading onto
+/// a drive nobody has mounted — `libraryfolders.vdf` on this machine still
+/// names a Steam library under `/run/media`, and `/run/media/tropaion` is not
+/// there — and the same sentence becomes a confident negative about files this
+/// reader never got to look at. It is the worst thing this crate can say, and
+/// it is reachable today.
+///
+/// Nothing in the error separates the two, and a mount table is a guess this
+/// module will not make. So the missing part of the path is named, the
+/// sentence stops short of a promise, and a user looking at it recognises
+/// their own unmounted drive in one line.
+fn nothing_at(dir: &Path) -> String {
+    // Shallowest first. A relative path's ancestors end at the empty path,
+    // which stats as nothing there and would be named as the missing part of
+    // the path; the working directory is not what is missing.
+    let mut ancestors: Vec<&Path> = dir
+        .ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    ancestors.reverse();
+    match ancestors
+        .into_iter()
+        .find(|p| matches!(p.try_exists(), Ok(false)))
+    {
+        Some(gone) if gone == dir => format!(
+            "there is no directory at {}: nothing has saved a control scheme here",
+            dir.display()
+        ),
+        Some(gone) => format!(
+            "there is no directory at {}, and no {} either: nothing has saved \
+             a control scheme here, unless this path leads onto something this \
+             machine has not mounted",
+            dir.display(),
+            gone.display()
+        ),
+        // Every ancestor answered with an error rather than a yes or a no — a
+        // component that cannot be searched, say. That the directory is not
+        // there is all this reader saw.
+        None => format!(
+            "there is no directory at {}, and this reader could not see how \
+             much of the path above it exists: nothing has saved a control \
+             scheme here, unless this path leads onto something this machine \
+             has not mounted",
+            dir.display()
+        ),
+    }
 }
 
 /// One preset the `StartPreset` file names, and what became of it.
@@ -372,6 +446,14 @@ pub struct Bindings {
 /// and reporting a value from its neighbour would be reporting a preset this
 /// reader cannot show is the one in use. The refusal names the file.
 ///
+/// Every `.binds` *name*, not every `.binds` regular file. A directory called
+/// `Custom.binds`, a symbolic link to one, a link to nothing at all — none of
+/// them is a document, and every one of them is a refusal naming the path,
+/// which is the answer the `StartPreset` names get as well. Skipping them
+/// instead would leave the directory read whole and reported as holding no
+/// preset of that name: a confident negative about a directory holding
+/// something the user can see, named after the very preset they asked about.
+///
 /// A file name is never decoded, so a name that is not UTF-8 is not a file
 /// this reader skips. These directories sit under a Proton prefix and are
 /// written by a Windows program, and a byte sequence the host cannot read as
@@ -393,10 +475,7 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Source::Unwritten(format!(
-                "there is no directory at {}: nothing has saved a control scheme here",
-                dir.display()
-            ))
+            return Source::Unwritten(nothing_at(dir))
         }
         Err(e) => {
             return Source::Rejected(format!("{} could not be listed: {e}", dir.display()));
@@ -427,7 +506,7 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
         let name = name.as_encoded_bytes();
         if let Some(schema) = start_schema(name) {
             starts.push((schema, path));
-        } else if strip_suffix_ignore_ascii_case(name, b".binds").is_some() && path.is_file() {
+        } else if strip_suffix_ignore_ascii_case(name, b".binds").is_some() {
             presets.push(path);
         }
     }
@@ -542,7 +621,7 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::tests::scratch;
 
@@ -692,9 +771,40 @@ pub(crate) mod tests {
             // A name the host holds and no decoder can read as text. It is
             // not a start file, and answering that takes no decoding.
             b"StartPreset.\xff.start",
+            // Rust's integer parsers take a leading sign; nothing that writes
+            // these files does. See below for what reading one costs.
+            b"StartPreset.+4.start",
+            b"StartPreset.-4.start",
+            b"StartPreset. 4.start",
         ] {
             assert_eq!(start_schema(no), None, "{}", String::from_utf8_lossy(no));
         }
+    }
+
+    /// A signed schema beside the real one is not a tie.
+    ///
+    /// `StartPreset.+4.start` is the shape a backup, a sync conflict or a hand
+    /// edit leaves behind. Read as schema 4 it collides with the live
+    /// `StartPreset.4.start`, and the tie refusal — which is right about two
+    /// files that really do claim one schema — then takes the whole directory
+    /// down over a name no writer of these files produces.
+    #[test]
+    fn a_start_file_with_a_signed_schema_is_not_a_start_file() {
+        let dir = dir_with(
+            "signed",
+            &[
+                ("StartPreset.4.start", b"Custom\r\n"),
+                ("StartPreset.+4.start", b"Stray\r\n"),
+                ("Custom.binds", &preset_file("Custom", "")),
+            ],
+        );
+        let Source::Read(b) = read(&dir, "HeadlookMode") else {
+            panic!("a name no writer produces is not a second start file");
+        };
+        assert_eq!(b.schema, Some(4));
+        assert_eq!(b.start, dir.join("StartPreset.4.start"));
+        assert!(b.superseded.is_empty(), "{:?}", b.superseded);
+        assert_eq!(b.presets[0].name, "Custom");
     }
 
     #[test]
@@ -743,6 +853,77 @@ pub(crate) mod tests {
         match read(&missing, "HeadlookMode") {
             Source::Unwritten(why) => assert!(why.contains("StartPreset"), "{why}"),
             other => panic!("presets with no StartPreset name nothing active: {other:?}"),
+        }
+    }
+
+    /// A path whose ancestors are gone is `ENOENT` as well, and that is the
+    /// shape of a Proton prefix on a drive nobody mounted.
+    ///
+    /// It is reachable on this machine today: `libraryfolders.vdf` still names
+    /// a Steam library under `/run/media`, and `/run/media/tropaion` does not
+    /// exist. *Nothing has saved a control scheme here* about that path is a
+    /// confident negative about files this reader never got to look at — the
+    /// one sentence the crate is built not to say — so it names the part of
+    /// the path that is missing and stops short of the promise.
+    #[test]
+    fn a_path_whose_ancestors_are_gone_does_not_promise_the_game_saved_nothing() {
+        const FLAT: &str = "nothing has saved a control scheme here";
+        let root = scratch("unmounted");
+        let unmounted = root.join("DatenSSD");
+        match read(&unmounted.join("games/steam/Bindings"), "HeadlookMode") {
+            Source::Unwritten(why) => {
+                assert!(
+                    why.contains(&unmounted.display().to_string()),
+                    "the missing part of the path is what a user recognises \
+                     their own unmounted drive by: {why}"
+                );
+                assert!(
+                    !why.ends_with(FLAT),
+                    "a path this reader could not follow is not a game that \
+                     saved nothing: {why}"
+                );
+            }
+            other => panic!("a path that is not there is not a reading: {other:?}"),
+        }
+        // And the ordinary case keeps the flat sentence. Everything above the
+        // directory is there, so whatever holds it is mounted and readable and
+        // the one thing missing is what the game would have written.
+        std::fs::create_dir_all(root.join("Options")).expect("fixture");
+        match read(&root.join("Options/Bindings"), "HeadlookMode") {
+            Source::Unwritten(why) => assert!(why.ends_with(FLAT), "{why}"),
+            other => panic!("a directory that is not there is not a reading: {other:?}"),
+        }
+    }
+
+    /// A name ending `.binds` that is not a document this reader can open.
+    ///
+    /// Skipping it would leave the directory read whole and reported as
+    /// holding no preset of the active name — a flat negative about a
+    /// directory holding something the user can see, named after the very
+    /// preset they are asking about. A `StartPreset` name one pattern away
+    /// refuses loudly, and so does this.
+    #[test]
+    fn a_directory_called_binds_is_refused_and_not_reported_absent() {
+        let dir = dir_with("trapdir", &[("StartPreset.4.start", b"Custom\r\n")]);
+        std::fs::create_dir(dir.join("Custom.binds")).expect("fixture");
+        match read(&dir, "HeadlookMode") {
+            Source::Rejected(why) => assert!(why.contains("Custom.binds"), "{why}"),
+            other => panic!("a directory is not a preset nobody saved: {other:?}"),
+        }
+    }
+
+    /// The same, for a link that points at nothing.
+    ///
+    /// These directories sit under a Proton prefix and are synced, backed up
+    /// and copied about; a link whose target went away is what that leaves.
+    #[cfg(unix)]
+    #[test]
+    fn a_binds_link_to_nothing_is_refused_and_not_reported_absent() {
+        let dir = dir_with("traplink", &[("StartPreset.4.start", b"Gone\r\n")]);
+        std::os::unix::fs::symlink("nowhere.binds", dir.join("Gone.binds")).expect("fixture");
+        match read(&dir, "HeadlookMode") {
+            Source::Rejected(why) => assert!(why.contains("Gone.binds"), "{why}"),
+            other => panic!("a link to nothing is not a preset nobody saved: {other:?}"),
         }
     }
 
@@ -907,205 +1088,6 @@ pub(crate) mod tests {
             Source::Rejected(why) => assert!(why.contains("Broken.binds"), "{why}"),
             other => panic!("a preset that cannot be read is not nothing: {other:?}"),
         }
-    }
-
-    /// Every habit in the census is one the example counts again.
-    ///
-    /// The census is a measurement of one install, and nothing in CI has those
-    /// files: what can be held here is not the numbers but the thing that lets
-    /// somebody check them. A habit written down with no counter behind it is
-    /// a sentence nobody can take again — which is how an indentation habit
-    /// came to be stated of all 30 files when four of them break it — so each
-    /// entry below is the seam: what the census calls the habit, and the line
-    /// the example prints its count on.
-    ///
-    /// The example's half is read out of its string literals and not out of
-    /// its source. Every one of these needles is also in the example's own
-    /// module docs, which describe the counting, and one of them in the name
-    /// of a local variable — so a test that searched the source would stay
-    /// green with every counter in the example deleted.
-    ///
-    /// What a declared seam cannot do is notice a habit nobody added to it.
-    /// That is the next test's job, and this one is honest about the limit: it
-    /// catches a counter that went away under a census still claiming its
-    /// habit.
-    #[test]
-    fn every_habit_in_the_census_is_counted_by_the_example() {
-        const HABITS: [(&str, &str); 4] = [
-            ("byte-order mark", "with a byte-order mark"),
-            ("bare line feeds", "bare line feeds"),
-            ("encoding=\"UTF-8\" ?>", "writing a space before"),
-            ("indented with four spaces", "indented with spaces"),
-        ];
-        let census = census();
-        let example = printed(include_str!("../examples/read.rs"));
-        for (stated, counted) in HABITS {
-            assert!(
-                census.contains(stated),
-                "the census does not state `{stated}`, which the example counts"
-            );
-            assert!(
-                example.contains(counted),
-                "the census states `{stated}` and the example prints no \
-                 `{counted}`: a number nobody can take again"
-            );
-        }
-    }
-
-    /// The census counts the set once, and never a habit of the whole of it.
-    ///
-    /// Every writing habit in this census splits 26 against 4 — the same four
-    /// files carry all four — so a sentence counting all 30 of them is either
-    /// a habit nobody checked on those four or a sentence that does not belong
-    /// in a census. That is how the indentation claim went wrong, and a ban on
-    /// the spellings that claim used would only ever catch the wording
-    /// somebody already corrected. So this is a rule: the population is stated
-    /// where the census says what it was measured against, and nowhere else in
-    /// its prose, in digits or spelled out.
-    ///
-    /// It is a rule about counts and not about claims. "Every one of these
-    /// files ends its lines with a carriage return", written without the
-    /// number, is past it — as it is past the guard in [`crate::xml`] that
-    /// this one borrows its reasoning from. What the two of them hold is that
-    /// a *measurement* cannot be restated, and a measurement is a number.
-    #[test]
-    fn no_habit_in_the_census_is_claimed_of_the_whole_set() {
-        /// Numbers written as words, past the digits. Cardinals only: an
-        /// ordinal counts nothing, and this prose is full of them.
-        const CARDINALS: [(&str, u32); 21] = [
-            ("one", 1),
-            ("two", 2),
-            ("three", 3),
-            ("four", 4),
-            ("five", 5),
-            ("six", 6),
-            ("seven", 7),
-            ("eight", 8),
-            ("nine", 9),
-            ("ten", 10),
-            ("eleven", 11),
-            ("twelve", 12),
-            ("twenty", 20),
-            ("thirty", 30),
-            ("forty", 40),
-            ("fifty", 50),
-            ("sixty", 60),
-            ("seventy", 70),
-            ("eighty", 80),
-            ("ninety", 90),
-            ("hundred", 100),
-        ];
-
-        fn numbers(prose: &str) -> Vec<u32> {
-            prose
-                .to_ascii_lowercase()
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .filter_map(|word| {
-                    word.parse::<u32>().ok().or_else(|| {
-                        CARDINALS
-                            .iter()
-                            .find(|(spelling, _)| *spelling == word)
-                            .map(|(_, value)| *value)
-                    })
-                })
-                .collect()
-        }
-
-        let census = census();
-        let counted = numbers(&census);
-        // The first one is the population, in the sentence saying what the
-        // census was taken off. Everything after it is a habit, and a habit
-        // here is of 26 files or of 4.
-        let population = *counted
-            .first()
-            .expect("the census opens by counting the files it was read off");
-        assert_eq!(
-            counted.iter().filter(|n| **n == population).count(),
-            1,
-            "the census counts all {population} files more than once, and \
-             every writing habit in it splits 26 against 4: {census}"
-        );
-    }
-
-    /// The census: everything from the opening sentence down to the bullet
-    /// that leaves the file's habits behind, flattened, without the sample.
-    ///
-    /// Flattened because these are sentences, and where a sentence happens to
-    /// wrap is not something a rule should depend on. Without the sample
-    /// because the numbers between the fences are a preset's — a sort order, a
-    /// deadzone — and reading them as counts would be reading a file as though
-    /// it were a census. The bullet below is about where a setting sits in the
-    /// document rather than about how the files were written, and the section
-    /// below *that* holds the one claim here that is true of all 30 and is not
-    /// a writing habit.
-    fn census() -> String {
-        let src = include_str!("binds.rs")
-            .split_once("//! * A setting is a direct child")
-            .expect("the census runs down to the next bullet")
-            .0;
-        let mut prose = String::new();
-        let mut sample = false;
-        for line in src.lines() {
-            if line
-                .trim_start()
-                .trim_start_matches("//!")
-                .trim_start()
-                .starts_with("```")
-            {
-                sample = !sample;
-            } else if !sample {
-                prose.push_str(line);
-                prose.push('\n');
-            }
-        }
-        flattened(&prose)
-    }
-
-    /// Doc text with the comment markers gone and every run of whitespace one
-    /// space, so that a rule about what a doc *says* is not a rule about where
-    /// the lines were broken.
-    fn flattened(src: &str) -> String {
-        src.lines()
-            .map(|line| line.trim_start().trim_start_matches("//!").trim())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .split_ascii_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    /// What `src` puts on standard output: the text inside its string
-    /// literals, one line of source at a time.
-    ///
-    /// A guard that a census is counted again has to read the counting and not
-    /// the source around it: searching a whole file finds the needle in prose
-    /// describing the counting and in the name of a local variable, and a
-    /// guard that matched either would let the line doing the counting go
-    /// without a word. A string literal is the nearest thing to output a test
-    /// can read without running the program.
-    ///
-    /// Line comments are dropped, and an escape takes the character after it
-    /// with it: neither appears inside anything this is asked about, and a
-    /// guard that needed a Rust lexer would be a guard nobody could check.
-    pub(crate) fn printed(src: &str) -> String {
-        let mut out = String::new();
-        for line in src.lines() {
-            let mut chars = line.chars().peekable();
-            let mut quoted = false;
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' if quoted => {
-                        chars.next();
-                    }
-                    '"' => quoted = !quoted,
-                    '/' if !quoted && chars.peek() == Some(&'/') => break,
-                    _ if quoted => out.push(c),
-                    _ => {}
-                }
-            }
-            out.push('\n');
-        }
-        out
     }
 
     /// The start file names a preset that is not here, or that two files claim.

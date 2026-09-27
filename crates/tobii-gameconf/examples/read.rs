@@ -11,12 +11,16 @@
 //! reads every `.binds` document in a directory on its own, which is what the
 //! presets a game *ships* look like — there is no active one among them. It
 //! also counts the writing habits `tobii_gameconf::binds` states a census of:
-//! byte-order marks, bare line feeds, the spacing of the declaration and the
-//! lines indented with spaces where the rest of the file uses tabs. `attrs`
-//! counts what `tobii_gameconf::attrs` states about the file it was read off:
-//! its size and how many `<Attr>` elements are in it. Those censuses are
-//! measurements of somebody's install, and a measurement that cannot be taken
-//! again is a number nobody can check.
+//! byte-order marks, bare line feeds, the spacing of the declaration, and the
+//! lines indented with spaces where the rest of the file uses tabs, down to
+//! how wide those indents are. `attrs` counts what `tobii_gameconf::attrs`
+//! states about the file it was read off: its size and how many `<Attr>`
+//! elements are in it.
+//!
+//! Those censuses are measurements of one maintainer's install. Nothing in CI
+//! has the files, so nothing in CI can show the numbers are still true — which
+//! is the whole reason this counting is here rather than in a test. Point it
+//! at the files and read the numbers back.
 //!
 //! Nothing here writes, and nothing here knows a game: every path and every
 //! setting name comes off the command line.
@@ -152,13 +156,20 @@ fn presets(dir: &Path, setting: &str) {
         if bare > 0 {
             mixed += 1;
         }
-        // Lines indented with spaces in a file that is otherwise tabs. Counted
-        // per line rather than per file, because what the census states is
-        // both: which files have the habit, and how far it goes in them.
-        let spaces = bytes
+        // Lines indented with spaces in a file that is otherwise tabs, and how
+        // wide those indents are. Counted per line rather than per file
+        // because the census states both: which files have the habit and how
+        // far it goes in them. The widths are here because the census states a
+        // number of spaces too, and a counter that took any line starting with
+        // one would leave that number uncounted.
+        let mut widths: Vec<usize> = bytes
             .split(|b| *b == b'\n')
-            .filter(|line| line.first() == Some(&b' '))
-            .count();
+            .map(|line| line.iter().take_while(|b| **b == b' ').count())
+            .filter(|width| *width > 0)
+            .collect();
+        let spaces = widths.len();
+        widths.sort_unstable();
+        widths.dedup();
         if spaces > 0 {
             space_indented += 1;
         }
@@ -178,7 +189,7 @@ fn presets(dir: &Path, setting: &str) {
             println!("  {bare} bare line feeds");
         }
         if spaces > 0 {
-            println!("  {spaces} lines indented with spaces");
+            println!("  {spaces} lines indented with spaces, {widths:?} spaces wide");
         }
     }
     println!("{seen} preset documents");
