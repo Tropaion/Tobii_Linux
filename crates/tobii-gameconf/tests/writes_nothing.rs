@@ -21,27 +21,45 @@
 //! stops it reaching further, and lets it reach less. `lib.rs`'s
 //! `the_behavioural_test_calls_every_public_function` is what checks it.
 //!
+//! # Running the code is not the same as reaching it
+//!
+//! A snapshot that comes back identical says nothing about a branch that
+//! never ran. `binds::read` answers at its first lookup for a directory with
+//! no `StartPreset` file in it, and a fixture made only of those would leave
+//! most of the function — and any write planted in it — untouched while every
+//! path in the tree stayed byte-identical.
+//!
+//! So the fixture holds one directory per shape the reader distinguishes, and
+//! [`Seen`] counts the cases each entry point answered with: the three
+//! `Source` cases, the three `Lookup` cases, and the three `binds::Found`
+//! cases one level down. A run where any of the nine went unreached fails
+//! here rather than passing on a tree that was never really read.
+//!
 //! # What it does not cover
 //!
-//! Three things, said plainly because the point of this file is to be the
-//! thing that does not promise more than it delivers.
+//! Said plainly, because the point of this file is to be the thing that does
+//! not promise more than it delivers.
 //!
-//! * **Paths the fixture does not contain.** The tree below is the shapes
-//!   this crate's readers are known to meet. A write to somewhere else
-//!   entirely — a log file in `$HOME`, a path built from an environment
-//!   variable — is outside the snapshot and invisible here. The name scan is
-//!   what looks for that, and it looks by spelling.
+//! * **Paths outside the scratch directory.** The fixture is a directory
+//!   inside a scratch directory of its own, and it is the scratch directory
+//!   that is snapshotted — so a write beside the fixture, or to its parent,
+//!   or to a sibling built with `with_extension`, shows up as something that
+//!   appeared. The working directory is checked too, by name only and one
+//!   level deep. Anywhere else — `$HOME`, `target/`, a path built from an
+//!   environment variable, `/tmp` at large — is invisible here. The name scan
+//!   is what looks for that, and it looks by spelling.
 //! * **Code that runs before this test does.** A `build.rs` has already run
 //!   by the time a test binary starts, so nothing here can see what it did.
-//!   That one is the name scan's, which walks every file cargo compiles,
-//!   `build.rs` included, and fails if one ships unscanned.
+//!   The name scan does not scan one either: it walks every directory cargo
+//!   compiles from, and a `build.rs` is on neither of its lists, so the build
+//!   fails until somebody decides what to do about it.
 //! * **A write and a restore inside one call.** Length, modification time to
 //!   the nanosecond and a hash of the bytes are what is compared; a write
 //!   that put every one of them back would pass. Nothing in reach of this
 //!   crate does that by accident, and a crate that did it on purpose is not
 //!   what either check here is for.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -145,12 +163,64 @@ fn snapshot(root: &Path) -> BTreeMap<String, Entry> {
     found
 }
 
+/// The names directly inside a directory, for a place this test only ever
+/// asks whether something appeared in.
+fn names_in(dir: &Path) -> BTreeSet<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A scratch directory of this process's own, removed when this value is
+/// dropped.
+///
+/// The fixture goes in a directory *inside* this one, so that a write that
+/// lands beside the fixture rather than in it — `root.with_extension(…)`,
+/// `root.parent()` — is inside the snapshot instead of outside it.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // The fixture seals a directory against this process on purpose, and
+        // a sealed directory cannot be removed while it is sealed.
+        unseal(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Give this process back the right to enter every directory under `path`.
+fn unseal(path: &Path) {
+    let Ok(meta) = path.symlink_metadata() else {
+        return;
+    };
+    if !meta.file_type().is_dir() {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        unseal(&entry.path());
+    }
+}
+
 /// A directory of this process's own, named so that two of them cannot
 /// collide even when the suite runs its tests at once.
 ///
 /// No `$HOME` and no fixed path: CI runs this as root, and this crate's whole
 /// subject is other people's files.
-fn scratch(what: &str) -> PathBuf {
+fn scratch(what: &str) -> Scratch {
     let path = std::env::temp_dir().join(format!(
         "tobii-gameconf-writes-nothing-{}-{}-{what}",
         std::process::id(),
@@ -160,7 +230,7 @@ fn scratch(what: &str) -> PathBuf {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&path).expect("a scratch directory");
-    path
+    Scratch(path)
 }
 
 /// One Elite-style preset document, written the way the real files are: a
@@ -177,6 +247,33 @@ fn preset(name: &str, setting_value: &str) -> Vec<u8> {
     )
     .into_bytes()
 }
+
+/// Every directory [`binds::read`] is run over, one per branch it can take.
+///
+/// They cannot share a directory. A directory where two files claim the name
+/// the start file names answers `Rejected` for that name and never reaches
+/// the branch that reads a preset; a directory whose start file cannot be
+/// read answers before it looks at a preset at all. One shape each is the
+/// only arrangement in which every branch runs.
+///
+/// The last four are not preset directories: a directory sealed against this
+/// process, a directory named like an attributes file, an attributes file
+/// where a directory was expected, and a path that is not there.
+const DIRECTORIES: [&str; 13] = [
+    "presets",
+    "read-presets",
+    "broken-presets",
+    "unwritten-presets",
+    "nameless-presets",
+    "unnamed-preset-presets",
+    "two-start-presets",
+    "unreadable-start-presets",
+    "other-case-presets",
+    "sealed-presets",
+    "directory.xml",
+    "attributes.xml",
+    "never-written",
+];
 
 /// The tree every entry point below is run over.
 ///
@@ -196,7 +293,8 @@ fn fixture(root: &Path) {
         path
     };
 
-    // A preset directory a game has written and this crate can read whole.
+    // A preset directory where two files claim the name the start file names,
+    // which is the one thing this reader will not pick between.
     let presets = dir(root.join("presets"));
     write(
         presets.join("StartPreset.4.start"),
@@ -209,6 +307,16 @@ fn fixture(root: &Path) {
     // A directory whose name ends `.binds`, which is not a preset however
     // much it reads like one.
     dir(presets.join("Trap.binds"));
+
+    // The ordinary directory: a start file naming one preset, and one file
+    // that calls itself that. This is the only shape that reaches the branch
+    // where a preset is actually read, which is the branch the whole crate
+    // exists for.
+    let read = dir(root.join("read-presets"));
+    write(read.join("StartPreset.4.start"), b"\xef\xbb\xbfOnly\r\n");
+    write(read.join("StartPreset.start"), b"Only\n");
+    write(read.join("Only.binds"), &preset("Only", "1"));
+    write(read.join("Spare.binds"), &preset("Spare", "0"));
 
     // A preset directory holding a document the scanner refuses, so that
     // `binds::read` takes its rejection path over a real directory.
@@ -229,6 +337,38 @@ fn fixture(root: &Path) {
     let nameless = dir(root.join("nameless-presets"));
     write(nameless.join("StartPreset.start"), b"  \n\t\n");
     write(nameless.join("Custom.binds"), &preset("Custom", "1"));
+
+    // A document that parses and calls itself nothing. It may be the preset
+    // in use, so the directory is refused rather than read around it.
+    let unnamed = dir(root.join("unnamed-preset-presets"));
+    write(unnamed.join("StartPreset.start"), b"Custom\n");
+    write(unnamed.join("Custom.binds"), &preset("Custom", "1"));
+    write(
+        unnamed.join("Anonymous.binds"),
+        b"<Root MajorVersion=\"1\" MinorVersion=\"8\"/>",
+    );
+
+    // Two start files at one schema, which is no ordering at all: `.04.` is
+    // the same number as `.4.`.
+    let two_starts = dir(root.join("two-start-presets"));
+    write(two_starts.join("StartPreset.4.start"), b"Custom\n");
+    write(two_starts.join("StartPreset.04.start"), b"Custom\n");
+    write(two_starts.join("Custom.binds"), &preset("Custom", "1"));
+
+    // A start file that is listed and cannot be read, which is not a game
+    // that never wrote one.
+    let unreadable_start = dir(root.join("unreadable-start-presets"));
+    dir(unreadable_start.join("StartPreset.start"));
+    write(
+        unreadable_start.join("Custom.binds"),
+        &preset("Custom", "1"),
+    );
+
+    // A preset spelled the way the start file spells it but for its case,
+    // which is neither a match nor an absence.
+    let other_case = dir(root.join("other-case-presets"));
+    write(other_case.join("StartPreset.start"), b"Custom\n");
+    write(other_case.join("Custom.binds"), &preset("CUSTOM", "1"));
 
     // A flat attribute list, and the documents an attribute reader refuses.
     write(
@@ -269,6 +409,11 @@ fn fixture(root: &Path) {
 
 /// Which cases an entry point answered with, so that a run that quietly
 /// stopped exercising something fails instead of passing.
+///
+/// Three levels, because a count that stopped at the outermost one is
+/// satisfied by a reader that got as far as opening a directory: `Source`
+/// says whether the directory was read at all, `Found` says what became of
+/// each preset the start file named, and `Lookup` says what one document held.
 #[derive(Default)]
 struct Seen {
     unwritten: usize,
@@ -277,6 +422,9 @@ struct Seen {
     absent: usize,
     text: usize,
     refused: usize,
+    missing_preset: usize,
+    unusable_preset: usize,
+    read_preset: usize,
 }
 
 impl Seen {
@@ -285,6 +433,14 @@ impl Seen {
             Source::Unwritten(_) => self.unwritten += 1,
             Source::Rejected(_) => self.rejected += 1,
             Source::Read(_) => self.read += 1,
+        }
+    }
+
+    fn found(&mut self, found: &binds::Found) {
+        match found {
+            binds::Found::Absent(_) => self.missing_preset += 1,
+            binds::Found::Rejected(_) => self.unusable_preset += 1,
+            binds::Found::Read { .. } => self.read_preset += 1,
         }
     }
 
@@ -302,23 +458,14 @@ impl Seen {
 fn run_everything(root: &Path) -> Seen {
     let mut seen = Seen::default();
 
-    // The directory readers, over every directory in the tree and over one
-    // that is not there at all.
-    for dir in [
-        "presets",
-        "broken-presets",
-        "unwritten-presets",
-        "nameless-presets",
-        "sealed-presets",
-        "directory.xml",
-        "attributes.xml",
-        "never-written",
-    ] {
+    // The directory reader, over every shape it distinguishes.
+    for dir in DIRECTORIES {
         for setting in ["HeadlookMode", "NotASetting"] {
             let found = binds::read(&root.join(dir), setting);
             seen.source(&found);
             if let Source::Read(bindings) = &found {
                 for active in &bindings.presets {
+                    seen.found(&active.found);
                     if let binds::Found::Read { preset, .. } = &active.found {
                         seen.lookup(&preset.name);
                         seen.lookup(&preset.setting);
@@ -371,12 +518,19 @@ fn run_everything(root: &Path) -> Seen {
 
 #[test]
 fn every_entry_point_leaves_the_tree_byte_identical() {
-    let root = scratch("tree");
+    let scratch = scratch("tree");
+    // Inside the scratch directory rather than being it, so that a write
+    // aimed beside the fixture lands inside what is snapshotted.
+    let root = scratch.path().join("tree");
+    std::fs::create_dir_all(&root).expect("the fixture root");
     fixture(&root);
 
-    let before = snapshot(&root);
+    let cwd = std::env::current_dir().expect("a working directory");
+    let before = snapshot(scratch.path());
+    let names_beside_before = names_in(&cwd);
     let seen = run_everything(&root);
-    let after = snapshot(&root);
+    let after = snapshot(scratch.path());
+    let names_beside_after = names_in(&cwd);
 
     // A snapshot that matched because nothing ran would be the same shape of
     // hole as every one found in the name scan: a check reading less than it
@@ -385,6 +539,11 @@ fn every_entry_point_leaves_the_tree_byte_identical() {
         seen.unwritten > 0 && seen.rejected > 0 && seen.read > 0,
         "the readers did not reach all three answers, so this tree did not \
          exercise what it is here to exercise"
+    );
+    assert!(
+        seen.missing_preset > 0 && seen.unusable_preset > 0 && seen.read_preset > 0,
+        "the preset lookup did not reach all three answers, so the branch that \
+         reads a preset — the one this crate exists for — never ran"
     );
     assert!(
         seen.absent > 0 && seen.text > 0 && seen.refused > 0,
@@ -402,19 +561,16 @@ fn every_entry_point_leaves_the_tree_byte_identical() {
                 .filter(|path| !before.contains_key(*path))
                 .map(|path| format!("{path}: appeared")),
         )
+        .chain(
+            names_beside_after
+                .difference(&names_beside_before)
+                .map(|name| format!("{name}: appeared in {}", cwd.display())),
+        )
         .collect();
-
-    // Unsealed before the assertion, so that a failure can still be cleaned
-    // up and a passing run leaves nothing behind either way.
-    let _ = std::fs::set_permissions(
-        root.join("sealed-presets"),
-        std::fs::Permissions::from_mode(0o700),
-    );
-    let _ = std::fs::remove_dir_all(&root);
 
     assert!(
         changed.is_empty(),
-        "this crate read a tree and the tree changed: {}",
+        "this crate read a tree and something changed: {}",
         changed.join("; ")
     );
 }
