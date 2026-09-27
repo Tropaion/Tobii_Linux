@@ -19,15 +19,17 @@
 //! </Root>
 //! ```
 //!
-//! * The document element is `Root` and carries `PresetName`. All 30 indent
-//!   with tabs, shown above with spaces only because a doc comment may not
-//!   hold one. 26 begin with a UTF-8 byte-order mark and end every line with
-//!   CRLF; the other 4 — `AdvancedPS3Controller`, `Empty`, `PS3Controller`
-//!   and `PS3ControllerYaw` — have no mark, are mixed rather than CRLF
-//!   throughout (96, 108, 103 and 103 bare line feeds among their carriage
-//!   returns), and write their declaration as `encoding="UTF-8" ?>` where the
-//!   26 write `encoding="utf-8"?>`. The same four files carry all three
-//!   habits, so this is one split in the set and not three.
+//! * The document element is `Root` and carries `PresetName`. Indentation is
+//!   tabs, shown above with spaces only because a doc comment may not hold
+//!   one — tabs throughout in 26 of the files, and in the other 4 with two
+//!   lines apiece, both of them inside `<ChargeECM>`, indented with four
+//!   spaces instead. Those same 26 begin with a UTF-8 byte-order mark and end
+//!   every line with CRLF; the other 4 — `AdvancedPS3Controller`, `Empty`,
+//!   `PS3Controller` and `PS3ControllerYaw` — have no mark, are mixed rather
+//!   than CRLF throughout (96, 108, 103 and 103 bare line feeds among their
+//!   carriage returns), and write their declaration as `encoding="UTF-8" ?>`
+//!   where the 26 write `encoding="utf-8"?>`. The same four files carry all
+//!   four habits, so this is one split in the set and not four.
 //! * A setting is a direct child with a `Value` attribute. Bindings are direct
 //!   children too, but they hold their own children instead — and those nest
 //!   names like `Deadzone` and `Binding` that repeat dozens of times per file,
@@ -140,6 +142,10 @@ pub fn parse(doc: &[u8], setting: &str) -> Preset {
         // afford to do. It also costs [`read`] the fact it needs most: a name
         // it can compare against the active one, to say whether this file is
         // the preset in use or a stranger in the directory.
+        //
+        // [`crate::attrs::parse`] answers a wrong document element the same
+        // way: what was decoded off it is reported, and the refusal reaches
+        // only the question the document cannot answer.
         return Preset {
             name: document.root.attribute("PresetName"),
             version: version(&document.root),
@@ -207,6 +213,18 @@ fn version(root: &xml::Element) -> Lookup {
 /// not something this project has been able to observe. Reporting every
 /// distinct name it holds is the honest shape — when they are all the same
 /// preset, which is the ordinary case, the report has one row.
+///
+/// Distinct means exactly distinct. Two lines spelled the same are one name;
+/// two that differ only in case are two, and are matched against the presets
+/// separately. This is the rule [`crate::attrs`] states for the other format
+/// and for the same reason: whether the game's own reader is case-sensitive is
+/// not something this project has measured, and the confident answers are both
+/// guesses about that — one of them collapsing two rows a user can see in
+/// their own file into one, the other reporting a preset as missing when a
+/// file here very nearly names it. So neither is given: the names are carried
+/// through as the file spells them, and [`read`] says what it found for each.
+/// The one place this module *is* case-insensitive is [`start_schema`], which
+/// is a question about a name on a disk rather than about a file's contents.
 pub fn start(text: &[u8]) -> Result<Vec<String>, String> {
     let text = text.strip_prefix(b"\xef\xbb\xbf").unwrap_or(text);
     let text = std::str::from_utf8(text)
@@ -226,7 +244,7 @@ pub fn start(text: &[u8]) -> Result<Vec<String>, String> {
                  as a preset name: {name:?}"
             ));
         }
-        if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+        if !out.iter().any(|n| n == name) {
             out.push(name.to_string());
         }
     }
@@ -245,22 +263,35 @@ pub fn start(text: &[u8]) -> Result<Vec<String>, String> {
 /// Compared ASCII-case-insensitively: this file is written by a Windows
 /// program, under a prefix whose filesystem may or may not be case-sensitive,
 /// and a reader that missed it because of a capital letter would report a
-/// configured game as unconfigured.
-fn start_schema(file_name: &str) -> Option<Option<u32>> {
-    let rest = strip_prefix_ignore_ascii_case(file_name, "StartPreset")?;
-    let rest = strip_suffix_ignore_ascii_case(rest, ".start")?;
+/// configured game as unconfigured. That is an argument about names on a
+/// disk, and it is why it does not carry over to the contents of the files —
+/// see [`start`].
+///
+/// A name, not a string: the bytes the host holds are what a filesystem
+/// actually stores, and every part of this spelling is ASCII.
+fn start_schema(file_name: &[u8]) -> Option<Option<u32>> {
+    let rest = strip_prefix_ignore_ascii_case(file_name, b"StartPreset")?;
+    let rest = strip_suffix_ignore_ascii_case(rest, b".start")?;
     if rest.is_empty() {
         return Some(None);
     }
-    rest.strip_prefix('.')?.parse::<u32>().ok().map(Some)
+    let (dot, digits) = rest.split_first()?;
+    if *dot != b'.' {
+        return None;
+    }
+    std::str::from_utf8(digits)
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .map(Some)
 }
 
-fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     let (head, rest) = s.split_at_checked(prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
-fn strip_suffix_ignore_ascii_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+fn strip_suffix_ignore_ascii_case<'a>(s: &'a [u8], suffix: &[u8]) -> Option<&'a [u8]> {
     let (rest, tail) = s.split_at_checked(s.len().checked_sub(suffix.len())?)?;
     tail.eq_ignore_ascii_case(suffix).then_some(rest)
 }
@@ -312,17 +343,29 @@ pub struct Bindings {
 /// what the files say.
 ///
 /// Every `.binds` file in the directory is opened, because a preset is matched
-/// by the `PresetName` inside it. That makes one file whose name cannot be read
-/// a refusal for the whole directory: such a file may be the one that calls
-/// itself the active preset, or a second file that also does, and reporting a
-/// value from the readable one would be reporting a preset this reader cannot
-/// show is the one in use. The refusal names the file.
+/// by the `PresetName` inside it rather than by what the file is called. That
+/// makes one unreadable file a refusal for the whole directory: it may be the
+/// one that calls itself the active preset, or a second file that also does,
+/// and reporting a value from its neighbour would be reporting a preset this
+/// reader cannot show is the one in use. The refusal names the file.
 ///
-/// A file whose name *can* be read is placed, whatever else is wrong with it.
+/// A file name is never decoded, so a name that is not UTF-8 is not a file
+/// this reader skips. These directories sit under a Proton prefix and are
+/// written by a Windows program, and a byte sequence the host cannot read as
+/// text is a name the host will still hand over intact — while `.binds` and
+/// `StartPreset` are ASCII, so recognising either takes no decoding at all.
+/// Skipping such a file would be silence about the one document that may hold
+/// the active preset; the name is only ever compared and printed.
+///
 /// A document that parses and is not a preset still says what it calls itself,
 /// and that is enough to tell whether it is the one in use — so it is reported
 /// where it belongs, with the refusal on the setting it could not answer,
 /// rather than taking the directory down with it.
+///
+/// A preset is matched to the name in the start file exactly, case included,
+/// and a spelling that differs only in case is neither a match nor an absence.
+/// See [`start`] for why: the case-insensitivity elsewhere in this module is
+/// an argument about file *names*, and this is a question about contents.
 pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -352,12 +395,16 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
     let mut starts: Vec<(Option<u32>, PathBuf)> = Vec::new();
     let mut presets: Vec<PathBuf> = Vec::new();
     for path in files {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        // Bytes, not text: see the function docs. The two things asked of a
+        // name here are ASCII, and a name that is not UTF-8 is a name this
+        // reader can still answer them about.
+        let Some(name) = path.file_name() else {
             continue;
         };
+        let name = name.as_encoded_bytes();
         if let Some(schema) = start_schema(name) {
             starts.push((schema, path));
-        } else if strip_suffix_ignore_ascii_case(name, ".binds").is_some() && path.is_file() {
+        } else if strip_suffix_ignore_ascii_case(name, b".binds").is_some() && path.is_file() {
             presets.push(path);
         }
     }
@@ -408,20 +455,38 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
         .map(|name| {
             let matches: Vec<&(PathBuf, Preset)> = read_presets
                 .iter()
-                .filter(
-                    |(_, p)| matches!(&p.name, Lookup::Text(n) if n.eq_ignore_ascii_case(&name)),
-                )
+                .filter(|(_, p)| matches!(&p.name, Lookup::Text(n) if *n == name))
                 .collect();
-            let found = match matches.as_slice() {
-                [] => Found::Unmatched(format!(
+            // Near misses, kept separately rather than folded in: whether the
+            // game reads them as this preset is the thing nobody here has
+            // measured, and silence about them would be a confident negative
+            // about a directory that plainly holds something very like it.
+            let other_case: Vec<&str> = read_presets
+                .iter()
+                .filter_map(|(_, p)| match &p.name {
+                    Lookup::Text(n) if *n != name && n.eq_ignore_ascii_case(&name) => {
+                        Some(n.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let found = match (matches.as_slice(), other_case.as_slice()) {
+                ([], []) => Found::Unmatched(format!(
                     "no preset in {} calls itself {name}",
                     dir.display()
                 )),
-                [(file, preset)] => Found::Read {
+                ([], spellings) => Found::Unmatched(format!(
+                    "no preset in {} calls itself {name}, only {} — and whether \
+                     the game reads that as the same preset is not something \
+                     this project has measured",
+                    dir.display(),
+                    spellings.join(" and ")
+                )),
+                ([(file, preset)], _) => Found::Read {
                     file: file.clone(),
                     preset: preset.clone(),
                 },
-                many => Found::Unmatched(format!(
+                (many, _) => Found::Unmatched(format!(
                     "{} presets in {} call themselves {name}, and this reader \
                      cannot tell which the game loads",
                     many.len(),
@@ -577,18 +642,21 @@ mod tests {
 
     #[test]
     fn start_files_are_recognised_by_name_and_schema() {
-        assert_eq!(start_schema("StartPreset.start"), Some(None));
-        assert_eq!(start_schema("StartPreset.4.start"), Some(Some(4)));
-        assert_eq!(start_schema("startpreset.4.START"), Some(Some(4)));
+        assert_eq!(start_schema(b"StartPreset.start"), Some(None));
+        assert_eq!(start_schema(b"StartPreset.4.start"), Some(Some(4)));
+        assert_eq!(start_schema(b"startpreset.4.START"), Some(Some(4)));
         for no in [
-            "StartPreset",
-            "StartPreset.4",
-            "Custom.4.0.binds",
-            "StartPreset.x.start",
-            "NotStartPreset.start",
-            "Start.start",
+            &b"StartPreset"[..],
+            b"StartPreset.4",
+            b"Custom.4.0.binds",
+            b"StartPreset.x.start",
+            b"NotStartPreset.start",
+            b"Start.start",
+            // A name the host holds and no decoder can read as text. It is
+            // not a start file, and answering that takes no decoding.
+            b"StartPreset.\xff.start",
         ] {
-            assert_eq!(start_schema(no), None, "{no}");
+            assert_eq!(start_schema(no), None, "{}", String::from_utf8_lossy(no));
         }
     }
 
@@ -683,6 +751,70 @@ mod tests {
         assert_eq!(file, &dir.join("whatever.binds"));
     }
 
+    /// A name the host will hand over and no decoder can read as text.
+    ///
+    /// These directories sit under a Proton prefix, written by a Windows
+    /// program, so this is not an exotic shape — and the answer that used to
+    /// come back was the worst one available: the file was skipped without a
+    /// word, and the directory reported that nothing in it calls itself the
+    /// active preset. That sentence is a confident negative about a directory
+    /// that plainly holds the preset, which is the one thing this crate is
+    /// built not to say.
+    #[cfg(unix)]
+    #[test]
+    fn a_preset_whose_file_name_is_not_text_is_still_read() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = dir_with("undecodable", &[("StartPreset.4.start", b"Custom\r\n")]);
+        let name = dir.join(OsStr::from_bytes(b"Cust\xffom.binds"));
+        std::fs::write(&name, preset_file("Custom", "")).expect("fixture");
+        let Source::Read(b) = read(&dir, "HeadlookMode") else {
+            panic!("a name this reader cannot decode is not a preset it cannot place");
+        };
+        let Found::Read { file, preset } = &b.presets[0].found else {
+            panic!("should have matched: {:?}", b.presets[0]);
+        };
+        assert_eq!(file, &name);
+        assert_eq!(
+            preset.setting,
+            Lookup::Text("Bindings_HeadlookModeAccumulate".into())
+        );
+    }
+
+    /// The case rule, at the directory level: whether the game reads `custom`
+    /// as `Custom` is unmeasured, so neither confident answer is available.
+    ///
+    /// Not the value — that would be this reader deciding a question it has
+    /// never looked at — and not "no preset here calls itself that", which is
+    /// a flat negative about a directory holding a file that very nearly does.
+    /// So the near miss is named, and the user is sent to look.
+    #[test]
+    fn a_preset_name_in_another_case_is_neither_a_match_nor_an_absence() {
+        let dir = dir_with(
+            "case",
+            &[
+                ("StartPreset.4.start", b"Custom\r\n"),
+                ("custom.binds", &preset_file("custom", "")),
+            ],
+        );
+        let Source::Read(b) = read(&dir, "HeadlookMode") else {
+            panic!("should have read it");
+        };
+        match &b.presets[0].found {
+            Found::Unmatched(why) => assert!(why.contains("only custom"), "{why}"),
+            other => panic!("should have refused to choose: {other:?}"),
+        }
+        // And the start file itself: two spellings are two names, each asked
+        // after on its own, because collapsing them would be the same guess
+        // made one step earlier.
+        assert_eq!(
+            start(b"Custom\r\ncustom\r\nCustom\r\n").expect("reads"),
+            ["Custom", "custom"],
+            "the same spelling twice is one name; two spellings are two"
+        );
+    }
+
     /// Two start files is what an upgraded game leaves behind. The higher
     /// schema is taken, and the other is *named* rather than silently dropped
     /// — see [`Bindings::superseded`].
@@ -730,6 +862,72 @@ mod tests {
             Source::Rejected(why) => assert!(why.contains("Broken.binds"), "{why}"),
             other => panic!("a preset that cannot be read is not nothing: {other:?}"),
         }
+    }
+
+    /// Every habit in the census is one the example counts again.
+    ///
+    /// The census is a measurement of one install, and nothing in CI has those
+    /// files: what can be held here is not the numbers but the thing that lets
+    /// somebody check them. A habit written down with no counter behind it is
+    /// a sentence nobody can take again — which is how an indentation habit
+    /// came to be stated of all 30 files when four of them break it — so each
+    /// entry below is the seam: what the census calls the habit, and the line
+    /// the example prints its count on.
+    ///
+    /// It also holds the shape the four files give the set. Every habit in
+    /// this census splits 26 against 4, so a habit claimed of all 30 is either
+    /// one nobody looked at on those four or one that does not belong in the
+    /// list; the setting in the section below is claimed of all 30 and is not
+    /// a writing habit, which is why the check is of the census and not of the
+    /// module.
+    #[test]
+    fn every_habit_in_the_census_is_counted_by_the_example() {
+        const HABITS: [(&str, &str); 4] = [
+            ("byte-order mark", "with a byte-order mark"),
+            ("bare line feeds", "bare line feeds"),
+            ("encoding=\"UTF-8\" ?>", "writing a space before"),
+            ("indented with four spaces", "indented with spaces"),
+        ];
+        // Flattened first: these are sentences, and where a sentence happens
+        // to wrap is not something a rule should depend on.
+        let census = flattened(
+            include_str!("binds.rs")
+                .split_once("//! * A setting is a direct child")
+                .expect("the census runs down to the next bullet")
+                .0,
+        );
+        let example = include_str!("../examples/read.rs");
+        for (stated, counted) in HABITS {
+            assert!(
+                census.contains(stated),
+                "the census does not state `{stated}`, which the example counts"
+            );
+            assert!(
+                example.contains(counted),
+                "the census states `{stated}` and the example prints no \
+                 `{counted}`: a number nobody can take again"
+            );
+        }
+        for all in ["all 30", "All 30"] {
+            assert!(
+                !census.contains(all),
+                "the census claims `{all}` of a writing habit, and every habit \
+                 in it splits 26 against 4"
+            );
+        }
+    }
+
+    /// Doc text with the comment markers gone and every run of whitespace one
+    /// space, so that a rule about what a doc *says* is not a rule about where
+    /// the lines were broken.
+    fn flattened(src: &str) -> String {
+        src.lines()
+            .map(|line| line.trim_start().trim_start_matches("//!").trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The start file names a preset that is not here, or that two files claim.
