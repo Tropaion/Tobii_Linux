@@ -590,16 +590,22 @@ impl GamesRow {
         // like the button above it.
         let setup_game = crate::widget::button("Set up a game…");
         setup_game.set_tooltip_text(Some(GAME_SETUP_TOOLTIP));
-        setup_game.connect_clicked(|b| {
-            // Nothing captured: the window and the application are both found
-            // from the button at click time, the way `lib.rs`'s help button
-            // does it, so this handler cannot be half of a cycle.
-            if let Some(w) = b.root().and_downcast::<gtk::Window>() {
-                if let Some(app) = w.application() {
-                    crate::game_setup::open(&app, &w);
+        {
+            // The one thing captured, and it is not a widget: the device
+            // thread's own answer about the joystick, so the window can report
+            // what became of the tick rather than the tick. `Arc<Mutex<_>>`
+            // holds nothing of GTK's, so this handler still cannot be half of
+            // a cycle — the window and the application are both found from the
+            // button at click time, the way `lib.rs`'s help button does it.
+            let joystick = joystick.clone();
+            setup_game.connect_clicked(move |b| {
+                if let Some(w) = b.root().and_downcast::<gtk::Window>() {
+                    if let Some(app) = w.application() {
+                        crate::game_setup::open(&app, &w, joystick.clone());
+                    }
                 }
-            }
-        });
+            });
+        }
 
         let controls = gtk::Box::new(Orientation::Vertical, 8);
         let top = gtk::Box::new(Orientation::Horizontal, 16);
