@@ -2,8 +2,8 @@
 //!
 //! # The format, as the file on this machine has it
 //!
-//! Read off a real `attributes.xml` — 6915 bytes, 226 attributes — rather than
-//! inferred:
+//! Read off a real `attributes.xml` — 6915 bytes, 112 `<Attr>` elements, no
+//! two of them sharing a name — rather than inferred:
 //!
 //! ```text
 //! <Attributes Version="35">
@@ -13,10 +13,17 @@
 //! </Attributes>
 //! ```
 //!
-//! No declaration, no byte-order mark, one space of indentation, every value a
-//! quoted string whatever it holds. `Version` on the document element is `35`
-//! today; it is read and reported, never checked, for the reason the crate
-//! docs give about schema drift.
+//! No declaration, no byte-order mark, one space of indentation, every line
+//! ending CRLF, every value a quoted string whatever it holds. `Version` on
+//! the document element is `35` today; it is read and reported, never checked,
+//! for the reason the crate docs give about schema drift.
+//!
+//! Both counts above are of one file on one machine, and the `attrs` mode of
+//! this crate's `read` example takes them again:
+//!
+//! ```text
+//! cargo run -p tobii-gameconf --example read -- attrs <attributes.xml> HeadtrackingSource
+//! ```
 //!
 //! # What this reader will not tell you
 //!
@@ -52,9 +59,10 @@ pub struct Attributes {
 }
 
 impl Attributes {
-    /// Both answers are the same refusal — for a document that is not one of
-    /// these files at all, which is the only case where one reason is the true
-    /// answer to both questions.
+    /// Both answers are the same refusal — for a document this reader could
+    /// not parse, which is the only case where one reason is the true answer
+    /// to both questions, because nothing in it was decoded to hold an answer
+    /// apart.
     fn rejected(why: &str) -> Self {
         Attributes {
             version: Lookup::Rejected(why.to_string()),
@@ -71,17 +79,31 @@ impl Attributes {
 /// whether the game's own reader is case-sensitive is not something this
 /// project has measured — and both of the confident answers would be a guess
 /// about that. The refusal says which spelling is in the file, which is what a
-/// user needs in order to go and look.
+/// user needs in order to go and look. [`crate::binds`] reads the other format
+/// by the same rule, and [`crate::binds::start`] gives the argument in full,
+/// including why a *file name* is the one thing either module compares
+/// case-insensitively.
 pub fn parse(doc: &[u8], name: &str) -> Attributes {
     let document = match xml::parse(doc) {
         Ok(d) => d,
         Err(why) => return Attributes::rejected(&why),
     };
     if document.root.name != ROOT {
-        return Attributes::rejected(&format!(
-            "a file whose outermost element is <{}> and not <{ROOT}>",
-            document.root.name
-        ));
+        // Not a refusal about XML but about *which* document this is, and it
+        // reaches exactly as far as that: a file that parses and is not one of
+        // these has no attribute list this reader can be asked about, and its
+        // document element is still an element this reader decoded to the last
+        // character. Answering "could not be read" about the number written
+        // plainly on it would be the crate telling a user to go and look at
+        // something it had in fact read. [`crate::binds::parse`] answers a
+        // wrong document element the same way, for the same reason.
+        return Attributes {
+            version: document.root.attribute("Version"),
+            value: Lookup::Rejected(format!(
+                "a file whose outermost element is <{}> and not <{ROOT}>",
+                document.root.name
+            )),
+        };
     }
     Attributes {
         // Two questions of two different parts of the document, so two
@@ -206,12 +228,31 @@ mod tests {
         let a = parse(doc, "A");
         assert_eq!(a.version, Lookup::Text("35".into()));
         assert!(matches!(a.value, Lookup::Rejected(_)), "{a:?}");
-        // A document that is not one of these files at all is the other case,
-        // and there one reason really is the answer to both.
+    }
+
+    /// A document element this reader does not know is a fact about which
+    /// document this is, and the refusal reaches exactly that far.
+    ///
+    /// The file is not one of these, so it has no attribute list to be asked
+    /// about — but `Version` is written on the element this reader just
+    /// decoded, and calling it unreadable would send a user to go and look at
+    /// a number the crate had in fact read. [`crate::binds::parse`] answers a
+    /// wrong document element the same way, and two modules answering one
+    /// question in opposite directions is a crate arguing with itself.
+    #[test]
+    fn a_document_that_is_not_one_of_these_files_still_says_its_version() {
         let a = parse(
             b"<Options Version=\"35\"><Attr name=\"A\" value=\"1\"/></Options>",
             "A",
         );
+        assert_eq!(a.version, Lookup::Text("35".into()));
+        match a.value {
+            Lookup::Rejected(why) => assert!(why.contains("<Options>"), "{why}"),
+            other => panic!("a file that is not one of these has no value to report: {other:?}"),
+        }
+        // The other case is unchanged: nothing was decoded, so there is one
+        // reason and it is the answer to both.
+        let a = parse(b"<Attributes Version=\"35\"><Attr name=\"A\"", "A");
         assert!(matches!(a.version, Lookup::Rejected(_)), "{a:?}");
         assert!(matches!(a.value, Lookup::Rejected(_)), "{a:?}");
     }
@@ -225,6 +266,41 @@ mod tests {
         match parse(doc, "HeadtrackingSource").value {
             Lookup::Rejected(why) => assert!(why.contains("headtrackingsource"), "{why}"),
             other => panic!("should have refused to choose: {other:?}"),
+        }
+    }
+
+    /// Every number the header states about the real file is one the example
+    /// takes again.
+    ///
+    /// The file is somebody's install and nothing in CI has it, so the numbers
+    /// themselves cannot be held here. What can is the property that makes
+    /// them worth writing down at all: a maintainer can point the example at
+    /// the file and read the same two numbers back. A figure with no counter
+    /// behind it is one nobody can check — which is how an element count that
+    /// matched nothing in the file sat under a heading promising it had been
+    /// measured — so the header states a size and a population, and the
+    /// example prints a size and a population.
+    #[test]
+    fn every_number_in_the_header_is_counted_by_the_example() {
+        // Without the code markers: whether a name is quoted in prose is a
+        // typographic choice, and a rule that turned on it would be a rule
+        // about typography.
+        let header = include_str!("attrs.rs")
+            .split_once("//! # What this reader will not tell you")
+            .expect("the header runs down to the next heading")
+            .0
+            .replace('`', "");
+        let example = include_str!("../examples/read.rs");
+        for (stated, counted) in [("bytes", "bytes"), ("<Attr> elements", "<Attr> elements")] {
+            assert!(
+                header.contains(stated),
+                "the header states no `{stated}` for the file it was read off"
+            );
+            assert!(
+                example.contains(counted),
+                "the header states `{stated}` and the example prints no \
+                 `{counted}`: a number nobody can take again"
+            );
         }
     }
 
