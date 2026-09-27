@@ -1498,6 +1498,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-gameconf"
+version = "0.5.0"
+
+[[package]]
 name = "tobii-gtk"
 version = "0.5.0"
 dependencies = [

@@ -1,0 +1,12 @@
+[package]
+name = "tobii-gameconf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reading a game's own configuration files to report what still has to be changed by hand. Never writes."
+
+# Dependency-free on purpose, external and internal both. What is here is two
+# file formats read far enough to answer one question each about one attribute
+# — an XML crate would be this project's first external dependency, bought for
+# that. The crate docs make the argument; the maintainer decides.
+[dependencies]
