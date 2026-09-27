@@ -1048,6 +1048,22 @@ fn read_keys_read_only(prefix: &Path) -> (Vec<(KeyEntry, Reading)>, Option<Strin
     (out, None)
 }
 
+/// What this prefix's wineserver lock says, from the answer to where the lock
+/// file is.
+///
+/// The Err-to-[`crate::wineserver::Lock::Unknown`] step in one place. Three
+/// callers made it — [`settled_keys`], [`run`] and [`gather_status`] — and
+/// they must not disagree about it: `Unknown` is the answer that sends
+/// `settled_keys` to wine and that puts "could not tell" in the report, so a
+/// caller that mapped a failed lookup to `Free` instead would have this
+/// installer act on a registry a live wineserver is still holding changes to.
+fn lock_state(found: &Result<PathBuf, String>) -> crate::wineserver::Lock {
+    match found {
+        Ok(path) => crate::wineserver::probe(path),
+        Err(why) => crate::wineserver::Lock::Unknown(why.clone()),
+    }
+}
+
 /// What [`KEYS`] hold according to the prefix's own files, when those files
 /// settle it well enough to *act* on. `None` means "ask wine".
 ///
@@ -1089,11 +1105,7 @@ fn read_keys_read_only(prefix: &Path) -> (Vec<(KeyEntry, Reading)>, Option<Strin
 /// is not seen. That window exists today with the wine read too — nothing here
 /// holds the prefix — and it is not made worse by asking the lock first.
 fn settled_keys(prefix: &Path) -> Option<Vec<(KeyEntry, Reading)>> {
-    let lock = match crate::wineserver::lock_for(prefix) {
-        Ok(path) => crate::wineserver::probe(&path),
-        Err(why) => crate::wineserver::Lock::Unknown(why),
-    };
-    if lock != crate::wineserver::Lock::Free {
+    if lock_state(&crate::wineserver::lock_for(prefix)) != crate::wineserver::Lock::Free {
         return None;
     }
     let (readings, unreadable) = read_keys_read_only(prefix);
@@ -1531,6 +1543,33 @@ fn replaced(taken: &[Taken]) -> String {
     out
 }
 
+/// Whether [`refuse_unverified_wine_for_steam`] refuses, as a question rather
+/// than as a refusal.
+///
+/// Split out for the reason [`stops_install`] is split out: `status` has to
+/// say what `install` will do with this prefix, and the only way to say it
+/// without keeping a second answer that can drift from the first is to ask the
+/// same function. The report modelled the per-key refusal that way and this
+/// one not at all, so it handed back an install command that stops before it
+/// reads a key — with this refusal's own text pointing the user back at the
+/// report that printed it.
+///
+/// The two exemptions arrive as facts rather than as an `args` slice because
+/// `status` has no `--force` to pass: it is not one of its flags — see
+/// [`SUBS`] — so the report asks with `forced: false` and gets the answer for
+/// the command it is about to print.
+fn steam_wine_refused(
+    source: &PrefixSource,
+    origin: WineOrigin,
+    wine_named: bool,
+    forced: bool,
+) -> bool {
+    matches!(source, PrefixSource::Steam(_))
+        && origin != WineOrigin::Prefix
+        && !wine_named
+        && !forced
+}
+
 /// A `--steam` prefix whose own runner could not be resolved, about to be
 /// written by whatever `wine` is on `$PATH`: refuse, and say what would have
 /// happened.
@@ -1568,10 +1607,12 @@ fn refuse_unverified_wine_for_steam(
     let PrefixSource::Steam(title) = source else {
         return Ok(());
     };
-    if origin == WineOrigin::Prefix
-        || crate::flag_value(args, "--wine").is_some()
-        || args.iter().any(|a| a == "--force")
-    {
+    if !steam_wine_refused(
+        source,
+        origin,
+        crate::flag_value(args, "--wine").is_some(),
+        args.iter().any(|a| a == "--force"),
+    ) {
         return Ok(());
     }
     Err(format!(
@@ -2017,16 +2058,7 @@ fn run(args: &[String]) -> CmdResult {
     }
 
     let lock = crate::wineserver::lock_for(&prefix);
-    match &lock {
-        Ok(path) => eprint!(
-            "{}",
-            crate::wineserver::before_run(&crate::wineserver::probe(path))
-        ),
-        Err(why) => eprint!(
-            "{}",
-            crate::wineserver::before_run(&crate::wineserver::Lock::Unknown(why.clone()))
-        ),
-    }
+    eprint!("{}", crate::wineserver::before_run(&lock_state(&lock)));
     eprintln!(
         "\nrunning the bridge in {} (Ctrl-C to stop)",
         prefix.display()
@@ -2698,6 +2730,21 @@ fn render_status(s: &Status) -> String {
         Some(v) => format!(" --npclient {}", quoted(v)),
         None => String::new(),
     };
+    // The whole-command refusal `install` makes before it reads a key at all,
+    // asked of the function `install` asks — see [`steam_wine_refused`]. The
+    // report used to model [`stops_install`] and stop there, which left it
+    // handing back a bare `install` line for a Proton prefix whose build could
+    // not be read: a command that exits without touching either key, over a
+    // refusal nothing in the report had named.
+    let proton_unknown = steam_wine_refused(&s.source, s.origin, s.wine_given, false);
+    // So every install line this report prints carries the flag that gets it
+    // past that refusal. Spelled `<Proton>` because only the user can fill it
+    // in, in the same words the refusal itself uses.
+    let proton = if proton_unknown {
+        " --wine <Proton>/files/bin/wine"
+    } else {
+        ""
+    };
     if anything_of_ours {
         // The state a bug reporter is actually in, and the report used to
         // answer it with one command: `uninstall`. Somebody whose game gets
@@ -2741,7 +2788,7 @@ fn render_status(s: &Status) -> String {
             "It refuses over them rather than overwrite them — the same rule this\n\
              report classified them by — and spells out the command that clears one,\n\
              if it is stale. Or go ahead anyway with:\n  \
-             tobii bridge install{how}{np} --force\n\
+             tobii bridge install{how}{np}{proton} --force\n\
              which promises nothing about putting back what is there now.\n"
         ));
     } else if s.unreadable.is_some() {
@@ -2753,16 +2800,42 @@ fn render_status(s: &Status) -> String {
             "\nNothing of ours was found in this prefix — though neither key could be\n\
              read, so that is not the same as nothing being in them. To put ours\n\
              there:\n  \
-             tobii bridge install{how}{np}\n\
+             tobii bridge install{how}{np}{proton}\n\
              It reads both keys itself before writing either, and stops if one holds\n\
              something it did not write.\n\
-             To take it out again afterwards, the same line with `uninstall`.\n"
+             To take it out again afterwards:\n  \
+             tobii bridge uninstall{how}\n"
         ));
     } else {
         o.push_str(&format!(
             "\nNothing of ours is in this prefix. To put it there:\n  \
-             tobii bridge install{how}{np}\n\
-             To take it out again afterwards, the same line with `uninstall`.\n"
+             tobii bridge install{how}{np}{proton}\n\
+             To take it out again afterwards:\n  \
+             tobii bridge uninstall{how}\n"
+        ));
+    }
+    // What `<Proton>` is, said once, under whichever of the three branches
+    // above printed an install line. Not under the fourth: that one hands back
+    // `uninstall`, which is never refused over this — see
+    // [`refuse_unverified_wine_for_steam`]'s "why only here" — so naming a
+    // refusal there would describe a command this report does not print.
+    //
+    // The last sentence is here because the branch above may have said
+    // `install` "spells out the command that clears one": it does, once it
+    // gets as far as the keys, and this refusal is the thing that stops it
+    // first.
+    if proton_unknown && !anything_of_ours {
+        o.push_str(&format!(
+            "\n`<Proton>` above is not a placeholder this report can fill in. Steam made\n\
+             this prefix with some Proton build, and which build could not be read out\n\
+             of it, so the only wine left here is {w} — which `install` refuses to run\n\
+             against a Proton prefix, because a wine that is not the build a prefix was\n\
+             made with upgrades the prefix out from under the game that owns it. Steam\n\
+             lists the build under the title's compatibility setting, under\n\
+             `steamapps/common`.\n\
+             That refusal comes before either key is read, so without `--wine` the\n\
+             command stops having said nothing about what they hold.\n",
+            w = s.wine.display()
         ));
     }
     // Said because the sentence above it tells the user to post this publicly,
@@ -2806,10 +2879,7 @@ fn gather_status(args: &[String]) -> Result<Status, String> {
     let (wine, origin, wine_warning) = resolve_wine_reporting(&prefix, args)?;
     let dir = prefix.join(INSTALL_SUBDIR);
 
-    let server = match crate::wineserver::lock_for(&prefix) {
-        Ok(path) => crate::wineserver::probe(&path),
-        Err(why) => crate::wineserver::Lock::Unknown(why),
-    };
+    let server = lock_state(&crate::wineserver::lock_for(&prefix));
 
     let artifacts = ARTIFACTS
         .iter()
@@ -4068,59 +4138,28 @@ exit 0
             std::fs::write(self.dest().join(RECORD_FILE), text).expect("record");
         }
 
-        /// `run`'s flags, which are not `install`'s: it reads no
-        /// `--npclient`, and [`FakeWine::args`] pins one.
         fn run_args(&self, extra: &[&str]) -> Vec<String> {
-            let mut v: Vec<String> = ["tobii", "bridge", "run"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
-            for (flag, value) in [
-                ("--prefix", self.prefix().display().to_string()),
-                ("--wine", fake_wine().display().to_string()),
-            ] {
-                v.push(flag.to_string());
-                v.push(value);
-            }
-            v.extend(extra.iter().map(|s| (*s).to_string()));
-            v
+            self.args("run", extra)
         }
 
-        /// `status`'s flags, which are neither `install`'s nor `run`'s: it
-        /// reads no `--artifacts`, and a helper that passed one would test a
-        /// command line the gate refuses.
-        ///
-        /// `--npclient` is pinned here for the reason [`FakeWine::args`] pins
-        /// it: `status` reads it now — it is what the report's refusal
-        /// prediction is decided against — and left to the default it would
-        /// answer differently on a machine that happens to have opentrack
-        /// installed.
         fn status_args(&self, extra: &[&str]) -> Vec<String> {
-            let mut v: Vec<String> = ["tobii", "bridge", "status"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
-            for (flag, value) in [
-                ("--prefix", self.prefix().display().to_string()),
-                ("--wine", fake_wine().display().to_string()),
-            ] {
-                v.push(flag.to_string());
-                v.push(value);
-            }
-            if !extra.contains(&"--npclient") {
-                v.push("--npclient".to_string());
-                v.push("ours".to_string());
-            }
-            v.extend(extra.iter().map(|s| (*s).to_string()));
-            v
+            self.args("status", extra)
         }
 
         fn args(&self, sub: &str, extra: &[&str]) -> Vec<String> {
             self.args_with_wine(sub, fake_wine(), extra)
         }
 
-        /// The same, for a test that hands the command a wine of its own —
-        /// [`wrecking_wine`], for the commands that must not start one.
+        /// The argv a test hands `tobii bridge <sub>`, spelled the way that
+        /// subcommand reads it — with a wine of the test's own, for the
+        /// commands that must not start one ([`wrecking_wine`]).
+        ///
+        /// One builder and not one per subcommand. Which flags a subcommand
+        /// takes is knowledge that belongs next to [`SUBS`], which is where
+        /// the gate reads it from; three hand-written copies of this body drift
+        /// from each other, and did — the copy that pinned no `--npclient`
+        /// tested a different report on a machine with opentrack installed
+        /// from the one it tested on CI.
         fn args_with_wine(&self, sub: &str, wine: &Path, extra: &[&str]) -> Vec<String> {
             let mut v: Vec<String> = ["tobii", "bridge", sub]
                 .iter()
@@ -4142,9 +4181,11 @@ exit 0
             }
             // Pinned unless the test picks its own, so the outcome does not
             // depend on whether the machine running the test happens to have
-            // opentrack installed — and, like `--artifacts` above, only on the
-            // subcommand that reads it.
-            if sub == "install" && !extra.contains(&"--npclient") {
+            // opentrack installed. `status` reads it too — it is what the
+            // report's refusal prediction is decided against — and, like
+            // `--artifacts` above, it goes only on the subcommands that read
+            // it: `run` and `uninstall` would be refused over it.
+            if matches!(sub, "install" | "status") && !extra.contains(&"--npclient") {
                 v.push("--npclient".to_string());
                 v.push("ours".to_string());
             }
@@ -5823,18 +5864,11 @@ exit 0
         let wrecker = wrecking_wine();
 
         let before = snapshot(&fw.prefix());
-        let args: Vec<String> = [
-            "tobii",
-            "bridge",
-            "status",
-            "--prefix",
-            &fw.prefix().display().to_string(),
-            "--wine",
-            &wrecker.display().to_string(),
-        ]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+        // Through the shared builder, not a hand-written argv: this was the
+        // one status test that passed no `--npclient`, so the report it
+        // rendered on a machine with opentrack installed was not the report it
+        // rendered on CI, and all four assertions below hold either way.
+        let args = fw.args_with_wine("status", wrecker, &[]);
         let out = render_status(&gather_status(&args).expect("status"));
 
         assert_eq!(
@@ -6204,20 +6238,207 @@ exit 0
         assert!(out.contains(&format!("`--steam '{title}'`")), "{out}");
     }
 
-    /// A prefix with nothing of ours in it is handed `install`, not `uninstall`.
+    /// A prefix with nothing of ours in it is handed `install` first.
     ///
     /// That state is the one that most often brings somebody to this command —
     /// a game gets nothing because the bridge was never put in its prefix — and
-    /// a report whose only command undoes an installation that does not exist
+    /// a report whose first command undoes an installation that does not exist
     /// names the wrong half of the pair.
+    ///
+    /// The undo line follows it rather than being absent: this branch always
+    /// promised one, in prose ("the same line with `uninstall`") until that
+    /// prose started describing a paste the gate refuses. What matters is the
+    /// order, which is what the wrong half of the pair means here.
     #[test]
     fn an_empty_prefix_is_handed_the_command_that_fills_it() {
         let out = render_status(&steam_status("2537590"));
+        let fills = out
+            .find("tobii bridge install --steam '2537590'")
+            .unwrap_or_else(|| panic!("no install line in {out}"));
         assert!(
-            out.contains("tobii bridge install --steam '2537590'"),
+            out.find("tobii bridge uninstall --steam")
+                .is_none_or(|undo| fills < undo),
+            "the undo command comes before the one that fills the prefix: {out}"
+        );
+    }
+
+    /// One report per state whose closing block hands a command back, each in
+    /// both wine states — the Proton build read out of the prefix, and not.
+    ///
+    /// A list rather than a test per state, because the rule the two tests
+    /// below check is about every command this report can print, and the way
+    /// this defect shipped twice was one state at a time: the per-key refusal
+    /// was fixed for the branch it was found in, and the branch next to it
+    /// grew a second one.
+    fn reports_that_hand_a_command_back() -> Vec<(String, Status)> {
+        let mut out = Vec::new();
+        for (wine, origin) in [
+            ("the prefix's own Proton", WineOrigin::Prefix),
+            (
+                "a wine the prefix does not corroborate",
+                WineOrigin::Unverified,
+            ),
+        ] {
+            for np in [None, Some("ours")] {
+                let base = || {
+                    let mut s = steam_status("Star Citizen");
+                    s.origin = origin;
+                    s.npclient_given = np.map(str::to_string);
+                    s
+                };
+                let np_said = match np {
+                    Some(v) => format!(", --npclient {v}"),
+                    None => String::new(),
+                };
+                let say = |what: &str| format!("{what} ({wine}{np_said})");
+
+                out.push((say("nothing of ours in the prefix"), base()));
+
+                let mut ours = base();
+                ours.dir_present = Presence::Yes;
+                out.push((say("ours installed"), ours));
+
+                let mut theirs = base();
+                theirs.keys[0].current = Reading::Plain(r"C:\opentrack".to_string());
+                out.push((say("a stranger's path in the way"), theirs));
+
+                let mut unreadable = base();
+                unreadable.unreadable = Some("Permission denied".to_string());
+                out.push((say("neither key could be read"), unreadable));
+
+                // The one shape that is not a `--steam` prefix: `--prefix`
+                // with a wine the user named, which is the spelling the undo
+                // line has to carry back — and the state in which no Proton
+                // refusal exists to model.
+                let mut given = base();
+                given.source = PrefixSource::Given;
+                given.wine_given = true;
+                out.push((say("a --prefix run that named its own wine"), given));
+            }
+        }
+        out
+    }
+
+    /// No line this report prints for pasting is one the command it names
+    /// refuses.
+    ///
+    /// The rule stated once, over every command every branch prints, rather
+    /// than asserted case by case — because case by case is how it was got
+    /// wrong twice in one commit. The report used to hand a prefix holding a
+    /// stranger's key an `install` its own key loop refuses; that was fixed by
+    /// sharing [`stops_install`], and the same commit added a second refusal
+    /// ([`steam_wine_refused`]) that fires earlier and that nothing in the
+    /// report consulted, so the bare `install` line came back for a Proton
+    /// prefix whose build could not be read.
+    ///
+    /// Both gates the command itself applies, in the order it applies them:
+    /// [`reject_unknown_flags`], which is what `tobii bridge` runs before it
+    /// dispatches, and then the whole-command refusal. What is deliberately
+    /// not checked is whether the command would then succeed — an `install`
+    /// that reads the keys and refuses over one is doing its job, and the
+    /// report says so.
+    #[test]
+    fn every_command_the_report_hands_back_is_one_that_command_accepts() {
+        for (what, s) in reports_that_hand_a_command_back() {
+            let out = render_status(&s);
+            let mut checked = 0;
+            for line in out.lines().map(str::trim) {
+                if !line.starts_with("tobii bridge ") {
+                    continue;
+                }
+                let argv = shell_words(line);
+                let sub = argv[2].clone();
+                let (_, known, _) = SUBS
+                    .iter()
+                    .find(|(n, _, _)| *n == sub)
+                    .unwrap_or_else(|| panic!("{what}: `{line}` names no subcommand that exists"));
+                if let Err(why) = reject_unknown_flags(&argv, &sub, known) {
+                    panic!("{what}: the report prints `{line}`, which that command rejects: {why}");
+                }
+                if sub == "install" {
+                    assert!(
+                        !steam_wine_refused(
+                            &s.source,
+                            s.origin,
+                            crate::flag_value(&argv, "--wine").is_some(),
+                            argv.iter().any(|a| a == "--force"),
+                        ),
+                        "{what}: the report prints `{line}`, which `install` refuses \
+                         outright before it reads a key"
+                    );
+                }
+                checked += 1;
+            }
+            assert!(
+                checked > 0,
+                "{what}: the report hands back no command at all:\n{out}"
+            );
+        }
+    }
+
+    /// The undo command is spelled out, not described.
+    ///
+    /// It used to read "the same line with `uninstall`" — and the line above
+    /// it carries `--npclient` when this run did, which `uninstall` does not
+    /// read, so the sentence described a paste that exits 1 on the flag gate.
+    /// [`Status::npclient_given`]'s own doc already says a command carrying a
+    /// flag the gate refuses is worse than no command; prose that reassembles
+    /// one is the same thing said out of reach of the test above.
+    #[test]
+    fn the_undo_command_is_spelled_out_rather_than_described() {
+        for (what, s) in reports_that_hand_a_command_back() {
+            let out = render_status(&s);
+            assert!(
+                !out.contains("the same line with"),
+                "{what}: the report describes a command instead of printing it:\n{out}"
+            );
+            if !out.contains("To take it out again") {
+                continue;
+            }
+            let line = out
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("tobii bridge uninstall"))
+                .unwrap_or_else(|| panic!("{what}: promised an undo it never spelled out:\n{out}"));
+            assert!(
+                !shell_words(line).iter().any(|a| a == "--npclient"),
+                "{what}: `{line}` carries a flag `uninstall` does not read"
+            );
+        }
+    }
+
+    /// A Steam prefix whose Proton build could not be read is told what
+    /// `install` wants before it is handed an `install`.
+    ///
+    /// The half of the state the report used to leave out. `install`'s refusal
+    /// answers "which build?" with "run `tobii bridge status`" — so a status
+    /// report that hands back the command that refuses closes the loop the
+    /// refusal was trying to open.
+    #[test]
+    fn a_proton_prefix_whose_build_is_unknown_is_told_what_install_wants() {
+        let mut s = steam_status("Star Citizen");
+        s.origin = WineOrigin::Unverified;
+        let out = render_status(&s);
+        assert!(
+            out.contains(
+                "tobii bridge install --steam 'Star Citizen' --wine <Proton>/files/bin/wine"
+            ),
             "{out}"
         );
-        assert!(!out.contains("bridge uninstall --steam"), "{out}");
+        assert!(out.contains("`steamapps/common`"), "{out}");
+        // And the reason, so that `<Proton>` is not a shape to be guessed at.
+        assert!(
+            out.contains("upgrades the prefix out from under the game"),
+            "{out}"
+        );
+        // A prefix that does corroborate its wine gets no such paragraph, and
+        // the plain line back.
+        let plain = render_status(&steam_status("Star Citizen"));
+        assert!(
+            plain.contains("tobii bridge install --steam 'Star Citizen'\n"),
+            "{plain}"
+        );
+        assert!(!plain.contains("<Proton>"), "{plain}");
     }
 
     /// Split a command line the way a POSIX shell would, for asserting that a
