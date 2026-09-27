@@ -9,8 +9,11 @@
 //!
 //! `presets` is the one that does not go through a `StartPreset` file: it
 //! reads every `.binds` document in a directory on its own, which is what the
-//! 30 presets a game *ships* look like — there is no active one among them.
-//! It exists because that is the census the crate docs make a claim about.
+//! presets a game *ships* look like — there is no active one among them. It
+//! also counts the writing habits `tobii_gameconf::binds` states a census of:
+//! byte-order marks, bare line feeds and the spacing of the declaration. That
+//! census is a measurement of somebody's install, and a measurement that
+//! cannot be taken again is a number nobody can check.
 //!
 //! Nothing here writes, and nothing here knows a game: every path and every
 //! setting name comes off the command line.
@@ -91,6 +94,9 @@ fn presets(dir: &Path, setting: &str) {
     };
     files.sort();
     let mut seen = 0;
+    let mut marked = 0;
+    let mut mixed = 0;
+    let mut spaced = 0;
     for file in files {
         if file
             .extension()
@@ -103,11 +109,47 @@ fn presets(dir: &Path, setting: &str) {
             continue;
         };
         seen += 1;
+        let body = match bytes.strip_prefix(b"\xef\xbb\xbf") {
+            Some(body) => {
+                marked += 1;
+                body
+            }
+            None => &bytes,
+        };
+        // Bare line feeds among the carriage returns, which is what "mixed"
+        // means: a file written by two things, or by one that changed.
+        let bare = bytes
+            .windows(2)
+            .filter(|w| w[1] == b'\n' && w[0] != b'\r')
+            .count()
+            + usize::from(bytes.first() == Some(&b'\n'));
+        if bare > 0 {
+            mixed += 1;
+        }
+        if body.starts_with(b"<?xml") {
+            if let Some(end) = body.windows(2).position(|w| w == b"?>") {
+                if body[..end].ends_with(b" ") {
+                    spaced += 1;
+                }
+            }
+        }
         let preset = binds::parse(&bytes, setting);
         println!("{}", file.display());
         say("name", &preset.name);
         say("version", &preset.version);
         say(setting, &preset.setting);
+        if bare > 0 {
+            println!("  {bare} bare line feeds");
+        }
     }
     println!("{seen} preset documents");
+    println!(
+        "  {marked} with a byte-order mark, {} without",
+        seen - marked
+    );
+    println!(
+        "  {mixed} mixed line endings, {} CRLF throughout",
+        seen - mixed
+    );
+    println!("  {spaced} writing a space before `?>`");
 }
