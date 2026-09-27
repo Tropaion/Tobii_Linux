@@ -35,14 +35,83 @@ const STEAM_ROOTS: [&str; 4] = [
 /// "Application", not "game": Proton builds and the Steam runtimes are
 /// installed exactly like titles are, and Steam's own files do not distinguish
 /// them. See [`looks_like_tool`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// # Identity
+///
+/// Two `App`s are the same application when their `appid` and `name` match.
+/// The build one of them happens to sit at is not part of who it is, and
+/// `Eq`, `Ord` and `Hash` all ignore it.
+///
+/// That matters because a machine can hold one title in two libraries at two
+/// patch levels — a stale `appmanifest` left behind by a manual copy, or
+/// native Steam and the Flatpak each holding the title. An identity that
+/// included the build made those two copies two applications: `tobii bridge
+/// games` printed the row twice, and [`resolve`] answered [`Match::Many`] for
+/// a name that matches one game, so its caller told the user to pass the app
+/// id and then listed the same app id twice — an instruction there is no way
+/// to follow.
+#[derive(Debug, Clone)]
 pub struct App {
     pub appid: String,
     pub name: String,
-    /// The build Steam last installed, if the manifest says. Worth keeping
-    /// because a per-game setting recorded against a build is a setting whose
-    /// staleness can be noticed later; nothing here uses it yet.
+    /// The build every copy of this title on the machine agrees it is at.
+    ///
+    /// `None` says no build can be named — either no manifest gave one, or two
+    /// libraries hold the title at different builds and there is no honest
+    /// single answer. The two are not told apart because nothing can act on
+    /// the difference: the reason to keep the field at all is that a per-game
+    /// setting recorded against a build is one whose staleness can be noticed
+    /// later, and "unknown" and "ambiguous" both mean staleness cannot be
+    /// judged. Nothing here uses it yet.
     pub buildid: Option<String>,
+}
+
+impl App {
+    /// What the comparisons below agree to compare — see the identity section
+    /// on [`App`] for why the build is not in it.
+    ///
+    /// The comparisons are written out rather than narrowed at the one call
+    /// site that collapses a list, because `resolve` is what turns two rows
+    /// into an unfollowable "pass the app id" and `resolve` never touches a
+    /// manifest. What is wrong when the build is counted is who an application
+    /// *is*, so it is said once, here, where every caller inherits it.
+    fn identity(&self) -> (&str, &str) {
+        (&self.appid, &self.name)
+    }
+}
+
+impl PartialEq for App {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for App {}
+
+impl PartialOrd for App {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for App {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity().cmp(&other.identity())
+    }
+}
+
+/// `Hash` exists, and agrees with `Eq`.
+///
+/// Nothing in this workspace hashes an `App` yet. It is written anyway because
+/// the contract is that equal values hash equally: a derived `Hash` would hash
+/// the build, so two copies of one title would compare equal and land in
+/// different buckets — a `HashSet` holding the same game twice, which is the
+/// listing bug again one layer down. Writing it out rather than deriving it
+/// also makes a later `#[derive(Hash)]` a duplicate-impl compile error.
+impl std::hash::Hash for App {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
 }
 
 /// Add `path` if it is a library and not already listed.
@@ -123,7 +192,21 @@ pub fn apps(home: &Path) -> Vec<App> {
         }
     }
     out.sort();
-    out.dedup();
+    // Not a plain `dedup`, which keeps the first of a run and whatever build
+    // that copy was at. Which copy comes first is the order the roots are
+    // scanned in and then whatever `read_dir` handed back, so naming that
+    // copy's build would be arbitrary and could change between two runs on a
+    // machine nobody touched. When the copies disagree there is no build to
+    // name, and the field says so.
+    out.dedup_by(|dropped, kept| {
+        if dropped != kept {
+            return false;
+        }
+        if dropped.buildid != kept.buildid {
+            kept.buildid = None;
+        }
+        true
+    });
     out
 }
 
@@ -328,16 +411,107 @@ mod tests {
         let found = apps(&home);
         assert_eq!(
             found,
-            vec![
-                App {
-                    appid: "1".into(),
-                    name: "First".into(),
-                    buildid: Some("111".into())
-                },
-                app("2", "Second"),
-            ],
-            "both libraries, sorted, with the buildid the manifest gave"
+            vec![app("1", "First"), app("2", "Second")],
+            "both libraries, sorted"
         );
+        // Asserted apart from the rows: equality is `(appid, name)`, so the
+        // comparison above says nothing about which build came back.
+        assert_eq!(
+            found[0].buildid.as_deref(),
+            Some("111"),
+            "the build the only manifest for it gave"
+        );
+        assert_eq!(found[1].buildid, None, "its manifest names no build");
+    }
+
+    /// One title written into two libraries at two patch levels — a stale
+    /// `appmanifest` left behind by a manual copy, or native Steam and the
+    /// Flatpak each holding it. Returns what `apps` makes of the pair.
+    fn one_title_twice(what: &str, first: Option<&str>, second: Option<&str>) -> Vec<App> {
+        let home = scratch(what);
+        let root = home.join(".steam/steam");
+        let other = home.join("games/library-two");
+        library(&root, &[("42", "Elite Dangerous", first)]);
+        library(&other, &[("42", "Elite Dangerous", second)]);
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            format!("\t\"path\"\t\t\"{}\"\n", other.display()),
+        )
+        .expect("vdf");
+        apps(&home)
+    }
+
+    /// The same title in two libraries is one title. An identity that included
+    /// the buildid listed it twice — and `resolve` then answered "matches more
+    /// than one game; pass the app id" above a list carrying the same app id on
+    /// both lines, which is an instruction the user cannot follow.
+    #[test]
+    fn one_title_in_two_libraries_at_two_builds_is_one_row() {
+        let found = one_title_twice("twobuilds", Some("111"), Some("222"));
+        assert_eq!(
+            found,
+            vec![app("42", "Elite Dangerous")],
+            "one row, not two: {found:?}"
+        );
+        assert_eq!(
+            resolve(&found, "elite"),
+            Match::One(app("42", "Elite Dangerous")),
+            "one game, not a choice between two rows carrying one app id"
+        );
+    }
+
+    /// Which build survives when the copies disagree: none does. Collapsing a
+    /// run keeps its first member, and which manifest that is comes from the
+    /// order the roots are scanned in and then whatever `read_dir` handed back
+    /// — so a surviving build would be arbitrary, and could differ between two
+    /// runs on a machine nobody touched.
+    #[test]
+    fn a_build_the_copies_disagree_on_is_reported_as_no_build_at_all() {
+        let agree = one_title_twice("agree", Some("111"), Some("111"));
+        assert_eq!(agree.len(), 1, "{agree:?}");
+        assert_eq!(
+            agree[0].buildid.as_deref(),
+            Some("111"),
+            "both copies say 111, so 111 is the answer"
+        );
+
+        let disagree = one_title_twice("disagree", Some("111"), Some("222"));
+        assert_eq!(disagree.len(), 1, "{disagree:?}");
+        assert_eq!(
+            disagree[0].buildid, None,
+            "two builds, so there is no build to name: {disagree:?}"
+        );
+
+        let half = one_title_twice("half", Some("111"), None);
+        assert_eq!(
+            half[0].buildid, None,
+            "a copy naming no build disagrees with one that does: {half:?}"
+        );
+    }
+
+    /// The build is not part of a title's identity, and `Hash` agrees with
+    /// `Eq` about that.
+    #[test]
+    fn two_builds_of_one_title_are_one_title_to_eq_ord_and_hash() {
+        let a = App {
+            appid: "42".into(),
+            name: "Elite Dangerous".into(),
+            buildid: Some("111".into()),
+        };
+        let b = App {
+            buildid: Some("222".into()),
+            ..a.clone()
+        };
+        assert_eq!(a, b, "the build is not who the app is");
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal, "nor where it sorts");
+        let set: std::collections::HashSet<App> = [a.clone(), b].into_iter().collect();
+        assert_eq!(set.len(), 1, "Hash agrees with Eq");
+        let renamed = App {
+            name: "Elite Dangerous Odyssey".into(),
+            ..a.clone()
+        };
+        assert_ne!(a, renamed, "the name is");
+        assert!(a < renamed, "and it breaks a tie on the app id");
     }
 
     /// Steam's "Move Install Folder" does not move `compatdata`, so a moved
