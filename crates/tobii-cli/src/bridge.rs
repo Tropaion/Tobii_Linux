@@ -423,16 +423,66 @@ pub use tobii_steam::libraries as steam_libraries;
 /// answers `None` for an id it cannot find installed and would turn each of
 /// them into "no installed Steam game matches".
 ///
-/// **The empty string passes this vacuously, and that is deliberate.**
-/// [`tobii_steam::resolve`] refuses it on purpose, calling `--steam ""` a name
-/// fragment that matches everything — which is a better answer than the one
-/// this gives, and a different one: it would print the ambiguous list on a
-/// machine with several games installed, and on a machine with exactly one it
-/// would silently succeed against that game's prefix. Moving this module onto
-/// the crate changes no output at all, so the old answer stands here. Changing
-/// it is worth doing on purpose, not as a side effect of moving code.
+/// **The empty string passes this vacuously, and that is deliberate.** It is
+/// therefore the empty app id, which nothing is installed under and nothing
+/// has a prefix for, so `--steam ""` reaches the prefix paragraph.
+///
+/// [`tobii_steam::resolve`] would answer better, and it refuses nothing: it
+/// excludes the empty string from its app-id branch and treats it as a name
+/// fragment, which every name contains. So it matches everything installed —
+/// [`tobii_steam::Match::Many`] on a machine with several games, which would
+/// print the ambiguous list, and [`tobii_steam::Match::One`] on a machine
+/// holding exactly one, which would silently succeed against that game's
+/// prefix. Better, and different enough to be somebody's decision rather than
+/// a side effect of this one: what a bare `--steam ""` should do is a question
+/// about this command's wording, and the wording is what this module owns.
 fn is_app_id(wanted: &str) -> bool {
     wanted.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The libraries `libraryfolders.vdf` names that are not on this machine, as
+/// a block to print — empty when there are none.
+///
+/// Every answer below that would otherwise read as the whole picture of what
+/// is installed carries this. Steam records a library's path, not whether its
+/// drive is plugged in, so a title on an external drive that is unplugged is
+/// installed and in no list here: "no installed Steam game matches" is then a
+/// negative this command has no grounds for. The maintainer's own
+/// `libraryfolders.vdf` names a library under `/run/media` that is not there.
+///
+/// The paths are named and nothing is inferred from them. Whether a drive
+/// could be mounted, or whether the wanted title is the one on it, is not
+/// something this can know — so the user is handed the one fact that is
+/// checkable and recognises their own drive in it.
+fn steam_libraries_missing(home: &Path) -> String {
+    let missing = tobii_steam::missing_libraries(home);
+    if missing.is_empty() {
+        return String::new();
+    }
+    let mut block = if missing.len() == 1 {
+        "libraryfolders.vdf names a Steam library this machine does not have, \
+         so anything installed there is in no list here:"
+            .to_string()
+    } else {
+        format!(
+            "libraryfolders.vdf names {} Steam libraries this machine does not \
+             have, so anything installed there is in no list here:",
+            missing.len()
+        )
+    };
+    for path in &missing {
+        block.push_str(&format!("\n  {}", path.display()));
+    }
+    block
+}
+
+/// `head`, then the missing-library block under it if there is one.
+fn with_missing(head: String, missing: &str) -> String {
+    if missing.is_empty() {
+        head
+    } else {
+        format!("{head}\n{missing}")
+    }
 }
 
 /// Turn `--steam <appid|name fragment>` into a prefix path.
@@ -460,7 +510,15 @@ fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
                 ));
             }
             tobii_steam::Match::None => {
-                let mut msg = format!("no installed Steam game matches {wanted:?}");
+                let missing = steam_libraries_missing(home);
+                // "No installed Steam game matches" is a claim about every
+                // game installed, and there is a library here that could not
+                // be looked in. So the sentence says what was looked at.
+                let mut msg = if missing.is_empty() {
+                    format!("no installed Steam game matches {wanted:?}")
+                } else {
+                    format!("nothing in the Steam libraries this machine has matches {wanted:?}")
+                };
                 if apps.is_empty() {
                     msg.push_str(" (no Steam libraries found)");
                 } else {
@@ -469,7 +527,7 @@ fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
                         msg.push_str(&format!("\n  {:<10} {}", a.appid, a.name));
                     }
                 }
-                return Err(msg);
+                return Err(with_missing(msg, &missing));
             }
         }
     };
@@ -2864,15 +2922,21 @@ fn list_steam_games() -> CmdResult {
         .map(PathBuf::from)
         .ok_or("HOME is not set, so Steam's libraries cannot be found")?;
     let libs = steam_libraries(&home);
+    let missing = steam_libraries_missing(&home);
     if libs.is_empty() {
-        return Err("no Steam libraries found".into());
+        return Err(with_missing("no Steam libraries found".to_string(), &missing).into());
     }
     for lib in &libs {
         println!("library: {}", lib.display());
     }
+    // With the libraries, not at the end: this is part of the same census, and
+    // a reader counting the lines above should see it while counting them.
+    if !missing.is_empty() {
+        println!("{missing}");
+    }
     let apps = tobii_steam::apps(&home);
     if apps.is_empty() {
-        return Err("no installed Steam games found".into());
+        return Err(with_missing("no installed Steam games found".to_string(), &missing).into());
     }
     println!();
     for app in &apps {
@@ -6094,8 +6158,31 @@ exit 0
         assert!(err.to_string().contains("status"), "{err}");
     }
 
+    /// The scratch homes one thread has made, removed when that thread ends.
+    ///
+    /// `steam_home` hands its home back out of itself, so a guard the caller
+    /// holds would drop at the end of the helper and take the home with it.
+    /// `libtest` gives each test a thread, and a thread-local's destructor
+    /// runs when that thread ends. What it rests on is that the tests do not
+    /// run on the main thread, whose locals are not destroyed; until this
+    /// existed they were left behind on every run, one per case per run.
+    struct SteamHomes(Vec<PathBuf>);
+
+    impl Drop for SteamHomes {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    thread_local! {
+        static STEAM_HOMES: std::cell::RefCell<SteamHomes> =
+            const { std::cell::RefCell::new(SteamHomes(Vec::new())) };
+    }
+
     /// A throwaway `$HOME` with one Steam library in it, holding a manifest
-    /// per `(appid, name)`.
+    /// per `(appid, name)`, removed when the thread that asked for it ends.
     ///
     /// No environment variable is read and nothing under the real home is
     /// touched: CI runs these as root, where `$HOME` is somebody else's, and
@@ -6104,6 +6191,7 @@ exit 0
         let home =
             std::env::temp_dir().join(format!("tobii-steamfix-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&home).ok();
+        STEAM_HOMES.with_borrow_mut(|homes| homes.0.push(home.clone()));
         let steamapps = home.join(".steam/steam/steamapps");
         std::fs::create_dir_all(&steamapps).expect("steamapps");
         for (id, name) in apps {
@@ -6159,6 +6247,35 @@ exit 0
             "no installed Steam game matches \"nothing\"\ninstalled:\n  \
              11         Fixture Game One\n  \
              22         Fixture Game Two"
+        );
+    }
+
+    /// A title on a drive nobody has plugged in is installed and in no list
+    /// here, so "no installed Steam game matches" is a confident negative this
+    /// command has no grounds for — the same answer `tobii-gameconf` spent two
+    /// rounds removing. `libraryfolders.vdf` outlives the drive, and the
+    /// maintainer's own file names a library under `/run/media` that is gone.
+    #[test]
+    fn a_name_matching_nothing_says_so_when_a_library_could_not_be_looked_in() {
+        let home = steam_home("unplugged", &[("11", "Fixture Game One")]);
+        // Under this test's own scratch home on purpose: a path reached by
+        // walking up out of it is how a fixture escapes into real files.
+        let gone = home.join("run/media/nobody/ExternalSSD/steam");
+        std::fs::write(
+            home.join(".steam/steam/steamapps/libraryfolders.vdf"),
+            format!("\t\"path\"\t\t\"{}\"\n", gone.display()),
+        )
+        .expect("vdf");
+        let err = steam_prefix_for(&home, "nothing").expect_err("no match is not an answer");
+        assert_eq!(
+            err,
+            format!(
+                "nothing in the Steam libraries this machine has matches \"nothing\"\n\
+                 installed:\n  11         Fixture Game One\n\
+                 libraryfolders.vdf names a Steam library this machine does not \
+                 have, so anything installed there is in no list here:\n  {}",
+                gone.display()
+            )
         );
     }
 

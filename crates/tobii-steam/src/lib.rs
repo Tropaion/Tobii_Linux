@@ -148,20 +148,27 @@ impl std::hash::Hash for App {
     }
 }
 
-/// Add `path` if it is a library and not already listed.
+/// Add `path` if it is a library and not already listed, and answer whether
+/// it is a library at all.
+///
+/// The answer is not "was it added": a library already listed is still a
+/// library. [`scan`] sorts the paths `libraryfolders.vdf` names by it, and a
+/// library named by two of the roots would otherwise be counted, the second
+/// time, as one that is not there.
 ///
 /// Canonicalised before it is compared with what is already listed:
 /// `~/.steam/steam` and `~/.steam/root` are both symlinks to the real install,
 /// so a plain path comparison reports the same library three times and would
 /// then install into it three times.
-fn push_library(out: &mut Vec<PathBuf>, path: PathBuf) {
+fn push_library(out: &mut Vec<PathBuf>, path: PathBuf) -> bool {
     if !path.join("steamapps").is_dir() {
-        return;
+        return false;
     }
     let real = path.canonicalize().unwrap_or(path);
     if !out.contains(&real) {
         out.push(real);
     }
+    true
 }
 
 /// The value of a `"key"    "value"` line in Valve's key-value format.
@@ -177,9 +184,17 @@ fn vdf_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     rest.trim().trim_start_matches('"').split('"').next()
 }
 
-/// Every Steam library on this machine.
-pub fn libraries(home: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// Every Steam root's `libraryfolders.vdf`, read once, sorting what those
+/// files name into the libraries that are on this machine and the ones that
+/// are not.
+///
+/// One walk behind both [`libraries`] and [`missing_libraries`], so the two
+/// can never disagree about a path. A message naming a library as absent,
+/// printed beside a list that shows that library, is worse than either answer
+/// given on its own.
+fn scan(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
     for root in STEAM_ROOTS {
         let root = home.join(root);
         // Not `else { continue }`: that skipped the root fallback below, so a
@@ -191,13 +206,54 @@ pub fn libraries(home: &Path) -> Vec<PathBuf> {
         let text = std::fs::read_to_string(&vdf).unwrap_or_default();
         for line in text.lines() {
             if let Some(p) = vdf_value(line, "path") {
-                push_library(&mut out, PathBuf::from(p.replace("\\\\", "/")));
+                let path = PathBuf::from(p.replace("\\\\", "/"));
+                // Kept exactly as the file spells it. There is nothing to
+                // canonicalise against, and the path a user has to recognise
+                // as their own unplugged drive is the one Steam wrote down.
+                if !push_library(&mut found, path.clone()) && !missing.contains(&path) {
+                    missing.push(path);
+                }
             }
         }
-        // The root is a library itself even when the file does not say so.
-        push_library(&mut out, root);
+        // The root is a library itself even when the file does not say so. A
+        // root that is not there is not reported missing: three of these four
+        // are absent on an ordinary machine, and naming them would bury the
+        // one absence that means something.
+        push_library(&mut found, root);
     }
-    out
+    (found, missing)
+}
+
+/// Every Steam library on this machine.
+///
+/// Not every library Steam knows about. A path `libraryfolders.vdf` names
+/// that is not a library here — an external drive nobody has plugged in is
+/// the ordinary way — is left out, because there is nothing to read there.
+/// [`missing_libraries`] names those, and a caller whose answer would
+/// otherwise read as the whole picture of what is installed owes the user
+/// that list.
+pub fn libraries(home: &Path) -> Vec<PathBuf> {
+    scan(home).0
+}
+
+/// The libraries `libraryfolders.vdf` names that are not on this machine,
+/// spelled as that file spells them.
+///
+/// Steam records a library's path, not whether its drive is plugged in, so a
+/// title installed on an external drive stays in that file after the drive is
+/// gone. [`apps`] cannot see it, [`resolve`] answers [`Match::None`] for its
+/// name, and a caller that reports that as "no such game is installed" has
+/// told the user a confident negative about a game that is installed. This is
+/// what such a caller shows instead of guessing.
+///
+/// **It is not every reason a title can be absent from [`apps`].** A library
+/// that IS here but whose `steamapps` directory cannot be read, and a
+/// manifest that cannot be read or is not UTF-8, are each skipped by [`apps`]
+/// and neither appears here. This answers one question — which of the paths
+/// in `libraryfolders.vdf` are not there — and a caller should word it as
+/// that, rather than as a complete account of what was missed.
+pub fn missing_libraries(home: &Path) -> Vec<PathBuf> {
+    scan(home).1
 }
 
 /// Everything installed, across every library.
@@ -402,9 +458,45 @@ pub fn resolve(apps: &[App], wanted: &str) -> Match {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A throwaway directory that is this process's alone.
+    /// The scratch directories one thread has made, removed when that thread
+    /// ends.
+    ///
+    /// A guard the caller holds is the plain way to write this, and it does
+    /// not fit: the helpers below build a home inside themselves and hand
+    /// back what was read out of it, so a guard would drop at the end of the
+    /// helper and take the home with it before the case had looked at
+    /// anything. So the guard lives here instead.
+    ///
+    /// `libtest` gives each test a thread of its own, and a thread-local's
+    /// destructor runs when that thread ends. Measured at nothing left
+    /// behind, with `--test-threads=1` as well as in parallel — counted by
+    /// the process id in the directory names, because other things on a
+    /// developer's machine run these tests too and a count of the whole
+    /// `/tmp` glob measures those runs as much as this one.
+    ///
+    /// What it rests on is that the tests do not run on the main thread,
+    /// whose locals are not destroyed. Were a harness ever to run them there,
+    /// this would leave behind what it used to: fifteen directories per run,
+    /// and the temporary directory had over a thousand of them.
+    struct Sweep(Vec<PathBuf>);
+
+    impl Drop for Sweep {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    thread_local! {
+        static SWEEP: RefCell<Sweep> = const { RefCell::new(Sweep(Vec::new())) };
+    }
+
+    /// A throwaway directory that is this process's alone, removed when the
+    /// thread that asked for it ends.
     ///
     /// No `$HOME` is read and no fixed path is used: CI runs these as root, and
     /// a test that reaches for the real home would find a different one there.
@@ -421,6 +513,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("scratch");
+        SWEEP.with_borrow_mut(|sweep| sweep.0.push(p.clone()));
         p
     }
 
@@ -488,6 +581,92 @@ mod tests {
         let libs = libraries(&home);
         assert_eq!(libs.len(), 1, "the root itself is a library: {libs:?}");
         assert_eq!(rows(&apps(&home)), vec![("1", "A Game", None)]);
+    }
+
+    /// `libraryfolders.vdf` outlives the drive: Steam records a library's
+    /// path, not whether it is plugged in. The library then drops out of
+    /// [`libraries`] and its titles out of [`apps`] without a word, so a
+    /// caller saying "no installed Steam game matches" says it about a game
+    /// that is installed. The maintainer's own file names a library under
+    /// `/run/media` that is not there.
+    #[test]
+    fn a_library_the_vdf_names_and_the_machine_does_not_have_is_reported() {
+        let home = scratch("unplugged");
+        let root = home.join(".steam/steam");
+        let here = home.join("games/plugged-in");
+        // Bounded to this test's own scratch directory on purpose: a path
+        // built by walking up from anywhere else is how a plant escapes.
+        let gone = home.join("run/media/nobody/ExternalSSD/steam");
+        library(&root, &[("1", "On The Internal Drive", None)]);
+        library(&here, &[("2", "On The Other Drive", None)]);
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            format!(
+                "\t\"path\"\t\t\"{}\"\n\t\"path\"\t\t\"{}\"\n",
+                here.display(),
+                gone.display()
+            ),
+        )
+        .expect("vdf");
+
+        assert_eq!(
+            missing_libraries(&home),
+            vec![gone.clone()],
+            "the one path the file names that is not here, as the file spells it"
+        );
+        assert!(
+            !libraries(&home).contains(&gone),
+            "and not among the libraries, because there is nothing to read there"
+        );
+        // What IS readable still reads: this reports the gap, it does not
+        // widen it.
+        assert_eq!(
+            rows(&apps(&home)),
+            vec![
+                ("1", "On The Internal Drive", None),
+                ("2", "On The Other Drive", None)
+            ]
+        );
+    }
+
+    /// Nothing missing is nothing said. A Steam root that is not installed is
+    /// not a missing library: three of the four are absent on an ordinary
+    /// machine, and naming them would bury the absence that means something.
+    #[test]
+    fn a_machine_holding_every_library_its_vdf_names_reports_none_missing() {
+        let home = scratch("allthere");
+        let root = home.join(".steam/steam");
+        let other = home.join("games/library-two");
+        library(&root, &[("1", "First", None)]);
+        library(&other, &[("2", "Second", None)]);
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            format!("\t\"path\"\t\t\"{}\"\n", other.display()),
+        )
+        .expect("vdf");
+        assert_eq!(missing_libraries(&home), Vec::<PathBuf>::new());
+    }
+
+    /// One absent library named by two roots is one absence. `~/.steam/steam`
+    /// and the Flatpak each keep their own `libraryfolders.vdf`, and an
+    /// external drive is in both.
+    #[test]
+    fn one_absent_library_named_by_two_roots_is_reported_once() {
+        let home = scratch("twiceabsent");
+        let gone = home.join("run/media/nobody/ExternalSSD/steam");
+        for root in [
+            ".steam/steam",
+            ".var/app/com.valvesoftware.Steam/data/Steam",
+        ] {
+            let root = home.join(root);
+            library(&root, &[]);
+            std::fs::write(
+                root.join("steamapps/libraryfolders.vdf"),
+                format!("\t\"path\"\t\t\"{}\"\n", gone.display()),
+            )
+            .expect("vdf");
+        }
+        assert_eq!(missing_libraries(&home), vec![gone]);
     }
 
     /// `~/.steam/steam` and `~/.steam/root` are both symlinks to the same
