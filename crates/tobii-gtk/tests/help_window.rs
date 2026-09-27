@@ -176,6 +176,24 @@ struct Narrowed {
 }
 
 impl Narrowed {
+    /// Read all five off a window, which is the only way they are ever taken.
+    ///
+    /// Both readings — the one at 6.9 s and the one the fold phase takes at
+    /// 9.8 s — are the same five questions asked of the same window, and they
+    /// were written out twice. The two copies were byte-identical but for one
+    /// field, which had found the "Topics" button by two different routes and
+    /// so read as a difference that meant something; it did not.
+    fn of(help: &gtk::Window) -> Self {
+        let root = help.clone().upcast::<gtk::Widget>();
+        Narrowed {
+            sidebar_shown: named(&root, tobii_gtk::help::SIDEBAR_NAME).is_visible(),
+            toggle_shown: named(&root, tobii_gtk::help::TOGGLE_NAME).is_visible(),
+            width: help.width(),
+            default_width: help.default_width(),
+            held_wide: help.is_maximized() || help.is_fullscreen(),
+        }
+    }
+
     /// Was the breakpoint asked to fire at all?
     ///
     /// The question every skip below turns on, and deliberately NOT "did the
@@ -508,6 +526,13 @@ struct Seen {
     /// The Tab chain from the state the window opens in, focus by focus, as
     /// GTK's own focus walk produces it.
     tab_order: Vec<String>,
+    /// Every topic row GTK's focus walk stops on, walked forward from the
+    /// first row rather than from the search box.
+    ///
+    /// The chain above is where Tab GOES; this is which rows it can REACH,
+    /// and they are separate readings because where GTK enters a `GtkListBox`
+    /// from outside it is GTK's own business and is not fixed — see the walk.
+    tab_rows: Vec<String>,
     /// Where Tab and Shift+Tab go when the list handles them itself — which
     /// `child_focus` cannot show, because it moves focus without dispatching a
     /// key at all.
@@ -523,6 +548,17 @@ struct Seen {
     /// Typing one word: the rows left in the list, and the page shown.
     search_rows: Vec<String>,
     search_page: String,
+    /// What the search box actually held, and how many rows the list actually
+    /// had, at the instant the two readings above were taken.
+    ///
+    /// The phase's own precondition, recorded because without it an empty
+    /// `search_rows` is three different faults wearing one face: the query
+    /// never reached the box, the list it was read from was not the topic
+    /// list, or the filter really did drop the topic that answers the query —
+    /// and only the last is a bug in the window. It read `[]` twice in 22 runs
+    /// of this test on a live desktop, and the failure could say nothing about
+    /// which of the three it was.
+    search_precondition: (String, usize),
     /// Typing a word that is in no topic at all.
     no_match_rows: Vec<String>,
     no_match_page: String,
@@ -566,6 +602,14 @@ struct Seen {
     /// content subtree leaks while the window itself disappears. A test that
     /// weak-refs only the window cannot see that, and did not.
     inner_alive_after_close: usize,
+    /// How many widgets that census weak-ref'd at all.
+    ///
+    /// Asserted before the count above, for the same reason the narrow census
+    /// below states: "nothing survived" and "nothing was ever weak-ref'd" are
+    /// the same zero. This one had no size guard while the narrow one was
+    /// being given its second — a census that cannot fail for the reason it
+    /// names is the shape this project has shipped six of.
+    wide_census: usize,
     /// How many widgets and event controllers the narrow-mode census weak-ref'd
     /// at all. Asserted before the count below, because "nothing survived" and
     /// "nothing was ever counted" are the same number.
@@ -731,6 +775,54 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                         }
                         s.tab_order.push(d);
                     }
+                    // The same walk again, started INSIDE the list instead of
+                    // asked to enter it — and this is the one that carries the
+                    // "every row is on GTK's own focus walk" claim.
+                    //
+                    // Where the chain above ENTERS the list is GTK's own
+                    // choice, and on a live desktop it is not always the first
+                    // row: measured over 22 runs of this test on one KDE
+                    // session, with the list in provably the same state every
+                    // time (row 0 selected, no focus child, all nine rows
+                    // child-visible, mapped, focusable and sensitive, the
+                    // scroller at the top), the chain entered at row 1, row 3
+                    // and row 5 as well as at row 0. A chain that enters at
+                    // row 5 still walks every row from there to the last and
+                    // still ends on Close — it is short at the FRONT, not
+                    // broken — but counting it against the model's length made
+                    // this test fail about one run in five for a window in
+                    // which nothing was wrong.
+                    //
+                    // So the entry point is taken out of the question rather
+                    // than asserted about: give the first row the focus, then
+                    // ask GTK to move forward and write down every row it
+                    // stops on until it leaves the list. `child_focus` is
+                    // still GTK's own focus walk and still the action a Tab
+                    // press resolves to, so the claim is unchanged — what is
+                    // gone is a degree of freedom that was never part of it.
+                    // The chain above keeps the rest of the claim: that Tab
+                    // out of the search box reaches the list at all, reaches a
+                    // topic's text after it, and reaches Close after that.
+                    let list = the_list(&root);
+                    if let Some(first) = list.row_at_index(0) {
+                        first.grab_focus();
+                    }
+                    for _ in 0..24 {
+                        let Some(w) = gtk::prelude::GtkWindowExt::focus(help) else {
+                            break;
+                        };
+                        let Ok(row) = w.downcast::<gtk::ListBoxRow>() else {
+                            break;
+                        };
+                        s.tab_rows.push(row_title(&row));
+                        if !help.child_focus(gtk::DirectionType::TabForward) {
+                            break;
+                        }
+                    }
+                    // And back to where the chain above left it — the search
+                    // box, which is what one full cycle wraps round to — so
+                    // the phases after this start from the state they used to.
+                    the_search(&root).grab_focus();
                 });
             }
             // A second F1 must raise the window it already opened, not open a
@@ -823,6 +915,7 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                     s.closed.last_mut().unwrap().1 = help_windows(&a).len();
                     s.alive_after_close =
                         weak.borrow().as_ref().and_then(|w| w.upgrade()).is_some();
+                    s.wide_census = inner.borrow().len();
                     s.inner_alive_after_close = inner
                         .borrow()
                         .iter()
@@ -986,8 +1079,16 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                 let (a, s) = (app.clone(), seen.clone());
                 at(5600, move || {
                     let root = help_windows(&a).remove(0).upcast::<gtk::Widget>();
+                    let list = the_list(&root);
+                    let mut rows = 0;
+                    while list.row_at_index(rows).is_some() {
+                        rows += 1;
+                    }
                     let mut s = s.borrow_mut();
-                    s.search_rows = visible_rows(&the_list(&root));
+                    // The precondition first, and off the same widgets in the
+                    // same instant as the readings it stands in front of.
+                    s.search_precondition = (the_search(&root).text().to_string(), rows as usize);
+                    s.search_rows = visible_rows(&list);
                     s.search_page = showing(&root);
                 });
             }
@@ -1043,13 +1144,7 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                     {
                         let mut s = s.borrow_mut();
                         s.cleared_page = showing(&root);
-                        s.at_420 = Narrowed {
-                            sidebar_shown: named(&root, tobii_gtk::help::SIDEBAR_NAME).is_visible(),
-                            toggle_shown: named(&root, tobii_gtk::help::TOGGLE_NAME).is_visible(),
-                            width: help.width(),
-                            default_width: help.default_width(),
-                            held_wide: help.is_maximized() || help.is_fullscreen(),
-                        };
+                        s.at_420 = Narrowed::of(&help);
                     }
                     // Ctrl+F has to reach the search box from here, which
                     // means unfolding the sidebar it lives in first.
@@ -1233,13 +1328,7 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
                     // explain itself. That is exactly what made the narrow
                     // layout's SKIPPED line unreachable: it could only print
                     // in the environment that aborted before it.
-                    let found = Narrowed {
-                        sidebar_shown: named(&root, tobii_gtk::help::SIDEBAR_NAME).is_visible(),
-                        toggle_shown: toggle.is_visible(),
-                        width: help.width(),
-                        default_width: help.default_width(),
-                        held_wide: help.is_maximized() || help.is_fullscreen(),
-                    };
+                    let found = Narrowed::of(&help);
                     s.borrow_mut().fold = Some(found);
                     if !found.toggle_shown {
                         return;
@@ -1322,6 +1411,21 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
     );
 
     // --- the v0.3.1 rule: it must not keep itself alive ---
+    //
+    // The size of this census before its count, the same way round as the
+    // narrow one further down. The three the loop looks for are the search
+    // entry, the topic list and the topic stack, one of each; a window that
+    // stopped building one of them, or a walk that stopped reaching them,
+    // would leave this at nought and the count below would then read zero for
+    // never having looked.
+    assert_eq!(
+        seen.wide_census, 3,
+        "the wide-window census weak-ref'd {} of the help window's inner widgets, \
+         and there are three to find — its search entry, its topic list and its \
+         topic stack. The count below is taken over exactly this set, so it would \
+         read zero however much the window leaked",
+        seen.wide_census
+    );
     assert_eq!(
         seen.inner_alive_after_close, 0,
         "{} of the help window's inner widgets outlived it. The window freeing is \
@@ -1454,17 +1558,19 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
         "{left_w} of {census_w} widgets and {left_c} of {census_c} event \
          controllers outlived a help window that was narrowed, had its \
          \"Topics\" list unfolded and folded again, and was then closed. \
-         Two shapes do this and the count cannot tell them apart. One is \
-         a handler on the toggle that captures a pane strongly and closes \
-         a ring through it; injected into `toggle.connect_toggled` while \
-         this assertion was being written, it reads exactly 80 of 87 and \
-         127 of 143, on a desktop and on a bare X server alike. The other \
-         is the focus, left pointing into a pane that was hidden, shown \
-         and hidden again without ever being given it back, which is what \
-         `2bd9ab1` measured at the same 80 of 87. Every widget counted is \
-         one this window built: GTK's own tooltip window, which wanders \
-         between toplevels and is not ours to free, is walked past by \
-         `own_widgets`"
+         What this census, and only this census, can catch is a hold taken \
+         DURING the fold: the focus, left pointing into a pane that was \
+         hidden, shown and hidden again without ever being given it back, \
+         which is what `2bd9ab1` measured at 80 of 87 widgets and 127 of \
+         143 event controllers, on a desktop and on a bare X server alike. \
+         Do not start by suspecting a reference cycle in `help.rs`'s own \
+         handlers — a strong capture that closes sidebar -> list -> toggle \
+         -> sidebar exists from construction, needs no fold to hold \
+         anything, and so is caught by the WIDE census at 3100 ms, which \
+         reads 3 of 3 and stops the run long before this line. Every \
+         widget counted is one this window built: GTK's own tooltip \
+         window, which wanders between toplevels and is not ours to free, \
+         is walked past by `own_widgets`"
     );
 
     // --- a window of text must not light the illuminators ---
@@ -1584,19 +1690,47 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
             "the list must come before the topic on the Tab chain — the window reads \
          left to right and so must the keyboard: {chain}"
         );
-        // Every row is on that chain, which is GTK's own behaviour for a
-        // `GtkListBox` of focusable rows and is what makes the claim above
-        // "reachable by Tab alone" rather than "reachable if a handler works".
-        let rows_on_chain = seen
+        // Every row is on GTK's own focus walk, which is what makes the claim
+        // above "reachable by Tab alone" rather than "reachable if a handler
+        // works". Read off the walk that starts on the first row, because
+        // where the chain above enters the list is GTK's choice and not part
+        // of the claim — the walk itself says why, and says what it cost.
+        let titles: Vec<String> = model.iter().map(|t| t.title.to_string()).collect();
+        assert_eq!(
+            seen.tab_rows,
+            titles,
+            "GTK's own focus walk must pass through every topic row, in the list's \
+         own order, so that the keyboard reaches the list even with nothing of \
+         ours in the way. Walked forward from {:?}",
+            titles.first()
+        );
+        // And the chain out of the search box has to agree with it from
+        // wherever it joined: every row from its entry point to the last one,
+        // in order, none skipped. A row that Tab cannot leave, or one it steps
+        // over, shortens this at the back or punches a hole in it, and both
+        // still fail here.
+        // `describe` cuts a caption at 24 characters, so the model's own
+        // titles are cut the same way to be compared with it.
+        let short = |t: &String| -> String { t.chars().take(24).collect() };
+        let rows_on_chain: Vec<String> = seen
             .tab_order
             .iter()
-            .filter(|x| x.contains("GtkListBoxRow"))
-            .count();
+            .filter_map(|x| x.strip_prefix("GtkListBoxRow("))
+            .filter_map(|x| x.strip_suffix(')'))
+            .map(str::to_string)
+            .collect();
+        let from_entry: Option<Vec<String>> = rows_on_chain.first().and_then(|first| {
+            titles
+                .iter()
+                .position(|t| short(t) == *first)
+                .map(|k| titles[k..].iter().map(short).collect())
+        });
         assert_eq!(
-            rows_on_chain,
-            model.len(),
-            "GTK's own focus walk must pass through every topic row, so that the \
-         keyboard reaches the list even with nothing of ours in the way: {chain}"
+            from_entry.as_ref(),
+            Some(&rows_on_chain),
+            "Tab out of the search box entered the topic list at {:?}, and from there \
+         it must pass through every row after it, in order, to the last one: {chain}",
+            rows_on_chain.first()
         );
 
         // And the shortcut that makes that chain bearable: nine rows between the
@@ -1639,6 +1773,26 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
     }
 
     // --- the search ---
+    //
+    // Its own precondition before its result, for the reason the field gives:
+    // "no row survived the query" and "the query never got into the box" are
+    // the same empty list, and the second is a fault in this timeline rather
+    // than in the window it is asking about.
+    let (typed, rows_in_list) = &seen.search_precondition;
+    assert_eq!(
+        typed, "joystick",
+        "the search phase read a list that had been filtered against {typed:?}, not \
+         against the word it typed: the reading 400 ms after `set_text` caught the \
+         box holding something else, and nothing below it is about the search"
+    );
+    assert_eq!(
+        rows_in_list,
+        &model.len(),
+        "the search phase read a list of {rows_in_list} rows, and the model has {}: \
+         it was not reading the topic list, so an empty result below says nothing \
+         about the filter",
+        model.len()
+    );
     assert!(
         seen.search_rows
             .contains(&"Head tracking for games".to_string()),
