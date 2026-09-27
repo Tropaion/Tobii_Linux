@@ -204,9 +204,17 @@ fn version(root: &xml::Element) -> Lookup {
 /// The preset names a `StartPreset` file holds, in order, without repeats.
 ///
 /// One name per line. Blank lines are skipped — a trailing newline is not a
-/// preset — and everything else is refused: a line that is not a plain name
-/// means this is not the file this reader thinks it is, and the answer to that
-/// is a sentence, not a best guess at which line was meant.
+/// preset — and a line holding a control character, a `/` or a `\` is refused:
+/// those say this is not the file this reader thinks it is, or that something
+/// here is a path rather than a name, and the answer to either is a sentence
+/// and not a best guess at which line was meant.
+///
+/// Every other line is carried through exactly as the file spells it. `..` is
+/// a preset name here and not a parent directory — a name off this file is
+/// only ever compared against what the preset documents call themselves and
+/// printed in a report, never joined onto a path — and a reader that decided
+/// which strings the game accepts as a preset name would be enforcing a rule
+/// nobody here has watched the game apply.
 ///
 /// A list rather than one name: newer versions of the game write several lines
 /// here, one per category of binding, and which line governs which setting is
@@ -305,10 +313,21 @@ pub struct Active {
 }
 
 /// Whether the named preset turned out to be one readable file.
+///
+/// Three cases for the reason [`Lookup`] has three, one level up: a directory
+/// that holds nothing of this name and a directory this reader will not choose
+/// within are different sentences in a report, and only the second one means
+/// *go look yourself*. Two of them in one variant would leave a caller
+/// string-matching the reason to tell "you have not saved this preset" from
+/// "two files here claim it".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Found {
-    /// There is no one file in the directory that calls itself this.
-    Unmatched(String),
+    /// No file in the directory calls itself this, and none comes near it.
+    Absent(String),
+    /// Something here answers to the name and this reader will not pick among
+    /// it: a preset spelled the same but for its case, or two files claiming
+    /// the name outright.
+    Rejected(String),
     /// The file whose `PresetName` is this name, and what it says.
     Read { file: PathBuf, preset: Preset },
 }
@@ -331,6 +350,10 @@ pub struct Bindings {
     /// back* their game would be running the lower one. A report that lists
     /// this field lets them see that, instead of being told a version number
     /// with no way to tell it is the wrong one.
+    ///
+    /// Lower-numbered and not merely other: two start files carrying the same
+    /// schema are no ordering at all, and [`read`] refuses the directory
+    /// rather than let the sort break the tie on the spelling of a file name.
     pub superseded: Vec<PathBuf>,
     /// One per distinct name the start file holds, in its order.
     pub presets: Vec<Active>,
@@ -417,6 +440,20 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
             dir.display()
         ));
     };
+    // Two of them at one schema, which the sort has no way to order. `pop`
+    // would pick whichever path sorts last and call the other superseded,
+    // though neither supersedes anything — and it is reachable: this name is
+    // matched case-insensitively, and `.04.` is the same number as `.4.` on
+    // any filesystem. Picking by path bytes is the guess this reader does not
+    // make, here as everywhere else it finds two files claiming one thing.
+    if let Some((_, other)) = starts.last().filter(|(s, _)| *s == schema) {
+        return Source::Rejected(format!(
+            "{} and {} are both StartPreset files at the same schema, and this \
+             reader cannot tell which the game loads",
+            other.display(),
+            start_file.display()
+        ));
+    }
     let bytes = match crate::read(&start_file) {
         Source::Read(b) => b,
         // A file that was listed a moment ago and is gone now is not a game
@@ -471,14 +508,14 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
                 })
                 .collect();
             let found = match (matches.as_slice(), other_case.as_slice()) {
-                ([], []) => Found::Unmatched(format!(
+                ([], []) => Found::Absent(format!(
                     "no preset in {} calls itself {name}",
                     dir.display()
                 )),
-                ([], spellings) => Found::Unmatched(format!(
+                ([], spellings) => Found::Rejected(format!(
                     "no preset in {} calls itself {name}, only {} — and whether \
-                     the game reads that as the same preset is not something \
-                     this project has measured",
+                     the game reads a name in another case as the same preset \
+                     is not something this project has measured",
                     dir.display(),
                     spellings.join(" and ")
                 )),
@@ -486,7 +523,7 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
                     file: file.clone(),
                     preset: preset.clone(),
                 },
-                (many, _) => Found::Unmatched(format!(
+                (many, _) => Found::Rejected(format!(
                     "{} presets in {} call themselves {name}, and this reader \
                      cannot tell which the game loads",
                     many.len(),
@@ -505,7 +542,7 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tests::scratch;
 
@@ -677,6 +714,14 @@ mod tests {
             start(b"Custom\r\n..\\..\\etc\r\n").is_err(),
             "a line that is not a preset name is not a line to skip"
         );
+        // And what the refusal is not about. A separator and a control
+        // character are the whole of it; `..` is a preset name here, only ever
+        // compared against what the documents call themselves and printed.
+        assert_eq!(
+            start(b"Custom\r\n..\r\nC:\r\n").expect("reads"),
+            ["Custom", "..", "C:"],
+            "this reader does not decide which strings the game allows"
+        );
     }
 
     /// The path this machine can actually exercise: Elite Dangerous is
@@ -802,7 +847,7 @@ mod tests {
             panic!("should have read it");
         };
         match &b.presets[0].found {
-            Found::Unmatched(why) => assert!(why.contains("only custom"), "{why}"),
+            Found::Rejected(why) => assert!(why.contains("only custom"), "{why}"),
             other => panic!("should have refused to choose: {other:?}"),
         }
         // And the start file itself: two spellings are two names, each asked
@@ -874,12 +919,16 @@ mod tests {
     /// entry below is the seam: what the census calls the habit, and the line
     /// the example prints its count on.
     ///
-    /// It also holds the shape the four files give the set. Every habit in
-    /// this census splits 26 against 4, so a habit claimed of all 30 is either
-    /// one nobody looked at on those four or one that does not belong in the
-    /// list; the setting in the section below is claimed of all 30 and is not
-    /// a writing habit, which is why the check is of the census and not of the
-    /// module.
+    /// The example's half is read out of its string literals and not out of
+    /// its source. Every one of these needles is also in the example's own
+    /// module docs, which describe the counting, and one of them in the name
+    /// of a local variable — so a test that searched the source would stay
+    /// green with every counter in the example deleted.
+    ///
+    /// What a declared seam cannot do is notice a habit nobody added to it.
+    /// That is the next test's job, and this one is honest about the limit: it
+    /// catches a counter that went away under a census still claiming its
+    /// habit.
     #[test]
     fn every_habit_in_the_census_is_counted_by_the_example() {
         const HABITS: [(&str, &str); 4] = [
@@ -888,15 +937,8 @@ mod tests {
             ("encoding=\"UTF-8\" ?>", "writing a space before"),
             ("indented with four spaces", "indented with spaces"),
         ];
-        // Flattened first: these are sentences, and where a sentence happens
-        // to wrap is not something a rule should depend on.
-        let census = flattened(
-            include_str!("binds.rs")
-                .split_once("//! * A setting is a direct child")
-                .expect("the census runs down to the next bullet")
-                .0,
-        );
-        let example = include_str!("../examples/read.rs");
+        let census = census();
+        let example = printed(include_str!("../examples/read.rs"));
         for (stated, counted) in HABITS {
             assert!(
                 census.contains(stated),
@@ -908,13 +950,115 @@ mod tests {
                  `{counted}`: a number nobody can take again"
             );
         }
-        for all in ["all 30", "All 30"] {
-            assert!(
-                !census.contains(all),
-                "the census claims `{all}` of a writing habit, and every habit \
-                 in it splits 26 against 4"
-            );
+    }
+
+    /// The census counts the set once, and never a habit of the whole of it.
+    ///
+    /// Every writing habit in this census splits 26 against 4 — the same four
+    /// files carry all four — so a sentence counting all 30 of them is either
+    /// a habit nobody checked on those four or a sentence that does not belong
+    /// in a census. That is how the indentation claim went wrong, and a ban on
+    /// the spellings that claim used would only ever catch the wording
+    /// somebody already corrected. So this is a rule: the population is stated
+    /// where the census says what it was measured against, and nowhere else in
+    /// its prose, in digits or spelled out.
+    ///
+    /// It is a rule about counts and not about claims. "Every one of these
+    /// files ends its lines with a carriage return", written without the
+    /// number, is past it — as it is past the guard in [`crate::xml`] that
+    /// this one borrows its reasoning from. What the two of them hold is that
+    /// a *measurement* cannot be restated, and a measurement is a number.
+    #[test]
+    fn no_habit_in_the_census_is_claimed_of_the_whole_set() {
+        /// Numbers written as words, past the digits. Cardinals only: an
+        /// ordinal counts nothing, and this prose is full of them.
+        const CARDINALS: [(&str, u32); 21] = [
+            ("one", 1),
+            ("two", 2),
+            ("three", 3),
+            ("four", 4),
+            ("five", 5),
+            ("six", 6),
+            ("seven", 7),
+            ("eight", 8),
+            ("nine", 9),
+            ("ten", 10),
+            ("eleven", 11),
+            ("twelve", 12),
+            ("twenty", 20),
+            ("thirty", 30),
+            ("forty", 40),
+            ("fifty", 50),
+            ("sixty", 60),
+            ("seventy", 70),
+            ("eighty", 80),
+            ("ninety", 90),
+            ("hundred", 100),
+        ];
+
+        fn numbers(prose: &str) -> Vec<u32> {
+            prose
+                .to_ascii_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter_map(|word| {
+                    word.parse::<u32>().ok().or_else(|| {
+                        CARDINALS
+                            .iter()
+                            .find(|(spelling, _)| *spelling == word)
+                            .map(|(_, value)| *value)
+                    })
+                })
+                .collect()
         }
+
+        let census = census();
+        let counted = numbers(&census);
+        // The first one is the population, in the sentence saying what the
+        // census was taken off. Everything after it is a habit, and a habit
+        // here is of 26 files or of 4.
+        let population = *counted
+            .first()
+            .expect("the census opens by counting the files it was read off");
+        assert_eq!(
+            counted.iter().filter(|n| **n == population).count(),
+            1,
+            "the census counts all {population} files more than once, and \
+             every writing habit in it splits 26 against 4: {census}"
+        );
+    }
+
+    /// The census: everything from the opening sentence down to the bullet
+    /// that leaves the file's habits behind, flattened, without the sample.
+    ///
+    /// Flattened because these are sentences, and where a sentence happens to
+    /// wrap is not something a rule should depend on. Without the sample
+    /// because the numbers between the fences are a preset's — a sort order, a
+    /// deadzone — and reading them as counts would be reading a file as though
+    /// it were a census. The bullet below is about where a setting sits in the
+    /// document rather than about how the files were written, and the section
+    /// below *that* holds the one claim here that is true of all 30 and is not
+    /// a writing habit.
+    fn census() -> String {
+        let src = include_str!("binds.rs")
+            .split_once("//! * A setting is a direct child")
+            .expect("the census runs down to the next bullet")
+            .0;
+        let mut prose = String::new();
+        let mut sample = false;
+        for line in src.lines() {
+            if line
+                .trim_start()
+                .trim_start_matches("//!")
+                .trim_start()
+                .starts_with("```")
+            {
+                sample = !sample;
+            } else if !sample {
+                prose.push_str(line);
+                prose.push('\n');
+            }
+        }
+        flattened(&prose)
     }
 
     /// Doc text with the comment markers gone and every run of whitespace one
@@ -930,10 +1074,53 @@ mod tests {
             .join(" ")
     }
 
+    /// What `src` puts on standard output: the text inside its string
+    /// literals, one line of source at a time.
+    ///
+    /// A guard that a census is counted again has to read the counting and not
+    /// the source around it: searching a whole file finds the needle in prose
+    /// describing the counting and in the name of a local variable, and a
+    /// guard that matched either would let the line doing the counting go
+    /// without a word. A string literal is the nearest thing to output a test
+    /// can read without running the program.
+    ///
+    /// Line comments are dropped, and an escape takes the character after it
+    /// with it: neither appears inside anything this is asked about, and a
+    /// guard that needed a Rust lexer would be a guard nobody could check.
+    pub(crate) fn printed(src: &str) -> String {
+        let mut out = String::new();
+        for line in src.lines() {
+            let mut chars = line.chars().peekable();
+            let mut quoted = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' if quoted => {
+                        chars.next();
+                    }
+                    '"' => quoted = !quoted,
+                    '/' if !quoted && chars.peek() == Some(&'/') => break,
+                    _ if quoted => out.push(c),
+                    _ => {}
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// The start file names a preset that is not here, or that two files claim.
-    /// Neither is a value, and neither is silence.
+    /// Neither is a value, and neither is silence — and they are not the same
+    /// answer as each other either.
+    ///
+    /// A directory that simply does not hold the preset is the ordinary thing:
+    /// the user has not saved it. Two files claiming it is this reader
+    /// refusing to choose, which is what *go look yourself* means here. For a
+    /// caller deciding which presets to offer, that is the difference between
+    /// a name it can leave out and a problem it has to report — so it is in
+    /// the type, where the difference can be matched on, and not only in the
+    /// wording of a sentence.
     #[test]
-    fn a_preset_that_is_not_there_or_is_there_twice_is_unmatched() {
+    fn a_preset_that_is_not_there_and_one_that_is_there_twice_are_two_answers() {
         let dir = dir_with(
             "unmatched",
             &[
@@ -947,11 +1134,59 @@ mod tests {
         };
         assert_eq!(b.presets.len(), 2);
         match (&b.presets[0].found, &b.presets[1].found) {
-            (Found::Unmatched(gone), Found::Unmatched(twice)) => {
+            (Found::Absent(gone), Found::Rejected(twice)) => {
                 assert!(gone.contains("no preset"), "{gone}");
                 assert!(twice.contains("2 presets"), "{twice}");
             }
-            other => panic!("neither should have matched one file: {other:?}"),
+            other => panic!(
+                "a preset nobody saved and one two files claim are not one \
+                 answer: {other:?}"
+            ),
         }
+    }
+
+    /// Two start files at one schema, which is not an ordering.
+    ///
+    /// `start_schema` compares the name case-insensitively, so a
+    /// case-sensitive filesystem can hold both spellings; `.04.` is the same
+    /// number as `.4.` anywhere. The sort then ties, and a pick falling to
+    /// whichever path sorts last would name one of them active and the other
+    /// superseded, of a pair where neither supersedes anything.
+    #[test]
+    fn two_start_files_at_one_schema_are_refused_rather_than_ordered_by_name() {
+        for pair in [
+            ["StartPreset.4.start", "startpreset.4.start"],
+            ["StartPreset.4.start", "StartPreset.04.start"],
+        ] {
+            let dir = dir_with(
+                "tied",
+                &[
+                    (pair[0], b"Newer\r\n"),
+                    (pair[1], b"Older\r\n"),
+                    ("Newer.binds", &preset_file("Newer", "")),
+                    ("Older.binds", &preset_file("Older", "")),
+                ],
+            );
+            match read(&dir, "HeadlookMode") {
+                Source::Rejected(why) => {
+                    assert!(why.contains(pair[0]) && why.contains(pair[1]), "{why}")
+                }
+                other => panic!("{pair:?} is a tie, not a reading: {other:?}"),
+            }
+        }
+        // One of each is still an ordering, and still read.
+        let dir = dir_with(
+            "untied",
+            &[
+                ("StartPreset.3.start", b"Older\r\n"),
+                ("StartPreset.4.start", b"Newer\r\n"),
+                ("Newer.binds", &preset_file("Newer", "")),
+                ("Older.binds", &preset_file("Older", "")),
+            ],
+        );
+        let Source::Read(b) = read(&dir, "HeadlookMode") else {
+            panic!("two schemas are an ordering");
+        };
+        assert_eq!(b.presets[0].name, "Newer");
     }
 }

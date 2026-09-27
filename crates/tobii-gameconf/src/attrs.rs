@@ -8,10 +8,19 @@
 //! ```text
 //! <Attributes Version="35">
 //!  <Attr name="ADSMouseSensitivity" value="1"/>
-//!  <Attr name="HeadtrackingSource" value="1"/>
+//!  …
 //!  <Attr name="HeadtrackingInactivityTime" value="2"/>
+//!  <Attr name="HeadtrackingSource" value="1"/>
+//!  …
 //! </Attributes>
 //! ```
+//!
+//! The ellipses are the rest of the file, not a rearrangement of it. The pairs
+//! are one run sorted by name in byte order — `FOV` ahead of
+//! `FlightCoreDisabledSensitivityRotation` — the first of them is the one
+//! shown, and the two head-tracking ones sit together a couple of dozen lines
+//! further down. Nothing here relies on that order; it is written down so the
+//! sample can be checked against the file rather than taken on trust.
 //!
 //! No declaration, no byte-order mark, one space of indentation, every line
 //! ending CRLF, every value a quoted string whatever it holds. `Version` on
@@ -80,9 +89,9 @@ impl Attributes {
 /// project has measured — and both of the confident answers would be a guess
 /// about that. The refusal says which spelling is in the file, which is what a
 /// user needs in order to go and look. [`crate::binds`] reads the other format
-/// by the same rule, and [`crate::binds::start`] gives the argument in full,
-/// including why a *file name* is the one thing either module compares
-/// case-insensitively.
+/// by the same rule, and [`crate::binds::start`] gives the argument in full —
+/// including the one place it does not hold, a *file name* on a disk, which
+/// that module compares case-insensitively and this one never sees.
 pub fn parse(doc: &[u8], name: &str) -> Attributes {
     let document = match xml::parse(doc) {
         Ok(d) => d,
@@ -141,8 +150,8 @@ fn value(document: &xml::Document<'_>, name: &str) -> Lookup {
     match (exact.as_slice(), other_case.as_slice()) {
         ([], []) => Lookup::Absent,
         ([], spellings) => Lookup::Rejected(format!(
-            "no attribute called {name}, but one called {}, and this reader \
-             cannot tell whether the game reads it as the same setting",
+            "no attribute called {name}, only {}, and this reader cannot tell \
+             whether the game reads a name in another case as the same setting",
             spellings.join(" and ")
         )),
         ([one], _) => match one.attribute("value") {
@@ -175,6 +184,7 @@ pub fn read(path: &Path, name: &str) -> Source<Attributes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binds::tests::printed;
     use crate::tests::scratch;
 
     /// The shape the real file has, down to the one-space indentation and the
@@ -260,11 +270,24 @@ mod tests {
     /// Whether the game's own reader is case-sensitive is unmeasured, so
     /// neither confident answer is available: not the value, and not "you have
     /// not set this".
+    ///
+    /// The refusal names every spelling it found, so the sentence around them
+    /// has to read for more than one: "but one called" in front of a list that
+    /// can hold two is a count of its own, and a wrong one.
     #[test]
     fn a_name_in_another_case_is_neither_a_value_nor_an_absence() {
         let doc = b"<Attributes><Attr name=\"headtrackingsource\" value=\"1\"/></Attributes>";
         match parse(doc, "HeadtrackingSource").value {
             Lookup::Rejected(why) => assert!(why.contains("headtrackingsource"), "{why}"),
+            other => panic!("should have refused to choose: {other:?}"),
+        }
+        let doc = b"<Attributes><Attr name=\"headtrackingsource\" value=\"1\"/>\
+                    <Attr name=\"HEADTRACKINGSOURCE\" value=\"2\"/></Attributes>";
+        match parse(doc, "HeadtrackingSource").value {
+            Lookup::Rejected(why) => assert!(
+                why.contains("only headtrackingsource and HEADTRACKINGSOURCE"),
+                "two spellings are not `one called`: {why}"
+            ),
             other => panic!("should have refused to choose: {other:?}"),
         }
     }
@@ -280,6 +303,12 @@ mod tests {
     /// matched nothing in the file sat under a heading promising it had been
     /// measured — so the header states a size and a population, and the
     /// example prints a size and a population.
+    ///
+    /// The example's half is read out of its string literals and not out of
+    /// its source, for the reason [`crate::binds`]'s twin gives: the word
+    /// `bytes` is also in the example's module docs and in the name of a
+    /// local, so a test that searched the source would stay green with the
+    /// line that prints the size deleted.
     #[test]
     fn every_number_in_the_header_is_counted_by_the_example() {
         // Without the code markers: whether a name is quoted in prose is a
@@ -290,7 +319,7 @@ mod tests {
             .expect("the header runs down to the next heading")
             .0
             .replace('`', "");
-        let example = include_str!("../examples/read.rs");
+        let example = printed(include_str!("../examples/read.rs"));
         for (stated, counted) in [("bytes", "bytes"), ("<Attr> elements", "<Attr> elements")] {
             assert!(
                 header.contains(stated),
