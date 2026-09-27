@@ -1475,6 +1475,7 @@ dependencies = [
  "tobii-ipc",
  "tobii-output",
  "tobii-protocol",
+ "tobii-steam",
  "tobii-update",
  "tobii-usb",
 ]

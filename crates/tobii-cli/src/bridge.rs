@@ -396,177 +396,88 @@ pub fn wine_from_steam_config_info(prefix: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Steam's install roots, in the order they are worth trying.
+/// Reading Steam's own files — the libraries, what is installed in them, and
+/// where a title's Proton prefix is — is [`tobii_steam`]'s job, not this
+/// module's.
 ///
-/// `~/.steam/steam` is the symlink Steam maintains to wherever it actually
-/// lives, so it wins; the others are the layouts it has used and the one
-/// Flatpak uses.
-const STEAM_ROOTS: [&str; 4] = [
-    ".steam/steam",
-    ".local/share/Steam",
-    ".steam/root",
-    ".var/app/com.valvesoftware.Steam/data/Steam",
-];
+/// It lives there so the GTK hub can reach it: `tobii-cli` is a `[[bin]]` with
+/// no `[lib]`, so nothing declared in here is callable from anywhere else in
+/// the workspace. What stays here is the wording — which errors this command
+/// prints and how — because a picker in the hub and a line on a terminal want
+/// the same decision phrased two different ways.
+///
+/// Re-exported under the name it had for `uninstall::wine_prefixes`, the one
+/// caller outside this module that asks bridge where the libraries are. It can
+/// go the day that caller reaches the crate itself.
+pub use tobii_steam::libraries as steam_libraries;
 
-/// Add `path` if it is a library and not already listed.
+/// Whether `--steam <wanted>` names an app id rather than a title.
 ///
-/// Canonicalised first: `~/.steam/steam` and `~/.steam/root` are both symlinks
-/// to the real install, so a plain path comparison reports the same library
-/// three times and would then install into it three times.
-fn push_library(out: &mut Vec<PathBuf>, path: PathBuf) {
-    if !path.join("steamapps").is_dir() {
-        return;
-    }
-    let real = path.canonicalize().unwrap_or(path);
-    if !out.contains(&real) {
-        out.push(real);
-    }
-}
-
-/// The value of a `"key"    "value"` line in Valve's key-value format.
+/// An app id is used verbatim and is never checked against what is installed,
+/// because `compatdata` outlives the manifest in both of the directions that
+/// matter: Steam keeps a prefix after the title is uninstalled — which is why
+/// `uninstall` scans `compatdata/*` rather than the installed list — and a
+/// non-Steam shortcut added to Steam gets a prefix under an id that no
+/// `appmanifest_*.acf` ever mentions. Both of those resolve today, and both
+/// would stop resolving if the id went through [`tobii_steam::resolve`], which
+/// answers `None` for an id it cannot find installed and would turn each of
+/// them into "no installed Steam game matches".
 ///
-/// `libraryfolders.vdf` and an `appmanifest_*.acf` are both that format, and
-/// both are read by pulling out the two or three keys that matter rather than
-/// by understanding VDF, because a real parser would be a dependency and a
-/// maintenance burden for three strings.
-///
-/// The key is matched a piece at a time rather than against a quoted copy of
-/// it, so running this over every line of every manifest allocates nothing.
-fn vdf_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let rest = line
-        .trim()
-        .strip_prefix('"')?
-        .strip_prefix(key)?
-        .strip_prefix('"')?;
-    rest.trim().trim_start_matches('"').split('"').next()
-}
-
-/// Every Steam library on this machine.
-///
-/// The libraries live in `libraryfolders.vdf`, out of which [`vdf_value`] pulls
-/// the `"path"` lines.
-pub fn steam_libraries(home: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for root in STEAM_ROOTS {
-        let root = home.join(root);
-        // Not `else { continue }`: that skipped the root fallback below, so a
-        // Steam install whose libraryfolders.vdf is missing, unreadable or not
-        // UTF-8 produced NO libraries at all — and every `--steam` path sources
-        // its libraries here, so the whole surface then reported "no Steam
-        // libraries found" on a machine with games plainly installed.
-        let vdf = root.join("steamapps/libraryfolders.vdf");
-        let text = std::fs::read_to_string(&vdf).unwrap_or_default();
-        for line in text.lines() {
-            if let Some(p) = vdf_value(line, "path") {
-                push_library(&mut out, PathBuf::from(p.replace("\\\\", "/")));
-            }
-        }
-        // The root is a library itself even when the file does not say so.
-        push_library(&mut out, root);
-    }
-    out
-}
-
-/// The installed games, as `(appid, name)`.
-pub fn steam_apps(home: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for lib in steam_libraries(home) {
-        let Ok(dir) = std::fs::read_dir(lib.join("steamapps")) else {
-            continue;
-        };
-        for entry in dir.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("appmanifest_") || !name.ends_with(".acf") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            let field = |key: &str| text.lines().find_map(|l| vdf_value(l, key));
-            if let (Some(id), Some(name)) = (field("appid"), field("name")) {
-                out.push((id.to_string(), name.to_string()));
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// The Proton prefix for `appid`, if the game has ever been run.
-///
-/// Proton creates `steamapps/compatdata/<appid>/pfx` the first time a title
-/// launches. Its absence is the commonest reason this fails and is worth saying
-/// out loud rather than reporting as "not found".
-pub fn steam_prefix(home: &Path, appid: &str) -> Option<PathBuf> {
-    let libs = steam_libraries(home);
-    // The library holding the manifest is asked first, not just whichever
-    // library happens to come first. Steam's "Move Install Folder" does not
-    // move `compatdata`, so a game moved between libraries leaves its old
-    // prefix behind and gets a fresh one on the next run — and installing into
-    // the abandoned one succeeds, prints the ordinary success text, and does
-    // nothing at all for the game.
-    let owner = libs
-        .iter()
-        .find(|lib| {
-            lib.join(format!("steamapps/appmanifest_{appid}.acf"))
-                .is_file()
-        })
-        .cloned();
-    owner
-        .into_iter()
-        .chain(libs)
-        .map(|lib| lib.join("steamapps/compatdata").join(appid).join("pfx"))
-        .find(|p| p.join("drive_c").is_dir())
+/// **The empty string passes this vacuously, and that is deliberate.**
+/// [`tobii_steam::resolve`] refuses it on purpose, calling `--steam ""` a name
+/// fragment that matches everything — which is a better answer than the one
+/// this gives, and a different one: it would print the ambiguous list on a
+/// machine with several games installed, and on a machine with exactly one it
+/// would silently succeed against that game's prefix. Moving this module onto
+/// the crate changes no output at all, so the old answer stands here. Changing
+/// it is worth doing on purpose, not as a side effect of moving code.
+fn is_app_id(wanted: &str) -> bool {
+    wanted.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Turn `--steam <appid|name fragment>` into a prefix path.
 ///
-/// A name is matched case-insensitively as a substring, because nobody types
-/// "Elite Dangerous" with the right capitalisation twice. An ambiguous fragment
-/// lists what it matched rather than picking one.
+/// What a name fragment picked out is [`tobii_steam::resolve`]'s decision; the
+/// wording of every answer is this function's. A name is matched
+/// case-insensitively as a substring, because nobody types "Elite Dangerous"
+/// with the right capitalisation twice. An ambiguous fragment lists what it
+/// matched rather than picking one.
 fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
-    let apps = steam_apps(home);
-    let appid = if wanted.chars().all(|c| c.is_ascii_digit()) {
+    let apps = tobii_steam::apps(home);
+    let appid = if is_app_id(wanted) {
         wanted.to_string()
     } else {
-        let needle = wanted.to_lowercase();
-        let hits: Vec<&(String, String)> = apps
-            .iter()
-            .filter(|(_, n)| n.to_lowercase().contains(&needle))
-            .collect();
-        match hits.as_slice() {
-            [] => {
-                let mut msg = format!("no installed Steam game matches {wanted:?}");
-                if apps.is_empty() {
-                    msg.push_str(" (no Steam libraries found)");
-                } else {
-                    msg.push_str("\ninstalled:");
-                    for (id, n) in &apps {
-                        msg.push_str(&format!("\n  {id:<10} {n}"));
-                    }
-                }
-                return Err(msg);
-            }
-            [one] => one.0.clone(),
-            many => {
-                let list: Vec<String> = many
+        match tobii_steam::resolve(&apps, wanted) {
+            tobii_steam::Match::One(app) => app.appid,
+            tobii_steam::Match::Many(hits) => {
+                let list: Vec<String> = hits
                     .iter()
-                    .map(|(id, n)| format!("  {id:<10} {n}"))
+                    .map(|a| format!("  {:<10} {}", a.appid, a.name))
                     .collect();
                 return Err(format!(
                     "{wanted:?} matches more than one game; pass the app id:\n{}",
                     list.join("\n")
                 ));
             }
+            tobii_steam::Match::None => {
+                let mut msg = format!("no installed Steam game matches {wanted:?}");
+                if apps.is_empty() {
+                    msg.push_str(" (no Steam libraries found)");
+                } else {
+                    msg.push_str("\ninstalled:");
+                    for a in &apps {
+                        msg.push_str(&format!("\n  {:<10} {}", a.appid, a.name));
+                    }
+                }
+                return Err(msg);
+            }
         }
     };
-    steam_prefix(home, &appid).ok_or_else(|| {
+    tobii_steam::prefix(home, &appid).ok_or_else(|| {
         let name = apps
             .iter()
-            .find(|(id, _)| *id == appid)
-            .map(|(_, n)| n.as_str())
+            .find(|a| a.appid == appid)
+            .map(|a| a.name.as_str())
             .unwrap_or("that app");
         format!(
             "no Proton prefix for {appid} ({name}). Proton creates it the first \
@@ -2959,20 +2870,25 @@ fn list_steam_games() -> CmdResult {
     for lib in &libs {
         println!("library: {}", lib.display());
     }
-    let apps = steam_apps(&home);
+    let apps = tobii_steam::apps(&home);
     if apps.is_empty() {
         return Err("no installed Steam games found".into());
     }
     println!();
-    for (id, name) in &apps {
+    for app in &apps {
         // A title with no prefix has never been run under Proton, which is the
         // one thing that stops `--steam` working — so it is shown, not hidden.
-        let mark = if steam_prefix(&home, id).is_some() {
+        //
+        // Proton itself and the Steam runtimes are shown too, which
+        // `tobii_steam::looks_like_tool` could now filter out. Left alone: this
+        // list is what it was before the move, and what it should be is the
+        // maintainer's call, not a rewiring's.
+        let mark = if tobii_steam::prefix(&home, &app.appid).is_some() {
             "proton"
         } else {
             "  --  "
         };
-        println!("  {mark}  {id:<10} {name}");
+        println!("  {mark}  {id:<10} {name}", id = app.appid, name = app.name);
     }
     println!(
         "\ninstall into one with:  tobii bridge install --steam <app id or name>\n\
@@ -6176,6 +6092,169 @@ exit 0
         let args: Vec<String> = ["tobii", "bridge"].iter().map(|s| s.to_string()).collect();
         let err = bridge(&args).expect_err("no subcommand is an error");
         assert!(err.to_string().contains("status"), "{err}");
+    }
+
+    /// A throwaway `$HOME` with one Steam library in it, holding a manifest
+    /// per `(appid, name)`.
+    ///
+    /// No environment variable is read and nothing under the real home is
+    /// touched: CI runs these as root, where `$HOME` is somebody else's, and
+    /// `steam_prefix_for` takes the home to look in for exactly that reason.
+    fn steam_home(tag: &str, apps: &[(&str, &str)]) -> PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("tobii-steamfix-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&home).ok();
+        let steamapps = home.join(".steam/steam/steamapps");
+        std::fs::create_dir_all(&steamapps).expect("steamapps");
+        for (id, name) in apps {
+            std::fs::write(
+                steamapps.join(format!("appmanifest_{id}.acf")),
+                format!(
+                    "\"AppState\"\n{{\n\t\"appid\"\t\t\"{id}\"\n\t\"name\"\t\t\"{name}\"\n}}\n"
+                ),
+            )
+            .expect("manifest");
+        }
+        home
+    }
+
+    /// What Proton leaves behind the first time a title is launched.
+    fn launched(home: &Path, appid: &str) -> PathBuf {
+        let pfx = home
+            .join(".steam/steam/steamapps/compatdata")
+            .join(appid)
+            .join("pfx");
+        std::fs::create_dir_all(pfx.join("drive_c")).expect("pfx");
+        pfx
+    }
+
+    /// The four things `--steam` can answer are worded here and decided in
+    /// `tobii_steam`, and the wording is what a user sees. These pin it
+    /// byte-for-byte, because the move onto that crate was allowed to change
+    /// where the answer comes from and nothing about what it says.
+    #[test]
+    fn an_ambiguous_name_lists_what_it_matched_and_asks_for_the_app_id() {
+        let home = steam_home(
+            "many",
+            &[("11", "Fixture Game One"), ("22", "Fixture Game Two")],
+        );
+        let err = steam_prefix_for(&home, "fixture").expect_err("two matches is not an answer");
+        assert_eq!(
+            err,
+            "\"fixture\" matches more than one game; pass the app id:\n  \
+             11         Fixture Game One\n  \
+             22         Fixture Game Two"
+        );
+    }
+
+    #[test]
+    fn a_name_that_matches_nothing_lists_everything_that_is_installed() {
+        let home = steam_home(
+            "none",
+            &[("11", "Fixture Game One"), ("22", "Fixture Game Two")],
+        );
+        let err = steam_prefix_for(&home, "nothing").expect_err("no match is not an answer");
+        assert_eq!(
+            err,
+            "no installed Steam game matches \"nothing\"\ninstalled:\n  \
+             11         Fixture Game One\n  \
+             22         Fixture Game Two"
+        );
+    }
+
+    /// An empty list is its own sentence: "installed:" followed by nothing
+    /// would read as a list that failed to print.
+    #[test]
+    fn a_name_matching_nothing_with_no_steam_at_all_says_there_are_no_libraries() {
+        let home = steam_home("nosteam", &[]);
+        std::fs::remove_dir_all(home.join(".steam")).expect("no library at all");
+        let err = steam_prefix_for(&home, "elite").expect_err("nothing is installed");
+        assert_eq!(
+            err,
+            "no installed Steam game matches \"elite\" (no Steam libraries found)"
+        );
+    }
+
+    /// An app id is used verbatim, and this is the case that proves it is not
+    /// checked against the installed list first: `compatdata` outlives the
+    /// manifest, so a non-Steam shortcut and an uninstalled title both keep a
+    /// prefix that `--steam <id>` still reaches. Asking `tobii_steam::resolve`
+    /// about the id instead would answer `None` here and turn a prefix that
+    /// resolves today into "no installed Steam game matches".
+    #[test]
+    fn an_app_id_with_a_prefix_but_no_manifest_still_resolves() {
+        let home = steam_home("orphan", &[("44", "Listed Fixture")]);
+        let pfx = launched(&home, "3512345678");
+        assert_eq!(
+            steam_prefix_for(&home, "3512345678").expect("the prefix is there"),
+            pfx.canonicalize().expect("real")
+        );
+    }
+
+    /// The other half of the same rule: an app id nothing is installed under
+    /// and nothing has a prefix for is answered by the prefix paragraph — "that
+    /// app", because no manifest names it — and not by the installed list.
+    #[test]
+    fn an_app_id_with_neither_manifest_nor_prefix_gets_the_prefix_paragraph() {
+        let home = steam_home("strangeid", &[("11", "Fixture Game One")]);
+        let err = steam_prefix_for(&home, "99").expect_err("no prefix under 99");
+        assert_eq!(
+            err,
+            "no Proton prefix for 99 (that app). Proton creates it the first \
+             time the game runs — start the game once, then run this again.\n\
+             If it is set to run natively rather than through Proton, there is \
+             no prefix and no Windows DLL to install into."
+        );
+    }
+
+    /// An installed title that has never been launched is the commonest way to
+    /// reach that paragraph, and there the manifest does name it.
+    #[test]
+    fn a_game_that_has_never_been_launched_is_named_in_the_prefix_paragraph() {
+        let home = steam_home("unlaunched", &[("11", "Fixture Game One")]);
+        let err = steam_prefix_for(&home, "game one").expect_err("never launched, no prefix");
+        assert!(
+            err.starts_with("no Proton prefix for 11 (Fixture Game One). Proton creates it"),
+            "{err}"
+        );
+    }
+
+    /// `--steam ""` is all-digits vacuously, so it is an app id — the empty
+    /// one, which nothing is installed under and nothing has a prefix for. The
+    /// answer is nonsense and it is the answer this command has always given;
+    /// see [`is_app_id`] for why the move onto `tobii_steam`, whose `resolve`
+    /// calls the empty string a name matching everything, did not take that
+    /// better answer along with it.
+    #[test]
+    fn an_empty_steam_value_answers_exactly_as_it_did_before() {
+        let home = steam_home(
+            "empty",
+            &[("11", "Fixture Game One"), ("22", "Fixture Game Two")],
+        );
+        let err = steam_prefix_for(&home, "").expect_err("the empty app id");
+        assert_eq!(
+            err,
+            "no Proton prefix for  (that app). Proton creates it the first \
+             time the game runs — start the game once, then run this again.\n\
+             If it is set to run natively rather than through Proton, there is \
+             no prefix and no Windows DLL to install into."
+        );
+    }
+
+    /// A name that matches exactly one is that one, whatever its capitalisation
+    /// — and the prefix it resolves to is the library's, not the first library
+    /// that happens to have a `compatdata`.
+    #[test]
+    fn one_name_match_resolves_to_that_titles_prefix() {
+        let home = steam_home(
+            "one",
+            &[("11", "Fixture Game One"), ("22", "Fixture Game Two")],
+        );
+        let pfx = launched(&home, "22");
+        assert_eq!(
+            steam_prefix_for(&home, "GAME TWO").expect("launched once"),
+            pfx.canonicalize().expect("real")
+        );
     }
 
     /// A Steam prefix is one the user never typed the path of — they named a

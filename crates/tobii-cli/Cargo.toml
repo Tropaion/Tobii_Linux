@@ -21,6 +21,11 @@ tobii-diagnostics = { path = "../tobii-diagnostics" }
 tobii-output = { path = "../tobii-output" }
 # For `tobii game`: hold the hub's tracking socket open for a child process.
 tobii-ipc = { path = "../tobii-ipc" }
+# Steam's libraries, installed applications and Proton prefixes, which
+# `tobii bridge --steam` reads. Dependency-free itself, so this adds nothing to
+# the build but its own file — it exists apart from this crate because
+# `tobii-cli` is a `[[bin]]` and the GTK hub cannot reach into one.
+tobii-steam = { path = "../tobii-steam" }
 tobii-update = { path = "../tobii-update" }
 tobii-headpose = { path = "../tobii-headpose", default-features = false }
 # For `tobii uninstall`'s O_NOFOLLOW | O_NONBLOCK opens. Already in the tree
