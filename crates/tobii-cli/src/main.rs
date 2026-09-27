@@ -78,6 +78,7 @@ fn main() -> ExitCode {
                  tobii stream [--json] [--eyes]\n  \
                  tobii game -- <command> [args...]\n  \
                  tobii games [set KEY VALUE]\n  \
+                 tobii games profile show|save|apply|forget [<app id or name>]\n  \
                  tobii bridge install --prefix PATH\n  \
                  tobii bridge status --prefix PATH\n  \
                  tobii bridge run --prefix PATH\n  \
@@ -2013,10 +2014,714 @@ fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
             println!("{key} = {value}");
             Ok(())
         }
-        Some(other) => {
-            Err(format!("unknown: tobii games {other} (try: tobii games set KEY VALUE)").into())
+        Some("profile") => profile_cmd(args),
+        Some(other) => Err(format!(
+            "unknown: tobii games {other}\nusage:\n  \
+             tobii games\n  \
+             tobii games set KEY VALUE\n\
+             {PROFILE_USAGE}"
+        )
+        .into()),
+    }
+}
+
+// ----------------------------------------------------- tobii games profile
+
+// A per-game profile holds three unequal things, and every sentence these
+// commands print exists to keep them from being read as one:
+//
+//   * this program's own settings, which it reads and writes, and can
+//     therefore capture and put back;
+//   * whether the game needs the Wine bridge, which is a claim about the game
+//     that somebody has to have established — installing the bridge does not
+//     establish it;
+//   * what the game's own configuration files should say, which this program
+//     reads and never writes, and cannot invent.
+//
+// `save` can honestly capture only the first. That is not a gap to be papered
+// over with a plausible-looking guess at the other two: a profile naming a
+// check nobody verified would send a user to change a setting on this
+// program's authority, and this program has none.
+
+/// The libraries `libraryfolders.vdf` names that are not on this machine, as
+/// a block to print — empty when there are none.
+///
+/// Steam records a library's path, not whether its drive is plugged in, so a
+/// title on an unplugged external drive is installed and in no list here.
+/// Every answer below that would otherwise read as the whole picture of what
+/// is installed carries this, so "this game is not installed" is never printed
+/// over a drive nobody could look in.
+///
+/// `pub(crate)` because `bridge.rs` words these same answers from its own
+/// private copy of this function. The crate root is the one module both can
+/// see; when that file is next opened, its copy should go and this should be
+/// what it calls.
+pub(crate) fn steam_libraries_missing(home: &std::path::Path) -> String {
+    let missing = tobii_steam::missing_libraries(home);
+    if missing.is_empty() {
+        return String::new();
+    }
+    let mut block = if missing.len() == 1 {
+        "libraryfolders.vdf names a Steam library this machine does not have, \
+         so anything installed there is in no list here:"
+            .to_string()
+    } else {
+        format!(
+            "libraryfolders.vdf names {} Steam libraries this machine does not \
+             have, so anything installed there is in no list here:",
+            missing.len()
+        )
+    };
+    for path in &missing {
+        block.push_str(&format!("\n  {}", path.display()));
+    }
+    block
+}
+
+/// `head`, then the missing-library block under it if there is one.
+fn with_missing(head: String, missing: &str) -> String {
+    if missing.is_empty() {
+        head
+    } else {
+        format!("{head}\n{missing}")
+    }
+}
+
+/// Whether what the user typed is an app id rather than a name fragment.
+///
+/// The same rule [`tobii_steam::resolve`] applies internally, and it has to
+/// stay the same rule: this is asked only about a value `resolve` has already
+/// answered [`tobii_steam::Match::None`] for, to tell *an app id for a game
+/// that is not installed here* from *a name that matches nothing*.
+fn is_app_id(wanted: &str) -> bool {
+    !wanted.is_empty() && wanted.chars().all(|c| c.is_ascii_digit())
+}
+
+/// One game the user named, resolved as far as this machine can resolve it.
+#[derive(Debug)]
+struct GameRef {
+    /// What names the profile file. The whole of a game's identity here, as it
+    /// is in `tobii_steam`.
+    appid: String,
+    /// What Steam calls it, when Steam has it. Display only.
+    name: Option<String>,
+    /// [`steam_libraries_missing`] for the home this was resolved in, carried
+    /// so the heading can never print a confident "not installed".
+    missing_libraries: String,
+}
+
+impl GameRef {
+    /// The line every answer about this game starts with.
+    fn heading(&self) -> String {
+        match &self.name {
+            Some(n) => format!("{:<10} {n}", self.appid),
+            // Not installed, and a library that could not be looked in: two
+            // different sentences, because only one of them is a negative this
+            // program is entitled to.
+            None if self.missing_libraries.is_empty() => {
+                format!("{:<10} (not installed on this machine)", self.appid)
+            }
+            None => with_missing(
+                format!(
+                    "{:<10} (not in the Steam libraries this machine has)",
+                    self.appid
+                ),
+                &self.missing_libraries,
+            ),
         }
     }
+}
+
+/// Turn `<app id or name>` into a game, the way `--steam` does elsewhere.
+///
+/// The decision is [`tobii_steam::resolve`]'s and the wording is this
+/// function's, exactly as in `bridge.rs`: a name is a case-insensitive
+/// substring, an ambiguous one lists what it matched rather than picking, and
+/// nothing matching says what was looked at.
+///
+/// One case `bridge.rs` has no use for: an app id that resolves to nothing is
+/// *not* an error here. A profile outlives the install it was written for, and
+/// `show`, `forget` and `apply` all have honest answers for a game that has
+/// since been uninstalled. A *name* that matches nothing stays an error —
+/// there is no app id to be had from it.
+fn steam_appid_for(home: &std::path::Path, wanted: &str) -> Result<GameRef, String> {
+    // Asked before `resolve`, which cannot answer it: an empty needle is a
+    // substring of every name, so it matches everything — and on a machine
+    // with exactly one application that is `Match::One`, indistinguishable
+    // from a fragment that picked it out. `tobii games profile save ""` would
+    // then write a profile for whatever that one application happened to be.
+    if wanted.is_empty() {
+        return Err("name a game: an app id, or part of its name".to_string());
+    }
+    let apps = tobii_steam::apps(home);
+    let missing_libraries = steam_libraries_missing(home);
+    match tobii_steam::resolve(&apps, wanted) {
+        tobii_steam::Match::One(app) => Ok(GameRef {
+            appid: app.appid,
+            name: Some(app.name),
+            missing_libraries,
+        }),
+        tobii_steam::Match::Many(hits) => {
+            let list: Vec<String> = hits
+                .iter()
+                .map(|a| format!("  {:<10} {}", a.appid, a.name))
+                .collect();
+            Err(format!(
+                "{wanted:?} matches more than one game; pass the app id:\n{}",
+                list.join("\n")
+            ))
+        }
+        tobii_steam::Match::None if is_app_id(wanted) => Ok(GameRef {
+            appid: wanted.to_string(),
+            name: None,
+            missing_libraries,
+        }),
+        tobii_steam::Match::None => {
+            // "No installed Steam game matches" is a claim about every game
+            // installed, and there may be a library here that could not be
+            // looked in. So the sentence says what was looked at.
+            let mut msg = if missing_libraries.is_empty() {
+                format!("no installed Steam game matches {wanted:?}")
+            } else {
+                format!("nothing in the Steam libraries this machine has matches {wanted:?}")
+            };
+            if apps.is_empty() {
+                msg.push_str(" (no Steam libraries found)");
+            } else {
+                msg.push_str("\ninstalled:");
+                for a in &apps {
+                    msg.push_str(&format!("\n  {:<10} {}", a.appid, a.name));
+                }
+            }
+            Err(with_missing(msg, &missing_libraries))
+        }
+    }
+}
+
+/// This program's own settings as `(key, value)` text, exactly as its config
+/// file spells them.
+///
+/// Read back out of `OutputConfig::to_toml` rather than listed here. The keys
+/// are `OutputConfig::keys()`, which a test in `tobii-output` pins to exactly
+/// what `to_toml` writes; a second list in this file would be a third place to
+/// forget a new setting, which is the mistake that list already carries a
+/// comment about. What this owes in return is
+/// `captured_settings_are_every_key_and_rebuild_the_config`, below: the pairs
+/// must be every advertised key, and must reconstruct the config they came
+/// from.
+///
+/// It takes the config rather than the text, so no caller can point it at a
+/// file somebody hand-edited: its input is always this program's own writer.
+fn captured_settings(cfg: &tobii_output::games::OutputConfig) -> Vec<(String, String)> {
+    let toml = cfg.to_toml();
+    let mut out = Vec::new();
+    let mut in_games = false;
+    for line in toml.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_games = line == "[games]";
+            continue;
+        }
+        if !in_games {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        // `to_toml` quotes a string and leaves a scalar bare. A profile's
+        // settings are text on their way to `apply_key`, which is handed the
+        // unquoted string in both cases — the same thing `from_toml` does.
+        let value = value
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .unwrap_or(value);
+        out.push((key.trim().to_string(), value.to_string()));
+    }
+    out
+}
+
+/// The `key = value` pairs in `settings` that `OutputConfig::apply_key` will
+/// not take, formatted one per line.
+///
+/// A profile is a hand-edited file, so `enabeld = true` is a thing that
+/// happens. `apply_key` is the one place that decides what a key means, and
+/// `tobii-output` depends on `tobii-config`, so `tobii-config` cannot ask it —
+/// which makes this the first place that can.
+fn unusable_settings(settings: &[(String, String)]) -> Vec<String> {
+    let mut probe = tobii_output::games::OutputConfig::default();
+    settings
+        .iter()
+        .filter(|(k, v)| !probe.apply_key(k, v))
+        .map(|(k, v)| format!("  {k} = {v:?}"))
+        .collect()
+}
+
+/// What a profile leaves for a person to do, as a block to print under it.
+///
+/// Shared by `show` and `apply` so the two cannot come to differ about what
+/// this program did not do.
+fn left_for_you(p: &tobii_config::profiles::Profile, appid: &str) -> String {
+    use tobii_config::profiles::Bridge;
+    let mut s = String::new();
+    match p.bridge {
+        Bridge::Required => s.push_str(&format!(
+            "\nThe Wine bridge: this game reads head tracking through it.\n  \
+             tobii bridge install --steam {appid}\n"
+        )),
+        Bridge::NotNeeded => {
+            s.push_str("\nThe Wine bridge: the profile says this game does not need it.\n")
+        }
+        // Absent is not "no". Nobody wrote it down, and this program has not
+        // worked it out — the bridge being installed in the prefix would say
+        // that somebody installed it, not that the game reads it.
+        Bridge::Unstated => s.push_str(
+            "\nThe Wine bridge: the profile does not say whether this game needs it,\n  \
+             and nothing here has established it either way.\n",
+        ),
+    }
+    let unknown = p.unknown_formats();
+    if !unknown.is_empty() {
+        // Counted over the checks, not over the names: two checks in one
+        // unreadable format are two checks that cannot be looked up.
+        let n = p.checks.iter().filter(|c| !c.format.is_known()).count();
+        s.push_str(&format!(
+            "\n{n} check{} name{} a file format this build cannot read: {}.\n  \
+             A newer tobii-linux may know {}.\n",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "s" } else { "" },
+            unknown.join(", "),
+            if unknown.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    if p.checks.is_empty() {
+        s.push_str(
+            "\nThe game's own configuration: the profile names nothing to check.\n  \
+             This program never writes a game's configuration files, so anything\n  \
+             that has to change in them is yours to change — and nobody has\n  \
+             written down what that is for this game.\n",
+        );
+        return s;
+    }
+    s.push_str(&format!(
+        "\nThe game's own configuration — {} thing{} to check, BY HAND. This\n  \
+         program has not read any of these files: it never writes a game's\n  \
+         configuration, and it does not read one from here either.\n",
+        p.checks.len(),
+        if p.checks.len() == 1 { "" } else { "s" },
+    ));
+    for c in &p.checks {
+        s.push_str(&format!(
+            "\n  {} ({}, under the Proton prefix)\n    \
+             {} should be {:?}\n    {}\n",
+            c.path,
+            c.format.as_str(),
+            c.setting,
+            c.wants,
+            c.tell
+        ));
+    }
+    s
+}
+
+/// `tobii games profile show` with no game: every profile there is.
+///
+/// Reads nothing but the profiles directory — not Steam, not `$HOME`. A user
+/// whose external drive is unplugged still gets the list of what they wrote.
+fn profile_list(out: &mut String, dir: &std::path::Path, builtin: &[(&str, &str)]) {
+    let listing = tobii_config::profiles::list_from(dir, builtin);
+    if listing.profiles.is_empty() {
+        out.push_str("no game profiles.\n");
+    } else {
+        for (appid, loaded) in &listing.profiles {
+            let p = &loaded.profile;
+            out.push_str(&format!(
+                "{:<10} {:<28} {} setting{}, {} check{}\n",
+                appid,
+                p.name.as_deref().unwrap_or(""),
+                p.settings.len(),
+                if p.settings.len() == 1 { "" } else { "s" },
+                p.checks.len(),
+                if p.checks.len() == 1 { "" } else { "s" },
+            ));
+            out.push_str(&format!("           {}\n", loaded.origin));
+        }
+    }
+    out.push_str(&format!("\ndirectory: {}\n", dir.display()));
+    // Read off the table rather than written into the sentence: on the day a
+    // profile is compiled in, a hardcoded "none ship" would be a lie nothing
+    // tests.
+    if builtin.is_empty() {
+        out.push_str("this build ships no profile for any game.\n");
+    }
+    // A name in the directory that is not a profile is not a broken profile,
+    // and `tobii uninstall --purge` will say the same of it. Separate
+    // paragraphs, because folding them together is how one gets read as the
+    // other.
+    if !listing.problems.is_empty() {
+        out.push_str("\ncould not be used:\n");
+        for e in &listing.problems {
+            out.push_str(&format!("  {e}\n"));
+        }
+    }
+    if !listing.strays.is_empty() {
+        out.push_str("\nin that directory and not a profile:\n");
+        for s in &listing.strays {
+            out.push_str(&format!("  {s}\n"));
+        }
+    }
+}
+
+/// `tobii games profile show <game>`: what this program knows, and from where.
+///
+/// Knowledge, not measurement. Nothing here opens a file belonging to the
+/// game, so nothing it prints may read as a result — see [`left_for_you`].
+fn profile_show(
+    out: &mut String,
+    dir: &std::path::Path,
+    builtin: &[(&str, &str)],
+    game: &GameRef,
+) -> Result<(), String> {
+    use tobii_config::profiles;
+    out.push_str(&format!("{}\n", game.heading()));
+    let loaded = profiles::load_from(dir, builtin, &game.appid).map_err(|e| e.to_string())?;
+    let Some(loaded) = loaded else {
+        out.push_str(&format!(
+            "\nno profile: nothing here knows anything about this game.\n\
+             looked in: {}\n",
+            profiles::path_in(dir, &game.appid).display()
+        ));
+        if builtin.is_empty() {
+            out.push_str(
+                "this build ships no profile for any game, so that is the whole answer.\n",
+            );
+        }
+        return Ok(());
+    };
+    out.push_str(&format!("profile: {}\n", loaded.origin));
+    let p = &loaded.profile;
+    if let Some(n) = &p.name {
+        out.push_str(&format!("the profile calls it: {n}\n"));
+    }
+    if p.settings.is_empty() {
+        out.push_str("\nthis program's own settings: the profile sets none.\n");
+    } else {
+        out.push_str(&format!(
+            "\nthis program's own settings, {} of them, to put into effect with\n  \
+             tobii games profile apply {}\n",
+            p.settings.len(),
+            game.appid
+        ));
+        for (k, v) in &p.settings {
+            out.push_str(&format!("  {k} = {v}\n"));
+        }
+        let bad = unusable_settings(&p.settings);
+        if !bad.is_empty() {
+            out.push_str(&format!(
+                "\n{} of those would be refused — a key this program does not have,\n  \
+                 or a value it cannot read. `apply` refuses the whole profile\n  \
+                 rather than half of it:\n{}\n",
+                bad.len(),
+                bad.join("\n")
+            ));
+        }
+    }
+    out.push_str(&left_for_you(p, &game.appid));
+    Ok(())
+}
+
+/// `tobii games profile save <game>`: capture what is honestly capturable.
+///
+/// This program's own settings, as they are this second, and nothing else.
+/// Everything else a profile can hold is a claim about the *game* — whether it
+/// reads the bridge, what its own configuration files should say — and there
+/// is nowhere here to read such a claim from. So an existing profile's checks,
+/// bridge line and name are carried across untouched rather than dropped: they
+/// are somebody's work, and this command has no better version of them.
+///
+/// A profile that is there and cannot be read stops this outright. Overwriting
+/// it would destroy hand-written checks and replace them with a file that has
+/// none, and the user would never learn what the old one said.
+fn profile_save(
+    out: &mut String,
+    dir: &std::path::Path,
+    builtin: &[(&str, &str)],
+    game: &GameRef,
+    cfg: &tobii_output::games::OutputConfig,
+) -> Result<(), String> {
+    use tobii_config::profiles::{self, Bridge, Profile};
+    let existing = profiles::load_from(dir, builtin, &game.appid).map_err(|e| {
+        format!(
+            "{e}\nrefusing to overwrite a profile this program cannot read. Whatever\n  \
+             it says, somebody wrote it: fix it, or move it aside, then run this\n  \
+             again."
+        )
+    })?;
+    let mut p = Profile {
+        settings: captured_settings(cfg),
+        ..Profile::default()
+    };
+    if let Some(l) = &existing {
+        p.name = l.profile.name.clone();
+        p.bridge = l.profile.bridge;
+        p.checks = l.profile.checks.clone();
+    }
+    // Steam's name only where the profile has none of its own: a name in the
+    // file is somebody's choice, and a save is not the moment to overrule it.
+    if p.name.is_none() {
+        p.name = game.name.clone();
+    }
+    let path = profiles::path_in(dir, &game.appid);
+    profiles::save_to(dir, &game.appid, &p)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    out.push_str(&format!("wrote {}\n", path.display()));
+    out.push_str(&format!(
+        "\ncaptured: {} settings — every setting this program has, as it stands\n  \
+         right now. Not a judgement about this game: it is this machine's\n  \
+         current configuration, written down under this game's app id.\n",
+        p.settings.len()
+    ));
+    if let Some(l) = &existing {
+        out.push_str(&format!(
+            "\nkept from the profile that was already there: {} check{}, the bridge\n  \
+             line, and the name. Nothing here knows better than they do.\n",
+            p.checks.len(),
+            if p.checks.len() == 1 { "" } else { "s" },
+        ));
+        // Which profile was already there is the one thing about it worth
+        // repeating, and only when the answer is surprising: the path is on
+        // the `wrote` line above. A built-in profile has just been superseded
+        // by a file, and nothing else in this report would say so.
+        if l.origin == profiles::Origin::Builtin {
+            out.push_str(
+                "  They came from the profile compiled into tobii-linux, which this\n  \
+                 file now replaces whole.\n",
+            );
+        }
+    }
+    if p.bridge == Bridge::Unstated {
+        out.push_str(
+            "\nnot captured: whether this game needs the Wine bridge. Nothing here\n  \
+             can find that out — the bridge being installed in the prefix would\n  \
+             say somebody installed it, not that the game reads it. Write\n  \
+             `bridge = true` or `bridge = false` in the file once you know.\n",
+        );
+    }
+    if p.checks.is_empty() {
+        out.push_str(
+            "\nnot captured: anything about this game's own configuration files.\n  \
+             This program never writes them, and it cannot invent what they\n  \
+             should say. Add [[check]] blocks by hand.\n",
+        );
+    }
+    Ok(())
+}
+
+/// `tobii games profile forget <game>`: remove the user's file, naming it.
+///
+/// Only ever the user's own file. A compiled-in profile is part of the
+/// program, and answering "removed" for one would be a claim about a file that
+/// was never there.
+fn profile_forget(
+    out: &mut String,
+    dir: &std::path::Path,
+    builtin: &[(&str, &str)],
+    appid: &str,
+) -> Result<(), String> {
+    use tobii_config::profiles;
+    if !profiles::is_appid(appid) {
+        return Err(profiles::LoadError::NotAnAppId(appid.to_string()).to_string());
+    }
+    let compiled_in = builtin.iter().any(|(id, _)| *id == appid);
+    let path = profiles::path_in(dir, appid);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            out.push_str(&format!("removed {}\n", path.display()));
+            if compiled_in {
+                out.push_str(
+                    "a profile for this game is compiled into tobii-linux, and that is\n  \
+                     what will be used from now on.\n",
+                );
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            out.push_str(&format!(
+                "nothing to remove: there is no file at {}.\n",
+                path.display()
+            ));
+            if compiled_in {
+                out.push_str(
+                    "This game's profile is compiled into tobii-linux, which is part of\n  \
+                     the program and not a file `forget` can take away.\n",
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("could not remove {}: {e}", path.display())),
+    }
+}
+
+/// `tobii games profile apply <game>`: put the profile's settings into effect.
+///
+/// It earns its place because it is the other half of `save`: settings
+/// captured and never restorable would make `save` a diary. What it must not
+/// do is sound like more than it is, so three things are true of it by
+/// construction.
+///
+/// It applies **this program's** settings, which are global. A profile is per
+/// game; `games.toml` is not. Applying one game's profile sets this program up
+/// the way that game wants it, and the next game's profile will overwrite
+/// that. The report says so rather than leaving it to be discovered.
+///
+/// It is **all or nothing**. A pair `apply_key` refuses stops the whole
+/// profile and writes nothing. Applying the half it understood is exactly how
+/// somebody ends up told to change a setting a newer profile had already
+/// marked as not needed.
+///
+/// It **touches no file belonging to the game**, and it does not install the
+/// bridge. Both are named as things still to do, with the command for the one
+/// that has a command.
+///
+/// Returns whether `cfg` changed and is worth saving: a profile with no
+/// settings must not be the reason a `games.toml` appears on disk.
+fn profile_apply(
+    out: &mut String,
+    dir: &std::path::Path,
+    builtin: &[(&str, &str)],
+    game: &GameRef,
+    cfg: &mut tobii_output::games::OutputConfig,
+) -> Result<bool, String> {
+    use tobii_config::profiles;
+    out.push_str(&format!("{}\n", game.heading()));
+    let loaded = profiles::load_from(dir, builtin, &game.appid).map_err(|e| e.to_string())?;
+    let Some(loaded) = loaded else {
+        return Err(format!(
+            "no profile for {}, so there is nothing to apply.\nlooked in: {}",
+            game.appid,
+            profiles::path_in(dir, &game.appid).display()
+        ));
+    };
+    out.push_str(&format!("profile: {}\n", loaded.origin));
+    let p = &loaded.profile;
+    let bad = unusable_settings(&p.settings);
+    if !bad.is_empty() {
+        return Err(format!(
+            "{}\nhas {} setting{} this program cannot use:\n{}\nvalid keys: {}\n\
+             Nothing was applied: half a profile is worse than none of it.",
+            loaded.origin,
+            bad.len(),
+            if bad.len() == 1 { "" } else { "s" },
+            bad.join("\n"),
+            tobii_output::games::OutputConfig::keys().join(", ")
+        ));
+    }
+    let changed = !p.settings.is_empty();
+    if changed {
+        for (k, v) in &p.settings {
+            if !cfg.apply_key(k, v) {
+                // Unreachable: `unusable_settings` put every pair through this
+                // same function a moment ago and found none it refused. If
+                // that ever stops being true, stop here — the caller saves
+                // nothing on an error, so a config half-changed by a bug never
+                // reaches the disk.
+                return Err(format!(
+                    "{k} = {v:?} was refused after being accepted a moment earlier; \
+                     nothing was written"
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "\napplied {} setting{} to {}.\n  \
+             These are this program's settings and there is one set of them: they\n  \
+             are now what every game gets, not only this one.\n",
+            p.settings.len(),
+            if p.settings.len() == 1 { "" } else { "s" },
+            tobii_output::games::games_path().display()
+        ));
+    } else {
+        out.push_str(
+            "\nthis profile sets none of this program's settings, so nothing was\n  \
+             applied and nothing was written.\n",
+        );
+    }
+    out.push_str("\nstill to do, and not done by this command:\n");
+    out.push_str(&left_for_you(p, &game.appid));
+    Ok(changed)
+}
+
+/// `$HOME`, for finding Steam's libraries.
+fn home_for_steam() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "HOME is not set, so Steam's libraries cannot be found".to_string())
+}
+
+/// The `tobii games profile` verbs, as usage lines — without a `usage:`
+/// header, because the one place that lists them under a wider usage would
+/// then print the word twice.
+const PROFILE_USAGE: &str = "  \
+     tobii games profile show [<app id or name>]\n  \
+     tobii games profile save <app id or name>\n  \
+     tobii games profile apply <app id or name>\n  \
+     tobii games profile forget <app id or name>";
+
+/// `tobii games profile …` — dispatch, and the only place here that reads the
+/// real directories.
+///
+/// Every verb above takes the profiles directory, the built-in table and an
+/// already-resolved game, so each is testable against a fixture directory
+/// without a config, a Steam install or a `$HOME` — which CI, running as root
+/// with somebody else's home, does not have.
+fn profile_cmd(args: &[String]) -> CmdResult {
+    use tobii_config::profiles;
+    let verb = args.get(3).map(String::as_str);
+    let wanted = args.get(4).map(String::as_str);
+    let dir = profiles::profiles_dir();
+    let mut out = String::new();
+    let result = match (verb, wanted) {
+        // `(None, _)` rather than `(None, None)`: there is no argv in which
+        // the fifth word exists and the fourth does not, and the compiler has
+        // no way to know that.
+        (None, _) | (Some("show"), None) => {
+            profile_list(&mut out, &dir, profiles::BUILTIN);
+            Ok(())
+        }
+        (Some("show"), Some(w)) => steam_appid_for(&home_for_steam()?, w)
+            .and_then(|g| profile_show(&mut out, &dir, profiles::BUILTIN, &g)),
+        (Some("save"), Some(w)) => steam_appid_for(&home_for_steam()?, w).and_then(|g| {
+            profile_save(
+                &mut out,
+                &dir,
+                profiles::BUILTIN,
+                &g,
+                &tobii_output::games::load_output_config(),
+            )
+        }),
+        (Some("forget"), Some(w)) => steam_appid_for(&home_for_steam()?, w)
+            .and_then(|g| profile_forget(&mut out, &dir, profiles::BUILTIN, &g.appid)),
+        (Some("apply"), Some(w)) => steam_appid_for(&home_for_steam()?, w).and_then(|g| {
+            let mut cfg = tobii_output::games::load_output_config();
+            if profile_apply(&mut out, &dir, profiles::BUILTIN, &g, &mut cfg)? {
+                tobii_output::games::save_output_config(&cfg).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }),
+        (Some(v @ ("save" | "apply" | "forget")), None) => {
+            Err(format!("usage: tobii games profile {v} <app id or name>"))
+        }
+        (Some(other), _) => Err(format!(
+            "unknown: tobii games profile {other}\nusage:\n{PROFILE_USAGE}"
+        )),
+    };
+    // Printed before the error is returned: `save` and `apply` both say what
+    // they did above the part saying what they could not, and an error that
+    // swallowed the first half would leave the less useful half on its own.
+    print!("{out}");
+    result.map_err(Into::into)
 }
 
 /// How long to wait for the hub to answer a lease request.
@@ -3163,5 +3868,633 @@ mod tests {
         assert!(rate > 0.0 && rate.is_finite(), "{rate}");
         let interval = Duration::from_secs_f64(1.0 / rate);
         assert!(interval > Duration::ZERO && interval < STATUS_INTERVAL);
+    }
+
+    // ------------------------------------------------- tobii games profile
+
+    /// The scratch directories one thread has made, removed when that thread
+    /// ends.
+    ///
+    /// The helpers below hand their directory back out of themselves, so a
+    /// guard the caller holds would drop at the end of the helper and take the
+    /// directory with it. `libtest` gives each test a thread, and a
+    /// thread-local's destructor runs when that thread ends.
+    struct ScratchDirs(Vec<std::path::PathBuf>);
+
+    impl Drop for ScratchDirs {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<ScratchDirs> =
+            const { std::cell::RefCell::new(ScratchDirs(Vec::new())) };
+    }
+
+    /// A throwaway directory, removed when the thread that asked for it ends.
+    ///
+    /// Its own prefix rather than the `tobii-steamfix-` one `bridge.rs`'s
+    /// tests use: two suites sharing a directory name is two suites able to
+    /// delete each other's fixtures.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tobii-cliprof-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("scratch");
+        SCRATCH.with_borrow_mut(|dirs| dirs.0.push(dir.clone()));
+        dir
+    }
+
+    /// A throwaway `$HOME` with one Steam library in it, holding a manifest
+    /// per `(appid, name)`.
+    ///
+    /// No environment variable is read and nothing under the real home is
+    /// touched: CI runs these as root, where `$HOME` is somebody else's, and
+    /// `steam_appid_for` takes the home to look in for exactly that reason.
+    fn steam_home(tag: &str, apps: &[(&str, &str)]) -> std::path::PathBuf {
+        let home = scratch(tag);
+        let steamapps = home.join(".steam/steam/steamapps");
+        std::fs::create_dir_all(&steamapps).expect("steamapps");
+        for (id, name) in apps {
+            std::fs::write(
+                steamapps.join(format!("appmanifest_{id}.acf")),
+                format!(
+                    "\"AppState\"\n{{\n\t\"appid\"\t\t\"{id}\"\n\t\"name\"\t\t\"{name}\"\n}}\n"
+                ),
+            )
+            .expect("manifest");
+        }
+        home
+    }
+
+    /// A game as a command would have resolved it, without a Steam install.
+    fn game(appid: &str, name: Option<&str>) -> GameRef {
+        GameRef {
+            appid: appid.to_string(),
+            name: name.map(str::to_string),
+            missing_libraries: String::new(),
+        }
+    }
+
+    /// A config that differs from the default in every kind of value there is:
+    /// a bool, an integer, a float, a socket address and a curve name.
+    fn tuned_config() -> tobii_output::games::OutputConfig {
+        let mut c = tobii_output::games::OutputConfig::default();
+        for (k, v) in [
+            ("enabled", "true"),
+            ("rate_hz", "90"),
+            ("filter_alpha", "0.5"),
+            ("opentrack", "10.0.0.5:5555"),
+            ("bridge_port", "4711"),
+            ("joystick", "false"),
+            ("ev_yaw_curve", "linear"),
+            ("ev_pitch_clamp_deg", "44"),
+        ] {
+            assert!(c.apply_key(k, v), "the fixture's own `{k}` was refused");
+        }
+        assert_ne!(
+            c,
+            tobii_output::games::OutputConfig::default(),
+            "a fixture equal to the default would make the round trip below vacuous"
+        );
+        c
+    }
+
+    /// One profile file, written by hand rather than by `Profile::to_toml`, so
+    /// that what these cases feed the reader is what a user would type.
+    fn write_profile(dir: &std::path::Path, appid: &str, text: &str) {
+        std::fs::create_dir_all(dir).expect("profiles dir");
+        std::fs::write(dir.join(format!("{appid}.toml")), text).expect("profile");
+    }
+
+    /// What `save` captures has to be *every* setting and has to be lossless:
+    /// a profile that dropped one would silently leave that setting at
+    /// whatever the machine it was applied to happened to have, and a profile
+    /// that mangled one would be refused by `apply` on a file this program
+    /// wrote itself.
+    ///
+    /// This is the debt `captured_settings` takes on by reading its pairs back
+    /// out of `to_toml` instead of listing them.
+    #[test]
+    fn captured_settings_are_every_key_and_rebuild_the_config() {
+        use tobii_output::games::OutputConfig;
+        let tuned = tuned_config();
+        let pairs = captured_settings(&tuned);
+
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            OutputConfig::keys(),
+            "the capture has to be exactly the settings this program advertises"
+        );
+
+        let mut back = OutputConfig::default();
+        for (k, v) in &pairs {
+            assert!(back.apply_key(k, v), "captured `{k} = {v:?}` was refused");
+        }
+        assert_eq!(
+            back, tuned,
+            "applying the capture back must rebuild the config it came from"
+        );
+    }
+
+    /// The checks and the bridge line are somebody's knowledge about the game;
+    /// the settings are this machine's current state. `save` has a new version
+    /// of the second and none of the first, so overwriting the first would
+    /// destroy hand-written work to replace it with nothing.
+    #[test]
+    fn save_keeps_the_checks_and_bridge_line_a_profile_already_had() {
+        use tobii_config::profiles;
+        let dir = scratch("save-keeps");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n\
+             name = \"My Own Name\"\n\
+             bridge = true\n\
+             \n[settings]\n\
+             rate_hz = 11.0\n\
+             \n[[check]]\n\
+             format = \"binds-dir\"\n\
+             path = \"drive_c/Bindings\"\n\
+             setting = \"HeadlookMode\"\n\
+             wants = \"1\"\n\
+             tell = \"Set Head Look to Toggle.\"\n",
+        );
+
+        let mut out = String::new();
+        profile_save(
+            &mut out,
+            &dir,
+            &[],
+            &game("359320", Some("Elite Dangerous")),
+            &tuned_config(),
+        )
+        .expect("save");
+
+        let p = profiles::load_from(&dir, &[], "359320")
+            .expect("readable")
+            .expect("present")
+            .profile;
+        assert_eq!(p.bridge, profiles::Bridge::Required, "the bridge line");
+        assert_eq!(p.checks.len(), 1, "the check");
+        assert_eq!(p.checks[0].setting, "HeadlookMode");
+        assert_eq!(p.checks[0].tell, "Set Head Look to Toggle.");
+        assert_eq!(
+            p.name.as_deref(),
+            Some("My Own Name"),
+            "a name in the file is somebody's choice; Steam's must not overrule it"
+        );
+        // And the settings ARE replaced — that is the half `save` can do.
+        assert_eq!(
+            p.settings,
+            captured_settings(&tuned_config()),
+            "the settings are the machine's current state, and are taken fresh"
+        );
+    }
+
+    /// Overwriting a profile this program could not read would destroy
+    /// hand-written checks and replace them with a file that has none, and the
+    /// user would never learn what the old one said.
+    #[test]
+    fn save_refuses_to_overwrite_a_profile_it_cannot_read() {
+        let dir = scratch("save-refuses");
+        // A version this build does not read: there and legible, and not
+        // something this build may interpret.
+        let text = "version = 9\nname = \"From The Future\"\n";
+        write_profile(&dir, "359320", text);
+
+        let mut out = String::new();
+        let err = profile_save(
+            &mut out,
+            &dir,
+            &[],
+            &game("359320", Some("Elite Dangerous")),
+            &tuned_config(),
+        )
+        .expect_err("an unreadable profile is not something to write over");
+        assert!(err.contains("version 9"), "{err}");
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("359320.toml")).expect("still there"),
+            text,
+            "not one byte of it may have changed"
+        );
+        assert!(out.is_empty(), "nothing was done, so nothing is reported");
+    }
+
+    /// A profile that is absent and a profile that is there and unreadable are
+    /// different answers. Reporting the second as the first is the exact bug
+    /// shape this project keeps finding in itself.
+    #[test]
+    fn an_absent_profile_and_an_unreadable_one_are_different_answers() {
+        let dir = scratch("absent-vs-unreadable");
+
+        let mut out = String::new();
+        profile_show(&mut out, &dir, &[], &game("359320", Some("Elite"))).expect("absent is fine");
+        assert!(out.contains("no profile"), "{out}");
+        assert!(
+            out.contains(&dir.join("359320.toml").display().to_string()),
+            "it has to name where it looked: {out}"
+        );
+
+        write_profile(&dir, "359320", "version = 1\nnonsense = 3\n");
+        let mut out = String::new();
+        let err = profile_show(&mut out, &dir, &[], &game("359320", Some("Elite")))
+            .expect_err("a file it cannot read is not 'nothing configured'");
+        assert!(
+            err.contains("line 2"),
+            "the line to open an editor at: {err}"
+        );
+    }
+
+    /// Every check is a thing a person has to go and change by hand, so a
+    /// report that dropped one would leave a game misconfigured and say
+    /// nothing. All four of its fields are needed to act on it.
+    #[test]
+    fn show_lists_every_check_with_what_to_change_and_where() {
+        let dir = scratch("show-checks");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n\
+             \n[[check]]\n\
+             format = \"binds-dir\"\n\
+             path = \"drive_c/Bindings\"\n\
+             setting = \"HeadlookMode\"\n\
+             wants = \"1\"\n\
+             tell = \"Set Head Look to Toggle.\"\n\
+             \n[[check]]\n\
+             format = \"attributes-xml\"\n\
+             path = \"drive_c/attributes.xml\"\n\
+             setting = \"FreeLook\"\n\
+             wants = \"on\"\n\
+             tell = \"Turn Free Look on.\"\n",
+        );
+        let mut out = String::new();
+        profile_show(&mut out, &dir, &[], &game("359320", Some("Elite"))).expect("show");
+        for needle in [
+            "drive_c/Bindings",
+            "HeadlookMode",
+            "\"1\"",
+            "Set Head Look to Toggle.",
+            "drive_c/attributes.xml",
+            "FreeLook",
+            "\"on\"",
+            "Turn Free Look on.",
+        ] {
+            assert!(out.contains(needle), "{needle:?} is missing from:\n{out}");
+        }
+    }
+
+    /// A format this build cannot read costs that one check, not the file —
+    /// and the user has to be told which checks it cost, or they will read the
+    /// list as complete.
+    #[test]
+    fn a_check_in_an_unreadable_format_is_named_as_one_that_was_not_looked_up() {
+        let dir = scratch("unknown-format");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n\
+             \n[[check]]\n\
+             format = \"something-newer\"\n\
+             path = \"drive_c/x.cfg\"\n\
+             setting = \"Thing\"\n\
+             wants = \"on\"\n\
+             tell = \"Turn it on.\"\n",
+        );
+        let mut out = String::new();
+        profile_show(&mut out, &dir, &[], &game("359320", None)).expect("show");
+        assert!(
+            out.contains("something-newer"),
+            "the format has to be named: {out}"
+        );
+        assert!(
+            out.contains("cannot read"),
+            "and said to be one this build cannot read: {out}"
+        );
+    }
+
+    /// A pair `apply_key` refuses stops the whole profile. Applying the half
+    /// it understood is how somebody ends up with a config nobody wrote.
+    #[test]
+    fn apply_refuses_a_profile_with_an_unusable_setting_and_changes_nothing() {
+        use tobii_output::games::OutputConfig;
+        let dir = scratch("apply-refuses");
+        // A typo, above a perfectly good pair — so a per-pair applier would
+        // get as far as the second and change the config.
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n[settings]\nenabeld = true\nrate_hz = 90.0\n",
+        );
+        let mut cfg = OutputConfig::default();
+        let before = cfg.clone();
+        let mut out = String::new();
+        let err = profile_apply(&mut out, &dir, &[], &game("359320", None), &mut cfg)
+            .expect_err("a setting it cannot use stops the profile");
+        assert!(err.contains("enabeld"), "name the pair at fault: {err}");
+        assert!(
+            err.contains("rate_hz"),
+            "and list the keys that are valid: {err}"
+        );
+        assert_eq!(cfg, before, "nothing may have been applied");
+    }
+
+    /// `apply` is `save`'s other half and must actually work — and must say
+    /// that what it changed is this program's one set of settings, not
+    /// something per-game.
+    #[test]
+    fn apply_puts_every_setting_into_effect_and_asks_to_be_saved() {
+        use tobii_output::games::OutputConfig;
+        let dir = scratch("apply-works");
+        let tuned = tuned_config();
+        let mut p = tobii_config::profiles::Profile {
+            settings: captured_settings(&tuned),
+            ..Default::default()
+        };
+        p.name = Some("Elite".to_string());
+        tobii_config::profiles::save_to(&dir, "359320", &p).expect("write the profile");
+
+        let mut cfg = OutputConfig::default();
+        let mut out = String::new();
+        let changed = profile_apply(&mut out, &dir, &[], &game("359320", None), &mut cfg)
+            .expect("every pair came from this program's own writer");
+        assert!(changed, "a profile with settings is worth saving");
+        assert_eq!(cfg, tuned, "the config the profile was captured from");
+        assert!(
+            out.contains(&tobii_output::games::games_path().display().to_string()),
+            "it has to name the file it changed: {out}"
+        );
+        assert!(
+            out.contains("every game"),
+            "and that these settings are not per-game: {out}"
+        );
+    }
+
+    /// A profile with no settings must not be the reason a `games.toml`
+    /// appears on disk: `apply` would then have written a file of defaults
+    /// nobody chose, and reported that it had applied a profile.
+    #[test]
+    fn apply_of_a_profile_with_no_settings_asks_for_nothing_to_be_written() {
+        use tobii_output::games::OutputConfig;
+        let dir = scratch("apply-empty");
+        write_profile(&dir, "359320", "version = 1\nbridge = true\n");
+        let mut cfg = OutputConfig::default();
+        let before = cfg.clone();
+        let mut out = String::new();
+        let changed = profile_apply(&mut out, &dir, &[], &game("359320", None), &mut cfg)
+            .expect("a checks-only profile is a fine profile");
+        assert!(!changed, "there was nothing to apply, so nothing to save");
+        assert_eq!(cfg, before);
+        // And it still says what is left to do, which is the whole of what
+        // this profile holds.
+        assert!(out.contains("tobii bridge install --steam 359320"), "{out}");
+    }
+
+    /// `apply` on a game with no profile is a question with no answer, not a
+    /// no-op: the user asked for something to be applied and nothing was.
+    #[test]
+    fn apply_without_a_profile_is_an_error_naming_where_it_looked() {
+        use tobii_output::games::OutputConfig;
+        let dir = scratch("apply-absent");
+        let mut cfg = OutputConfig::default();
+        let mut out = String::new();
+        let err = profile_apply(&mut out, &dir, &[], &game("359320", None), &mut cfg)
+            .expect_err("nothing to apply");
+        assert!(
+            err.contains(&dir.join("359320.toml").display().to_string()),
+            "{err}"
+        );
+    }
+
+    /// `forget` removes the user's file and names it. Twice in a row is not an
+    /// error — but the second time must not claim to have removed anything.
+    #[test]
+    fn forget_removes_the_users_file_and_names_it_exactly_once() {
+        let dir = scratch("forget");
+        write_profile(&dir, "359320", "version = 1\n");
+        let path = dir.join("359320.toml");
+
+        let mut out = String::new();
+        profile_forget(&mut out, &dir, &[], "359320").expect("removing a file that is there");
+        assert!(
+            out.contains("removed") && out.contains(&path.display().to_string()),
+            "{out}"
+        );
+        assert!(!path.exists(), "the file is gone");
+
+        let mut out = String::new();
+        profile_forget(&mut out, &dir, &[], "359320").expect("removing nothing is not an error");
+        assert!(
+            !out.contains("removed"),
+            "nothing was removed the second time: {out}"
+        );
+        assert!(
+            out.contains(&path.display().to_string()),
+            "and it still names the file it did not find: {out}"
+        );
+    }
+
+    /// A compiled-in profile is part of the program. `forget` can take away
+    /// the file that replaced it and must not claim to have taken away the
+    /// profile itself.
+    #[test]
+    fn forget_does_not_claim_to_remove_a_compiled_in_profile() {
+        let dir = scratch("forget-builtin");
+        let builtin: &[(&str, &str)] = &[("359320", "version = 1\nname = \"Shipped\"\n")];
+
+        let mut out = String::new();
+        profile_forget(&mut out, &dir, builtin, "359320").expect("not an error");
+        assert!(!out.contains("removed"), "there was no file: {out}");
+        assert!(
+            out.contains("compiled into tobii-linux"),
+            "and it has to say why the profile is still there: {out}"
+        );
+
+        // With a file over the top, the file goes and the built-in one comes
+        // back — which is also worth a sentence.
+        write_profile(&dir, "359320", "version = 1\n");
+        let mut out = String::new();
+        profile_forget(&mut out, &dir, builtin, "359320").expect("removing the file");
+        assert!(out.contains("removed"), "{out}");
+        assert!(out.contains("compiled into tobii-linux"), "{out}");
+    }
+
+    /// A name that is not an app id has no profile file, and `forget` must say
+    /// that rather than build a path out of it. `is_appid` is tighter than
+    /// "all digits" for this reason: `0999.toml` and `999.toml` would be two
+    /// files for one game.
+    #[test]
+    fn forget_refuses_a_name_that_could_not_be_a_profile_file() {
+        let dir = scratch("forget-notanappid");
+        let mut out = String::new();
+        let err = profile_forget(&mut out, &dir, &[], "0999").expect_err("a leading zero");
+        assert!(err.contains("0999"), "{err}");
+        assert!(
+            !dir.join("0999.toml").exists() && out.is_empty(),
+            "nothing was touched"
+        );
+    }
+
+    /// The four things `--steam` can answer are worded in `bridge.rs` and
+    /// decided in `tobii_steam`, and the wording is what a user sees. These
+    /// pin the two that this command shares with it, byte for byte, because
+    /// the phrasing is settled and must not drift between commands.
+    #[test]
+    fn an_ambiguous_name_lists_what_it_matched_and_asks_for_the_app_id() {
+        let home = steam_home(
+            "many",
+            &[("11", "Fixture Game One"), ("22", "Fixture Game Two")],
+        );
+        let err = steam_appid_for(&home, "fixture").expect_err("two matches is not an answer");
+        assert_eq!(
+            err,
+            "\"fixture\" matches more than one game; pass the app id:\n  \
+             11         Fixture Game One\n  \
+             22         Fixture Game Two"
+        );
+    }
+
+    #[test]
+    fn a_name_that_matches_nothing_lists_everything_that_is_installed() {
+        let home = steam_home(
+            "none",
+            &[("11", "Fixture Game One"), ("22", "Fixture Game Two")],
+        );
+        let err = steam_appid_for(&home, "nothing").expect_err("no match is not an answer");
+        assert_eq!(
+            err,
+            "no installed Steam game matches \"nothing\"\ninstalled:\n  \
+             11         Fixture Game One\n  \
+             22         Fixture Game Two"
+        );
+    }
+
+    /// A profile outlives the install it was written for. An app id that
+    /// matches nothing is still an app id, and `show`, `forget` and `apply`
+    /// all have honest answers for a game that has been uninstalled — so it
+    /// must not be refused the way a name is.
+    #[test]
+    fn an_app_id_for_a_game_that_is_not_installed_is_still_a_game() {
+        let home = steam_home("gone", &[("11", "Fixture Game One")]);
+        let g = steam_appid_for(&home, "359320").expect("an app id is an app id");
+        assert_eq!(g.appid, "359320");
+        assert_eq!(g.name, None, "this machine has no name for it");
+        assert!(
+            g.heading().contains("not installed on this machine"),
+            "{}",
+            g.heading()
+        );
+        // A name, though, yields no app id at all, so it is still refused.
+        assert!(steam_appid_for(&home, "elite").is_err());
+    }
+
+    /// Steam records a library's path, not whether its drive is plugged in.
+    /// "Not installed on this machine" over an unplugged drive is the exact
+    /// confident negative this project keeps removing.
+    #[test]
+    fn a_library_this_machine_cannot_see_stops_the_not_installed_claim() {
+        let home = steam_home("unplugged", &[("11", "Fixture Game One")]);
+        let gone = home.join("not-mounted");
+        std::fs::write(
+            home.join(".steam/steam/steamapps/libraryfolders.vdf"),
+            format!(
+                "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
+                gone.display()
+            ),
+        )
+        .expect("libraryfolders");
+
+        let g = steam_appid_for(&home, "359320").expect("an app id resolves");
+        let heading = g.heading();
+        assert!(
+            !heading.contains("not installed on this machine"),
+            "a drive nobody could look in is not grounds for that: {heading}"
+        );
+        assert!(
+            heading.contains(&gone.display().to_string()),
+            "and the user has to recognise their own drive in it: {heading}"
+        );
+
+        // The same for a name that matched nothing.
+        let err = steam_appid_for(&home, "nothing").expect_err("no match");
+        assert!(
+            err.starts_with("nothing in the Steam libraries this machine has matches"),
+            "{err}"
+        );
+        assert!(err.contains(&gone.display().to_string()), "{err}");
+    }
+
+    /// An empty needle is a substring of every name, so `resolve` matches
+    /// everything with it — and on a machine with exactly one application that
+    /// is `Match::One`, indistinguishable from a fragment that picked it out.
+    /// `tobii games profile save ""` would then write a profile for whatever
+    /// that one application happened to be.
+    #[test]
+    fn an_empty_game_argument_is_refused_before_it_can_match_everything() {
+        let home = steam_home("empty-needle", &[("11", "The Only Game Here")]);
+        assert!(
+            matches!(
+                tobii_steam::resolve(&tobii_steam::apps(&home), ""),
+                tobii_steam::Match::One(_)
+            ),
+            "premise: with one app installed, the empty needle resolves to it"
+        );
+        let err = steam_appid_for(&home, "").expect_err("an empty argument names no game");
+        assert!(err.contains("name a game"), "{err}");
+    }
+
+    /// A broken profile and a file that is not a profile are different things,
+    /// and `tobii uninstall --purge` will say the same of the second. Folding
+    /// them together is how one gets read as the other.
+    #[test]
+    fn the_listing_keeps_a_broken_profile_apart_from_something_that_is_not_one() {
+        let dir = scratch("listing");
+        write_profile(&dir, "11", "version = 1\nname = \"Good One\"\n");
+        write_profile(&dir, "22", "version = 99\n");
+        std::fs::write(dir.join("notes.txt"), "mine\n").expect("stray");
+
+        let mut out = String::new();
+        profile_list(&mut out, &dir, &[]);
+        let broken = out.find("could not be used:").expect("the broken one");
+        let stray = out
+            .find("in that directory and not a profile:")
+            .expect("stray");
+        assert!(
+            out[broken..stray].contains("22.toml"),
+            "the version this build cannot read belongs under 'could not be used':\n{out}"
+        );
+        assert!(
+            out[stray..].contains("notes.txt") && !out[stray..].contains("22.toml"),
+            "and somebody's own file belongs under the other heading:\n{out}"
+        );
+        assert!(out.contains("Good One"), "the usable one is still listed");
+        assert!(
+            out.contains("this build ships no profile for any game"),
+            "which is true of this build, and read off the table: {out}"
+        );
+    }
+
+    /// With a profile compiled in, that sentence is false. It is read off the
+    /// table for exactly this reason, so this is what proves it is.
+    #[test]
+    fn the_listing_does_not_claim_no_profiles_ship_when_one_does() {
+        let dir = scratch("listing-builtin");
+        let builtin: &[(&str, &str)] = &[("359320", "version = 1\nname = \"Shipped\"\n")];
+        let mut out = String::new();
+        profile_list(&mut out, &dir, builtin);
+        assert!(
+            !out.contains("ships no profile"),
+            "one is compiled in: {out}"
+        );
+        assert!(out.contains("Shipped"), "and it is listed: {out}");
+        assert!(
+            out.contains("built into tobii-linux"),
+            "with its origin: {out}"
+        );
     }
 }
