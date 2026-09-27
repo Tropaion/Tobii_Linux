@@ -65,8 +65,8 @@ const STEAM_ROOTS: [&str; 4] = [
 #[derive(Debug, Clone)]
 pub struct App {
     pub appid: String,
-    /// What to call this title: every name this machine's manifests give for
-    /// the app id, in alphabetical order, joined by ` / `.
+    /// What to call this title: every distinct name this machine's manifests
+    /// give for the app id, in alphabetical order, joined by ` / `.
     ///
     /// Which is to say the one name they all give, except when copies
     /// disagree. Then nothing here can say which name is the true one, any
@@ -90,7 +90,8 @@ pub struct App {
     /// the difference: the reason to keep the field at all is that a per-game
     /// setting recorded against a build is one whose staleness can be noticed
     /// later, and "unknown" and "ambiguous" both mean staleness cannot be
-    /// judged. Nothing here uses it yet.
+    /// judged. No caller reads it yet; the collapse in [`apps`] is the only
+    /// code that touches it.
     pub buildid: Option<String>,
 }
 
@@ -98,12 +99,15 @@ impl App {
     /// What the comparisons below agree to compare — see the identity section
     /// on [`App`] for why neither the name nor the build is in it.
     ///
-    /// The comparisons are written out rather than narrowed at the one call
-    /// site that collapses a list, because `resolve` is what turns two rows
-    /// into a "pass the app id" naming one id twice, and `resolve` never
-    /// touches a manifest. What is wrong when anything else is counted is who
-    /// an application *is*, so it is said once, here, where every caller
-    /// inherits it.
+    /// It is one function rather than three copies of `&self.appid` so that
+    /// `Eq`, `Ord` and `Hash` cannot drift apart. `Hash` counting a field
+    /// `Eq` does not is the listing bug one layer down — the same game in two
+    /// buckets of a `HashSet` — and nothing would say a word about it.
+    ///
+    /// The collapses in [`apps`] do not go through here. They compare the
+    /// name as well, on purpose: two manifests under one name are one row
+    /// outright, and two under different names are one row carrying both.
+    /// Identity is what every *other* caller inherits, and it is the app id.
     fn identity(&self) -> &str {
         &self.appid
     }
@@ -131,13 +135,13 @@ impl Ord for App {
 
 /// `Hash` exists, and agrees with `Eq`.
 ///
-/// Nothing in this workspace hashes an `App` yet. It is written anyway because
-/// the contract is that equal values hash equally: a derived `Hash` would hash
-/// the name and the build too, so two copies of one title would compare equal
-/// and land in different buckets — a `HashSet` holding the same game twice,
-/// which is the listing bug again one layer down. Writing it out rather than
-/// deriving it also makes a later `#[derive(Hash)]` a duplicate-impl compile
-/// error.
+/// Nothing outside this file's own tests hashes an `App`. It is written anyway
+/// because the contract is that equal values hash equally: a derived `Hash`
+/// would hash the name and the build too, so two copies of one title would
+/// compare equal and land in different buckets — a `HashSet` holding the same
+/// game twice, which is the listing bug again one layer down. Writing it out
+/// rather than deriving it also makes a later `#[derive(Hash)]` a
+/// duplicate-impl compile error.
 impl std::hash::Hash for App {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.identity().hash(state);
@@ -146,9 +150,10 @@ impl std::hash::Hash for App {
 
 /// Add `path` if it is a library and not already listed.
 ///
-/// Canonicalised first: `~/.steam/steam` and `~/.steam/root` are both symlinks
-/// to the real install, so a plain path comparison reports the same library
-/// three times and would then install into it three times.
+/// Canonicalised before it is compared with what is already listed:
+/// `~/.steam/steam` and `~/.steam/root` are both symlinks to the real install,
+/// so a plain path comparison reports the same library three times and would
+/// then install into it three times.
 fn push_library(out: &mut Vec<PathBuf>, path: PathBuf) {
     if !path.join("steamapps").is_dir() {
         return;
@@ -332,8 +337,9 @@ pub fn looks_like_tool(name: &str) -> bool {
 /// them as a picker. Neither wording belongs in the deciding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Match {
-    /// Nothing matched. Carries everything installed, because every caller
-    /// wants to show the user what there was.
+    /// Nothing matched. Carries nothing: every caller wants to show the user
+    /// what there was instead, and every caller already holds that — the list
+    /// is what it passed in.
     None,
     /// Exactly one, by app id or by name.
     One(App),
@@ -361,11 +367,18 @@ pub enum Match {
 ///
 /// An empty `wanted` is not an app id — the all-digits test excludes it, so it
 /// cannot come back with whatever [`App`] happens to carry the empty app id.
-/// It is a name fragment, and every name contains it, so the answer is
-/// [`Match::Many`] over everything installed — except on a machine with
-/// exactly one application, where matching everything is [`Match::One`]
-/// naming that application. A caller for which an empty value means "not
-/// given" has to say so before it asks; nothing here can tell the two apart.
+/// It is a name fragment like any other, and every name contains it, so the
+/// answer is [`Match::Many`] over everything installed — except on a machine
+/// with exactly one application, where matching everything is [`Match::One`]
+/// naming that application, indistinguishable from a fragment that picked
+/// that one application out.
+///
+/// **It is never refused.** No answer here means "you gave me nothing":
+/// [`Match::None`] means the needle matched none of the names, which an empty
+/// needle reaches only when there are no names — on a machine with nothing
+/// installed, where every needle answers that. A caller for which an empty
+/// value means "not given" has to say so before it asks, because nothing in
+/// this function can tell the two apart.
 pub fn resolve(apps: &[App], wanted: &str) -> Match {
     if !wanted.is_empty() && wanted.chars().all(|c| c.is_ascii_digit()) {
         return match apps.iter().find(|a| a.appid == wanted) {
@@ -426,11 +439,41 @@ mod tests {
         }
     }
 
+    /// An `App` to feed a pure function that takes a list — never an expected
+    /// value, for the reason on [`row`].
     fn app(id: &str, name: &str) -> App {
         App {
             appid: id.into(),
             name: name.into(),
             buildid: None,
+        }
+    }
+
+    /// Every field of one row, as a tuple that compares as all three.
+    ///
+    /// An `App` equals another when the APP ID matches and nothing else,
+    /// which is the whole point of the type — so `assert_eq!` on an `App`, on
+    /// a `Vec<App>`, or on a [`Match`] carrying either, compares app ids. An
+    /// expected name written out beside one is then read by whoever maintains
+    /// the test and by nothing else, and the case can go on passing with the
+    /// name read out of the manifest replaced by anything at all. Every
+    /// answer below is compared as a row, so the name and the build a case
+    /// spells out are the name and the build it checks.
+    fn row(a: &App) -> (&str, &str, Option<&str>) {
+        (&a.appid, &a.name, a.buildid.as_deref())
+    }
+
+    fn rows(apps: &[App]) -> Vec<(&str, &str, Option<&str>)> {
+        apps.iter().map(row).collect()
+    }
+
+    /// The single app a [`Match::One`] named, or a panic naming what came back
+    /// instead. A `Match` compares by app id too, so an answer is unwrapped
+    /// and checked as a row rather than compared against a built one.
+    fn only(m: Match) -> App {
+        match m {
+            Match::One(a) => a,
+            other => panic!("expected exactly one match, got {other:?}"),
         }
     }
 
@@ -444,7 +487,7 @@ mod tests {
         library(&home.join(".steam/steam"), &[("1", "A Game", None)]);
         let libs = libraries(&home);
         assert_eq!(libs.len(), 1, "the root itself is a library: {libs:?}");
-        assert_eq!(apps(&home), vec![app("1", "A Game")]);
+        assert_eq!(rows(&apps(&home)), vec![("1", "A Game", None)]);
     }
 
     /// `~/.steam/steam` and `~/.steam/root` are both symlinks to the same
@@ -481,18 +524,11 @@ mod tests {
         .expect("vdf");
         let found = apps(&home);
         assert_eq!(
-            found,
-            vec![app("1", "First"), app("2", "Second")],
-            "both libraries, sorted"
+            rows(&found),
+            vec![("1", "First", Some("111")), ("2", "Second", None)],
+            "both libraries, sorted, under the names and builds their \
+             manifests gave"
         );
-        // Asserted apart from the rows: equality is `(appid, name)`, so the
-        // comparison above says nothing about which build came back.
-        assert_eq!(
-            found[0].buildid.as_deref(),
-            Some("111"),
-            "the build the only manifest for it gave"
-        );
-        assert_eq!(found[1].buildid, None, "its manifest names no build");
     }
 
     /// One app id written into two libraries — a stale `appmanifest` left
@@ -542,13 +578,14 @@ mod tests {
     fn one_title_in_two_libraries_at_two_builds_is_one_row() {
         let found = one_title_twice("twobuilds", Some("111"), Some("222"));
         assert_eq!(
-            found,
-            vec![app("42", "Elite Dangerous")],
-            "one row, not two: {found:?}"
+            rows(&found),
+            vec![("42", "Elite Dangerous", None)],
+            "one row, not two, and no build the copies disagree on"
         );
+        let picked = only(resolve(&found, "elite"));
         assert_eq!(
-            resolve(&found, "elite"),
-            Match::One(app("42", "Elite Dangerous")),
+            row(&picked),
+            ("42", "Elite Dangerous", None),
             "one game, not a choice between two rows carrying one app id"
         );
     }
@@ -561,18 +598,17 @@ mod tests {
     #[test]
     fn a_build_the_copies_disagree_on_is_reported_as_no_build_at_all() {
         let agree = one_title_twice("agree", Some("111"), Some("111"));
-        assert_eq!(agree.len(), 1, "{agree:?}");
         assert_eq!(
-            agree[0].buildid.as_deref(),
-            Some("111"),
+            rows(&agree),
+            vec![("42", "Elite Dangerous", Some("111"))],
             "both copies say 111, so 111 is the answer"
         );
 
         let disagree = one_title_twice("disagree", Some("111"), Some("222"));
-        assert_eq!(disagree.len(), 1, "{disagree:?}");
         assert_eq!(
-            disagree[0].buildid, None,
-            "two builds, so there is no build to name: {disagree:?}"
+            rows(&disagree),
+            vec![("42", "Elite Dangerous", None)],
+            "two builds, so there is no build to name"
         );
 
         // Both ways round. The library the vdf names is scanned before the
@@ -581,13 +617,28 @@ mod tests {
         // answers, and it would pass with no merging at all. The mirror is the
         // one a plain `dedup` gets wrong.
         for (what, first, second) in [("half", Some("111"), None), ("mirror", None, Some("111"))] {
-            let half = one_title_twice(what, first, second);
-            assert_eq!(half.len(), 1, "{half:?}");
             assert_eq!(
-                half[0].buildid, None,
-                "a copy naming no build disagrees with one that does: {half:?}"
+                rows(&one_title_twice(what, first, second)),
+                vec![("42", "Elite Dangerous", None)],
+                "a copy naming no build disagrees with one that does ({what})"
             );
         }
+
+        // Renamed AND repatched, which is the case the second collapse has to
+        // answer alone: the first one folds copies that agree on the name, and
+        // these do not, so the run reaches the name-joining pass still
+        // carrying two builds. Dropping the merge there left the joined row at
+        // whichever build was met first, and every other case still passed.
+        assert_eq!(
+            rows(&one_appid_twice(
+                "renamedandrepatched",
+                "578080",
+                ("PUBG", Some("111")),
+                ("PUBG: BATTLEGROUNDS", Some("222")),
+            )),
+            vec![("578080", "PUBG / PUBG: BATTLEGROUNDS", None)],
+            "both names, and no build either copy can claim"
+        );
     }
 
     /// The same defect reached by the other field: two manifests for one app
@@ -603,24 +654,22 @@ mod tests {
             ("PUBG", Some("111")),
             ("PUBG: BATTLEGROUNDS", Some("111")),
         );
-        assert_eq!(found.len(), 1, "one app id is one game: {found:?}");
-        // The copy met first is the vdf'd library's, so scan order would put
-        // the longer name in front; alphabetical order is what is asserted.
+        // One app id is one game, under both names. The copy met first is the
+        // vdf'd library's, so scan order would put the longer name in front;
+        // alphabetical order is what is asserted. Renamed, not repatched, so
+        // the copies agree on the build.
         assert_eq!(
-            found[0].name, "PUBG / PUBG: BATTLEGROUNDS",
+            rows(&found),
+            vec![("578080", "PUBG / PUBG: BATTLEGROUNDS", Some("111"))],
             "both names, in an order that does not depend on the scan"
-        );
-        assert_eq!(
-            found[0].buildid.as_deref(),
-            Some("111"),
-            "renamed, not repatched: the copies agree on the build"
         );
         // Either way of typing it reaches the one row. Picking one name would
         // have left the other matching nothing.
         for typed in ["pubg", "battlegrounds", "PUBG: BATTLEGROUNDS"] {
+            let picked = only(resolve(&found, typed));
             assert_eq!(
-                resolve(&found, typed),
-                Match::One(found[0].clone()),
+                row(&picked),
+                ("578080", "PUBG / PUBG: BATTLEGROUNDS", Some("111")),
                 "{typed:?} is this game, not a choice between two rows"
             );
         }
@@ -638,9 +687,13 @@ mod tests {
             ("elite dangerous", Some("111")),
             ("Elite Dangerous: Odyssey", Some("111")),
         );
-        assert_eq!(found.len(), 1, "one app id is one game: {found:?}");
         assert_eq!(
-            found[0].name, "elite dangerous / Elite Dangerous: Odyssey",
+            rows(&found),
+            vec![(
+                "99",
+                "elite dangerous / Elite Dangerous: Odyssey",
+                Some("111")
+            )],
             "a letter's case is not its place in the alphabet"
         );
 
@@ -648,9 +701,9 @@ mod tests {
         // breaks the tie. Without it the order is the scan's — the vdf'd
         // library is met first, which would put `pubg` in front.
         let tied = one_appid_twice("casetie", "98", ("PUBG", None), ("pubg", None));
-        assert_eq!(tied.len(), 1, "one app id is one game: {tied:?}");
         assert_eq!(
-            tied[0].name, "PUBG / pubg",
+            rows(&tied),
+            vec![("98", "PUBG / pubg", None)],
             "a tie in the fold is broken by the name, not by the scan"
         );
     }
@@ -739,9 +792,9 @@ mod tests {
         )
         .expect("not utf-8");
         assert_eq!(
-            apps(&home),
-            vec![app("1", "Fine")],
-            "the readable one survives"
+            rows(&apps(&home)),
+            vec![("1", "Fine", None)],
+            "the readable one survives, and nothing was guessed for the rest"
         );
     }
 
@@ -801,7 +854,8 @@ mod tests {
     /// empty string — which is to say, whatever `find` happened on. What is
     /// left is a name fragment every name contains, and that is the hazard the
     /// callers have to know about: it matches everything, and on a machine
-    /// with exactly one application everything is one game.
+    /// with exactly one application everything is one game. The one machine it
+    /// answers [`Match::None`] on is the one with nothing installed.
     #[test]
     fn an_empty_name_is_every_game_rather_than_an_app_id() {
         // If the digit branch took the empty string, `find` would hand back
@@ -826,6 +880,12 @@ mod tests {
             resolve(&one, ""),
             Match::One(one[0].clone()),
             "with one application installed, matching everything matches it"
+        );
+
+        assert_eq!(
+            resolve(&[], ""),
+            Match::None,
+            "the only way an empty fragment matches nothing: there is nothing"
         );
     }
 
