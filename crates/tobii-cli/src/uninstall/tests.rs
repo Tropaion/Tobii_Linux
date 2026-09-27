@@ -751,6 +751,12 @@ fn populate_config_and_state(t: &Tree, cfg: &str, state: &str) {
     t.put(&format!("{cfg}/models/head-pose-0.5-small.onnx"), "m");
     t.put(&format!("{cfg}/models/head-localizer.onnx.partial"), "m");
     t.put(&format!("{cfg}/models/my-own.onnx"), "m");
+    // Written by `tobii games profile save`, one file per game the user has.
+    t.put(&format!("{cfg}/profiles/359320.toml"), "p");
+    t.put(&format!("{cfg}/profiles/999.toml.tmp"), "p");
+    // Somebody's editor backup, and somebody's notes. Neither is a profile.
+    t.put(&format!("{cfg}/profiles/359320.toml~"), "p");
+    t.put(&format!("{cfg}/profiles/what-i-measured.md"), "p");
     t.put(&format!("{state}/tobii.log"), "log");
     t.put(&format!("{state}/diagnostics.txt"), "old report");
 }
@@ -822,27 +828,49 @@ fn purge_removes_known_names_only_and_reports_the_rest() {
     assert!(r.contains(&format!("{state}/tobii.log")));
     assert!(r.contains(&format!("{state}/diagnostics.txt")));
 
+    // A profile is a file this program writes, so --purge takes it; the
+    // temporary an interrupted write_atomic leaves is one too. Which names
+    // those are is `profiles::is_profile_file`'s rule and is asked of it.
+    for n in [
+        "359320.toml",
+        &format!("999.toml{}", paths::ATOMIC_TMP_SUFFIX),
+    ] {
+        assert!(
+            r.contains(&format!("{cfg}/profiles/{n}")),
+            "profiles/{n} missing: {r:#?}"
+        );
+    }
+
     for keep in [
         "config.toml.bak-offsetz",
         "calibration.bin.baseline-20260810",
         "models/my-own.onnx",
+        // An editor's backup of a profile, and a file of somebody's notes,
+        // get exactly what a config.toml.bak gets.
+        "profiles/359320.toml~",
+        "profiles/what-i-measured.md",
     ] {
         let path = format!("{cfg}/{keep}");
         assert!(!r.contains(&path), "{keep} must survive --purge");
         assert!(kept(&p).contains(&path), "{keep} must be reported");
     }
-    // The models directory is purged on its own, so the config directory's
-    // pass does not report it as something of the user's.
-    assert!(
-        !kept(&p).contains(&format!("{cfg}/models")),
-        "{:#?}",
-        p.kept
-    );
+    // The models and profiles directories are purged on their own, so the
+    // config directory's pass does not report either as something of the
+    // user's — which is what it said about `profiles` before it looked in it.
+    for sub in ["models", "profiles"] {
+        assert!(
+            !kept(&p).contains(&format!("{cfg}/{sub}")),
+            "{sub}: {:#?}",
+            p.kept
+        );
+    }
     // Directories go only if empty, and never as a tree.
     let dirs: Vec<String> = p.rmdirs.iter().map(|d| d.display().to_string()).collect();
     let models = dirs.iter().position(|d| d == &format!("{cfg}/models"));
+    let profiles = dirs.iter().position(|d| d == &format!("{cfg}/profiles"));
     let config = dirs.iter().position(|d| d == cfg);
     assert!(models < config && models.is_some(), "{dirs:?}");
+    assert!(profiles < config && profiles.is_some(), "{dirs:?}");
     assert!(
         p.remove.iter().all(|r| !r.tree),
         "no tree removal in a purge"
