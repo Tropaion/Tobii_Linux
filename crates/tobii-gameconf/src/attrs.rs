@@ -52,6 +52,9 @@ pub struct Attributes {
 }
 
 impl Attributes {
+    /// Both answers are the same refusal — for a document that is not one of
+    /// these files at all, which is the only case where one reason is the true
+    /// answer to both questions.
     fn rejected(why: &str) -> Self {
         Attributes {
             version: Lookup::Rejected(why.to_string()),
@@ -80,6 +83,21 @@ pub fn parse(doc: &[u8], name: &str) -> Attributes {
             document.root.name
         ));
     }
+    Attributes {
+        // Two questions of two different parts of the document, so two
+        // answers that fail for their own reasons. `Version` is on the
+        // document element; whether some `<Attr>` further down carries a name
+        // this reader can place says nothing about it, and reporting it as
+        // unreadable because of one would be this crate sending a user to go
+        // and look at a number it had in fact decoded.
+        version: document.root.attribute("Version"),
+        value: value(&document, name),
+    }
+}
+
+/// What the attribute called `name` holds, in a document already known to be
+/// one of these files.
+fn value(document: &xml::Document<'_>, name: &str) -> Lookup {
     let mut exact: Vec<&xml::Element> = Vec::new();
     let mut other_case: Vec<String> = Vec::new();
     for element in document.children.iter().filter(|e| e.name == PAIR) {
@@ -91,14 +109,14 @@ pub fn parse(doc: &[u8], name: &str) -> Attributes {
             // the one being asked about — so the answer to the question is
             // that it could not be answered, not that the setting is unset.
             Lookup::Absent => {
-                return Attributes::rejected(&format!("an <{PAIR}> with no name attribute"))
+                return Lookup::Rejected(format!("an <{PAIR}> with no name attribute"))
             }
             Lookup::Rejected(why) => {
-                return Attributes::rejected(&format!("an <{PAIR}> whose name is {why}"))
+                return Lookup::Rejected(format!("an <{PAIR}> whose name is {why}"))
             }
         }
     }
-    let value = match (exact.as_slice(), other_case.as_slice()) {
+    match (exact.as_slice(), other_case.as_slice()) {
         ([], []) => Lookup::Absent,
         ([], spellings) => Lookup::Rejected(format!(
             "no attribute called {name}, but one called {}, and this reader \
@@ -114,10 +132,6 @@ pub fn parse(doc: &[u8], name: &str) -> Attributes {
              them the game uses",
             many.len()
         )),
-    };
-    Attributes {
-        version: document.root.attribute("Version"),
-        value,
     }
 }
 
@@ -177,6 +191,28 @@ mod tests {
             b"<Attributes><Attr name=\"A\" value=\"1\"/><Attr name=\"A\" value=\"2\"/></Attributes>",
             "A",
         );
+        assert!(matches!(a.value, Lookup::Rejected(_)), "{a:?}");
+    }
+
+    /// The schema version is a fact about the document element, and an
+    /// `<Attr>` this reader cannot place is a fact about one line further
+    /// down. Answering the first out of the second puts a sentence in a report
+    /// that is simply untrue — the file plainly says `Version="35"` — and this
+    /// crate is worth using only for being exact about what it did read.
+    #[test]
+    fn an_unplaceable_attr_does_not_make_the_version_unreadable() {
+        let doc = b"<Attributes Version=\"35\"><Attr name=\"A\" value=\"1\"/>\
+                    <Attr value=\"2\"/></Attributes>";
+        let a = parse(doc, "A");
+        assert_eq!(a.version, Lookup::Text("35".into()));
+        assert!(matches!(a.value, Lookup::Rejected(_)), "{a:?}");
+        // A document that is not one of these files at all is the other case,
+        // and there one reason really is the answer to both.
+        let a = parse(
+            b"<Options Version=\"35\"><Attr name=\"A\" value=\"1\"/></Options>",
+            "A",
+        );
+        assert!(matches!(a.version, Lookup::Rejected(_)), "{a:?}");
         assert!(matches!(a.value, Lookup::Rejected(_)), "{a:?}");
     }
 
