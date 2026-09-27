@@ -196,6 +196,14 @@ fn synthetic(apps: Vec<tobii_steam::App>) -> game_setup::Scan {
     }
 }
 
+/// The joystick status a window opened here is given: nobody has asked for
+/// one. This test starts no device thread, and the window only ever reads it.
+fn no_joystick() -> std::sync::Arc<std::sync::Mutex<tobii_gtk::device::JoystickStatus>> {
+    std::sync::Arc::new(std::sync::Mutex::new(
+        tobii_gtk::device::JoystickStatus::Off,
+    ))
+}
+
 fn app_named(appid: &str, name: &str) -> tobii_steam::App {
     tobii_steam::App {
         appid: appid.to_string(),
@@ -364,7 +372,7 @@ fn the_game_setup_window_opens_closes_frees_itself_and_takes_no_claim_on_the_tra
                     keep.clone(),
                 );
                 at(2600, move || {
-                    let win = game_setup::open_with(&a, &h, synthetic(Vec::new()));
+                    let win = game_setup::open_with(&a, &h, synthetic(Vec::new()), no_joystick());
                     let mut s = s.borrow_mut();
                     s.pages.push((
                         "no games",
@@ -438,6 +446,7 @@ fn the_game_setup_window_opens_closes_frees_itself_and_takes_no_claim_on_the_tra
                             app_named("359320", "Elite Dangerous"),
                             app_named("220", "Half-Life 2"),
                         ]),
+                        no_joystick(),
                     );
                     let mut s = s.borrow_mut();
                     s.pages.push((
