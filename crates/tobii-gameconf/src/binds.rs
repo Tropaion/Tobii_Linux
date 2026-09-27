@@ -19,20 +19,32 @@
 //! </Root>
 //! ```
 //!
-//! * The document element is `Root` and carries `PresetName`. 26 of the 30
-//!   files begin with a UTF-8 byte-order mark and 4 do not; all 30 use CRLF
-//!   line endings and tab indentation, shown above with spaces only because a
-//!   doc comment may not hold a tab. One writes its declaration as
-//!   `encoding="UTF-8" ?>` where the rest write `encoding="utf-8"?>`.
+//! * The document element is `Root` and carries `PresetName`. All 30 indent
+//!   with tabs, shown above with spaces only because a doc comment may not
+//!   hold one. 26 begin with a UTF-8 byte-order mark and end every line with
+//!   CRLF; the other 4 — `AdvancedPS3Controller`, `Empty`, `PS3Controller`
+//!   and `PS3ControllerYaw` — have no mark, are mixed rather than CRLF
+//!   throughout (96, 108, 103 and 103 bare line feeds among their carriage
+//!   returns), and write their declaration as `encoding="UTF-8" ?>` where the
+//!   26 write `encoding="utf-8"?>`. The same four files carry all three
+//!   habits, so this is one split in the set and not three.
 //! * A setting is a direct child with a `Value` attribute. Bindings are direct
 //!   children too, but they hold their own children instead — and those nest
 //!   names like `Deadzone` and `Binding` that repeat dozens of times per file,
 //!   which is why [`crate::xml`] only ever offers the first level.
 //! * `MajorVersion` and `MinorVersion` appear on `Root` in 2 of the 30 shipped
 //!   files (`SaitekX56` and `T16000MHOTAS`, both `1`.`8`) and not in the other
-//!   28. The game's own saved presets carry the schema of the version that
-//!   wrote them, which has moved over the game's life, so the numbers are read
-//!   and reported rather than checked against anything.
+//!   28. `1`.`8` is the only bindings schema this project has ever seen, and
+//!   nobody here has watched it change — but a saved preset carries the schema
+//!   of the version that wrote it, so the numbers are read and reported rather
+//!   than checked against a list this crate would have had to invent.
+//!
+//! Every count above is of the files in one install on one machine, and the
+//! `presets` mode of this crate's `read` example takes it again:
+//!
+//! ```text
+//! cargo run -p tobii-gameconf --example read -- presets <ControlSchemes> HeadlookMode
+//! ```
 //!
 //! # Why this is worth reading at all
 //!
@@ -94,7 +106,8 @@ pub struct Preset {
 
 impl Preset {
     /// Every answer is the same refusal — for a document that could not be
-    /// read at all.
+    /// read at all, which is the only case where one reason is the true
+    /// answer to all three questions.
     fn rejected(why: &str) -> Self {
         Preset {
             name: Lookup::Rejected(why.to_string()),
@@ -118,10 +131,23 @@ pub fn parse(doc: &[u8], setting: &str) -> Preset {
         // that parses and is not a preset would otherwise be reported as a
         // preset with nothing in it, which is the conflation this crate exists
         // to avoid.
-        return Preset::rejected(&format!(
-            "a file whose outermost element is <{}> and not <{ROOT}>",
-            document.root.name
-        ));
+        //
+        // Only the setting is refused by it. What the document element calls
+        // itself and what version it carries are attributes this reader
+        // decoded to the last character, and answering "could not be read"
+        // about them would be the crate telling a user to go and look at a
+        // file it had in fact read — the one thing a report like this cannot
+        // afford to do. It also costs [`read`] the fact it needs most: a name
+        // it can compare against the active one, to say whether this file is
+        // the preset in use or a stranger in the directory.
+        return Preset {
+            name: document.root.attribute("PresetName"),
+            version: version(&document.root),
+            setting: Lookup::Rejected(format!(
+                "a file whose outermost element is <{}> and not <{ROOT}>",
+                document.root.name
+            )),
+        };
     }
     let found: Vec<&xml::Element> = document
         .children
@@ -286,11 +312,17 @@ pub struct Bindings {
 /// what the files say.
 ///
 /// Every `.binds` file in the directory is opened, because a preset is matched
-/// by the `PresetName` inside it. That makes one file that cannot be read a
-/// refusal for the whole directory: an unreadable file may be the one that
-/// calls itself the active preset, or a second file that also does, and
-/// reporting a value from the readable one would be reporting a preset this
-/// reader cannot show is the one in use. The refusal names the file.
+/// by the `PresetName` inside it. That makes one file whose name cannot be read
+/// a refusal for the whole directory: such a file may be the one that calls
+/// itself the active preset, or a second file that also does, and reporting a
+/// value from the readable one would be reporting a preset this reader cannot
+/// show is the one in use. The refusal names the file.
+///
+/// A file whose name *can* be read is placed, whatever else is wrong with it.
+/// A document that parses and is not a preset still says what it calls itself,
+/// and that is enough to tell whether it is the one in use — so it is reported
+/// where it belongs, with the refusal on the setting it could not answer,
+/// rather than taking the directory down with it.
 pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -481,10 +513,6 @@ mod tests {
     fn an_unreadable_document_is_refused_and_not_reported_empty() {
         for (bad, what) in [
             (&b"<Root PresetName=\"C\"><A Value=\"1\"/>"[..], "unclosed"),
-            (
-                &b"<Options PresetName=\"C\"><A Value=\"1\"/></Options>"[..],
-                "not a preset",
-            ),
             (&b"\xff\xfe<Root/>"[..], "not UTF-8"),
         ] {
             let p = parse(bad, "A");
@@ -502,6 +530,49 @@ mod tests {
             "A",
         );
         assert!(matches!(p.setting, Lookup::Rejected(_)), "{p:?}");
+    }
+
+    /// A document that parses and is not a preset cannot answer about the
+    /// setting — but it can still say what it calls itself, and saying
+    /// otherwise would send a user to look at a file this reader read.
+    ///
+    /// The distinction is not cosmetic at the directory level: [`read`] places
+    /// a file by the name inside it, so a name reported as unreadable is a
+    /// file it cannot rule out as the active preset, and every other preset in
+    /// the directory goes unread with it.
+    #[test]
+    fn a_document_that_is_not_a_preset_still_says_what_it_calls_itself() {
+        let p = parse(
+            b"<Options PresetName=\"C\" MajorVersion=\"1\" MinorVersion=\"8\">\
+              <A Value=\"1\"/></Options>",
+            "A",
+        );
+        assert_eq!(p.name, Lookup::Text("C".into()));
+        assert_eq!(p.version, Lookup::Text("1.8".into()));
+        match p.setting {
+            Lookup::Rejected(why) => assert!(why.contains("<Options>"), "{why}"),
+            other => panic!("a file that is not a preset has no setting to report: {other:?}"),
+        }
+        // And the directory around it is still read, because this file's own
+        // name is enough to place it.
+        let dir = dir_with(
+            "stranger",
+            &[
+                ("StartPreset.4.start", b"Custom\r\n"),
+                ("Custom.binds", &preset_file("Custom", "")),
+                ("Other.binds", &b"<Options PresetName=\"Stranger\"/>"[..]),
+            ],
+        );
+        let Source::Read(b) = read(&dir, "HeadlookMode") else {
+            panic!("a stranger this reader can place does not refuse the directory");
+        };
+        let Found::Read { preset, .. } = &b.presets[0].found else {
+            panic!("should have matched: {:?}", b.presets[0]);
+        };
+        assert_eq!(
+            preset.setting,
+            Lookup::Text("Bindings_HeadlookModeAccumulate".into())
+        );
     }
 
     #[test]

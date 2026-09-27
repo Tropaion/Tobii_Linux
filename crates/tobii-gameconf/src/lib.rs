@@ -12,8 +12,13 @@
 //! write costs somebody their bindings; a wrong read costs a confusing
 //! sentence. So nothing in this crate creates, opens for writing, renames or
 //! deletes anything, and `never_writes` in the tests below holds that to the
-//! source: it reads this crate's own non-test code and fails on the name of
-//! any call that could modify a file.
+//! source: it reads every line of this crate that ships, the modules and the
+//! example alike, and fails on the name of any call that could modify a file.
+//! Reading for names is only worth anything because of two other facts, which
+//! the tests beside it assert rather than assume: this crate has no
+//! dependencies, so `std` is the whole of what it can call, and it has no
+//! `unsafe`, so it cannot reach past `std` under a name that is in no Rust
+//! source at all.
 //!
 //! # A file that cannot be read is never a file that says nothing
 //!
@@ -26,13 +31,15 @@
 //! the last character comes back [`Lookup::Rejected`].
 //!
 //! Schema drift is the reason this matters more here than it does for a
-//! registry. Elite's bindings root carries a major and a minor version that
-//! have moved 3.0 → 4.0 → 4.1 in the lifetime of the game, and Star Citizen's
-//! `attributes.xml` says `Version="35"` today. This crate does not check those
-//! numbers against a list it believes in — it reports them, so that a reader
-//! of the report can see what it was looking at — but it does refuse anything
-//! whose *shape* it cannot read exactly, and a version it has never seen is
-//! most likely to show up as exactly that.
+//! registry. Both formats carry a schema version on their document element,
+//! and what this project has seen of either is one number, counted off the
+//! files on one machine and written down in the module that counted it — see
+//! [`binds`] and [`attrs`]. Nobody here has watched either number move. That
+//! is exactly why this crate does not check them against a list it believes
+//! in: it reports them, so a reader of the report can see what it was looking
+//! at. What it does refuse is anything whose *shape* it cannot read exactly,
+//! and a schema this reader has never met is most likely to arrive as exactly
+//! that.
 //!
 //! # It knows two file formats and no games
 //!
@@ -84,15 +91,23 @@ pub enum Lookup {
 /// question about its contents.
 ///
 /// [`Self::Unwritten`] is the answer for a game that has never saved its
-/// options: the directory or the file is simply not there. It is separated
-/// from [`Self::Rejected`] because it is the one negative answer with a
-/// confident sentence behind it — *nothing has written this yet* — while a
-/// directory that exists and cannot be read means *go look yourself*. A caller
-/// that folded them together would tell a user who has never launched the game
-/// that something is wrong with their installation.
+/// options. It is separated from [`Self::Rejected`] because it is the one
+/// negative answer with a confident sentence behind it — *nothing has written
+/// this yet* — while a directory that exists and cannot be read means *go look
+/// yourself*. A caller that folded them together would tell a user who has
+/// never launched the game that something is wrong with their installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source<T> {
-    /// Nothing is there at all: no such file or directory.
+    /// Nothing has written this yet.
+    ///
+    /// Usually there is no such file or directory. It is also the answer for a
+    /// directory that is there and holds nothing that names a saved
+    /// configuration — [`binds::read`] gives it for a preset directory with no
+    /// `StartPreset` file in it, however many `.binds` documents are sitting
+    /// next to the missing one, because a game ships those and a game that has
+    /// run writes the other. The string says which of the two it was, and it
+    /// is the sentence a report should print: the cases share an answer, not a
+    /// wording.
     Unwritten(String),
     /// Something is there that cannot be read back exactly.
     Rejected(String),
@@ -144,21 +159,40 @@ mod tests {
         p
     }
 
-    /// The crate's own source, with the tests cut off.
+    /// Every line of this crate that ships, with the tests cut off.
     ///
     /// Cut at the first `#[cfg(test)]`, because the tests themselves write —
     /// they build fixture directories, and they are the only code here that is
     /// allowed to.
+    ///
+    /// The example is in here with the modules. It is code this crate ships,
+    /// it is the thing a maintainer points at real files to check something,
+    /// and a guarantee that covered the library but not the program that
+    /// exercises it would be a guarantee about the half nobody runs by hand.
     fn shipped_source() -> Vec<(&'static str, &'static str)> {
         [
             ("lib.rs", include_str!("lib.rs")),
             ("xml.rs", include_str!("xml.rs")),
             ("binds.rs", include_str!("binds.rs")),
             ("attrs.rs", include_str!("attrs.rs")),
+            ("examples/read.rs", include_str!("../examples/read.rs")),
         ]
         .into_iter()
         .map(|(name, src)| (name, src.split("#[cfg(test)]").next().unwrap_or(src)))
         .collect()
+    }
+
+    /// Source with the comment lines dropped, so that a rule can be *written
+    /// down* in the file it governs.
+    ///
+    /// `//` only: there are no block comments here, and a checker that
+    /// pretended to understand Rust lexically would be a worse liar than one
+    /// that admits what it scans.
+    fn code_of(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The promise the crate docs open with, held to the source rather than to
@@ -169,44 +203,184 @@ mod tests {
     /// content hashes, before and after a read, and came back identical — but
     /// a measurement proves one afternoon and this fails the build.
     ///
-    /// Comment lines are dropped first, so that the rule can be *written down*
-    /// in the file it governs. `//` only: there are no block comments here,
-    /// and a checker that pretended to understand Rust lexically would be a
-    /// worse liar than one that admits what it scans.
+    /// Scanning for names is a blunt instrument, and blunt in a particular
+    /// way: the check is exactly as complete as the list, and a list is a
+    /// thing somebody wrote from memory. What makes it sound here is not the
+    /// list, it is that the list can be *finished* —
+    /// [`nothing_can_be_called_that_is_not_in_std`] holds the two facts that
+    /// make it finite. `std` is the whole of what this crate can call, and
+    /// `std`'s file-modifying surface is a page of documentation somebody can
+    /// read to the end once and enumerate. Take those away and this becomes
+    /// theatre; so they are asserted next to it rather than remembered.
+    ///
+    /// The list must therefore be written against the surface and not against
+    /// the habits: three of the entries below are spellings that reach the
+    /// filesystem while naming none of the obvious ones. `File::options` opens
+    /// for writing without the word `OpenOptions` appearing, `DirBuilder`
+    /// creates a directory without the word `create_dir`, and `soft_link`
+    /// makes a symbolic link without the word `symlink`.
     #[test]
     fn never_writes() {
-        // Every std entry point that can modify a file or a directory. A name
-        // is enough: this crate has no `unsafe`, no `std::process`, and no
-        // dependency that could hide one behind another spelling — which is
-        // itself part of why it has no dependencies.
-        const FORBIDDEN: [&str; 14] = [
+        // Every `std` entry point that can create, modify, remove or relink
+        // something on disk, each spelled the shortest way that still cannot
+        // match anything else. Sub-spellings are covered by their prefixes:
+        // `File::create` catches `create_new`, `create_dir` catches
+        // `create_dir_all`, `remove_dir` catches `remove_dir_all`, and `chown`
+        // catches `lchown` and `fchown`.
+        const FORBIDDEN: [&str; 21] = [
             "fs::write",
             "File::create",
+            "File::options",
             "OpenOptions",
-            "create_dir",
             "create_new",
+            "create_dir",
+            "DirBuilder",
             "remove_file",
             "remove_dir",
             "fs::copy",
             "fs::rename",
+            "hard_link",
+            "soft_link",
+            "symlink",
             "set_permissions",
             "set_len",
-            "symlink",
-            "hard_link",
+            "set_modified",
+            "set_times",
+            "FileTimes",
+            "chown",
             "Command",
         ];
         for (name, src) in shipped_source() {
-            let code: String = src
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let code = code_of(src);
             for bad in FORBIDDEN {
                 assert!(
                     !code.contains(bad),
                     "{name} names `{bad}`: this crate only ever reads"
                 );
             }
+        }
+    }
+
+    /// The preconditions that make [`never_writes`] a proof and not a gesture.
+    ///
+    /// Each check here closes a way for code to run in this crate under a
+    /// name the scan has never read. A dependency brings its own vocabulary,
+    /// and no list written against `std` can cover it. `unsafe` reaches libc
+    /// directly, where the name on the call need not be a Rust name at all. A
+    /// module or an example the scan does not open is simply a file nobody
+    /// checked — which is why neither is listed twice: the modules are matched
+    /// against what `lib.rs` declares, and the examples against the directory
+    /// they live in.
+    #[test]
+    fn nothing_can_be_called_that_is_not_in_std() {
+        let manifest = include_str!("../Cargo.toml");
+        let mut under_dependencies = false;
+        for line in manifest.lines() {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            if let Some(table) = line.strip_prefix('[') {
+                under_dependencies = table.trim_end_matches(']').ends_with("dependencies");
+                continue;
+            }
+            assert!(
+                !under_dependencies || line.is_empty(),
+                "a dependency — `{line}` — puts names under this crate that \
+                 `never_writes` was never written against"
+            );
+        }
+        let scanned: Vec<&str> = shipped_source().iter().map(|(name, _)| *name).collect();
+        let (lib, _) = shipped_source()
+            .into_iter()
+            .find(|(name, _)| *name == "lib.rs")
+            .expect("lib.rs");
+        for line in code_of(lib).lines() {
+            let line = line.trim();
+            let Some(rest) = line
+                .strip_prefix("pub mod ")
+                .or_else(|| line.strip_prefix("pub(crate) mod "))
+                .or_else(|| line.strip_prefix("mod "))
+            else {
+                continue;
+            };
+            let Some(module) = rest.strip_suffix(';') else {
+                continue;
+            };
+            assert!(
+                scanned.contains(&format!("{module}.rs").as_str()),
+                "module {module} is declared here and not scanned by `never_writes`"
+            );
+        }
+        // The same question of the examples, asked of the directory rather
+        // than of a second list: a program that ships here and is not scanned
+        // is a program nobody checked, and the way that happens is somebody
+        // adding one.
+        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        for entry in std::fs::read_dir(&examples).expect("the examples directory") {
+            let path = entry.expect("an entry").path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
+            assert!(
+                scanned.contains(&format!("examples/{name}").as_str()),
+                "examples/{name} ships and is not scanned by `never_writes`"
+            );
+        }
+        for (name, src) in shipped_source() {
+            assert!(
+                !code_of(src).contains("unsafe"),
+                "{name} names `unsafe`: past `std` there is no name to scan for"
+            );
+        }
+    }
+
+    /// [`Source::Unwritten`] answers for more than a path that is not there,
+    /// and the type is where a caller finds out which cases it covers.
+    ///
+    /// The sentence each case carries is right; a type whose doc names only
+    /// one of them sends a reader to the wrong conclusion about the other.
+    #[test]
+    fn unwritten_names_every_case_that_answers_it() {
+        let src = include_str!("lib.rs");
+        let (before, _) = src
+            .split_once("Unwritten(String),")
+            .expect("the variant is declared");
+        let doc: Vec<&str> = before
+            .lines()
+            .rev()
+            .take_while(|l| {
+                let l = l.trim_start();
+                // The variant line itself is cut mid-way by the split, and
+                // what is left of it is its indentation.
+                l.starts_with("///") || l.is_empty()
+            })
+            .collect();
+        let doc = doc.join("\n");
+        assert!(
+            doc.contains("StartPreset"),
+            "`binds::read` answers Unwritten for a directory that is there and \
+             holds no StartPreset file, and this doc does not say so: {doc}"
+        );
+    }
+
+    /// The crate docs make the argument; the modules hold the measurements.
+    ///
+    /// Every number in this crate is a count of real files somebody opened,
+    /// and it belongs beside the reader it was counted with — [`binds`] for
+    /// Elite's presets, [`attrs`] for the one `attributes.xml` on this
+    /// machine. Restated up here it becomes a second copy that no measurement
+    /// keeps honest, and the cheapest rule that holds the line is that the
+    /// docs in this file carry no digits at all.
+    #[test]
+    fn the_crate_docs_count_nothing_themselves() {
+        for line in include_str!("lib.rs").lines() {
+            let doc = line.trim_start();
+            if !doc.starts_with("//!") && !doc.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !doc.contains(|c: char| c.is_ascii_digit()),
+                "a measurement in the crate docs, where nothing is measured: {doc}"
+            );
         }
     }
 }
