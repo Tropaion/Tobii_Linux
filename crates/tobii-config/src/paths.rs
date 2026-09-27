@@ -27,14 +27,15 @@
 //! rule is unchanged where it matters — what `--purge` deletes is decided in
 //! one place per directory, and everything else is reported.
 //!
-//! It asks `tobii-headpose`. Whether it asks [`crate::profiles`] is
-//! `tobii uninstall`'s business; what this module owes it either way is the
-//! predicate, and that is here. If the uninstaller does not look in the
-//! profiles directory, a `--purge` reports the directory itself as "not
-//! written by this program", which is the one sentence there that is untrue
-//! of it: nothing is deleted that should not be — the failure is in the
-//! other direction — but it is a gap, not a policy, and it is the
-//! uninstaller's to close.
+//! It asks both. `tobii uninstall --purge` walks the profiles directory
+//! through [`crate::profiles::is_profile_file`] exactly as it walks the
+//! models directory through `tobii-headpose`'s list of names: it removes the
+//! `<appid>.toml` and the `<appid>.toml`[`ATOMIC_TMP_SUFFIX`] an interrupted
+//! write left, keeps and reports an `<appid>.toml~` a text editor made and a
+//! `what-i-measured.md` somebody typed beside it, and takes the directory
+//! itself only if it is empty by then. So neither subdirectory is reported
+//! as "not written by this program" — which is what the config directory's
+//! own pass said about `profiles` until the uninstaller looked inside it.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
