@@ -7,7 +7,7 @@
 //! `.binds` nests further — a binding holds `<Primary>`, `<Deadzone>` and so
 //! on — but nothing this crate is asked about lives below the first level, and
 //! keeping the scan to that level is what stops a question about `Deadzone`
-//! from matching the forty of them buried inside individual bindings.
+//! from matching the dozens of them buried inside individual bindings.
 //!
 //! # What it refuses
 //!
@@ -622,17 +622,126 @@ mod tests {
     /// believes whichever one they happen to open. The count lives in
     /// [`crate::binds`], beside the files it was taken off and beside the
     /// example that takes it again, and this fails if a copy grows here.
+    ///
+    /// What it holds is the rule and not a list of wordings. A census is a
+    /// number about those files, so it is caught in whichever of the two
+    /// halves it is written: the module docs carry no digits at all beyond the
+    /// encodings they have to name, and no sentence anywhere in this file's
+    /// prose puts a number — digits or spelled out — next to a word for the
+    /// files Elite ships. A list of phrases would only ever catch the phrase
+    /// somebody already corrected.
     #[test]
     fn the_shipped_preset_census_is_stated_somewhere_else() {
-        // The shipped half only: the needles below are themselves in this
-        // file, and a check that matched them would only ever find itself.
+        /// Names for the set a census would be of.
+        const THE_SET: [&str; 5] = ["elite", "preset", "shipped", "ships", ".binds"];
+        /// Numbers a census can be written with, past the digits.
+        ///
+        /// Cardinals only: an ordinal counts nothing — "the first level", "a
+        /// second copy" — and this file's prose is full of them.
+        const CARDINALS: [&str; 28] = [
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+            "twenty",
+            "thirty",
+            "forty",
+            "fifty",
+            "sixty",
+            "seventy",
+            "eighty",
+            "ninety",
+            "hundred",
+        ];
+        /// The only numbers with a reason to be in the module docs: the names
+        /// of encodings, which are names and not counts.
+        const ENCODINGS: [&str; 3] = ["UTF-8", "UTF-16", "CP1252"];
+
+        // The shipped half only. The needles above are themselves in this
+        // file, and a check that read them would only ever find itself.
         let src = include_str!("xml.rs");
         let src = src.split("#[cfg(test)]").next().unwrap_or(src);
-        for count in ["of the 30", "30 presets", "all 30"] {
+
+        for line in src.lines() {
+            let Some(doc) = line.trim_start().strip_prefix("//!") else {
+                continue;
+            };
+            let mut rest = doc.to_string();
+            for encoding in ENCODINGS {
+                rest = rest.replace(encoding, "");
+            }
             assert!(
-                !src.contains(count),
-                "xml.rs states `{count}`: the census belongs to binds.rs, where it was measured"
+                !rest.contains(|c: char| c.is_ascii_digit()),
+                "a number in xml.rs's module docs, which count nothing: {doc}"
             );
         }
+
+        // Sentences, because a census is a claim and a claim can be spread
+        // over as many lines as the wrapping takes. Each run of doc lines is
+        // its own text: joining across items would invent sentences neither
+        // of them says.
+        for sentence in doc_sentences(src) {
+            let lower = sentence.to_ascii_lowercase();
+            if !THE_SET.iter().any(|word| lower.contains(word)) {
+                continue;
+            }
+            let number = lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .find(|word| {
+                    word.contains(|c: char| c.is_ascii_digit()) || CARDINALS.contains(word)
+                });
+            assert!(
+                number.is_none(),
+                "xml.rs counts Elite's shipped files — `{}` — and the census \
+                 belongs to binds.rs, where it was measured: {sentence}",
+                number.unwrap_or_default()
+            );
+        }
+    }
+
+    /// Every sentence of every doc comment in `src`, one run of doc lines at a
+    /// time.
+    fn doc_sentences(src: &str) -> Vec<String> {
+        let mut blocks: Vec<String> = Vec::new();
+        let mut open = false;
+        for line in src.lines() {
+            let line = line.trim_start();
+            let doc = line
+                .strip_prefix("//!")
+                .or_else(|| line.strip_prefix("///"));
+            match doc {
+                Some(text) => {
+                    if !open {
+                        blocks.push(String::new());
+                        open = true;
+                    }
+                    let block = blocks.last_mut().expect("just pushed");
+                    block.push(' ');
+                    block.push_str(text.trim());
+                }
+                None => open = false,
+            }
+        }
+        blocks
+            .iter()
+            .flat_map(|block| block.split(". "))
+            .map(|sentence| sentence.trim().to_string())
+            .filter(|sentence| !sentence.is_empty())
+            .collect()
     }
 }
