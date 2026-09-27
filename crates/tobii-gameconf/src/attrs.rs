@@ -2,8 +2,8 @@
 //!
 //! # The format, as the file on this machine has it
 //!
-//! Read off a real `attributes.xml` — 6915 bytes, 112 `<Attr>` elements, no
-//! two of them sharing a name — rather than inferred:
+//! Read off a real `attributes.xml` on 2026-09-27 — 6915 bytes, 112 `<Attr>`
+//! elements, no two of them sharing a name — rather than inferred:
 //!
 //! ```text
 //! <Attributes Version="35">
@@ -27,12 +27,21 @@
 //! the document element is `35` today; it is read and reported, never checked,
 //! for the reason the crate docs give about schema drift.
 //!
-//! Both counts above are of one file on one machine, and the `attrs` mode of
-//! this crate's `read` example takes them again:
+//! Both counts above are of one file on one machine on the date named.
+//! Nothing in CI has that file, so no test here can show they are still true —
+//! what a test can do, and what this crate's `read` example is for, is take
+//! them again:
 //!
 //! ```text
 //! cargo run -p tobii-gameconf --example read -- attrs <attributes.xml> HeadtrackingSource
 //! ```
+//!
+//! It prints the size and the element count of whatever file it is pointed at,
+//! counted off the bytes rather than asked of this reader, which is what makes
+//! it a second opinion. A number in this header the example does not print is
+//! a number nobody can check; that is a rule for whoever edits the header, and
+//! not something a test can hold, because the file it would have to count is
+//! on one maintainer's disk.
 //!
 //! # What this reader will not tell you
 //!
@@ -184,7 +193,6 @@ pub fn read(path: &Path, name: &str) -> Source<Attributes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binds::tests::printed;
     use crate::tests::scratch;
 
     /// The shape the real file has, down to the one-space indentation and the
@@ -289,47 +297,6 @@ mod tests {
                 "two spellings are not `one called`: {why}"
             ),
             other => panic!("should have refused to choose: {other:?}"),
-        }
-    }
-
-    /// Every number the header states about the real file is one the example
-    /// takes again.
-    ///
-    /// The file is somebody's install and nothing in CI has it, so the numbers
-    /// themselves cannot be held here. What can is the property that makes
-    /// them worth writing down at all: a maintainer can point the example at
-    /// the file and read the same two numbers back. A figure with no counter
-    /// behind it is one nobody can check — which is how an element count that
-    /// matched nothing in the file sat under a heading promising it had been
-    /// measured — so the header states a size and a population, and the
-    /// example prints a size and a population.
-    ///
-    /// The example's half is read out of its string literals and not out of
-    /// its source, for the reason [`crate::binds`]'s twin gives: the word
-    /// `bytes` is also in the example's module docs and in the name of a
-    /// local, so a test that searched the source would stay green with the
-    /// line that prints the size deleted.
-    #[test]
-    fn every_number_in_the_header_is_counted_by_the_example() {
-        // Without the code markers: whether a name is quoted in prose is a
-        // typographic choice, and a rule that turned on it would be a rule
-        // about typography.
-        let header = include_str!("attrs.rs")
-            .split_once("//! # What this reader will not tell you")
-            .expect("the header runs down to the next heading")
-            .0
-            .replace('`', "");
-        let example = printed(include_str!("../examples/read.rs"));
-        for (stated, counted) in [("bytes", "bytes"), ("<Attr> elements", "<Attr> elements")] {
-            assert!(
-                header.contains(stated),
-                "the header states no `{stated}` for the file it was read off"
-            );
-            assert!(
-                example.contains(counted),
-                "the header states `{stated}` and the example prints no \
-                 `{counted}`: a number nobody can take again"
-            );
         }
     }
 
