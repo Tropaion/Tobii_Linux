@@ -40,19 +40,34 @@ const CARDS: [&str; 6] = [
     "Head tracking for games",
 ];
 
-fn walk(w: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
-    out.push(w.clone());
-    let mut c = w.first_child();
-    while let Some(ch) = c {
-        walk(&ch, out);
-        c = ch.next_sibling();
+/// `root` and its descendants in `first_child`/`next_sibling` order, descending
+/// into a child only when `descend` accepts it.
+///
+/// One walker with the difference written down, rather than two copies of the
+/// descent with one line between them. A child `descend` rejects is neither
+/// pushed nor walked into; its siblings still are, and `root` itself is always
+/// pushed whatever `descend` would say about it — which is what lets
+/// `own_widgets` take a census of a window that is itself a `GtkNative`.
+fn walk(root: &gtk::Widget, descend: &dyn Fn(&gtk::Widget) -> bool) -> Vec<gtk::Widget> {
+    fn go(w: &gtk::Widget, descend: &dyn Fn(&gtk::Widget) -> bool, out: &mut Vec<gtk::Widget>) {
+        out.push(w.clone());
+        let mut c = w.first_child();
+        while let Some(ch) = c {
+            if descend(&ch) {
+                go(&ch, descend, out);
+            }
+            c = ch.next_sibling();
+        }
     }
+    let mut v = Vec::new();
+    go(root, descend, &mut v);
+    v
 }
 
+/// Every widget under `root`, stopping at nothing. What the finders below
+/// search; NOT what the leak census is taken over — see `own_widgets`.
 fn all(root: &gtk::Widget) -> Vec<gtk::Widget> {
-    let mut v = Vec::new();
-    walk(root, &mut v);
-    v
+    walk(root, &|_| true)
 }
 
 /// The widgets a window actually OWNS: `all`, minus every subtree that has a
@@ -84,20 +99,26 @@ fn all(root: &gtk::Widget) -> Vec<gtk::Widget> {
 /// `GtkNative` is GTK's own word for "owns its surface" — popovers, and that
 /// tooltip window. Nothing behind one of them is this window's to free, so
 /// the walk stops there.
+///
+/// And the tooltip is the ONLY thing it drops — which is the half worth
+/// stating, because a filter standing in front of a leak census is a fair
+/// thing to suspect of hiding the leak, and a review did suspect exactly that.
+/// The argument: the only `GtkNative` `help.rs` builds is the toplevel window
+/// itself, and the toplevel is `root`, which is pushed before `descend` is
+/// consulted. Everything else it builds is a box, a label, a button, a toggle,
+/// a search entry, a scroller, a list, a row or a stack — not one of which
+/// owns a surface. So the help window has no `GtkNative` CHILD for this to
+/// prune, and the subtree that leaks (the sidebar at `help.rs`'s `split` and
+/// the "Topics" toggle) hangs off plain boxes and is counted in full.
+///
+/// The arithmetic says the same thing: this reports 87 widgets and 143
+/// controllers, which is the census `2bd9ab1` measured the leak against
+/// before any exclusion existed, and the injected leak still reads 80 of 87.
+/// Nothing went missing. What would break the argument is a `Popover` or a
+/// second `Window` added to `help.rs` later — re-read this comment if one is,
+/// because then the exclusion really could start eating evidence.
 fn own_widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
-    fn walk_own(w: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
-        out.push(w.clone());
-        let mut c = w.first_child();
-        while let Some(ch) = c {
-            if !ch.is::<gtk::Native>() {
-                walk_own(&ch, out);
-            }
-            c = ch.next_sibling();
-        }
-    }
-    let mut v = Vec::new();
-    walk_own(root, &mut v);
-    v
+    walk(root, &|ch| !ch.is::<gtk::Native>())
 }
 
 /// Every event controller on every widget of `ws`.
@@ -169,7 +190,8 @@ impl Narrowed {
         !self.held_wide && self.default_width > 0 && self.default_width < NARROW
     }
 
-    /// Why it was not asked, as a clause a SKIPPED line can end on.
+    /// Why it was not asked, as a clause a skip line — or the census failure
+    /// above it — can end on.
     fn why_not(&self) -> String {
         if self.held_wide {
             "a window manager had maximised or fullscreened the window, and GTK \
@@ -547,10 +569,10 @@ struct Seen {
     /// How many widgets and event controllers the narrow-mode census weak-ref'd
     /// at all. Asserted before the count below, because "nothing survived" and
     /// "nothing was ever counted" are the same number.
+    narrow_census: (usize, usize),
     /// The topic showing when a reopened window resumed, and the topic showing
     /// after the first word was typed into its empty search box.
     first_query: (String, String),
-    narrow_census: (usize, usize),
     /// How many of ALL the window's own widgets and ALL its own event
     /// controllers were still alive 800 ms after closing a window that had
     /// been narrowed and had its "Topics" list unfolded and folded again.
@@ -1334,97 +1356,116 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
          phases before it close and reopen the window, and one of them left it \
          shut",
     );
-    if !fold.breakpoint_was_asked() {
-        eprintln!(
-            "SKIPPED the post-fold leak census ONLY: {}. The window was allocated \
-             {}px and the Topics button was {}. Everything else in this test ran, \
-             including the wide-window leak census. This is the one check on the \
-             fold leak, so a run that prints this line has not covered it: rerun \
-             where the test's own window is not maximised for it — a bare \
-             `Xwayland :NN` with no window manager does, and so does an ordinary \
-             desktop session.",
-            fold.why_not(),
-            fold.width,
-            if fold.toggle_shown {
-                "shown"
-            } else {
-                "not shown"
-            },
-        );
-    } else {
-        // From here the breakpoint WAS asked, so every step is the layout's
-        // own doing and is asserted as such — on a bare X server with no
-        // window manager exactly as on a desktop.
-        assert!(
-            fold.toggle_shown,
-            "`default-width` is {}px, below the {NARROW}px breakpoint, and the \
-             window is neither maximised nor fullscreen — so the Topics button \
-             must be on screen and it is not. `relayout` reads `default-width`, \
-             which `set_default_size` sets whether or not a compositor grants \
-             the resize (the allocation here is {}px), so this is the layout \
-             and not the environment",
-            fold.default_width, fold.width
-        );
-        assert!(
-            !fold.sidebar_shown,
-            "the Topics button is on screen and the sidebar is too, so the fold \
-             below would hide a pane that was never the whole window and the \
-             census would prove nothing"
-        );
-        assert!(
-            seen.unfolded,
-            "pressing \"Topics\" did not unfold the list, so the sequence the \
-             census is taken across never happened"
-        );
-        assert!(
-            seen.folded,
-            "the Topics list did not fold back, so the census below is taken \
-             over a window that was left unfolded — which is not the sequence \
-             that leaks"
-        );
-        assert_eq!(
-            seen.focus_at_fold, "the search box",
-            "the fold must happen with the focus inside the pane it is about to \
-             hide, or the census below is taken across a sequence that cannot \
-             leak and passes for that reason. The focus was on {:?}. \
-             `toggle.connect_toggled` hands it to the search box when the list \
-             unfolds, and the search box is in the sidebar that folds away \
-             again a tick later",
-            seen.focus_at_fold
-        );
+    // NOT a skip. This is the one automated cover for the folding-sidebar
+    // leak, and a check that cannot be run is not a check that passed: libtest
+    // captures a passing test's stderr, so the `eprintln!("SKIPPED …")` that
+    // used to stand here printed nothing under the plain `-- --ignored` this
+    // project's release checklist runs, and the run reported `ok`. A leak that
+    // loses 80 of 87 widgets per fold, in a program that sits in the tray all
+    // day, then rode out a release on a green tick that meant "the census was
+    // never taken". So it fails instead, and says what to do about it.
+    //
+    // The cost is bounded and was weighed: CI never sees this test at all
+    // (`#[ignore = "needs a display"]`, and CI has no display), and the only
+    // environment this can fail in without a real regression is one where a
+    // window manager maximised or fullscreened a freshly opened 420px help
+    // window. That environment cannot cover the leak whatever this line does;
+    // the choice is only whether it says so out loud.
+    //
+    // The sibling narrow-layout block near the end of this function keeps its
+    // SKIPPED line, and is still reachable: it reads `at_420`, measured at
+    // 6.9 s on a DIFFERENT window from the one folded here (8.2 s closes it,
+    // 8.5 s reopens it), so its gate can be false while this one was true.
+    // What it guards is layout behaviour, not the leak census.
+    assert!(
+        fold.breakpoint_was_asked(),
+        "the post-fold leak census could not be taken: {}. The window was \
+         allocated {}px and the Topics button was {}. Everything else in this \
+         test ran, including the wide-window leak census — this failure is \
+         about the ONE check on the fold leak, and it is not a claim that the \
+         fold leaks. Rerun where the test's own window is not held wide for \
+         it: a bare `Xwayland :NN` with no window manager does, and so does an \
+         ordinary desktop session that does not maximise a 420px window.",
+        fold.why_not(),
+        fold.width,
+        if fold.toggle_shown {
+            "shown"
+        } else {
+            "not shown"
+        },
+    );
+    // From here the breakpoint WAS asked, so every step is the layout's own
+    // doing and is asserted as such — on a bare X server with no window
+    // manager exactly as on a desktop.
+    assert!(
+        fold.toggle_shown,
+        "`default-width` is {}px, below the {NARROW}px breakpoint, and the \
+         window is neither maximised nor fullscreen — so the Topics button \
+         must be on screen and it is not. `relayout` reads `default-width`, \
+         which `set_default_size` sets whether or not a compositor grants \
+         the resize (the allocation here is {}px), so this is the layout \
+         and not the environment",
+        fold.default_width, fold.width
+    );
+    assert!(
+        !fold.sidebar_shown,
+        "the Topics button is on screen and the sidebar is too, so the fold \
+         below would hide a pane that was never the whole window and the \
+         census would prove nothing"
+    );
+    assert!(
+        seen.unfolded,
+        "pressing \"Topics\" did not unfold the list, so the sequence the \
+         census is taken across never happened"
+    );
+    assert!(
+        seen.folded,
+        "the Topics list did not fold back, so the census below is taken \
+         over a window that was left unfolded — which is not the sequence \
+         that leaks"
+    );
+    assert_eq!(
+        seen.focus_at_fold, "the search box",
+        "the fold must happen with the focus inside the pane it is about to \
+         hide, or the census below is taken across a sequence that cannot \
+         leak and passes for that reason. The focus was on {:?}. \
+         `toggle.connect_toggled` hands it to the search box when the list \
+         unfolds, and the search box is in the sidebar that folds away \
+         again a tick later",
+        seen.focus_at_fold
+    );
 
-        // The size of the census is asserted before the count. "Nothing
-        // survived" and "nothing was ever weak-ref'd" are the same number, and
-        // a leak census that cannot fail for the reason it names is worse than
-        // no census: this file shipped one, at 3100 ms, in front of a phase
-        // that starts at 6400.
-        let (census_w, census_c) = seen.narrow_census;
-        assert!(
-            census_w >= 40 && census_c >= 40,
-            "the narrow-mode census weak-ref'd {census_w} widgets and {census_c} \
-             event controllers, which is too few to be the help window at all — \
-             so the count below would read zero whatever the window did with them"
-        );
-        let (left_w, left_c) = seen.narrow_alive_after_close;
-        assert_eq!(
-            (left_w, left_c),
-            (0, 0),
-            "{left_w} of {census_w} widgets and {left_c} of {census_c} event \
-             controllers outlived a help window that was narrowed, had its \
-             \"Topics\" list unfolded and folded again, and was then closed. \
-             Two shapes do this and the count cannot tell them apart. One is \
-             a handler on the toggle that captures a pane strongly and closes \
-             a ring through it; injected into `toggle.connect_toggled` while \
-             this assertion was being written, it reads exactly 80 of 87 and \
-             127 of 143, on a desktop and on a bare X server alike. The other \
-             is the focus, left pointing into a pane that was hidden, shown \
-             and hidden again without ever being given it back, which is what \
-             `2bd9ab1` measured at the same 80 of 87. Every widget counted is \
-             one this window built: GTK's own tooltip window, which wanders \
-             between toplevels and is not ours to free, is walked past by \
-             `own_widgets`"
-        );
-    }
+    // The size of the census is asserted before the count. "Nothing
+    // survived" and "nothing was ever weak-ref'd" are the same number, and
+    // a leak census that cannot fail for the reason it names is worse than
+    // no census: this file shipped one, at 3100 ms, in front of a phase
+    // that starts at 6400.
+    let (census_w, census_c) = seen.narrow_census;
+    assert!(
+        census_w >= 40 && census_c >= 40,
+        "the narrow-mode census weak-ref'd {census_w} widgets and {census_c} \
+         event controllers, which is too few to be the help window at all — \
+         so the count below would read zero whatever the window did with them"
+    );
+    let (left_w, left_c) = seen.narrow_alive_after_close;
+    assert_eq!(
+        (left_w, left_c),
+        (0, 0),
+        "{left_w} of {census_w} widgets and {left_c} of {census_c} event \
+         controllers outlived a help window that was narrowed, had its \
+         \"Topics\" list unfolded and folded again, and was then closed. \
+         Two shapes do this and the count cannot tell them apart. One is \
+         a handler on the toggle that captures a pane strongly and closes \
+         a ring through it; injected into `toggle.connect_toggled` while \
+         this assertion was being written, it reads exactly 80 of 87 and \
+         127 of 143, on a desktop and on a bare X server alike. The other \
+         is the focus, left pointing into a pane that was hidden, shown \
+         and hidden again without ever being given it back, which is what \
+         `2bd9ab1` measured at the same 80 of 87. Every widget counted is \
+         one this window built: GTK's own tooltip window, which wanders \
+         between toplevels and is not ours to free, is walked past by \
+         `own_widgets`"
+    );
 
     // --- a window of text must not light the illuminators ---
     for r in &seen.reasons_while_open {
@@ -1491,25 +1532,23 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
     // measured with `child_focus`, which is the action a Tab press resolves to.
     // The exact path, stated as a claim rather than a snapshot, because the
     // window's own "Keyboard" topic promises it to the user.
-    let chain = seen.tab_order.join(" -> ");
-    // Stated before the chain is read, because the chain cannot say it for
-    // itself. `child_focus` is GTK's own focus walk, and in a window the
-    // compositor has not made ACTIVE it reports that it moved and then leaves
-    // the focus on the first list row — so every assertion below fails with a
-    // message about Tab, in a session where Tab is fine and the window simply
-    // never came to the front. Run this on a desktop where the test's own
-    // windows can take the focus: another program holding it (this program's
-    // own release build, for one) is enough.
     // The Tab walk needs the window to be ACTIVE: `child_focus` is GTK's own
     // focus walk, and in a window the compositor never brought to the front it
-    // reports that it moved and then leaves the focus where it was. Asserting
-    // there says "Tab is broken" about a session where Tab is fine — and no
-    // environment available to this project satisfies it, since a desktop
-    // session has something else in front and a bare Xwayland has no window
-    // manager to activate anything. So this block alone is skipped, loudly;
+    // reports that it moved and then leaves the focus where it was — on the
+    // first list row. Asserting there says "Tab is broken" about a session
+    // where Tab is fine, and no environment available to this project
+    // satisfies it: a desktop session has something else in front (this
+    // program's own release build is enough), and a bare Xwayland has no
+    // window manager to activate anything. So this block alone is skipped;
     // everything after it — the arrows, the search, the leak census, the
     // coverage contract, the narrow layout — does not need focus and still
     // runs. CI skips the whole test anyway, having no display at all.
+    //
+    // A skip and not a failure, unlike the census gate above, and the
+    // difference is the point: that one is the sole cover for a real leak and
+    // CAN be run here, so a run that does not take it has a hole in it. This
+    // one cannot be run anywhere we have, and a failure every operator must
+    // learn to ignore is worse than a line they have to go looking for.
     if !seen.active_for_tab_walk {
         eprintln!(
             "SKIPPED the Tab walk only: the window never became active (focus sat \
@@ -1518,6 +1557,9 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
             seen.focus_on_open
         );
     } else {
+        // Read only here: the chain is a claim about the walk, and on a skipped
+        // run there was no walk to make a claim about.
+        let chain = seen.tab_order.join(" -> ");
         let reached = |what: &str| seen.tab_order.iter().any(|x| x.contains(what));
         assert!(
             reached("GtkListBoxRow"),
