@@ -2547,15 +2547,16 @@ fn refusing_to_overwrite(e: tobii_config::profiles::LoadError) -> String {
 /// back, as a paragraph to print — empty when there are none.
 ///
 /// Every command here that writes a profile rebuilds the file from the
-/// `Profile` it parsed, and a comment is not part of a `Profile`. So a
-/// hand-written `# measured 2026-10-01 by playing the game with the bridge
-/// running` is gone after a `save`, and it is the only place in the format a
-/// verification date can live — the thing a first verified profile is *for*.
+/// `Profile` it parsed, and a comment is not part of a `Profile`. The writer
+/// puts them back by position, which covers a hand-written
+/// `# measured 2026-10-01 by playing the game with the bridge running` — the
+/// only place in the format a verification date can live, and the thing a
+/// first verified profile is *for*.
 ///
-/// This does not stop the write and does not keep the comments: the writer is
-/// `Profile::to_toml`, in `tobii-config`, and until it carries them the honest
-/// thing a command here can do is print them back at the person whose work
-/// they are, in full, so a copy of them survives on the terminal.
+/// What it cannot place, it refuses to write at all, so the cases left for
+/// this paragraph are the ones a write really does drop. They are printed back
+/// in full at the person whose work they are, so a copy survives on the
+/// terminal.
 ///
 /// Read off the file rather than remembered from the parse, so that what it
 /// reports is what is actually about to be overwritten. A file that cannot be
@@ -2568,7 +2569,11 @@ fn comments_this_write_loses(
     let Ok(before) = std::fs::read_to_string(path) else {
         return String::new();
     };
-    let after = p.to_toml();
+    // Asked of the writer that is actually about to run, not of a second guess
+    // at what it does. `to_toml_over` carries comments across; `to_toml` cannot
+    // see them. Deriving the loss independently is how this paragraph came to
+    // list, in full, six comments that were still in the file.
+    let after = p.to_toml_over(&before).unwrap_or_else(|_| p.to_toml());
     let kept: Vec<&str> = comment_lines(&after);
     let lost: Vec<&str> = comment_lines(&before)
         .into_iter()
