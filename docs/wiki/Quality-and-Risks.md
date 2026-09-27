@@ -906,22 +906,32 @@ built for the purpose.
 so rather than failing when it will not oblige.** The Tab walk needs the window
 to be ACTIVE — `child_focus` is GTK's own focus walk, and in a window the
 compositor never brought to the front it reports that it moved and leaves the
-focus where it was — and the narrow-layout block needs a window manager to grant
-a resize to 420px. Neither holds in a bare Xwayland, which has no window
-manager, nor in a session where something else keeps the front. Both blocks then
+focus where it was — and the narrow-layout block needs the 520px breakpoint to be
+asked, which is not the same as a granted resize: `relayout` reads
+`default-width`, which `set_default_size` sets whether or not a compositor obeys
+it, so a refused resize still folds the sidebar. A bare Xwayland therefore runs
+that block; what stops it is a window manager holding the window maximised or
+fullscreen, where GTK freezes `default-width`. The Tab walk is the one that
+needs the window to be at the front. Both blocks then
 print a SKIPPED line naming what went unchecked. **Run on 2026-09-27 on the
 maintainer's own KDE session, all five display-gated tests passed with zero
 skips**, so both halves did run there, including the fold.
 
-One control is worth recording exactly, because it proves less than it looks
-like it proves. Removing the focus handoff inside `toggle.connect_toggled` —
-the fix for the leak — makes the test FAIL, but at the precondition above the
-census, not at the census: *"the fold must happen with the focus inside the pane
-it is about to hide, or the census below is taken across a sequence that cannot
-leak and passes for that reason."* That is the vacuous-pass problem genuinely
-closed; the test now refuses to report a census it could not have taken. **It is
-not a demonstration that the census detects a leak.** That remains measured by
-hand, once, and no control has reproduced it.
+Two controls, which say different things and were at one point confused for
+each other. Removing the focus handoff inside `toggle.connect_toggled` — the fix
+for the leak — makes the test FAIL, but at the precondition above the census,
+not at the census: *"the fold must happen with the focus inside the pane it is
+about to hide, or the census below is taken across a sequence that cannot leak
+and passes for that reason."* That is the vacuous pass closed, and nothing more:
+with the precondition relaxed the same run leaves the census at (0, 0).
+
+**The census itself is a working detector, and that is measured.** Stashing a
+strong reference to the split box from inside `toggle.connect_toggled`'s
+`is_active` branch — a fold-scoped hold, the shape of the original bug — fails
+the run at the narrow census with *82 of 87 widgets and 127 of 143 event
+controllers outlived*, the magnitude the assertion advertises, while the wide
+census 3100ms earlier stays green because the hold does not exist until the
+fold. Two runs out of two.
 
 
 Three card descriptions were shortened and two were removed from the card
