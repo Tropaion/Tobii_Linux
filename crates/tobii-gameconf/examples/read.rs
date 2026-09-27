@@ -11,11 +11,11 @@
 //! reads every `.binds` document in a directory on its own, which is what the
 //! presets a game *ships* look like — there is no active one among them. It
 //! also counts the writing habits `tobii_gameconf::binds` states a census of:
-//! byte-order marks, bare line feeds, the spacing of the declaration, and the
+//! byte-order marks, bare line feeds, the spacing of the declaration, the
 //! lines indented with spaces where the rest of the file uses tabs, down to
-//! how wide those indents are. `attrs` counts what `tobii_gameconf::attrs`
-//! states about the file it was read off: its size and how many `<Attr>`
-//! elements are in it.
+//! how wide those indents are, and how many of the files name a schema version
+//! on `<Root>`. `attrs` counts what `tobii_gameconf::attrs` states about the
+//! file it was read off: its size and how many `<Attr>` elements are in it.
 //!
 //! Those censuses are measurements of one maintainer's install. Nothing in CI
 //! has the files, so nothing in CI can show the numbers are still true — which
@@ -127,6 +127,15 @@ fn presets(dir: &Path, setting: &str) {
     let mut mixed = 0;
     let mut spaced = 0;
     let mut space_indented = 0;
+    // The census states how many files name a schema version on `<Root>` and
+    // how many do not. The per-file `version:` line below shows which, but a
+    // reader checking a count wants the count, so the files are tallied as
+    // well. Three tallies and not two: a version this reader refused is
+    // neither of the two the census names, and folding it into "naming none"
+    // would print a number that is not the one it claims to be.
+    let mut versioned = 0;
+    let mut unversioned = 0;
+    let mut version_refused = 0;
     for file in files {
         if file
             .extension()
@@ -181,6 +190,11 @@ fn presets(dir: &Path, setting: &str) {
             }
         }
         let preset = binds::parse(&bytes, setting);
+        match &preset.version {
+            Lookup::Text(_) => versioned += 1,
+            Lookup::Absent => unversioned += 1,
+            Lookup::Rejected(_) => version_refused += 1,
+        }
         println!("{}", file.display());
         say("name", &preset.name);
         say("version", &preset.version);
@@ -205,5 +219,9 @@ fn presets(dir: &Path, setting: &str) {
     println!(
         "  {space_indented} with lines indented with spaces, {} tabs throughout",
         seen - space_indented
+    );
+    println!(
+        "  {versioned} naming a schema version on <Root>, {unversioned} naming \
+         none, {version_refused} this reader would not read one off"
     );
 }

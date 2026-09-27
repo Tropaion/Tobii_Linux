@@ -4,20 +4,37 @@
 //! # The format, as the game's own files have it
 //!
 //! Measured on 2026-09-27 against the 30 presets Elite Dangerous ships, read
-//! off this machine's install rather than inferred:
+//! off this machine's install rather than inferred. The sample below is one of
+//! them, `KeyboardMouseOnly.binds`:
 //!
 //! ```text
 //! <?xml version="1.0" encoding="utf-8"?>
 //! <Root PresetName="KeyboardMouseOnly" SortOrder="0">
+//!   …
 //!   <MouseHeadlook Value="1" />
 //!   …
 //!   <HeadlookMode Value="Bindings_HeadlookModeAccumulate" />
+//!   …
 //!   <HeadLookPitchAxisRaw>
 //!     <Binding Device="{NoDevice}" Key="" />
+//!     <Inverted Value="0" />
 //!     <Deadzone Value="0.00000000" />
 //!   </HeadLookPitchAxisRaw>
+//!   …
 //! </Root>
 //! ```
+//!
+//! The ellipses are the rest of the file, not a rearrangement of it. The three
+//! `<Root>` children shown are in the order the file has them, and none of them
+//! is `<Root>`'s first child or its last: `MouseHeadlook` sits about twenty
+//! children in, `HeadlookMode` well over a hundred further down,
+//! `HeadLookPitchAxisRaw` three bindings after that, and hundreds more children
+//! follow before `</Root>`. Inside `<HeadLookPitchAxisRaw>` there is no
+//! ellipsis because there is nothing left out: those are its three children, in
+//! that order. Nothing here relies on any of that; it is written down so the
+//! sample can be opened beside the file and checked rather than taken on trust.
+//! Those distances are eyeballed off the one file and stay deliberately round;
+//! the census below is the part that is counted.
 //!
 //! * The document element is `Root` and carries `PresetName`. Indentation is
 //!   tabs, shown above with spaces only because a doc comment may not hold
@@ -41,21 +58,22 @@
 //!   version that wrote it, so the numbers are read and reported rather than
 //!   checked against a list this crate would have had to invent.
 //!
-//! Every count above is of one install on one machine on the date named.
-//! Nothing in CI has those files, so no test here can show the numbers are
-//! still true — what a test can do, and what this crate's `read` example is
-//! for, is take them again:
+//! Every count in that census is of one install on one machine on the date
+//! named. Nothing in CI has those files, so no test here can show the numbers
+//! are still true — what a test can do, and what this crate's `read` example
+//! is for, is take them again:
 //!
 //! ```text
 //! cargo run -p tobii-gameconf --example read -- presets <ControlSchemes> HeadlookMode
 //! ```
 //!
 //! Its `presets` mode reads every `.binds` document in a directory, without a
-//! `StartPreset` file, and prints each count above beside the per-file numbers
-//! it is made of. A number in this census that the example does not print is a
-//! number nobody can check; that is a rule for whoever edits the census, and
-//! not something a test can hold, because the files it would have to count are
-//! on one maintainer's disk.
+//! `StartPreset` file, and prints each of those counts beside the per-file
+//! numbers it is made of — the 2 and the 28 included, tallied off what the
+//! reader made of each `<Root>`. A number in this census that the example does
+//! not print is a number nobody can check; that is a rule for whoever edits the
+//! census, and not something a test can hold, because the files it would have
+//! to count are on one maintainer's disk.
 //!
 //! # Why this is worth reading at all
 //!
@@ -324,28 +342,39 @@ fn strip_suffix_ignore_ascii_case<'a>(s: &'a [u8], suffix: &[u8]) -> Option<&'a 
     tail.eq_ignore_ascii_case(suffix).then_some(rest)
 }
 
-/// What to say about a directory that is not there.
+/// What to say about a file or directory that is not there.
+///
+/// `missing` is the word for what was looked for — `"directory"` for [`read`],
+/// `"file"` for [`crate::attrs::read`] — and `claim` is the confident half of
+/// the sentence, the one saying what the caller's reader would have found had
+/// it been written.
 ///
 /// `ENOENT` is one error covering two situations, and the sentence has to be
-/// true of both. If everything above the directory is there, the filesystem
-/// holding it is mounted and readable and the only thing missing is what the
-/// game would have written: *nothing has saved a control scheme here* is a
-/// fact. If something further up is missing too, the path may be leading onto
-/// a drive nobody has mounted — `libraryfolders.vdf` on this machine still
-/// names a Steam library under `/run/media`, and `/run/media/tropaion` is not
-/// there — and the same sentence becomes a confident negative about files this
-/// reader never got to look at. It is the worst thing this crate can say, and
-/// it is reachable today.
+/// true of both. If everything above the path is there, the filesystem holding
+/// it is mounted and readable and the only thing missing is what the game
+/// would have written: `claim` is then a fact. If something further up is
+/// missing too, the path may be leading onto a drive nobody has mounted —
+/// `libraryfolders.vdf` on this machine still names a Steam library under
+/// `/run/media`, and `/run/media/tropaion` is not there — and the same
+/// sentence becomes a confident negative about files this reader never got to
+/// look at. It is the worst thing this crate can say, and it is reachable
+/// today.
 ///
 /// Nothing in the error separates the two, and a mount table is a guess this
-/// module will not make. So the missing part of the path is named, the
-/// sentence stops short of a promise, and a user looking at it recognises
-/// their own unmounted drive in one line.
-fn nothing_at(dir: &Path) -> String {
+/// crate will not make. So the missing part of the path is named, the sentence
+/// stops short of a promise, and a user looking at it recognises their own
+/// unmounted drive in one line.
+///
+/// Both readers call it — [`read`] for a preset directory and
+/// [`crate::attrs::read`] for an attributes file — because the two answers
+/// are one answer: an unmounted drive is an unmounted drive whichever of them
+/// is pointed at it, and a reader that skipped this would print the bare
+/// `claim` and be confidently wrong about a disk it never saw.
+pub(crate) fn nothing_at(missing: &str, path: &Path, claim: &str) -> String {
     // Shallowest first. A relative path's ancestors end at the empty path,
     // which stats as nothing there and would be named as the missing part of
     // the path; the working directory is not what is missing.
-    let mut ancestors: Vec<&Path> = dir
+    let mut ancestors: Vec<&Path> = path
         .ancestors()
         .filter(|p| !p.as_os_str().is_empty())
         .collect();
@@ -354,26 +383,23 @@ fn nothing_at(dir: &Path) -> String {
         .into_iter()
         .find(|p| matches!(p.try_exists(), Ok(false)))
     {
-        Some(gone) if gone == dir => format!(
-            "there is no directory at {}: nothing has saved a control scheme here",
-            dir.display()
-        ),
+        Some(gone) if gone == path => {
+            format!("there is no {missing} at {}: {claim}", path.display())
+        }
         Some(gone) => format!(
-            "there is no directory at {}, and no {} either: nothing has saved \
-             a control scheme here, unless this path leads onto something this \
-             machine has not mounted",
-            dir.display(),
+            "there is no {missing} at {}, and no {} either: {claim}, unless \
+             this path leads onto something this machine has not mounted",
+            path.display(),
             gone.display()
         ),
         // Every ancestor answered with an error rather than a yes or a no — a
-        // component that cannot be searched, say. That the directory is not
-        // there is all this reader saw.
+        // component that cannot be searched, say. That the path is not there
+        // is all this reader saw.
         None => format!(
-            "there is no directory at {}, and this reader could not see how \
-             much of the path above it exists: nothing has saved a control \
-             scheme here, unless this path leads onto something this machine \
-             has not mounted",
-            dir.display()
+            "there is no {missing} at {}, and this reader could not see how \
+             much of the path above it exists: {claim}, unless this path leads \
+             onto something this machine has not mounted",
+            path.display()
         ),
     }
 }
@@ -475,7 +501,11 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Source::Unwritten(nothing_at(dir))
+            return Source::Unwritten(nothing_at(
+                "directory",
+                dir,
+                "nothing has saved a control scheme here",
+            ))
         }
         Err(e) => {
             return Source::Rejected(format!("{} could not be listed: {e}", dir.display()));
