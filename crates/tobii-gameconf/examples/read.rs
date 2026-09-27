@@ -11,9 +11,12 @@
 //! reads every `.binds` document in a directory on its own, which is what the
 //! presets a game *ships* look like — there is no active one among them. It
 //! also counts the writing habits `tobii_gameconf::binds` states a census of:
-//! byte-order marks, bare line feeds and the spacing of the declaration. That
-//! census is a measurement of somebody's install, and a measurement that
-//! cannot be taken again is a number nobody can check.
+//! byte-order marks, bare line feeds, the spacing of the declaration and the
+//! lines indented with spaces where the rest of the file uses tabs. `attrs`
+//! counts what `tobii_gameconf::attrs` states about the file it was read off:
+//! its size and how many `<Attr>` elements are in it. Those censuses are
+//! measurements of somebody's install, and a measurement that cannot be taken
+//! again is a number nobody can check.
 //!
 //! Nothing here writes, and nothing here knows a game: every path and every
 //! setting name comes off the command line.
@@ -80,8 +83,27 @@ fn attributes(file: &Path, name: &str) {
             println!("{}", file.display());
             say("version", &a.version);
             say(name, &a.value);
+            census(file);
         }
     }
+}
+
+/// The two numbers `tobii_gameconf::attrs` states about the real file, taken
+/// again off whatever file this was pointed at.
+///
+/// Counted off the bytes rather than asked of the reader, which is what makes
+/// it a second opinion: `attrs` answers about one attribute and has no reason
+/// to hand back a population. A start tag inside a comment would be counted
+/// here and not by a parser — the file this was measured on holds no comment,
+/// and a count that disagrees with the reader is a thing worth seeing rather
+/// than a thing to hide.
+fn census(file: &Path) {
+    let Ok(bytes) = std::fs::read(file) else {
+        return;
+    };
+    const PAIR: &[u8] = b"<Attr ";
+    let elements = bytes.windows(PAIR.len()).filter(|w| *w == PAIR).count();
+    println!("  {} bytes, {elements} <Attr> elements", bytes.len());
 }
 
 fn presets(dir: &Path, setting: &str) {
@@ -97,6 +119,7 @@ fn presets(dir: &Path, setting: &str) {
     let mut marked = 0;
     let mut mixed = 0;
     let mut spaced = 0;
+    let mut space_indented = 0;
     for file in files {
         if file
             .extension()
@@ -126,6 +149,16 @@ fn presets(dir: &Path, setting: &str) {
         if bare > 0 {
             mixed += 1;
         }
+        // Lines indented with spaces in a file that is otherwise tabs. Counted
+        // per line rather than per file, because what the census states is
+        // both: which files have the habit, and how far it goes in them.
+        let spaces = bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| line.first() == Some(&b' '))
+            .count();
+        if spaces > 0 {
+            space_indented += 1;
+        }
         if body.starts_with(b"<?xml") {
             if let Some(end) = body.windows(2).position(|w| w == b"?>") {
                 if body[..end].ends_with(b" ") {
@@ -141,6 +174,9 @@ fn presets(dir: &Path, setting: &str) {
         if bare > 0 {
             println!("  {bare} bare line feeds");
         }
+        if spaces > 0 {
+            println!("  {spaces} lines indented with spaces");
+        }
     }
     println!("{seen} preset documents");
     println!(
@@ -152,4 +188,8 @@ fn presets(dir: &Path, setting: &str) {
         seen - mixed
     );
     println!("  {spaced} writing a space before `?>`");
+    println!(
+        "  {space_indented} with lines indented with spaces, {} tabs throughout",
+        seen - space_indented
+    );
 }
