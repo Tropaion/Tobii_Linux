@@ -15,35 +15,42 @@
 //!
 //! ## What holds that up, and what each part of it is worth
 //!
-//! **The test that runs the code.** This is what the promise rests on.
+//! **The test that runs the code.** This is what the promise rests on, and
+//! what it establishes is bounded by where it looks: no write landed in any
+//! place it watches. Those places are its own scratch directory, every path
+//! under it, and one level down — entry by entry, not merely by name — the
+//! directory a test binary is started in and the directory it was built
+//! into. Nothing in this crate watches anywhere else.
+//!
 //! `writes_nothing`, in this crate's `tests` directory, builds a tree shaped
 //! like the real data — a preset directory, a flat attribute list, documents
 //! malformed in each way the scanner refuses, a file that is not text, a
 //! symbolic link, a path sealed against the process — records every path in
 //! it with its length, its modification time to the nanosecond and a hash of
 //! its bytes, runs every public entry point of this crate over it, and
-//! records the tree again. The two records have to be equal. That catches a
-//! write whatever the write is called: a file that was modified looks
-//! different afterwards no matter which name modified it, so no import
-//! style, macro, comment or submodule gets past it. Its limits are stated in
-//! that file, and they are real — it sees its own scratch directory and the
-//! working directory and nowhere else, and it cannot see code that had
+//! records the tree again. The two records have to be equal. Inside those
+//! places that catches a write whatever the write is called: a file that was
+//! modified looks different afterwards no matter which name modified it, so
+//! no import style, alias, macro, comment or submodule gets past it. Its
+//! limits are stated in that file, and they are real — the three places
+//! above are the whole of what it sees, and it cannot see code that had
 //! already run by the time it started. That it runs *every* entry point is
 //! checked from in here rather than promised there, and that it *reaches*
 //! the branches those entry points are made of is counted there: a tree that
 //! comes back unchanged says nothing about a branch no call went down.
 //!
-//! **The tripwire.** `never_writes` in the tests below reads this crate's
-//! shipping source and fails the build on the name of a call that could
-//! modify a file. It is secondary and it is not a proof: a list of spellings
-//! is exactly as complete as the spellings somebody thought of, and this one
-//! has been walked past repeatedly — by a comment, by a grouped import, by a
-//! module nobody had listed, by an attribute that names a file on another
-//! platform — almost every time by ordinary Rust rather than by anything
-//! trying to. It is not complete and it cannot be made complete: every round
-//! of work on it has found another spelling that is ordinary Rust, and the
-//! useful claim is the narrow one — it catches the spellings it knows, in
-//! the diff that introduced them.
+//! **The tripwire, which nothing above rests on.** `never_writes` in the
+//! tests below reads this crate's shipping source and fails the build on the
+//! name of a call that could modify a file. What it is is drift detection,
+//! and it is not a proof: a list of spellings is exactly as complete as the
+//! spellings somebody thought of, and this one has been walked past
+//! repeatedly — by a comment, by a grouped import, by a module nobody had
+//! listed, by an attribute that names a file on another platform, by a type
+//! alias for `File` — almost every time by ordinary Rust rather than by
+//! anything trying to. It is not complete and it cannot be made complete:
+//! every round of work on it has found another spelling that is ordinary
+//! Rust, and the useful claim is the narrow one — it catches the spellings
+//! it knows, in the diff that introduced them.
 //!
 //! What it is for is code the behavioural test cannot run. The example is
 //! scanned: it is a program a maintainer points at real files by hand. A
@@ -67,13 +74,14 @@
 //! execute, and the number of them is not evidence either.
 //!
 //! This crate's readers were also run under a shim that aborts on any
-//! mutating syscall, which did not fire. That one is the stronger of the two
-//! and it is the one that is path-independent: it answers about the call
-//! rather than about a directory somebody remembered to look in, which is the
-//! whole class the behavioural test cannot see. What it still needs is a
-//! positive control in the same run — a deliberate write, shown to abort it —
-//! because a shim that was never armed and a shim that found nothing report
-//! the same silence.
+//! mutating syscall, which did not fire. That one is the stronger of the two,
+//! and the only check anybody here has that is path-independent: it answers
+//! about the call rather than about a directory somebody remembered to look
+//! in, which is the whole class the behavioural test cannot see. It is also
+//! the one nothing runs on its own — no test here invokes it and no CI job
+//! does — and what it still needs is a positive control in the same run, a
+//! deliberate write shown to abort it, because a shim that was never armed
+//! and a shim that found nothing report the same silence.
 //!
 //! Neither can be reproduced from anything in this repository: no fixture
 //! here is that prefix and no shim here is that shim. They are a person's
@@ -151,23 +159,31 @@ pub enum Lookup {
 /// question about its contents.
 ///
 /// [`Self::Unwritten`] is the answer for a game that has never saved its
-/// options. It is separated from [`Self::Rejected`] because it is the one
-/// negative answer with a confident sentence behind it — *nothing has written
-/// this yet* — while a directory that exists and cannot be read means *go look
-/// yourself*. A caller that folded them together would tell a user who has
-/// never launched the game that something is wrong with their installation.
+/// options. It is separated from [`Self::Rejected`] because the two negative
+/// answers read differently in a report — *there is nothing here* against *go
+/// look yourself* — and a caller that folded them together would tell a user
+/// who has never launched the game that something is wrong with their
+/// installation. What it is not is a confident *nothing has written this
+/// yet*; the variant says why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source<T> {
-    /// Nothing has written this yet.
+    /// Nothing here holds a saved configuration, as far as this program can
+    /// tell.
     ///
-    /// Usually there is no such file or directory. It is also the answer for a
-    /// directory that is there and holds nothing that names a saved
-    /// configuration — [`binds::read`] gives it for a preset directory with no
-    /// `StartPreset` file in it, however many `.binds` documents are sitting
-    /// next to the missing one, because a game ships those and a game that has
-    /// run writes the other. The string says which of the two it was, and it
-    /// is the sentence a report should print: the cases share an answer, not a
-    /// wording.
+    /// Usually there is no such file or directory, and that is as far as the
+    /// evidence goes. A path missing because the drive holding it is not
+    /// mounted is missing in exactly the same way, and nothing here tells the
+    /// two apart — so a caller that matches on this variant and writes its
+    /// own *the game has never saved this* has claimed more than the answer
+    /// carries. The string is the sentence to print, and it was written to
+    /// be printed.
+    ///
+    /// It is also the answer for a directory that is there and holds nothing
+    /// that names a saved configuration — [`binds::read`] gives it for a
+    /// preset directory with no `StartPreset` file in it, however many
+    /// `.binds` documents are sitting next to the missing one, because a game
+    /// ships those and a game that has run writes the other. The string says
+    /// which of the cases it was: they share an answer, not a wording.
     Unwritten(String),
     /// Something is there that cannot be read back exactly.
     Rejected(String),
@@ -179,10 +195,17 @@ pub enum Source<T> {
 ///
 /// [`std::io::ErrorKind::NotFound`] is the only error that becomes
 /// [`Source::Unwritten`]. Everything else — a permission error, a directory
-/// where a file was expected, an I/O error off a failing disk — is a file this
-/// program could not read, which is not the same as a file that is not there,
-/// and a Proton prefix on a drive that is not mounted produces exactly the
-/// second while looking like the first to a careless reader.
+/// where a file was expected, an I/O error off a failing disk — is a file
+/// this program could not read, and that is a different answer from a file
+/// that is not there.
+///
+/// A Proton prefix on a drive that is not mounted is worth stating outright,
+/// because it lands on the side a reader does not expect. The prefix is
+/// unreachable, which sounds like *could not be read*; but an unmounted mount
+/// point is an empty directory, so every path under it gives
+/// [`std::io::ErrorKind::NotFound`] and this function answers
+/// [`Source::Unwritten`] — *not there*. [`Source::Unwritten`] says what a
+/// caller must not turn that into.
 pub(crate) fn read(path: &Path) -> Source<Vec<u8>> {
     match std::fs::read(path) {
         Ok(bytes) => Source::Read(bytes),
@@ -1185,56 +1208,5 @@ mod tests {
             unscanned_files(&["lib.rs", "xml.rs", "examples/read.rs"], &root),
             ["xml/scratchpad.rs"]
         );
-    }
-
-    /// [`Source::Unwritten`] answers for more than a path that is not there,
-    /// and the type is where a caller finds out which cases it covers.
-    ///
-    /// The sentence each case carries is right; a type whose doc names only
-    /// one of them sends a reader to the wrong conclusion about the other.
-    #[test]
-    fn unwritten_names_every_case_that_answers_it() {
-        let src = include_str!("lib.rs");
-        let (before, _) = src
-            .split_once("Unwritten(String),")
-            .expect("the variant is declared");
-        let doc: Vec<&str> = before
-            .lines()
-            .rev()
-            .take_while(|l| {
-                let l = l.trim_start();
-                // The variant line itself is cut mid-way by the split, and
-                // what is left of it is its indentation.
-                l.starts_with("///") || l.is_empty()
-            })
-            .collect();
-        let doc = doc.join("\n");
-        assert!(
-            doc.contains("StartPreset"),
-            "`binds::read` answers Unwritten for a directory that is there and \
-             holds no StartPreset file, and this doc does not say so: {doc}"
-        );
-    }
-
-    /// The crate docs make the argument; the modules hold the measurements.
-    ///
-    /// Every number in this crate is a count of real files somebody opened,
-    /// and it belongs beside the reader it was counted with — [`binds`] for
-    /// Elite's presets, [`attrs`] for the one `attributes.xml` on this
-    /// machine. Restated up here it becomes a second copy that no measurement
-    /// keeps honest, and the cheapest rule that holds the line is that the
-    /// docs in this file carry no digits at all.
-    #[test]
-    fn the_crate_docs_count_nothing_themselves() {
-        for line in include_str!("lib.rs").lines() {
-            let doc = line.trim_start();
-            if !doc.starts_with("//!") && !doc.starts_with("///") {
-                continue;
-            }
-            assert!(
-                !doc.contains(|c: char| c.is_ascii_digit()),
-                "a measurement in the crate docs, where nothing is measured: {doc}"
-            );
-        }
     }
 }

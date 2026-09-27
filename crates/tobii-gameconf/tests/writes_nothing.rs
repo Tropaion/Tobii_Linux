@@ -5,14 +5,15 @@
 //! every public entry point of the crate over it — the answers and the
 //! refusals both — and records the tree again. The two records must be equal.
 //!
-//! What that catches is a write, however it is spelled. A grouped import, a
-//! renamed one, a macro that assembles the call out of fragments, a helper in
-//! a module nobody thought to scan, a name added to `std` after anybody here
-//! stopped looking: none of them changes the fact that a file that was
-//! modified has a different length, or a different modification time, or
-//! different bytes. That is the whole reason this test exists beside the
-//! name scan in `lib.rs`, which can only ever find what somebody spelled out
-//! in advance.
+//! What that catches is a write to a path it watches, however the write is
+//! spelled. A grouped import, a renamed one, a type alias, a macro that
+//! assembles the call out of fragments, a helper in a module nobody thought
+//! to scan, a name added to `std` after anybody here stopped looking: none of
+//! them changes the fact that a file that was modified has a different
+//! length, or a different modification time, or different bytes. That is the
+//! whole reason this test exists beside the name scan in `lib.rs`, which can
+//! only ever find what somebody spelled out in advance. Which paths it
+//! watches is the limit that matters, and it is listed below.
 //!
 //! It is an integration test on purpose: from out here the only things
 //! reachable are the ones a caller can reach, so what it runs is the crate
@@ -44,10 +45,16 @@
 //!   inside a scratch directory of its own, and it is the scratch directory
 //!   that is snapshotted — so a write beside the fixture, or to its parent,
 //!   or to a sibling built with `with_extension`, shows up as something that
-//!   appeared. The working directory is checked too, by name only and one
-//!   level deep. Anywhere else — `$HOME`, `target/`, a path built from an
-//!   environment variable, `/tmp` at large — is invisible here. The name scan
-//!   is what looks for that, and it looks by spelling.
+//!   appeared. Two places outside it are watched one level deep, by
+//!   [`watched_outside`] and [`shallow`]: the directory a test binary is
+//!   started in, and the directory it was built into. What that catches is a
+//!   file directly inside either that appeared or was rewritten; what it does
+//!   not is anything further down. Anywhere else — `$HOME`, a path built from
+//!   an environment variable, `/tmp` at large — is invisible here,
+//!   and nothing else in this crate makes up for that. The name scan in
+//!   `lib.rs` looks by spelling and has been walked past by ordinary Rust
+//!   every round somebody has tried; the syscall shim that would answer
+//!   about any path at all is run by hand and is not in this repository.
 //! * **Code that runs before this test does.** A `build.rs` has already run
 //!   by the time a test binary starts, so nothing here can see what it did.
 //!   The name scan does not scan one either: it walks every directory cargo
@@ -59,7 +66,7 @@
 //!   crate does that by accident, and a crate that did it on purpose is not
 //!   what either check here is for.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -163,16 +170,113 @@ fn snapshot(root: &Path) -> BTreeMap<String, Entry> {
     found
 }
 
-/// The names directly inside a directory, for a place this test only ever
-/// asks whether something appeared in.
-fn names_in(dir: &Path) -> BTreeSet<String> {
+/// What sits directly inside `dir`, for a directory this test watches and
+/// does not own.
+///
+/// One level down and no recursion: one of the directories this is asked
+/// about holds cargo's whole output tree, which is enormous, forever in
+/// motion, and none of this test's business. A file directly inside is
+/// recorded the way
+/// [`snapshot`] records one, so a file rewritten on every run is caught on
+/// every run and not only the first. A directory or a link is recorded under
+/// its kind and its permissions and nothing more: a directory's length and
+/// modification time move whenever cargo puts anything anywhere inside it,
+/// and this test is not here to report on cargo.
+fn shallow(dir: &Path) -> BTreeMap<String, Entry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return BTreeSet::new();
+        return BTreeMap::new();
     };
-    entries
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    let mut found = BTreeMap::new();
+    for entry in entries.flatten() {
+        let at = entry.path();
+        let Ok(meta) = at.symlink_metadata() else {
+            continue;
+        };
+        let file_type = meta.file_type();
+        let record = if file_type.is_file() {
+            Entry {
+                kind: "file",
+                len: meta.len(),
+                modified_nanos: meta.modified().ok().and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_nanos())
+                }),
+                mode: meta.permissions().mode(),
+                hash: std::fs::read(&at).ok().map(|bytes| hash_of(&bytes)),
+            }
+        } else {
+            Entry {
+                kind: if file_type.is_symlink() {
+                    "symlink"
+                } else {
+                    "directory"
+                },
+                len: 0,
+                modified_nanos: None,
+                mode: meta.permissions().mode(),
+                hash: None,
+            }
+        };
+        found.insert(entry.file_name().to_string_lossy().into_owned(), record);
+    }
+    found
+}
+
+/// What two records of the same place disagree about, worded for the failure
+/// message and prefixed with where they were taken.
+fn differences(
+    under: &str,
+    before: &BTreeMap<String, Entry>,
+    after: &BTreeMap<String, Entry>,
+) -> Vec<String> {
+    before
+        .iter()
+        .filter(|(path, entry)| after.get(*path) != Some(*entry))
+        .map(|(path, entry)| format!("{under}{path}: {entry:?} became {:?}", after.get(path)))
+        .chain(
+            after
+                .keys()
+                .filter(|path| !before.contains_key(*path))
+                .map(|path| format!("{under}{path}: appeared")),
+        )
         .collect()
+}
+
+/// The directories watched one level down instead of being snapshotted
+/// whole: the one a test binary is started in, and the one it was built into.
+///
+/// Neither is this test's to record path by path. The build directory is
+/// cargo's and holds cargo's whole output tree; the working directory is the
+/// crate root cargo starts a test binary in. So each is read by [`shallow`],
+/// and that is the whole of what
+/// they give: something directly inside either of them that appeared during
+/// the run, or was rewritten during it.
+///
+/// The build directory is here because a write to it passed everything this
+/// crate had. A helper called from a reader wrote a log of every directory
+/// the crate had visited into the build directory, under a type alias for
+/// [`std::fs::File`] that spelled none of the names the scan in `lib.rs`
+/// looks for — and the scan read the file, found nothing to object to, and
+/// the suite stayed green. Watching the build directory ends that on its own,
+/// without the scan having to grow another spelling.
+///
+/// Recording the file rather than the name is the other half of it, and it is
+/// not decoration. This crate's own unit tests run before this file does and
+/// go through the same readers, so a log a reader rewrites on every call is
+/// already sitting in the build directory by the time this test takes its
+/// first record, and a check that asked only whether the name was new would
+/// see nothing. Cargo runs one test binary at a time, so nothing else is
+/// writing there while this one runs.
+fn watched_outside() -> Vec<PathBuf> {
+    let mut watched = vec![std::env::current_dir().expect("a working directory")];
+    // Cargo sets this when it compiles an integration test, to `tmp` inside
+    // the build directory — which is how the build directory is named here
+    // without this test having to believe it is called `target`.
+    if let Some(build) = Path::new(env!("CARGO_TARGET_TMPDIR")).parent() {
+        watched.push(build.to_path_buf());
+    }
+    watched
 }
 
 /// A scratch directory of this process's own, removed when this value is
@@ -253,14 +357,17 @@ fn preset(name: &str, setting_value: &str) -> Vec<u8> {
 /// They cannot share a directory. A directory where two files claim the name
 /// the start file names answers `Rejected` for that name and never reaches
 /// the branch that reads a preset; a directory whose start file cannot be
-/// read answers before it looks at a preset at all. One shape each is the
-/// only arrangement in which every branch runs.
+/// read answers before it looks at a preset at all; a directory holding a
+/// `.binds` name this reader cannot read back is refused whole, before any
+/// preset is looked up at all. One shape each is the only arrangement in
+/// which every branch runs.
 ///
 /// The last four are not preset directories: a directory sealed against this
 /// process, a directory named like an attributes file, an attributes file
 /// where a directory was expected, and a path that is not there.
-const DIRECTORIES: [&str; 13] = [
+const DIRECTORIES: [&str; 14] = [
     "presets",
+    "trap-presets",
     "read-presets",
     "broken-presets",
     "unwritten-presets",
@@ -294,7 +401,10 @@ fn fixture(root: &Path) {
     };
 
     // A preset directory where two files claim the name the start file names,
-    // which is the one thing this reader will not pick between.
+    // which is the one thing this reader will not pick between — and, in the
+    // same start file, a third name that no file here carries, which is the
+    // only shape in the tree that reaches the branch for a preset that is
+    // simply not on disk.
     let presets = dir(root.join("presets"));
     write(
         presets.join("StartPreset.4.start"),
@@ -304,9 +414,14 @@ fn fixture(root: &Path) {
     write(presets.join("Custom.binds"), &preset("Custom", "1"));
     write(presets.join("Spare.binds"), &preset("Spare", "0"));
     write(presets.join("Empty.binds"), &preset("Custom", ""));
-    // A directory whose name ends `.binds`, which is not a preset however
-    // much it reads like one.
-    dir(presets.join("Trap.binds"));
+    // A directory whose name ends `.binds`. It is a preset name this reader
+    // cannot read back, so it refuses the directory it sits in rather than
+    // skipping it — which is why it has a directory of its own: in `presets`
+    // above it would refuse that one before a single preset was looked up.
+    let trap = dir(root.join("trap-presets"));
+    write(trap.join("StartPreset.start"), b"Custom\n");
+    write(trap.join("Custom.binds"), &preset("Custom", "1"));
+    dir(trap.join("Trap.binds"));
 
     // The ordinary directory: a start file naming one preset, and one file
     // that calls itself that. This is the only shape that reaches the branch
@@ -525,12 +640,12 @@ fn every_entry_point_leaves_the_tree_byte_identical() {
     std::fs::create_dir_all(&root).expect("the fixture root");
     fixture(&root);
 
-    let cwd = std::env::current_dir().expect("a working directory");
+    let watched = watched_outside();
     let before = snapshot(scratch.path());
-    let names_beside_before = names_in(&cwd);
+    let watched_before: Vec<BTreeMap<String, Entry>> = watched.iter().map(|d| shallow(d)).collect();
     let seen = run_everything(&root);
     let after = snapshot(scratch.path());
-    let names_beside_after = names_in(&cwd);
+    let watched_after: Vec<BTreeMap<String, Entry>> = watched.iter().map(|d| shallow(d)).collect();
 
     // A snapshot that matched because nothing ran would be the same shape of
     // hole as every one found in the name scan: a check reading less than it
@@ -551,22 +666,10 @@ fn every_entry_point_leaves_the_tree_byte_identical() {
          exercise what it is here to exercise"
     );
 
-    let changed: Vec<String> = before
-        .iter()
-        .filter(|(path, entry)| after.get(*path) != Some(*entry))
-        .map(|(path, entry)| format!("{path}: {entry:?} became {:?}", after.get(path)))
-        .chain(
-            after
-                .keys()
-                .filter(|path| !before.contains_key(*path))
-                .map(|path| format!("{path}: appeared")),
-        )
-        .chain(
-            names_beside_after
-                .difference(&names_beside_before)
-                .map(|name| format!("{name}: appeared in {}", cwd.display())),
-        )
-        .collect();
+    let mut changed = differences("", &before, &after);
+    for ((dir, before), after) in watched.iter().zip(&watched_before).zip(&watched_after) {
+        changed.extend(differences(&format!("{}/", dir.display()), before, after));
+    }
 
     assert!(
         changed.is_empty(),
