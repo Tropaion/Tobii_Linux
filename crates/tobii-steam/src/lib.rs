@@ -9,10 +9,11 @@
 //! # What this does not do
 //!
 //! It does not parse VDF. `libraryfolders.vdf` and an `appmanifest_*.acf` are
-//! both Valve's key-value format, and both are read by pulling out the three
-//! or four keys that matter. A real parser would be a dependency and a
-//! maintenance burden for three strings, and the strings have not changed in
-//! the lifetime of this project.
+//! both Valve's key-value format, and both are read by pulling out the four
+//! keys that matter: `path` from the one, and `appid`, `name` and `buildid`
+//! from the other. A real parser would be a dependency and a maintenance
+//! burden for four strings, and the strings have not changed in the lifetime
+//! of this project.
 //!
 //! It also never writes. Nothing here creates, modifies or deletes anything —
 //! a wrong answer here should cost the user a confusing list, never a file.
@@ -225,7 +226,14 @@ pub fn apps(home: &Path) -> Vec<App> {
     // to the order the roots are scanned in and then whatever `read_dir` handed
     // back. Both collapses below fold a run into its first row, and the joined
     // name is read by a human, so the run has to come out the same every time.
-    out.sort_by(|a, b| (&a.appid, &a.name).cmp(&(&b.appid, &b.name)));
+    //
+    // Case-folded first, because the joined name claims to be alphabetical and
+    // byte order is not: it puts every capital ahead of every lowercase
+    // letter, so a manifest written in lower case sank below one that was not
+    // and the row read `Elite Dangerous: Odyssey / elite dangerous`. The raw
+    // name then breaks the tie, so copies whose names differ only in case come
+    // out in one fixed order rather than the scan's.
+    out.sort_by_cached_key(|a| (a.appid.clone(), a.name.to_lowercase(), a.name.clone()));
     // Copies that agree on the name are the same row already, and all that can
     // differ is the build. Not a plain `dedup`, which keeps the first of a run
     // and whatever build that copy was at: that copy is whichever library was
@@ -350,6 +358,14 @@ pub enum Match {
 /// An all-digits `wanted` is an app id and is matched exactly; anything else
 /// is matched case-insensitively as a substring, because nobody types
 /// "Elite Dangerous" with the right capitalisation twice.
+///
+/// An empty `wanted` is not an app id — the all-digits test excludes it, so it
+/// cannot come back with whatever [`App`] happens to carry the empty app id.
+/// It is a name fragment, and every name contains it, so the answer is
+/// [`Match::Many`] over everything installed — except on a machine with
+/// exactly one application, where matching everything is [`Match::One`]
+/// naming that application. A caller for which an empty value means "not
+/// given" has to say so before it asks; nothing here can tell the two apart.
 pub fn resolve(apps: &[App], wanted: &str) -> Match {
     if !wanted.is_empty() && wanted.chars().all(|c| c.is_ascii_digit()) {
         return match apps.iter().find(|a| a.appid == wanted) {
@@ -610,6 +626,35 @@ mod tests {
         }
     }
 
+    /// "Alphabetical" has to mean what a reader means by it. Byte order sorts
+    /// every capital ahead of every lowercase letter, so a copy whose manifest
+    /// was written in lower case sank below one that was not and the joined
+    /// name came back `Elite Dangerous: Odyssey / elite dangerous`.
+    #[test]
+    fn names_that_differ_in_case_are_joined_in_alphabetical_order() {
+        let found = one_appid_twice(
+            "casefold",
+            "99",
+            ("elite dangerous", Some("111")),
+            ("Elite Dangerous: Odyssey", Some("111")),
+        );
+        assert_eq!(found.len(), 1, "one app id is one game: {found:?}");
+        assert_eq!(
+            found[0].name, "elite dangerous / Elite Dangerous: Odyssey",
+            "a letter's case is not its place in the alphabet"
+        );
+
+        // Names differing ONLY in case fold to one key, so the name itself
+        // breaks the tie. Without it the order is the scan's — the vdf'd
+        // library is met first, which would put `pubg` in front.
+        let tied = one_appid_twice("casetie", "98", ("PUBG", None), ("pubg", None));
+        assert_eq!(tied.len(), 1, "one app id is one game: {tied:?}");
+        assert_eq!(
+            tied[0].name, "PUBG / pubg",
+            "a tie in the fold is broken by the name, not by the scan"
+        );
+    }
+
     /// Neither the build nor the name is part of a title's identity, and
     /// `Hash` agrees with `Eq` about both.
     #[test]
@@ -751,15 +796,36 @@ mod tests {
         assert_eq!(resolve(&apps, "no such game"), Match::None);
     }
 
-    /// An empty `--steam` value is all-digits vacuously, and taking that branch
-    /// would match an app whose id is the empty string — which is to say,
-    /// whatever `find` happened on.
+    /// An empty `--steam` value is all-digits vacuously, so the digit branch
+    /// excludes it on purpose: taking it would match an app whose id is the
+    /// empty string — which is to say, whatever `find` happened on. What is
+    /// left is a name fragment every name contains, and that is the hazard the
+    /// callers have to know about: it matches everything, and on a machine
+    /// with exactly one application everything is one game.
     #[test]
-    fn an_empty_name_is_not_an_app_id() {
-        let apps = vec![app("42", "Elite Dangerous")];
+    fn an_empty_name_is_every_game_rather_than_an_app_id() {
+        // If the digit branch took the empty string, `find` would hand back
+        // the app whose id is the empty string and nothing else. It does not:
+        // both of these are reached as name matches.
+        let with_idless = vec![
+            App {
+                appid: String::new(),
+                name: "Not What Was Asked For".into(),
+                buildid: None,
+            },
+            app("42", "Elite Dangerous"),
+        ];
         assert_eq!(
-            resolve(&apps, ""),
-            Match::Many(apps.clone()).into_one_or(&apps)
+            resolve(&with_idless, ""),
+            Match::Many(with_idless.clone()),
+            "a name fragment, not a lookup of the empty app id"
+        );
+
+        let one = vec![app("42", "Elite Dangerous")];
+        assert_eq!(
+            resolve(&one, ""),
+            Match::One(one[0].clone()),
+            "with one application installed, matching everything matches it"
         );
     }
 
@@ -781,18 +847,6 @@ mod tests {
             "Protonaut",
         ] {
             assert!(!looks_like_tool(game), "{game}");
-        }
-    }
-
-    impl Match {
-        /// Test helper: an empty query matches everything, which is `Many`
-        /// unless there is exactly one app installed.
-        fn into_one_or(self, all: &[App]) -> Match {
-            if all.len() == 1 {
-                Match::One(all[0].clone())
-            } else {
-                self
-            }
         }
     }
 }
