@@ -26,16 +26,26 @@
 //!   element;
 //! * an attribute without a quoted value, an attribute name spelled twice in
 //!   one element, and a `<` inside an attribute value;
+//! * a tag or an attribute whose name holds an ASCII character XML does not
+//!   allow in a name. Characters above ASCII are let through without the
+//!   Unicode table a conforming parser carries, which is the one place this
+//!   reader is knowingly the more permissive of the two — see [`is_name`] for
+//!   what that costs and what it buys;
+//! * a `<!…>` construct that is none of the three it knows: a comment, a CDATA
+//!   section or a document type declaration;
 //! * a document type declaration with an internal subset, because entity
 //!   declarations in it would change what the rest of the document means;
 //! * an entity reference other than the five XML defines and numeric
 //!   character references, and any numeric reference that does not name a
 //!   character.
 //!
-//! It tolerates a UTF-8 byte-order mark (Elite writes one on 28 of the 30
-//! presets it ships, and not on the other two), CRLF line endings, single- or
-//! double-quoted attribute values, comments, processing instructions and CDATA
-//! sections.
+//! It tolerates a UTF-8 byte-order mark, CRLF and bare line-feed endings,
+//! single- or double-quoted attribute values, comments, processing
+//! instructions and CDATA sections — every one of them a habit of the program
+//! that wrote the file rather than content. Which of Elite's shipped presets
+//! has which habit is counted in [`crate::binds`], next to the files it was
+//! counted off and next to the example that counts them again; a second copy
+//! of a count here would be a second answer.
 //!
 //! # What it deliberately does not do
 //!
@@ -121,9 +131,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Document<'_>, String> {
             // A declaration, a comment, a CDATA section or a doctype: not an
             // element, but its extent has to be known exactly, or a `<` inside
             // one would be read as a tag.
-            if i == 0 {
-                check_encoding(&rest[..skip])?;
-            }
+            check_encoding(&rest[..skip])?;
             i += skip;
             continue;
         }
@@ -191,6 +199,18 @@ fn skipped(rest: &str) -> Result<Option<usize>, String> {
     let Some(after) = rest.strip_prefix("<!") else {
         return Ok(None);
     };
+    // Comments and CDATA sections were taken above, so a document type
+    // declaration is the only `<!…>` construct left that this reader knows.
+    // Anything else spelled that way gets skipped whole if it is let through,
+    // and whatever sits inside it goes with it — which is how an element this
+    // crate was asked about turns into [`Lookup::Absent`], *the user has not
+    // set this*, on a document no parser would have read.
+    if !after
+        .strip_prefix("DOCTYPE")
+        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_whitespace()) || r.starts_with('>'))
+    {
+        return Err("a <!…> construct this reader does not know".to_string());
+    }
     let end = after
         .find('>')
         .ok_or_else(|| "a document type declaration that never ends".to_string())?;
@@ -203,14 +223,25 @@ fn skipped(rest: &str) -> Result<Option<usize>, String> {
     Ok(Some(2 + end + 1))
 }
 
-/// Refuse a declaration that names an encoding this reader did not decode.
+/// Refuse a construct that names an encoding this reader did not decode.
 ///
-/// Only the first construct in the file can be the XML declaration, which is
-/// why this is asked at offset zero and nowhere else.
+/// Only the first construct in a file can be the XML declaration proper, and
+/// a well-formed document may not spell `<?xml …?>` anywhere else — but a
+/// document that does is one whose author meant those bytes to be read as
+/// something other than what this reader decoded, and that is the single shape
+/// where a tolerated construct turns into a wrong value rather than a missing
+/// one. So the question is asked of every construct that is skipped, and where
+/// it sits is not part of the answer.
 fn check_encoding(declaration: &str) -> Result<(), String> {
     let Some(body) = declaration.strip_prefix("<?xml") else {
         return Ok(());
     };
+    // `<?xml-stylesheet …?>` is a processing instruction aimed at something
+    // else and says nothing about how these bytes are encoded; the
+    // declaration's target is `xml` and nothing longer.
+    if !body.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return Ok(());
+    }
     let Some(at) = body.find("encoding") else {
         return Ok(());
     };
@@ -230,6 +261,32 @@ fn check_encoding(declaration: &str) -> Result<(), String> {
     ))
 }
 
+/// Whether `name` is spelled the way XML spells a name, as far as here.
+///
+/// XML's `Name` production is a table of Unicode ranges, and this reader does
+/// not carry one: it checks the ASCII half exactly and lets every character
+/// above ASCII through. That is knowingly the more permissive of the two, and
+/// the trade is deliberate. Carrying the table is the weight that argues for a
+/// real parser, which this crate has an argument against; and what the ASCII
+/// half buys is the whole of what either format spells, since Elite and Star
+/// Citizen both write every element and attribute name in ASCII letters. So an
+/// ASCII character XML does not allow in a name means the scan is holding
+/// something that is not the name it thinks it is — and the honest answer to
+/// that is a refusal. The alternative is worse than it looks: a lookup against
+/// a name nobody could have written comes back [`Lookup::Absent`], which says
+/// *the user has not set this* about a document no parser would have read at
+/// all.
+fn is_name(name: &str) -> bool {
+    fn first(c: char) -> bool {
+        c.is_ascii_alphabetic() || c == '_' || c == ':' || !c.is_ascii()
+    }
+    fn later(c: char) -> bool {
+        first(c) || c.is_ascii_digit() || c == '-' || c == '.'
+    }
+    let mut chars = name.chars();
+    chars.next().is_some_and(first) && chars.all(later)
+}
+
 /// Read a start tag: the element, whether it closes itself, and its length.
 fn start_tag(rest: &str) -> Result<(Element<'_>, bool, usize), String> {
     let after = &rest[1..];
@@ -237,8 +294,10 @@ fn start_tag(rest: &str) -> Result<(Element<'_>, bool, usize), String> {
         .find(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
         .ok_or_else(|| "a tag that never ends".to_string())?;
     let name = &after[..name_len];
-    if name.is_empty() || !name.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == ':') {
-        return Err("a tag whose name this reader cannot read".to_string());
+    if !is_name(name) {
+        return Err(format!(
+            "a tag whose name this reader cannot read: `{name}`"
+        ));
     }
     // The end of the tag, found with quoting in mind: a `>` inside an
     // attribute value is legal XML and ends nothing.
@@ -284,6 +343,11 @@ fn attributes(mut raw: &str) -> Result<Vec<(&str, &str)>, String> {
         let (name, after) = raw.split_at(name_len);
         if name.is_empty() {
             return Err("an attribute with no name".to_string());
+        }
+        if !is_name(name) {
+            return Err(format!(
+                "an attribute whose name this reader cannot read: `{name}`"
+            ));
         }
         let after = after
             .trim_start_matches(|c: char| c.is_ascii_whitespace())
@@ -489,5 +553,86 @@ mod tests {
     fn a_control_character_in_a_value_is_refused() {
         let d = doc("<Root V=\"a\nb\"/>").expect("parses");
         assert!(matches!(d.root.attribute("V"), Lookup::Rejected(_)));
+    }
+
+    /// The declaration is refused for what it says, not for where it sits.
+    ///
+    /// A document may not spell `<?xml …?>` after anything else, so each of
+    /// these is already a file no parser would read — but the bytes still
+    /// claim an encoding this reader did not decode, and answering out of them
+    /// is the one way a tolerated construct turns into a wrong value rather
+    /// than a missing one.
+    #[test]
+    fn an_encoding_this_reader_did_not_decode_is_refused_wherever_it_is_named() {
+        for bad in [
+            "<?xml version=\"1.0\" encoding=\"windows-1252\"?><Root V=\"1\"/>",
+            " <?xml version=\"1.0\" encoding=\"windows-1252\"?><Root V=\"1\"/>",
+            "<!-- first --><?xml version=\"1.0\" encoding=\"windows-1252\"?><Root V=\"1\"/>",
+            "<Root V=\"1\"/><?xml version=\"1.0\" encoding=\"iso-8859-1\"?>",
+        ] {
+            match doc(bad) {
+                Err(why) => assert!(why.contains("which this reader cannot decode"), "{why}"),
+                Ok(_) => panic!("read as though the encoding were not there: {bad:?}"),
+            }
+        }
+        // A processing instruction aimed at something else is not the
+        // declaration, whatever it happens to hold.
+        let d = doc("<?xml-stylesheet href=\"a.xsl\" encoding=\"windows-1252\"?><Root V=\"1\"/>")
+            .expect("parses");
+        assert_eq!(d.root.attribute("V"), Lookup::Text("1".into()));
+    }
+
+    /// A name no parser would accept is a document this reader has lost its
+    /// place in, and [`Lookup::Absent`] — *the user has not set this* — is the
+    /// wrong thing to say about one.
+    #[test]
+    fn a_name_spelled_with_a_character_xml_forbids_is_refused() {
+        for bad in [
+            "<Ro=ot V=\"1\"/>",
+            "<Ro\"ot V=\"1\"/>",
+            "<Root V=\"1\"><A'B V=\"2\"/></Root>",
+            "<Root V(x)=\"1\"/>",
+            "<Root a<b=\"1\"/>",
+            // Not a name at all: a <!…> construct that is none of the three
+            // this reader knows, skipped whole and taking its contents with it
+            // if it were let through.
+            "<Root><! V=\"1\"/></Root>",
+            "<Root><!Z V=\"1\"/></Root>",
+        ] {
+            assert!(doc(bad).is_err(), "should have been refused: {bad:?}");
+        }
+        // The one it does know still reads.
+        let d = doc("<!DOCTYPE Root><Root V=\"1\"/>").expect("parses");
+        assert_eq!(d.root.attribute("V"), Lookup::Text("1".into()));
+        // The ASCII half only. Above it this reader has no table and does not
+        // pretend to: a name it cannot judge is let through rather than
+        // refused on a guess.
+        let d = doc("<R\u{f6}ot V\u{e4}=\"1\"/>").expect("parses");
+        assert_eq!(d.root.attribute("V\u{e4}"), Lookup::Text("1".into()));
+        // And everything the two real formats spell still reads.
+        let d =
+            doc("<Root><HeadLookPitchAxisRaw.2 xml:id=\"a-b\" _v=\"1\"/></Root>").expect("parses");
+        assert_eq!(d.children[0].attribute("_v"), Lookup::Text("1".into()));
+    }
+
+    /// This module states no census of Elite's shipped files.
+    ///
+    /// Prose cannot be unit-tested, but a second copy of a measurement can be:
+    /// two modules that count the same files are two counts, and a reader
+    /// believes whichever one they happen to open. The count lives in
+    /// [`crate::binds`], beside the files it was taken off and beside the
+    /// example that takes it again, and this fails if a copy grows here.
+    #[test]
+    fn the_shipped_preset_census_is_stated_somewhere_else() {
+        // The shipped half only: the needles below are themselves in this
+        // file, and a check that matched them would only ever find itself.
+        let src = include_str!("xml.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for count in ["of the 30", "30 presets", "all 30"] {
+            assert!(
+                !src.contains(count),
+                "xml.rs states `{count}`: the census belongs to binds.rs, where it was measured"
+            );
+        }
     }
 }
