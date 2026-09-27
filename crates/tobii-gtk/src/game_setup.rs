@@ -91,6 +91,14 @@ use crate::games::{strength_index, STRENGTHS};
 /// [`BRIDGE_FILES`] is a list and never a count written out in a sentence: the
 /// paragraph offering the install used to say "two small files" while the
 /// installer copied three and printed `copied 3 file(s)` underneath it.
+///
+/// Only [`BRIDGE_ARTIFACT`] is `bridge.rs`' `REQUIRED_ARTIFACT`. The installer
+/// prints `note: <name> not built yet — skipping` for either of the other two
+/// and carries on, and `tobii bridge status` has a `missing (optional)` line
+/// for that state — so a prefix holding one of the three is an ordinary
+/// outcome and not a corruption. It is also why nothing here says "the
+/// bridge's files" off a stat of one of them: what a stat supports is the set
+/// it actually looked at, which is [`present_files`].
 const BRIDGE_SUBDIR: &str = "drive_c/tobii-bridge";
 const BRIDGE_FILES: [&str; 3] = [
     "tobii-bridge.exe",
@@ -607,8 +615,15 @@ pub(crate) enum BridgeState {
     NoPrefix,
     /// A prefix, with no bridge artifact in it.
     Absent { prefix: PathBuf },
-    /// A prefix with the bridge's files in it.
-    Files { prefix: PathBuf, dir: PathBuf },
+    /// A prefix with the bridge's required artifact in it. `present` is which
+    /// of [`BRIDGE_FILES`] a stat actually found — never assumed to be all
+    /// three, because the installer skips an optional one it was not built
+    /// with and says so.
+    Files {
+        prefix: PathBuf,
+        dir: PathBuf,
+        present: Vec<&'static str>,
+    },
 }
 
 /// What the bridge block's button does when it is pressed. Both run the same
@@ -634,13 +649,74 @@ fn bridge_state(home: &Path, appid: &str) -> BridgeState {
         None => BridgeState::NoPrefix,
         Some(prefix) => {
             let dir = prefix.join(BRIDGE_SUBDIR);
-            if dir.join(BRIDGE_ARTIFACT).is_file() {
-                BridgeState::Files { prefix, dir }
+            let present = present_files(&dir);
+            if present.contains(&BRIDGE_ARTIFACT) {
+                BridgeState::Files {
+                    prefix,
+                    dir,
+                    present,
+                }
             } else {
                 BridgeState::Absent { prefix }
             }
         }
     }
+}
+
+/// Which of [`BRIDGE_FILES`] are in an install directory, in the order that
+/// list gives them.
+///
+/// Three stats rather than one. The one decides whether a game can load
+/// anything at all; all three decide what this window is allowed to say it
+/// found, and those are not the same question. A prefix installed from a tree
+/// with no `NPClient64.dll` holds one file, and "the bridge's files are in
+/// this prefix" over it is this window reporting an absence as a presence —
+/// which is the one bug shape this whole window is written against.
+fn present_files(dir: &Path) -> Vec<&'static str> {
+    BRIDGE_FILES
+        .into_iter()
+        .filter(|name| dir.join(name).is_file())
+        .collect()
+}
+
+/// Which of [`BRIDGE_FILES`] are **not** in `present`, in the same order.
+fn absent_files(present: &[&'static str]) -> Vec<&'static str> {
+    BRIDGE_FILES
+        .into_iter()
+        .filter(|name| !present.contains(name))
+        .collect()
+}
+
+/// The sentence naming what a stat of the install directory found, and what it
+/// did not.
+///
+/// Shared by block 2 and by [`outcome_text`], so the paragraph offering the
+/// page and the paragraph reporting an install cannot disagree about the same
+/// set of stats.
+fn present_sentence(dir: &Path, present: &[&'static str]) -> String {
+    let missing = absent_files(present);
+    if missing.is_empty() {
+        return format!(
+            "All {n} of the bridge's files are in this prefix, at {dir} — {list}.",
+            n = BRIDGE_FILES.len(),
+            dir = dir.display(),
+            list = present.join(", "),
+        );
+    }
+    format!(
+        "{n} of the bridge's {total} files {is} in this prefix, at {dir} — {list}. {gone} \
+         {isnt} not. The one a game has to load, {req}, is there; the rest are optional, and \
+         the installer prints `not built yet — skipping` for one the build it ran did not \
+         have.",
+        n = present.len(),
+        total = BRIDGE_FILES.len(),
+        is = plural(present.len(), "is", "are"),
+        dir = dir.display(),
+        list = present.join(", "),
+        gone = missing.join(" and "),
+        isnt = plural(missing.len(), "is", "are"),
+        req = BRIDGE_ARTIFACT,
+    )
 }
 
 /// The Proton prefixes for this game that [`bridge_state`] did **not** pick,
@@ -749,24 +825,30 @@ pub(crate) fn bridge_block(
         }
         BridgeState::Absent { prefix } => (
             format!(
-                "The prefix is at {}.\nThe bridge's files are not in it.\n\n\
+                "The prefix is at {}.\nThe bridge's files are not in it: there is no {req} \
+                 under {dir}.\n\n\
                  The bridge is what lets a game see a TrackIR or FreeTrack device from inside \
-                 Wine. Installing it copies {n} small {file} into the prefix — {list} — and \
-                 sets two registry values. It does not touch the game or its saves.",
+                 Wine. Installing it copies up to {n} small {file} into the prefix — {list} — \
+                 and sets two registry values. Only {req} is required, and a `tobii` built \
+                 without one of the others copies what it has and says which it skipped. It \
+                 does not touch the game or its saves.",
                 prefix.display(),
+                dir = prefix.join(BRIDGE_SUBDIR).display(),
                 n = BRIDGE_FILES.len(),
                 file = plural(BRIDGE_FILES.len(), "file", "files"),
                 list = BRIDGE_FILES.join(", "),
+                req = BRIDGE_ARTIFACT,
             ),
             Some(Action::Install),
         ),
-        BridgeState::Files { dir, .. } => (
+        BridgeState::Files { dir, present, .. } => (
             format!(
-                "The bridge's files are in this prefix, at {}.\n\n\
-                 Whether the game will actually find them is a question about two registry \
+                "{}\n\n\
+                 Whether the game will actually find {them} is a question about two registry \
                  values inside the prefix, which this window does not read. Details below is \
                  `tobii bridge status`, which does.",
-                dir.display()
+                present_sentence(dir, present),
+                them = plural(present.len(), "it", "them"),
             ),
             Some(Action::Reinstall),
         ),
@@ -785,9 +867,9 @@ pub(crate) fn bridge_block(
             text.push_str("\n\n");
             text.push_str(&binary_line(t));
         }
-        (None, Some(_)) => {
+        (None, Some(a)) => {
             text.push_str("\n\n");
-            text.push_str(&no_binary_text(appid));
+            text.push_str(&no_binary_text(*a, appid));
             return (text, None);
         }
         (None, None) => {}
@@ -959,7 +1041,19 @@ pub(crate) fn outcome_text(o: &Outcome, after: &BridgeState) -> String {
             .to_string()
     } else if o.ok {
         match after {
-            BridgeState::Files { .. } => "The bridge is installed.".to_string(),
+            // Not "The bridge is installed." full stop. The installer prints
+            // `copied 1 file(s)` and a `not built yet — skipping` note over a
+            // build missing an optional artifact, and a flat success sentence
+            // above its own account of what it skipped is this window
+            // contradicting the program it just ran, in the same paragraph.
+            BridgeState::Files { dir, present, .. } => {
+                let mut s = "The bridge is installed.".to_string();
+                if !absent_files(present).is_empty() {
+                    s.push(' ');
+                    s.push_str(&present_sentence(dir, present));
+                }
+                s
+            }
             BridgeState::Absent { prefix } => format!(
                 "The installer reported no error, and the bridge's files are still not in \
                  the prefix: there is no {BRIDGE_ARTIFACT} under {}. This window will not \
@@ -1140,12 +1234,34 @@ pub(crate) fn tobii_binary(
 }
 
 /// What to say when there is no `tobii` to run.
-pub(crate) fn no_binary_text(appid: &str) -> String {
-    format!(
-        "The command-line program `tobii` is not beside this one and is not on your PATH, so \
-         the bridge cannot be installed from here. Run this in a terminal instead:\n\n\
-         tobii bridge install --steam {appid}"
-    )
+///
+/// It takes the [`Action`] it is replacing, because it is replacing a button
+/// and has to name the same job that button did. Written for [`Action::Install`]
+/// and printed over a prefix that already holds the files, it read "the bridge
+/// cannot be installed from here" under a paragraph saying the files are in
+/// this prefix and over a button that said *Reinstall* — a page stating a
+/// state and then denying it two paragraphs later.
+///
+/// `Details` is hidden by the same missing binary, so the reinstall wording
+/// names `bridge status` as well: that is the one thing the page tells the
+/// user to press for an answer it will not give itself.
+pub(crate) fn no_binary_text(action: Action, appid: &str) -> String {
+    let head = "The command-line program `tobii` is not beside this one and is not on your \
+                PATH, so";
+    match action {
+        Action::Install => format!(
+            "{head} the bridge cannot be installed from here. Run this in a terminal \
+             instead:\n\n\
+             tobii bridge install --steam {appid}"
+        ),
+        Action::Reinstall => format!(
+            "{head} nothing here can be run against this prefix — neither a reinstall nor \
+             the registry read behind Details, which is why that button is not on the page \
+             either. Run these in a terminal instead:\n\n\
+             tobii bridge status --steam {appid}\n\
+             tobii bridge install --steam {appid}"
+        ),
+    }
 }
 
 /// `$PATH`, searched with the same `exists` the caller used for the binary
@@ -1218,11 +1334,97 @@ pub(crate) fn profile_verdict(
     }
 }
 
+/// How to write the profile this window has just said does not exist.
+///
+/// The state every user of this build is in — `profiles::BUILTIN` is empty —
+/// and the page used to end at *where* profiles go, which is a window naming a
+/// directory and leaving the user to find the command that fills it. The
+/// commands are `tobii games profile`'s own, spelled as its usage spells them;
+/// `check add` writes the profile if there is none, so the two lines work in
+/// either order and are given in the order somebody does them.
+///
+/// Named here in full rather than as "see the manual", for the reason block 2
+/// names its binary: this window is the hub, and the thing it is telling
+/// somebody to do lives in a different program.
+pub(crate) fn write_a_profile_commands(appid: &str) -> String {
+    format!(
+        "To write one, in a terminal:\n\n\
+         {save} {appid}\n\
+         {add} {appid} {ADD_FLAGS}\n\n\
+         `save` records this program's own settings as they stand under this game's app id. \
+         `check add` is what fills this section: one setting in one of the game's own files, \
+         and what it should say. Run `{PROFILE_CHECK}` on its own for what the fields mean \
+         and which file formats this build reads, and `{where_} {appid}` to see which \
+         directory the paths are taken as relative to.",
+        save = PROFILE_SAVE,
+        add = PROFILE_CHECK_ADD,
+        where_ = PROFILE_CHECK_WHERE,
+    )
+}
+
+/// The `tobii games profile` commands this window tells somebody to type, and
+/// the help window's "Set up a game…" topic types the same ones.
+///
+/// One spelling each, in one place, for the reason [`BRIDGE_FILES`] is one
+/// list: two surfaces that both name a command and are edited apart end up
+/// telling the user to run something that is not there. They are `tobii games
+/// profile`'s own usage, as `crates/tobii-cli/src/main.rs` prints it — that
+/// crate is a binary with no library target, so nothing here can link it and
+/// the agreement is kept by hand.
+pub(crate) const PROFILE_CHECK: &str = "tobii games profile check";
+/// See [`PROFILE_CHECK`].
+pub(crate) const PROFILE_SAVE: &str = "tobii games profile save";
+/// See [`PROFILE_CHECK`].
+pub(crate) const PROFILE_CHECK_ADD: &str = "tobii games profile check add";
+/// See [`PROFILE_CHECK`].
+pub(crate) const PROFILE_CHECK_WHERE: &str = "tobii games profile check where";
+/// What `check add` needs after the game, as its usage spells it.
+pub(crate) const ADD_FLAGS: &str = "--format <format> --path <path> --setting <name> \
+                                    --wants <value> --tell \"<what to do about it>\"";
+
+/// Which prefix the check rows below were read out of, when there is more than
+/// one on this machine.
+///
+/// Block 2 carries [`other_prefixes_note`] and block 3 did not, so the page
+/// warned that the prefix it names may be the abandoned one and then reported
+/// *"there is no directory at …, nothing has saved a control scheme here"*
+/// about that same prefix, as settled fact and one block lower. Both blocks
+/// read the one path [`refresh`] chose, so both say so.
+///
+/// [`None`] unless a check actually read a prefix: with no other prefixes
+/// there is nothing to warn about, and with no prefix at all the rows say that
+/// themselves.
+pub(crate) fn checked_prefix_note(
+    checks: usize,
+    prefix: Option<&Path>,
+    others: &[(PathBuf, bool)],
+) -> Option<String> {
+    let prefix = prefix?;
+    if checks == 0 || others.is_empty() {
+        return None;
+    }
+    let n = others.len();
+    Some(format!(
+        "What follows was read under {p} — the same prefix block 2 names, and this title has \
+         {n} other Proton {prefix_word} on this machine. If the game runs from {one}, every \
+         line below is about the wrong copy of its settings, including the ones saying \
+         nothing is there.",
+        p = prefix.display(),
+        prefix_word = plural(n, "prefix", "prefixes"),
+        one = plural(n, "that one", "one of those"),
+    ))
+}
+
 /// The paragraphs at the head of block 3, before any check rows.
 ///
 /// Every one of them says the block is read-only, because every one of them is
 /// a state somebody might act on.
-pub(crate) fn profile_intro(v: &ProfileVerdict, game: &str, profiles_dir: &Path) -> String {
+pub(crate) fn profile_intro(
+    v: &ProfileVerdict,
+    game: &str,
+    appid: &str,
+    profiles_dir: &Path,
+) -> String {
     match v {
         ProfileVerdict::None => format!(
             "This program has no profile for {game}, so it does not know which of this game's \
@@ -1233,8 +1435,10 @@ pub(crate) fn profile_intro(v: &ProfileVerdict, game: &str, profiles_dir: &Path)
              costs a confusing sentence, a wrong write costs the bindings. What a profile \
              buys is the reading — this window telling you which setting is wrong before you \
              go hunting.\n\n\
-             Profiles go in {dir}, one file per game, named by app id. This build ships none.",
+             Profiles go in {dir}, one file per game, named by app id. This build ships \
+             none, so writing one is the only way this section ever says anything.\n\n{cmds}",
             dir = profiles_dir.display(),
+            cmds = write_a_profile_commands(appid),
         ),
         ProfileVerdict::TooNew { origin, found } => format!(
             "{origin} was written for a newer version of this program: it says profile format \
@@ -1364,15 +1568,20 @@ fn tell_clause(r: &Row) -> String {
 /// What the profile expects and what to do about it, for every answer that has
 /// not already said the first half.
 ///
-/// Appended to every answer but a confirmed match, and that is the point of
-/// it: the commonest real case is not a wrong value, it is a player who has
-/// never touched the setting, and that answer used to read in full as
+/// Appended to every answer that read the game's files and did not confirm a
+/// match, and that is the point of it: the commonest real case is not a wrong
+/// value, it is a player who has never touched the setting, and that answer
+/// used to read in full as
 /// `HeadlookMode: not set.` — no statement of what was expected and no
 /// instruction, on a page whose third block exists to say exactly those two
 /// things. `tobii games profile show` prints both under every check it lists,
 /// whatever the file turned out to hold, and two halves of one feature
 /// disagreeing about whether the user is told what to do is worse than either
 /// answer on its own.
+///
+/// Not appended to [`Answer::NoPrefix`] or [`Answer::UnknownFormat`]. Those
+/// two say the check could not run — a remedy belongs on an answer that says
+/// the setting is wrong, not on one that says nothing was looked at.
 fn expectation(r: &Row) -> String {
     format!(" This program expects {}.{}", r.wants, tell_clause(r))
 }
@@ -1384,15 +1593,24 @@ pub(crate) fn row_text(r: &Row) -> String {
         None => String::new(),
     };
     let mut s = match &r.answer {
-        Answer::NoPrefix => format!(
-            "{}: not checked — this game has no Proton prefix here yet, so its own settings \
-             have nowhere to be.",
-            r.setting
-        ),
-        Answer::UnknownFormat(fmt) => format!(
-            "{}: not checked — this build has no reader for the file format “{fmt}”.",
-            r.setting
-        ),
+        // The two answers that are about this machine and this build rather
+        // than about the game's setting, and so the two that take no
+        // [`expectation`]: there is no file to go and change a value in, and
+        // "set head look to Toggle" under "this game has no Proton prefix here
+        // yet" is an instruction to edit something that does not exist.
+        Answer::NoPrefix => {
+            return format!(
+                "{}: not checked — this game has no Proton prefix here yet, so its own \
+                 settings have nowhere to be.",
+                r.setting
+            );
+        }
+        Answer::UnknownFormat(fmt) => {
+            return format!(
+                "{}: not checked — this build has no reader for the file format “{fmt}”.",
+                r.setting
+            );
+        }
         // The crate's own sentence, printed rather than reworded. It is the
         // one thing that knows which of the several ways of being absent this
         // was.
@@ -1552,9 +1770,29 @@ thread_local! {
 }
 
 /// What the pick page says above the list.
-const LEAD: &str = "Everything Steam says is installed on this machine. Pick one and this \
-                    window will show the three things that have to be configured for it, and \
-                    do the two it can.";
+///
+/// "…and do the two it can" is true of a machine that has a `tobii` to run.
+/// Without one the bridge block has no button at all — [`bridge_block`]
+/// replaces it with the command to type — so the page does one of the three
+/// and the lead promised two before the user had picked anything. The count is
+/// the one thing about it knowable before a game is picked, so it is the one
+/// thing this branches on; everything per-game is block 2's to say.
+fn lead(tobii: Option<&Path>) -> &'static str {
+    match tobii {
+        Some(_) => {
+            "Everything Steam says is installed on this machine. Pick one and this window \
+             will show the three things that have to be configured for it, and do the two it \
+             can."
+        }
+        None => {
+            "Everything Steam says is installed on this machine. Pick one and this window \
+             will show the three things that have to be configured for it. It can set this \
+             program's own settings; the Wine bridge needs the command-line program `tobii`, \
+             which is not beside this one and is not on your PATH, so for that one the \
+             window says what to type instead."
+        }
+    }
+}
 
 /// One numbered section of the game page: a title and a body.
 ///
@@ -1772,6 +2010,18 @@ pub fn open_with(
             .collect(),
     );
 
+    // Before the pick page, because the lead above the list says what this
+    // window will do for a game and one of the two things it does needs this.
+    let tobii: Rc<Option<PathBuf>> = Rc::new({
+        let exists = |p: &Path| p.is_file();
+        let path_lookup = on_path(&exists);
+        tobii_binary(
+            std::env::current_exe().ok().as_deref(),
+            &exists,
+            &path_lookup,
+        )
+    });
+
     // ---- the pick page
 
     let pick = gtk::Box::new(Orientation::Vertical, 10);
@@ -1779,7 +2029,7 @@ pub fn open_with(
     pick_head.set_halign(Align::Start);
     pick_head.set_xalign(0.0);
     pick_head.add_css_class("dialog-heading");
-    let lead = Label::new(Some(LEAD));
+    let lead = Label::new(Some(lead(tobii.as_deref())));
     lead.set_halign(Align::Start);
     lead.set_xalign(0.0);
     lead.set_wrap(true);
@@ -1926,15 +2176,6 @@ pub fn open_with(
     let outcome: Rc<RefCell<Option<(String, Outcome)>>> = Rc::default();
     let report: Rc<RefCell<Option<(String, String)>>> = Rc::default();
     let wrote: Rc<RefCell<Option<(String, String)>>> = Rc::default();
-    let tobii: Rc<Option<PathBuf>> = Rc::new({
-        let exists = |p: &Path| p.is_file();
-        let path_lookup = on_path(&exists);
-        tobii_binary(
-            std::env::current_exe().ok().as_deref(),
-            &exists,
-            &path_lookup,
-        )
-    });
 
     // ---- refresh
     //
@@ -2080,7 +2321,18 @@ pub fn open_with(
             }
 
             // --- block 3
-            p_body.set_text(&profile_intro(&verdict, &app.name, &scan.profiles_dir));
+            let mut p_text = profile_intro(&verdict, &app.name, &app.appid, &scan.profiles_dir);
+            // The same `chosen` block 2 has just warned about, said over the
+            // rows that were read out of it.
+            if let Some(n) = checked_prefix_note(
+                profile.map(|p| p.checks.len()).unwrap_or(0),
+                chosen,
+                &others,
+            ) {
+                p_text.push_str("\n\n");
+                p_text.push_str(&n);
+            }
+            p_body.set_text(&p_text);
             while let Some(c) = rows_box.first_child() {
                 rows_box.remove(&c);
             }
@@ -2651,6 +2903,7 @@ mod tests {
             &BridgeState::Files {
                 dir: prefix.join(BRIDGE_SUBDIR),
                 prefix,
+                present: BRIDGE_FILES.to_vec(),
             },
             &[],
             &[],
@@ -2684,6 +2937,7 @@ mod tests {
             &BridgeState::Files {
                 dir: prefix.join(BRIDGE_SUBDIR),
                 prefix: prefix.clone(),
+                present: BRIDGE_FILES.to_vec(),
             },
             &[],
             &[],
@@ -2791,10 +3045,17 @@ mod tests {
         BridgeState::Absent { prefix: prefix() }
     }
 
+    /// A prefix holding all three files.
     fn present() -> BridgeState {
+        files_with(BRIDGE_FILES.to_vec())
+    }
+
+    /// A prefix holding exactly `present` of them.
+    fn files_with(present: Vec<&'static str>) -> BridgeState {
         BridgeState::Files {
             dir: prefix().join(BRIDGE_SUBDIR),
             prefix: prefix(),
+            present,
         }
     }
 
@@ -2979,13 +3240,41 @@ mod tests {
     /// reports.
     #[test]
     fn the_page_names_the_program_its_buttons_run() {
-        let line = binary_line(Path::new("/home/x/.local/bin/tobii"));
-        assert!(line.contains("/home/x/.local/bin/tobii"), "{line}");
-        assert_ne!(
-            line,
-            binary_line(Path::new("/usr/bin/tobii")),
-            "a line that named no path would be the same for both"
+        // Through `bridge_block`, because the claim is about the PAGE. Calling
+        // `binary_line` and asserting on its return value tests that function
+        // and nothing else: it stayed green with the line never appended to
+        // any block.
+        let (here, _) = bridge_block(
+            &absent(),
+            &[],
+            &[],
+            Some(Path::new("/home/x/.local/bin/tobii")),
+            "359320",
         );
+        assert!(here.contains("/home/x/.local/bin/tobii"), "{here}");
+
+        let (there, _) = bridge_block(
+            &absent(),
+            &[],
+            &[],
+            Some(Path::new("/usr/bin/tobii")),
+            "359320",
+        );
+        assert!(there.contains("/usr/bin/tobii"), "{there}");
+        assert!(
+            !there.contains("/home/x/.local/bin/tobii"),
+            "the page names the one that was found, not a fixed path: {there}"
+        );
+
+        // And on every state that has a button, not only the one.
+        for state in [absent(), present()] {
+            let (text, action) = block2(&state, &[], &[]);
+            assert!(action.is_some(), "{state:?}");
+            assert!(
+                text.contains("/usr/bin/tobii"),
+                "{state:?} carries a button and does not say what runs it: {text}"
+            );
+        }
     }
 
     // ---------------------------------------------------------- the binary
@@ -3026,11 +3315,13 @@ mod tests {
         );
 
         // And the sentence that replaces the button says what to type.
-        let text = no_binary_text("359320");
-        assert!(
-            text.contains("tobii bridge install --steam 359320"),
-            "{text}"
-        );
+        for a in [Action::Install, Action::Reinstall] {
+            let text = no_binary_text(a, "359320");
+            assert!(
+                text.contains("tobii bridge install --steam 359320"),
+                "{a:?}: {text}"
+            );
+        }
     }
 
     // ---------------------------------------------------------- the profile
@@ -3056,11 +3347,48 @@ mod tests {
             matches!(v, ProfileVerdict::TooNew { .. }),
             "a newer grammar means update this program, not fix your file: {v:?}"
         );
-        let text = profile_intro(&v, "A Game", Path::new("/cfg/profiles"));
+        let text = profile_intro(&v, "A Game", "359320", Path::new("/cfg/profiles"));
         assert!(text.contains("/cfg/profiles/359320.toml"), "{text}");
-        assert!(text.contains(&newer.to_string()), "{text}");
-        assert!(text.contains(&profiles::VERSION.to_string()), "{text}");
+        // Both numbers in the sentence that carries them, not loose anywhere
+        // in the paragraph: `text.contains("2")` was satisfied by the 2 in
+        // `359320.toml`, so a build that never told the user which version
+        // their file claimed passed it.
+        assert!(text.contains(&format!("profile format {newer}")), "{text}");
+        assert!(
+            text.contains(&format!("this build reads {}", profiles::VERSION)),
+            "{text}"
+        );
         assert!(text.contains("has not been used at all"), "{text}");
+    }
+
+    /// Block 2 warns that the prefix it names may be the abandoned one; block 3
+    /// read the very same path and reported *"there is no directory at …,
+    /// nothing has saved a control scheme here"* as settled fact, one block
+    /// lower. One `chosen`, so one warning covering both.
+    #[test]
+    fn the_check_rows_say_which_prefix_they_read_when_there_is_more_than_one() {
+        let here = PathBuf::from("/home/u/.steam/steam/steamapps/compatdata/359320/pfx");
+        let there = PathBuf::from("/mnt/games2/steamapps/compatdata/359320/pfx");
+
+        let note = checked_prefix_note(2, Some(&here), &[(there.clone(), false)])
+            .expect("two prefixes and checks that read one of them");
+        assert!(note.contains(&here.display().to_string()), "{note}");
+        assert!(
+            note.contains("wrong copy of its settings"),
+            "including the rows reporting an absence: {note}"
+        );
+        assert!(note.contains("1 other Proton prefix"), "{note}");
+
+        // One prefix is nothing to warn about, and appending this to every
+        // page would invent a second prefix nobody has.
+        assert_eq!(checked_prefix_note(2, Some(&here), &[]), None);
+        // Nothing was read, so there is nothing to place.
+        assert_eq!(
+            checked_prefix_note(0, Some(&here), &[(there.clone(), false)]),
+            None
+        );
+        // No prefix at all: the rows say that themselves.
+        assert_eq!(checked_prefix_note(2, None, &[(there, false)]), None);
     }
 
     /// A profile that is there and could not be opened is not a game nobody has
@@ -3072,11 +3400,16 @@ mod tests {
             origin: at("/cfg/profiles/359320.toml"),
             why: "Permission denied (os error 13)".to_string(),
         }));
-        let text = profile_intro(&v, "A Game", Path::new("/cfg/profiles"));
+        let text = profile_intro(&v, "A Game", "359320", Path::new("/cfg/profiles"));
         assert!(text.contains("Permission denied"), "{text}");
         assert!(text.contains("not the same as there being none"), "{text}");
 
-        let absent = profile_intro(&ProfileVerdict::None, "A Game", Path::new("/cfg/profiles"));
+        let absent = profile_intro(
+            &ProfileVerdict::None,
+            "A Game",
+            "359320",
+            Path::new("/cfg/profiles"),
+        );
         assert_ne!(text, absent, "the two negatives are two sentences");
     }
 
@@ -3091,6 +3424,7 @@ mod tests {
         let text = profile_intro(
             &ProfileVerdict::None,
             "Elite Dangerous",
+            "359320",
             Path::new("/cfg/profiles"),
         );
         assert!(text.contains("Elite Dangerous"), "{text}");
@@ -3103,6 +3437,20 @@ mod tests {
         assert!(
             text.contains("ships none"),
             "and it says so rather than reading as a fault: {text}"
+        );
+        // And it does not end at where profiles go. This is the state every
+        // user of this build is in, and the paragraph named a directory and
+        // stopped: the commands that fill it appeared nowhere a user could
+        // see them, in this window or anywhere else.
+        for cmd in [PROFILE_SAVE, PROFILE_CHECK_ADD, PROFILE_CHECK_WHERE] {
+            assert!(
+                text.contains(&format!("{cmd} 359320")),
+                "`{cmd}` is not on the page, or not with this game's app id after it: {text}"
+            );
+        }
+        assert!(
+            text.contains(PROFILE_CHECK),
+            "and the one that explains what a check is: {text}"
         );
     }
 
@@ -3548,6 +3896,175 @@ mod tests {
             !text.contains("two small files"),
             "the installer copies three and prints `copied 3 file(s)`: {text}"
         );
+        // The count in the promise and the file in the check are two numbers,
+        // and the paragraph that gives the first has to give the second: this
+        // window counted three when it promised and one when it looked.
+        assert!(
+            text.contains(&format!("there is no {BRIDGE_ARTIFACT} under")),
+            "the stat this state rests on is one file, and the paragraph says which: {text}"
+        );
+        assert!(
+            text.contains(&format!("Only {BRIDGE_ARTIFACT} is required")),
+            "and which of the three an install has to produce: {text}"
+        );
+    }
+
+    /// `bridge.rs` marks one of the three artifacts required and prints
+    /// `note: <name> not built yet — skipping` for either of the others. Over
+    /// such a prefix this window said "The bridge's files are in this prefix"
+    /// and "The bridge is installed." directly above the installer's own
+    /// account of what it had skipped — a plural over one file, and an absence
+    /// reported as a presence.
+    #[test]
+    fn a_prefix_holding_one_of_the_three_is_not_reported_as_holding_all_three() {
+        let one = files_with(vec![BRIDGE_ARTIFACT]);
+        let (text, action) = block2(&one, &[], &[]);
+        assert_eq!(action, Some(Action::Reinstall));
+        assert!(
+            !text.contains("The bridge's files are in this prefix"),
+            "one file is not \"the bridge's files\": {text}"
+        );
+        assert!(
+            text.contains(&format!("1 of the bridge's {} files", BRIDGE_FILES.len())),
+            "{text}"
+        );
+        for gone in absent_files(&[BRIDGE_ARTIFACT]) {
+            assert!(
+                text.contains(gone),
+                "{gone} is not in the prefix and the page does not say so: {text}"
+            );
+        }
+        assert!(
+            text.contains("find it is a question"),
+            "and the singular carries through the paragraph: {text}"
+        );
+
+        assert!(text.contains("The one a game has to load"), "{text}");
+
+        // The full set reads as it always did — the qualification is earned by
+        // a gap, not appended to every page.
+        let (all, _) = block2(&present(), &[], &[]);
+        assert!(
+            all.contains(&format!("All {} of the bridge's files", BRIDGE_FILES.len())),
+            "{all}"
+        );
+        assert!(
+            !all.contains("The one a game has to load"),
+            "nothing is missing, so there is nothing to explain away: {all}"
+        );
+        assert!(all.contains("find them is a question"), "{all}");
+
+        // And the success sentence agrees with the same set, because it is the
+        // one printed over `note: … skipping`.
+        let said = outcome_text(&install_outcome(Some(0), "copied 1 file(s)\n", ""), &one);
+        assert!(said.contains("The bridge is installed."), "{said}");
+        for gone in absent_files(&[BRIDGE_ARTIFACT]) {
+            assert!(
+                said.contains(gone),
+                "{gone} was skipped and the report does not say so: {said}"
+            );
+        }
+        let whole = outcome_text(
+            &install_outcome(Some(0), "copied 3 file(s)\n", ""),
+            &present(),
+        );
+        assert!(
+            !whole.contains("of the bridge's"),
+            "all three arrived; the plain sentence is the whole truth: {whole}"
+        );
+    }
+
+    /// The stat behind all of that, against a directory on disk. Three stats,
+    /// not one: `BRIDGE_ARTIFACT` alone answers whether a game can load
+    /// anything, and it is not the same question as what is in there.
+    #[test]
+    fn present_files_lists_what_is_there_and_nothing_else() {
+        let dir = scratch("present-files").join(BRIDGE_SUBDIR);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        assert!(present_files(&dir).is_empty());
+
+        std::fs::write(dir.join(BRIDGE_ARTIFACT), b"x").expect("fixture");
+        assert_eq!(present_files(&dir), vec![BRIDGE_ARTIFACT]);
+        assert_eq!(
+            absent_files(&present_files(&dir)).len(),
+            BRIDGE_FILES.len() - 1
+        );
+
+        // A directory, not a file, is not a file.
+        std::fs::create_dir(dir.join("NPClient64.dll")).expect("fixture");
+        assert_eq!(present_files(&dir), vec![BRIDGE_ARTIFACT]);
+
+        for f in BRIDGE_FILES {
+            let p = dir.join(f);
+            if !p.is_file() {
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::write(&p, b"x").expect("fixture");
+            }
+        }
+        assert_eq!(present_files(&dir), BRIDGE_FILES.to_vec());
+        assert!(absent_files(&present_files(&dir)).is_empty());
+
+        let _ = std::fs::remove_dir_all(dir.parent().expect("drive_c"));
+    }
+
+    /// The sentence that replaces the button names the job the button did.
+    /// Written for `Install` and printed over a prefix that already holds the
+    /// files, it told the user the bridge "cannot be installed from here"
+    /// under a paragraph saying the files are in this prefix, where the action
+    /// it replaced was *Reinstall*.
+    #[test]
+    fn the_sentence_replacing_the_button_names_what_the_button_did() {
+        let (files, action) = bridge_block(&present(), &[], &[], None, "359320");
+        assert_eq!(action, None, "nothing to run: {files}");
+        assert!(
+            !files.contains("cannot be installed from here"),
+            "the files are in the prefix and the button said Reinstall: {files}"
+        );
+        assert!(files.contains("reinstall"), "{files}");
+        assert!(
+            files.contains("tobii bridge status --steam 359320"),
+            "Details is gone for the same reason, so the page says what it ran: {files}"
+        );
+
+        let (absent, _) = bridge_block(&absent(), &[], &[], None, "359320");
+        assert!(absent.contains("cannot be installed from here"), "{absent}");
+        assert_ne!(
+            no_binary_text(Action::Install, "359320"),
+            no_binary_text(Action::Reinstall, "359320"),
+            "two jobs, two sentences"
+        );
+
+        // No button at all, and so no sentence about one: a prefix that does
+        // not exist is not a machine missing a program.
+        let (none, action) = bridge_block(&BridgeState::NoPrefix, &[], &[], None, "359320");
+        assert_eq!(action, None);
+        assert!(
+            !none.contains("not beside this one"),
+            "there was no button here to replace: {none}"
+        );
+    }
+
+    /// The lead above the game list promised the window would "do the two it
+    /// can" on a machine where block 2 has no button at all — the count was
+    /// written once and never asked whether there was a `tobii` to run.
+    #[test]
+    fn the_lead_does_not_promise_a_button_this_machine_has_not_got() {
+        let with = lead(Some(Path::new("/usr/bin/tobii")));
+        assert!(with.contains("do the two it can"), "{with}");
+
+        let without = lead(None);
+        assert!(
+            !without.contains("do the two it can"),
+            "with no `tobii` the bridge block has no button: {without}"
+        );
+        assert!(
+            without.contains("three things"),
+            "it still shows all three: {without}"
+        );
+        assert!(
+            without.contains("`tobii`"),
+            "and says which program is missing: {without}"
+        );
     }
 
     // ---------------------------------------------------------- the remedies
@@ -3559,8 +4076,6 @@ mod tests {
     #[test]
     fn every_answer_but_a_match_says_what_is_expected_and_what_to_do() {
         let answers = [
-            Answer::NoPrefix,
-            Answer::UnknownFormat("binds-v2".to_string()),
             Answer::Unwritten("there is no directory at /p/Bindings".to_string()),
             Answer::Unreadable("/p/Bindings could not be listed".to_string()),
             Answer::Absent,
@@ -3597,6 +4112,33 @@ mod tests {
         });
         assert!(blank.contains("expects 1"), "{blank}");
         assert_eq!(blank.trim_end(), blank, "no trailing gap: {blank:?}");
+    }
+
+    /// The other half of the rule, and the half a remedy appended to *every*
+    /// non-match broke: a row that says the check could not run must not then
+    /// tell somebody to go and change the setting it did not look at. "This
+    /// game has no Proton prefix here yet" followed by "In Controls, set Head
+    /// Look to Toggle" sends a user into a directory that does not exist.
+    #[test]
+    fn a_check_that_could_not_run_is_not_given_a_remedy() {
+        for a in [
+            Answer::NoPrefix,
+            Answer::UnknownFormat("binds-v2".to_string()),
+        ] {
+            let text = row_text(&row(a.clone()));
+            assert!(text.contains("not checked"), "{a:?}: {text}");
+            assert!(
+                !text.contains("In Controls, set Head Look to Toggle."),
+                "{a:?} sends the reader to a file this row just said was not read: {text}"
+            );
+            assert!(
+                !text.contains("expects 1"),
+                "{a:?} states an expectation about a value nothing here read: {text}"
+            );
+            // And the sentence ends where it ends: no orphaned space left by
+            // dropping a clause off the end of it.
+            assert_eq!(text.trim_end(), text, "{a:?}: {text:?}");
+        }
     }
 
     /// The verb agrees with the count as well as the noun.
@@ -3881,7 +4423,7 @@ mod tests {
                 origin: at("/cfg/profiles/359320.toml"),
                 error,
             }));
-            let body = profile_intro(&v, "A Game", Path::new("/cfg/profiles"));
+            let body = profile_intro(&v, "A Game", "359320", Path::new("/cfg/profiles"));
             assert!(body.contains("/cfg/profiles/359320.toml"), "{bad}: {body}");
             assert!(body.contains("None of it has been used"), "{bad}: {body}");
         }

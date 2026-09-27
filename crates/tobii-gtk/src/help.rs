@@ -275,8 +275,28 @@ pub fn topics() -> Vec<Topic> {
                  read-only: this program reports what those files say and never \
                  writes them. It checks them only where a profile says what to \
                  look at, and this build ships no profiles at all, so on a fresh \
-                 install that section says so rather than guessing.",
+                 install that section says so rather than guessing.\n\n\
+                 A profile is a file per game in {profiles}, named by app id, and \
+                 you write it from a terminal — that window prints the same two \
+                 commands with the app id already filled in for the game you \
+                 picked:\n\n\
+                 {save} <app id>\n\
+                 {add} <app id> {add_flags}\n\n\
+                 `save` writes down this program's own settings under that app \
+                 id; `check add` adds one thing to look at in one of the game's \
+                 own files, and what it should say. Run `{check}` on its own for \
+                 what those fields mean and which file formats this build reads, \
+                 and `{check_where} <app id>` for the directory the paths are \
+                 taken as relative to.",
                 switch = switch,
+                profiles = tobii_config::profiles::profiles_dir().display(),
+                // The same constants the game-setup window types, so the two
+                // surfaces that name these commands cannot drift apart.
+                save = crate::game_setup::PROFILE_SAVE,
+                add = crate::game_setup::PROFILE_CHECK_ADD,
+                add_flags = crate::game_setup::ADD_FLAGS,
+                check = crate::game_setup::PROFILE_CHECK,
+                check_where = crate::game_setup::PROFILE_CHECK_WHERE,
                 strength = crate::games::STRENGTH_TOOLTIP,
                 joystick = crate::games::JOYSTICK_TOOLTIP,
                 recentre = crate::games::RECENTRE_TOOLTIP,
@@ -1083,6 +1103,38 @@ mod tests {
                  window, so no keyboard or touch user can ever read it: {fact:?}"
             );
         }
+    }
+
+    /// The window that creates the need names the cure, and so does this one.
+    ///
+    /// Zero profiles ship, so "the game's own options" is a section that says
+    /// nothing for every user of this build until they write a profile — and
+    /// both this topic and the game-setup window used to stop at *where*
+    /// profiles go. The commands are asserted off the constants both surfaces
+    /// interpolate, so deleting the paragraph out of either one fails here
+    /// rather than leaving the other to look right on its own.
+    #[test]
+    fn the_help_window_says_how_to_write_a_profile() {
+        let text = super::topics()
+            .iter()
+            .map(super::Topic::text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        for cmd in [
+            crate::game_setup::PROFILE_SAVE,
+            crate::game_setup::PROFILE_CHECK_ADD,
+            crate::game_setup::PROFILE_CHECK_WHERE,
+            crate::game_setup::PROFILE_CHECK,
+        ] {
+            assert!(
+                text.contains(cmd),
+                "a new hub window, a new file format and nothing anywhere saying what to \
+                 type: {cmd:?} is in no help topic"
+            );
+        }
+        // And the same sentence the window prints, so somebody reading the
+        // help gets the flags rather than being sent back to guess.
+        assert!(text.contains(crate::game_setup::ADD_FLAGS), "{text}");
     }
 
     /// The topics are the hub's own order, so a topic sits where its card sits.
