@@ -781,6 +781,30 @@ mod tests {
         }
     }
 
+    /// A file outside the walked directories cannot be pulled into a file
+    /// inside them.
+    ///
+    /// The walk is what makes "every file that compiles is scanned" true, and
+    /// these two are how a file the walk never saw compiles anyway. They are
+    /// refused rather than followed, because a scan that followed them would
+    /// be reading a file whose existence nothing here accounts for.
+    #[test]
+    fn a_file_the_walk_never_saw_cannot_be_pulled_into_one_it_did() {
+        for src in [
+            "#[path = \"../../elsewhere/writer.rs\"]\nmod writer;\n",
+            "include!(\"../../elsewhere/writer.rs\");\n",
+        ] {
+            assert!(
+                !complaints_about(src).is_empty(),
+                "a file from outside the walked directories was let in: {src}"
+            );
+        }
+        assert!(
+            complaints_about("const DOC: &str = include_str!(\"../README.md\");\n").is_empty(),
+            "`include_str!` reads a file at compile time and produces a string"
+        );
+    }
+
     /// The behavioural test calls every function a caller of this crate can
     /// call.
     ///
