@@ -63,7 +63,7 @@ pub const USAGE: &str =
   --dry-run    print the plan and change nothing (do this first)
   --yes        do not ask; required when there is no terminal to ask on.
                --yes also stops running copies with SIGTERM if they do not quit
-  --purge      also delete your settings, calibration, models and log
+  --purge      also delete your settings, calibration, models, profiles and log
   --udev       also remove the udev rule from /etc/udev/rules.d (uses sudo)
   --system     remove a `sudo ./install.sh --system` install (run with sudo)
   --bindir DIR also look in DIR for an install (absolute path; repeatable)";
@@ -2107,6 +2107,7 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
     if opts.purge {
         let cfg = config_home.join(paths::APP_DIR);
         let models = cfg.join(paths::MODELS_DIR);
+        let profiles = cfg.join(paths::PROFILES_DIR);
         let state = env.state_home().join(paths::APP_DIR);
         let cfg_known: Vec<String> = paths::CONFIG_FILES
             .iter()
@@ -2114,11 +2115,45 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             .collect();
         let model_known = tobii_headpose::model_store::file_names();
         let state_known: Vec<String> = paths::STATE_FILES.iter().map(|s| s.to_string()).collect();
-        // The models directory first, so the config directory can be empty by
+        // The subdirectories first, so the config directory can be empty by
         // the time its own remove_dir comes round.
-        purge_dir(&mut p, &fs, &models, &model_known, None);
-        purge_dir(&mut p, &fs, &cfg, &cfg_known, Some(paths::MODELS_DIR));
-        purge_dir(&mut p, &fs, &state, &state_known, None);
+        //
+        // `profiles` is here because `tobii games profile save` writes it: a
+        // `--purge` that walked past it reported the directory itself as "not
+        // written by this program", which stopped being true the day that
+        // command shipped. What a profile file is called is
+        // `tobii_config::profiles`' rule, asked of it, exactly as the model
+        // store is asked for its file names — so an `<appid>.toml~` a text
+        // editor left behind is kept and reported, as a `config.toml.bak`
+        // beside the config is.
+        purge_dir(
+            &mut p,
+            &fs,
+            &models,
+            &|n| model_known.iter().any(|k| k == n),
+            &[],
+        );
+        purge_dir(
+            &mut p,
+            &fs,
+            &profiles,
+            &tobii_config::profiles::is_profile_file,
+            &[],
+        );
+        purge_dir(
+            &mut p,
+            &fs,
+            &cfg,
+            &|n| cfg_known.iter().any(|k| k == n),
+            &[paths::MODELS_DIR, paths::PROFILES_DIR],
+        );
+        purge_dir(
+            &mut p,
+            &fs,
+            &state,
+            &|n| state_known.iter().any(|k| k == n),
+            &[],
+        );
         if p.remove
             .iter()
             .any(|r| r.path == cfg.join(paths::CALIBRATION_BIN))
@@ -2266,18 +2301,26 @@ fn listed_check(fs: &Fs, path: &Path, euid: u32) -> Result<(), (Ident, String)> 
     Ok(())
 }
 
-/// Plan the removal of known names from `dir`, report everything else, and
-/// plan a `remove_dir` of it.
-fn purge_dir(p: &mut Plan, fs: &Fs, dir: &Path, known: &[String], subdir: Option<&str>) {
+/// Plan the removal of the names `ours` recognises from `dir`, report
+/// everything else, and plan a `remove_dir` of it.
+///
+/// A predicate rather than a list, because the two subdirectories under the
+/// config directory cannot be lists: `models` and `profiles` hold one file per
+/// thing the *user* has, so what belongs to this program there is a rule about
+/// a name, and the module that writes the files owns the rule. The list-shaped
+/// directories pass a closure over their list. Either way the policy at the
+/// top of `paths.rs` is unchanged: only names this program writes go, and
+/// anything else in the directory is reported and kept.
+fn purge_dir(p: &mut Plan, fs: &Fs, dir: &Path, ours: &dyn Fn(&str) -> bool, subdirs: &[&str]) {
     let Some(names) = fs.list(dir) else {
         return;
     };
     for name in names {
         let path = dir.join(&name);
-        if subdir == Some(name.as_str()) && fs.is_real_dir(&path) {
+        if subdirs.contains(&name.as_str()) && fs.is_real_dir(&path) {
             continue; // purged on its own
         }
-        if known.contains(&name) && fs.is_file_or_link(&path) {
+        if ours(&name) && fs.is_file_or_link(&path) {
             p.push_remove(path, "--purge", false);
         } else {
             p.keep(path, "not written by this program, so --purge leaves it");
@@ -2869,7 +2912,7 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
             if !opts.purge {
                 let _ = writeln!(
                     o,
-                    "  Your settings, calibration and log stay unless you pass --purge."
+                    "  Your settings, calibration, game profiles and log stay unless you pass --purge."
                 );
             }
         }
