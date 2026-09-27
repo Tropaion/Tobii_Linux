@@ -902,21 +902,26 @@ built for the purpose.
 
 ### 11.3h The shortened cards and the F1 help window (new in v0.5.0)
 
-**Two halves of the help window's display test do not run anywhere available to
-this project, and now say so rather than failing.** The Tab walk needs the
-window to be ACTIVE — `child_focus` is GTK's own focus walk, and in a window the
+**Two halves of the help window's display test depend on the session, and say
+so rather than failing when it will not oblige.** The Tab walk needs the window
+to be ACTIVE — `child_focus` is GTK's own focus walk, and in a window the
 compositor never brought to the front it reports that it moved and leaves the
 focus where it was — and the narrow-layout block needs a window manager to grant
-a resize to 420px. A desktop session has something else in front; a bare
-Xwayland has no window manager at all. Both blocks print a SKIPPED line naming
-what went unchecked, and everything that does not need focus still runs: the
-leak census, the coverage contract, the search, Escape, and reopening where it
-was left. CI skips the whole test regardless, having no display.
+a resize to 420px. Neither holds in a bare Xwayland, which has no window
+manager, nor in a session where something else keeps the front. Both blocks then
+print a SKIPPED line naming what went unchecked. **Run on 2026-09-27 on the
+maintainer's own KDE session, all five display-gated tests passed with zero
+skips**, so both halves did run there, including the fold.
 
-The consequence worth stating: **the folding-sidebar leak this section records
-is not covered in any environment we can run.** The census runs, but the Topics
-toggle it is meant to exercise needs the resize that is not granted here, so a
-regression in that specific path would pass. It was measured by hand, once.
+One control is worth recording exactly, because it proves less than it looks
+like it proves. Removing the focus handoff inside `toggle.connect_toggled` —
+the fix for the leak — makes the test FAIL, but at the precondition above the
+census, not at the census: *"the fold must happen with the focus inside the pane
+it is about to hide, or the census below is taken across a sequence that cannot
+leak and passes for that reason."* That is the vacuous-pass problem genuinely
+closed; the test now refuses to report a census it could not have taken. **It is
+not a demonstration that the census detects a leak.** That remains measured by
+hand, once, and no control has reproduced it.
 
 
 Three card descriptions were shortened and two were removed from the card
