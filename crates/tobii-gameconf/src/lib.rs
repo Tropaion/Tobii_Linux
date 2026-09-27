@@ -26,37 +26,59 @@
 //! write whatever the write is called: a file that was modified looks
 //! different afterwards no matter which name modified it, so no import
 //! style, macro, comment or submodule gets past it. Its limits are stated in
-//! that file, and they are real — it sees the paths its fixture holds and
-//! nothing else, and it cannot see code that had already run by the time it
-//! started. That it runs *every* entry point is checked from in here rather
-//! than promised there.
+//! that file, and they are real — it sees its own scratch directory and the
+//! working directory and nowhere else, and it cannot see code that had
+//! already run by the time it started. That it runs *every* entry point is
+//! checked from in here rather than promised there, and that it *reaches*
+//! the branches those entry points are made of is counted there: a tree that
+//! comes back unchanged says nothing about a branch no call went down.
 //!
 //! **The tripwire.** `never_writes` in the tests below reads this crate's
 //! shipping source and fails the build on the name of a call that could
 //! modify a file. It is secondary and it is not a proof: a list of spellings
 //! is exactly as complete as the spellings somebody thought of, and this one
 //! has been walked past repeatedly — by a comment, by a grouped import, by a
-//! module nobody had listed — almost every time by ordinary Rust rather than
-//! by anything trying to. What it is for is code the behavioural test cannot
-//! run. This crate has no `build.rs`; a `build.rs` would run on every build
-//! of every program that depends on it and would have finished before any
-//! test here started, and it is scanned if it ever appears — along with the
-//! example, which is a program a maintainer points at real files by hand,
-//! and every other target cargo compiles. The tripwire also leans on two
+//! module nobody had listed, by an attribute that names a file on another
+//! platform — almost every time by ordinary Rust rather than by anything
+//! trying to. It is not complete and it cannot be made complete: every round
+//! of work on it has found another spelling that is ordinary Rust, and the
+//! useful claim is the narrow one — it catches the spellings it knows, in
+//! the diff that introduced them.
+//!
+//! What it is for is code the behavioural test cannot run. The example is
+//! scanned: it is a program a maintainer points at real files by hand. A
+//! `build.rs` is not scanned — nothing here can read a file that does not
+//! exist — and there is none; the walk beside the tripwire finds one on
+//! neither of its lists and refuses it, so the day somebody adds one the
+//! build stops until they say what it is. The tripwire also leans on two
 //! facts the test beside it asserts rather than assumes — no dependencies,
 //! so `std` is the whole of what this crate can call, and no `unsafe`, so it
 //! cannot reach past `std` under a name that is in no Rust source at all —
 //! and those bound its vocabulary without completing it.
 //!
-//! **Two measurements, run once, by hand.** A real Proton prefix was
-//! snapshotted whole before and after this crate read it and came back
-//! identical, and this crate's readers were run under a shim that aborts on
-//! any mutating syscall, which did not fire. Neither can be reproduced from
-//! anything in this repository: no fixture here is that prefix and no shim
-//! here is that shim. They are a person's report of what happened on one
-//! machine on one day. They are worth what that is worth, which is something
-//! — and they are not what any of the above rests on, because a `build.rs`
-//! added the day after either of them would have gone unremarked beside both.
+//! **Two measurements, run once, by hand.** Both are branch-limited, and one
+//! of them severely.
+//!
+//! A real Proton prefix was snapshotted whole before and after this crate
+//! read it, and came back identical. That prefix held no preset document and
+//! no `StartPreset` file, so every call into [`binds`] answered at its first
+//! lookup and the body of the reader — where a write would sit — never ran.
+//! A count of unchanged paths is not evidence about code that did not
+//! execute, and the number of them is not evidence either.
+//!
+//! This crate's readers were also run under a shim that aborts on any
+//! mutating syscall, which did not fire. That one is the stronger of the two
+//! and it is the one that is path-independent: it answers about the call
+//! rather than about a directory somebody remembered to look in, which is the
+//! whole class the behavioural test cannot see. What it still needs is a
+//! positive control in the same run — a deliberate write, shown to abort it —
+//! because a shim that was never armed and a shim that found nothing report
+//! the same silence.
+//!
+//! Neither can be reproduced from anything in this repository: no fixture
+//! here is that prefix and no shim here is that shim. They are a person's
+//! report of what happened on one machine on one day, and they are not what
+//! any of the above rests on.
 //!
 //! # A file that cannot be read is never a file that says nothing
 //!
@@ -173,10 +195,41 @@ pub(crate) fn read(path: &Path) -> Source<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A throwaway directory that is this process's alone.
+    /// The scratch directories one thread has made, removed when that thread
+    /// ends.
+    ///
+    /// A guard the caller holds is the plain way to write this, and it is not
+    /// available: [`scratch`] is called from three modules, and two of the
+    /// callers build a directory inside a helper and hand the path back out
+    /// of it, where a guard would drop and take the directory with it. So the
+    /// guard lives here instead. `libtest` runs each test on a thread of its
+    /// own, and a thread-local's destructor runs when that thread ends.
+    ///
+    /// The one case it does not cover is a run pinned to a single thread,
+    /// where the tests run on the main thread and main thread locals are not
+    /// destroyed. That leaves the directories behind, which is what used to
+    /// happen on every run: a crate whose subject is not writing where it
+    /// should not had filled the temporary directory with them.
+    struct Sweep(Vec<PathBuf>);
+
+    impl Drop for Sweep {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    thread_local! {
+        static SWEEP: RefCell<Sweep> = const { RefCell::new(Sweep(Vec::new())) };
+    }
+
+    /// A throwaway directory that is this process's alone, removed when the
+    /// thread that asked for it ends.
     ///
     /// No `$HOME` is read and no fixed path is used: CI runs these as root,
     /// and a test that reached for the real home would find a different one
@@ -194,6 +247,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("scratch");
+        SWEEP.with_borrow_mut(|sweep| sweep.0.push(p.clone()));
         p
     }
 
@@ -204,11 +258,15 @@ mod tests {
     /// it is the thing a maintainer points at real files to check something,
     /// and a guarantee that covered the library but not the program that
     /// exercises it would be a guarantee about the half nobody runs by hand.
-    /// A `build.rs` would belong here too, and there is none — which is a
-    /// fact [`nothing_can_be_called_that_is_not_in_std`] checks rather than
-    /// one this list asserts.
     ///
-    /// Whether this is all of them is not taken on trust: that same test
+    /// A `build.rs` cannot be listed here: these are `include_str!`, and that
+    /// needs the file to exist for the crate to compile at all. So a
+    /// `build.rs` is not scanned — it is walked, found on neither list, and
+    /// refused by [`nothing_can_be_called_that_is_not_in_std`], which is the
+    /// answer this crate wants for a file that has finished running before
+    /// any test here starts.
+    ///
+    /// Whether this is all the files is not taken on trust: that same test
     /// walks every directory cargo compiles and fails on any `.rs` file that
     /// is named neither here nor in [`TEST_ONLY`].
     fn shipped_source() -> Vec<(&'static str, Result<String, String>)> {
@@ -230,9 +288,19 @@ mod tests {
     /// targets are separate crates: nothing in `src` can call into one, so a
     /// write here cannot become a write in a program somebody installed.
     /// They are listed rather than waved through as a directory so that
-    /// adding one is a decision somebody makes on purpose. The two ways
-    /// shipping code could reach a file outside its own directories —
-    /// `#[path]` and `include!` — are refused by [`forbidden_in`].
+    /// adding one is a decision somebody makes on purpose.
+    ///
+    /// `build.rs` must never be put on this list. It is the one compiled file
+    /// for which every part of the sentence above is false: it is not a
+    /// separate crate from the consumer's point of view, it runs on every
+    /// build of every program that depends on this one, and it has finished
+    /// before any test here starts. A `build.rs` failing the walk is the walk
+    /// working.
+    ///
+    /// The argument above also assumes shipping code cannot reach a file
+    /// outside its own directories. [`forbidden_in`] refuses the spellings
+    /// that do — `include!`, and an attribute giving a module a path — and
+    /// that list is not claimed to be complete.
     const TEST_ONLY: [&str; 1] = ["tests/writes_nothing.rs"];
 
     /// One file's shipping code: the comments taken out, then everything from
@@ -251,11 +319,14 @@ mod tests {
     ///
     /// So the cut refuses rather than guesses. The first occurrence in the
     /// comment-stripped source must be the whole of a column-zero line,
-    /// followed by the column-zero line `mod tests {`, with nothing at column
-    /// zero after it but the brace that closes that module — which, under
-    /// `cargo fmt`, is what "the gated tests are the last item in the file"
-    /// looks like. An occurrence anywhere else is an error naming itself, not
-    /// a shorter scan. A file with no occurrence at all is scanned whole.
+    /// followed by a column-zero `mod tests {` under any visibility — a
+    /// sibling module's tests share a helper through `pub(crate) mod tests`,
+    /// and where the shipping code ends is the same either way — with nothing
+    /// at column zero after it but the brace that closes that module, which,
+    /// under `cargo fmt`, is what "the gated tests are the last item in the
+    /// file" looks like. An occurrence anywhere else is an error naming
+    /// itself, not a shorter scan. A file with no occurrence at all is
+    /// scanned whole.
     ///
     /// What this does not check is the text between those braces: a string
     /// literal holding a line at column zero would be read as an item and
@@ -277,7 +348,14 @@ mod tests {
                  code ends"
             ));
         }
-        if lines.next().map(str::trim_end) != Some("mod tests {") {
+        // A visibility in front of `mod tests` is ordinary Rust and does not
+        // move where the shipping code ends: a sibling module's tests share a
+        // helper through `pub(crate) mod tests`. Anything else in front of it
+        // does move it, so the sentinel below is a string no visibility can
+        // be, and it fails the match.
+        let gated = lines.next().map(str::trim_end).unwrap_or_default();
+        let visibility = gated.strip_suffix("mod tests {").unwrap_or("!");
+        if !matches!(visibility, "" | "pub " | "pub(crate) " | "pub(super) ") {
             return Err(format!(
                 "has a `{GATE}` that is not the gate on the final `mod tests`, and \
                  gated code outside that module is code this scan would not read"
@@ -360,6 +438,53 @@ mod tests {
         names
     }
 
+    /// Every attribute in this code that gives a module a path of its own.
+    ///
+    /// `#[path = "…"]` names a file anywhere on disk, and the walk that makes
+    /// "every file cargo compiles is scanned" mean anything never sees it.
+    /// Looking for the literal `#[path` is not enough and is not a spelling
+    /// trick to look for: `#[cfg_attr(unix, path = "…")]` is how you write a
+    /// module path that applies on one platform, it holds no such substring,
+    /// and it compiles a file from outside every walked directory. So the
+    /// attribute is read as an attribute — from `#[` to the next `]` — and
+    /// `path` used as a key anywhere inside one is refused.
+    ///
+    /// The span ends at the first `]`, which a `]` inside a string literal
+    /// would cut short. That direction only ever reads less of one
+    /// attribute and more of the text after it; it cannot turn a refusal
+    /// into a pass for the `path` key itself, because that key is before the
+    /// literal in every spelling of it.
+    fn path_attributes(code: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut at = 0;
+        while let Some(start) = code[at..].find("#[") {
+            let start = at + start;
+            let end = code[start..]
+                .find(']')
+                .map_or(code.len(), |i| start + i + 1);
+            at = end;
+            let attribute = &code[start..end];
+            let mut within = 0;
+            while let Some(word) = attribute[within..].find("path") {
+                let word = within + word;
+                within = word + "path".len();
+                let own_word = attribute[..word]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                if own_word && attribute[within..].trim_start().starts_with('=') {
+                    found.push(format!(
+                        "gives a module a path of its own in `{}`, which compiles a file \
+                         from outside every directory the walk looks in",
+                        attribute.trim()
+                    ));
+                    break;
+                }
+            }
+        }
+        found
+    }
+
     /// Everything in one file's shipping code that says this crate might
     /// write, worded for the failure message.
     fn forbidden_in(code: &str) -> Vec<String> {
@@ -378,7 +503,7 @@ mod tests {
         // the word `OpenOptions`, `DirBuilder` creates a directory without the
         // word `create_dir`, and `soft_link` makes a symbolic link without the
         // word `symlink`.
-        const FORBIDDEN: [&str; 23] = [
+        const FORBIDDEN: [&str; 22] = [
             "fs::write",
             "File::create",
             "File::options",
@@ -400,14 +525,12 @@ mod tests {
             "FileTimes",
             "chown",
             "Command",
-            // Not writes: the two ways a file outside the walked directories
-            // becomes part of a scanned one. `#[path]` names a module
-            // anywhere on disk and `include!` pastes a file in whole, and
-            // either would put code in this crate that the walk above reports
-            // as nothing to scan. `include_str!` is a different word and is
-            // not matched by this one; it reads a file at compile time and
-            // produces a string.
-            "#[path",
+            // Not a write: `include!` pastes a file in whole, so a file the
+            // walk never saw becomes part of one it did. `include_str!` is a
+            // different word and is not matched by this one; it reads a file
+            // at compile time and produces a string. The other spelling of
+            // the same idea — an attribute that gives a module a path — is
+            // not a fixed substring and is read by [`path_attributes`].
             "include!",
         ];
         // `fs::write`, `fs::copy` and `fs::rename` are the only entries above
@@ -425,7 +548,7 @@ mod tests {
         // `File::options` are associated functions, which no `use` can name.
         const MUTATING_IMPORTS: [&str; 3] = ["write", "copy", "rename"];
 
-        let mut found = Vec::new();
+        let mut found = path_attributes(code);
         for bad in FORBIDDEN {
             if code.contains(bad) {
                 found.push(format!("names `{bad}`"));
@@ -579,17 +702,22 @@ mod tests {
     /// anything trying to.
     ///
     /// What it is for is the one thing running the code cannot do: it reads
-    /// files that never run inside a test. A `build.rs` runs on every build
-    /// of every program that depends on this crate, and has already run by
-    /// the time a test binary starts; an example is a program a maintainer
-    /// points at real files by hand. Both are scanned here. It also fails on
-    /// the spot, in the diff that introduced the call, which is cheaper than
-    /// finding out from a behavioural test which tree got written to.
+    /// files that never run inside a test. The example is one — a program a
+    /// maintainer points at real files by hand — and it is scanned here. A
+    /// `build.rs` is the other, and it is not scanned: it is refused, by the
+    /// walk in [`nothing_can_be_called_that_is_not_in_std`], because
+    /// [`shipped_source`] is a list of `include_str!` and a file that is not
+    /// there cannot be one of them. This also fails on the spot, in the diff
+    /// that introduced the call, which is cheaper than finding out from a
+    /// behavioural test which tree got written to.
     ///
     /// So: a tripwire against drift, useful where it is the only thing
-    /// looking, and not a guarantee. What it cannot catch is a call that
-    /// reaches the filesystem under a spelling nobody wrote into the list —
-    /// a `std` entry point added after this was written, a macro that
+    /// looking, and not a guarantee — and not completable into one. Three
+    /// rounds of work on it have each found another spelling that is
+    /// ordinary Rust rather than an evasion, which is the argument against
+    /// ever calling the next list finished. What it cannot catch is a call
+    /// that reaches the filesystem under a spelling nobody wrote into the
+    /// list — a `std` entry point added after this was written, a macro that
     /// assembles the call out of fragments, a name that arrives through a
     /// dependency. The checks in
     /// [`nothing_can_be_called_that_is_not_in_std`] are what bound that
@@ -649,7 +777,12 @@ mod tests {
         let missing = unscanned_files(&named, Path::new(env!("CARGO_MANIFEST_DIR")));
         assert!(
             missing.is_empty(),
-            "cargo compiles these and nobody has said what they are: {}",
+            "cargo compiles these and nobody has said what they are: {}. A module \
+             or an example goes in `shipped_source`, where it is scanned. A test \
+             or a benchmark goes in `TEST_ONLY`, which is a decision that nothing \
+             in `src` can call into it. A `build.rs` is neither: it runs on every \
+             build of every program that depends on this crate, and this crate \
+             does not have one.",
             missing.join(", ")
         );
         for (name, code) in &shipped {
@@ -680,35 +813,64 @@ mod tests {
         }
     }
 
-    /// The cut fails closed: the gate literal anywhere but in attribute
-    /// position on the final `mod tests` is an error, not a shorter scan.
+    /// Which of the two mechanisms answered for one file: the cut refusing
+    /// it, or the scan reading it whole and finding a name.
+    ///
+    /// They are told apart because `!complaints_about(src).is_empty()` is
+    /// satisfied by either, and a case that was meant to exercise one of them
+    /// while the other quietly did the work reads exactly like a case that
+    /// passes.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Answered {
+        Cut,
+        Scan,
+    }
+
+    fn answered_for(src: &str) -> Option<Answered> {
+        match shipped_code(src) {
+            Err(_) => Some(Answered::Cut),
+            Ok(code) if !forbidden_in(&code).is_empty() => Some(Answered::Scan),
+            Ok(_) => None,
+        }
+    }
+
+    /// The gate literal anywhere but in attribute position on the final `mod
+    /// tests` never shortens the scan, and each case says which mechanism
+    /// leaves it that way.
     ///
     /// Every entry below is a way this scan has actually been walked past,
-    /// and only the last of them was anybody trying to. They were four
-    /// separate holes while the cut took the first occurrence wherever it
-    /// found it; they are one rule now.
+    /// and only the last of them was anybody trying to. The first is the one
+    /// that shows why the mechanism has to be named: the cut never sees it,
+    /// because [`code_of`] deletes the comment before the cut looks, and what
+    /// catches the write is the ordinary scan of a file with no gate left in
+    /// it.
     #[test]
-    fn a_gate_literal_out_of_place_is_refused_rather_than_obeyed() {
+    fn a_gate_literal_out_of_place_never_shortens_the_scan() {
         let writes = "fn stash(p: &Path) { let _ = std::fs::write(p, b\"\"); }\n";
-        for (what, src) in [
+        for (what, mechanism, src) in [
             (
                 "a line comment naming the gate",
+                Answered::Scan,
                 format!("// The tests below are gated on #[cfg(test)], as usual.\n{writes}"),
             ),
             (
                 "a block comment naming the gate",
+                Answered::Cut,
                 format!("/* everything below is #[cfg(test)] */\n{writes}"),
             ),
             (
                 "a string constant holding the gate",
+                Answered::Cut,
                 format!("const GATE: &str = \"#[cfg(test)]\";\n{writes}"),
             ),
             (
                 "a trailing comment after a quote",
+                Answered::Cut,
                 format!("const KEY: &str = \"X\"; // gated on #[cfg(test)]\n{writes}"),
             ),
             (
                 "a gated helper beside the code it exercises",
+                Answered::Cut,
                 format!(
                     "#[cfg(test)]\nfn sample() -> &'static str {{ \"x\" }}\n{writes}\
                      #[cfg(test)]\nmod tests {{\n}}\n"
@@ -716,27 +878,46 @@ mod tests {
             ),
             (
                 "a gated helper inside a module",
+                Answered::Cut,
                 format!("mod xml {{\n    #[cfg(test)]\n    fn sample() {{}}\n}}\n{writes}"),
             ),
             (
+                "a gated module that is not the test module",
+                Answered::Cut,
+                format!("#[cfg(test)]\nmod fixtures {{\n}}\n{writes}"),
+            ),
+            (
                 "an item after the gated module",
+                Answered::Cut,
                 format!("#[cfg(test)]\nmod tests {{\n    fn fixture() {{}}\n}}\n{writes}"),
             ),
         ] {
-            assert!(
-                !complaints_about(&src).is_empty(),
-                "{what} left the write below it unscanned: {src}"
-            );
+            match answered_for(&src) {
+                None => panic!("{what} left the write below it unscanned: {src}"),
+                Some(answered) => assert_eq!(
+                    answered, mechanism,
+                    "{what} was caught, by the other mechanism than the one it is \
+                     here to exercise: {src}"
+                ),
+            }
         }
 
-        let gated = "fn read_it() {}\n#[cfg(test)]\nmod tests {\n    \
-                     fn fixture() { std::fs::remove_file(\"x\"); }\n}\n";
-        assert!(
-            complaints_about(gated).is_empty(),
-            "the gate in its one legitimate place no longer cuts the tests off"
-        );
-        assert!(
-            !complaints_about(writes).is_empty(),
+        // Every visibility a gated test module is written under, because the
+        // module that holds it may be sharing a helper with a sibling, and
+        // none of them moves where the shipping code ends.
+        for visibility in ["", "pub ", "pub(crate) ", "pub(super) "] {
+            let gated = format!(
+                "fn read_it() {{}}\n#[cfg(test)]\n{visibility}mod tests {{\n    \
+                 fn fixture() {{ std::fs::remove_file(\"x\"); }}\n}}\n"
+            );
+            assert!(
+                complaints_about(&gated).is_empty(),
+                "the gate in its one legitimate place no longer cuts the tests off: {gated}"
+            );
+        }
+        assert_eq!(
+            answered_for(writes),
+            Some(Answered::Scan),
             "a file with no gate in it at all is scanned whole"
         );
     }
@@ -782,17 +963,25 @@ mod tests {
     }
 
     /// A file outside the walked directories cannot be pulled into a file
-    /// inside them.
+    /// inside them, by any spelling this scan has been shown.
     ///
-    /// The walk is what makes "every file that compiles is scanned" true, and
-    /// these two are how a file the walk never saw compiles anyway. They are
+    /// The walk is what makes "every file that compiles is scanned" worth
+    /// saying, and each of these compiles a file the walk never saw. They are
     /// refused rather than followed, because a scan that followed them would
     /// be reading a file whose existence nothing here accounts for.
+    ///
+    /// The third entry is why the attribute is read as an attribute instead
+    /// of matched as the substring `#[path`: it is ordinary conditional
+    /// compilation, it holds no such substring, and it wrote to a directory
+    /// outside the fixture while every check here passed. That this list is
+    /// now complete is not claimed — see [`never_writes`].
     #[test]
     fn a_file_the_walk_never_saw_cannot_be_pulled_into_one_it_did() {
         for src in [
             "#[path = \"../../elsewhere/writer.rs\"]\nmod writer;\n",
             "include!(\"../../elsewhere/writer.rs\");\n",
+            "#[cfg_attr(unix, path = \"../../elsewhere/writer.rs\")]\nmod writer;\n",
+            "#[cfg_attr(test, path=\"../../elsewhere/writer.rs\")]\nmod writer;\n",
         ] {
             assert!(
                 !complaints_about(src).is_empty(),
@@ -803,6 +992,17 @@ mod tests {
             complaints_about("const DOC: &str = include_str!(\"../README.md\");\n").is_empty(),
             "`include_str!` reads a file at compile time and produces a string"
         );
+        for reading_only in [
+            // `path` is refused as an attribute key and nowhere else: the
+            // word is ordinary in this crate, which is about paths.
+            "fn walk(path: &Path) { let path = path.join(\"x\"); }\n",
+            "#[derive(Debug, Clone, PartialEq, Eq)]\npub struct Preset {}\n",
+        ] {
+            assert!(
+                complaints_about(reading_only).is_empty(),
+                "an ordinary line refused: {reading_only}"
+            );
+        }
     }
 
     /// The behavioural test calls every function a caller of this crate can
@@ -816,21 +1016,40 @@ mod tests {
     /// where the public modules and their functions can be read off the
     /// source.
     ///
+    /// Methods count. A `pub fn` inside an `impl` is as reachable from
+    /// outside as a free one and is spelled differently, so it is looked for
+    /// under the spellings a caller writes — `.name(` on a value, or
+    /// `::name(` for one taking no `self`. Which of the two it is, is not
+    /// read off the signature: either satisfies it, and the point is that
+    /// somebody has to call it.
+    ///
     /// This is a name scan like [`never_writes`], and worth the same: it
-    /// catches drift and it is not a proof. What it is checking, though, is
-    /// a list of five names in one file, rather than every way a call can be
-    /// spelled.
+    /// catches drift and it is not a proof. A call named in a comment used to
+    /// satisfy it, which is why the test file is read through [`code_of`]
+    /// first. What is read is one file, under the spellings listed above; a
+    /// call assembled out of fragments, or reached through a trait, is not
+    /// among them.
     #[test]
     fn the_behavioural_test_calls_every_public_function() {
-        let behavioural = include_str!("../tests/writes_nothing.rs");
+        // Through the comment stripper, because `contains` on the raw source
+        // is satisfied by a call named in prose. Replacing the one real
+        // `binds::start(&bytes)` with a comment mentioning it left the whole
+        // suite green.
+        let behavioural = code_of(include_str!("../tests/writes_nothing.rs"));
         let shipped = shipped_source();
-        let source_of = |file: &str| {
-            shipped
-                .iter()
-                .find(|(name, _)| *name == file)
-                .and_then(|(_, code)| code.as_ref().ok())
-                .expect("a module this crate ships")
-                .clone()
+        // Two different failures, said apart. Folding them together is how a
+        // test about which functions are called came to die with a sentence
+        // about module membership, naming neither the module nor the reason.
+        let source_of = |file: &str| match shipped.iter().find(|(name, _)| *name == file) {
+            Some((_, Ok(code))) => code.clone(),
+            Some((_, Err(why))) => panic!(
+                "{file} is a file this crate ships and `never_writes` refused it, so \
+                 its public functions were never read: {why}"
+            ),
+            None => panic!(
+                "`lib.rs` declares `pub mod` for {file} and `shipped_source` does not \
+                 list it, so nothing here reads it"
+            ),
         };
         let mut missing = Vec::new();
         let mut checked = 0;
@@ -840,13 +1059,25 @@ mod tests {
             };
             let module = module.trim_end_matches(';');
             for line in source_of(&format!("{module}.rs")).lines() {
-                let Some(rest) = line.strip_prefix("pub fn ") else {
+                let method = line.starts_with([' ', '\t']);
+                let Some(rest) = line.trim_start().strip_prefix("pub fn ") else {
                     continue;
                 };
-                let call = format!("{module}::{}(", rest.split('(').next().unwrap_or_default());
+                let name = rest.split(['(', '<']).next().unwrap_or_default();
+                let (shown, spellings) = if method {
+                    (
+                        format!("{module}'s `{name}`"),
+                        vec![format!(".{name}("), format!("::{name}(")],
+                    )
+                } else {
+                    (
+                        format!("`{module}::{name}`"),
+                        vec![format!("{module}::{name}(")],
+                    )
+                };
                 checked += 1;
-                if !behavioural.contains(&call) {
-                    missing.push(call);
+                if !spellings.iter().any(|call| behavioural.contains(call)) {
+                    missing.push(shown);
                 }
             }
         }
@@ -865,9 +1096,11 @@ mod tests {
     /// Everything cargo compiles is walked, not only the two directories
     /// that hold the library.
     ///
-    /// `build.rs` is the one this used to miss, and the expensive one to
-    /// miss: it runs on every build of everything that depends on this
-    /// crate, and it has finished running before any test here starts.
+    /// `build.rs` is the expensive one to miss: it runs on every build of
+    /// everything that depends on this crate, and it has finished running
+    /// before any test here starts. It is also the one a walk over
+    /// directories is most likely to skip, being a single file at the crate
+    /// root rather than a directory, so it is asserted for by name below.
     #[test]
     fn every_target_cargo_compiles_is_asked_about() {
         let root = scratch("compiled-targets");
@@ -908,7 +1141,6 @@ mod tests {
             .is_empty(),
             "a crate whose every compiled file is named still reports some"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Cargo's spellings of a dependency table, one of which used to read as
