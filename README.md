@@ -199,12 +199,12 @@ diagnostics report, *Help*, and *Quit*.
 **Help is a window, opened with F1**, with the **?** beside the cogwheel, or
 from the cogwheel itself. It explains every card and every control, including
 the ones that only explain themselves when you hover — the strength presets,
-the virtual joystick, and why *Recentre view* is greyed out. That is not a
-nicety: GTK4 shows a tooltip on pointer hover and on nothing else, so anything
-that lives only in a tooltip is unreachable by keyboard and by touch, and the
-help window is where those sentences are reachable. Esc, F1 again or the Close
-button put it away; the topics are selectable text, so Tab walks them and they
-can be copied into a bug report.
+the virtual joystick, what *Set up a game…* opens, and why *Recentre view* is
+greyed out. That is not a nicety: GTK4 shows a tooltip on pointer hover and on
+nothing else, so anything that lives only in a tooltip is unreachable by
+keyboard and by touch, and the help window is where those sentences are
+reachable. Esc, F1 again or the Close button put it away; the topics are
+selectable text, so Tab walks them and they can be copied into a bug report.
 
 It is nine topics in a list, with a **search box** the window opens focused, so
 you can type the question rather than find it: the search reads every heading
@@ -346,6 +346,50 @@ on from the command line: only one process can claim the ET5 over USB, so they
 all have to come from the same place. With `tobii games set enabled true`,
 `tobii headpose` feeds all three itself — skipping the joystick when a hub
 already presents one.
+
+### Setting a game up
+
+**Set up a game…**, on the hub's *Head tracking for games* card, opens a window
+listing everything Steam says is installed on this machine. Pick a title and it
+shows the three things that have to be configured for it, numbered:
+
+1. **These settings** — this program's own game output. The window reads them
+   and can change them.
+2. **The Wine bridge**, inside that game's Proton prefix. The window reports
+   which of the bridge's files are already there and can install them, provided
+   the command-line `tobii` is on this machine — the hub shells out to it. When
+   it is not, the block says what to type instead rather than offering a button
+   that cannot work.
+3. **The game's own settings** — and this one is **read-only in every state.**
+   The program reports what those files say and never writes them.
+
+Block 3 needs a **profile** to know what to look at: which setting, in which
+file, and what it should say. **No profiles ship with this program**, so on a
+fresh install that section is empty for everyone and says so, rather than
+guessing. It also prints the commands that fill it, with the app id already
+substituted for the game you picked.
+
+The bridge is three files, of which **only `freetrackclient64.dll` is
+required** — it is the one a game has to load. `tobii-bridge.exe` and
+`NPClient64.dll` are optional, and the installer prints
+`note: <name> not built yet — skipping` for one this build was not built with.
+So a prefix holding one of the three is a working bridge, not a broken install,
+even though `tobii bridge status` describes the other two as
+`missing (optional)`.
+
+Everything the window can report, the command line can too:
+
+```sh
+tobii games profile show               # every profile, and where they live
+tobii games profile save <app id>      # record this program's settings
+tobii games profile check add <app id> …   # record one thing to check
+tobii games profile check where <app id>   # where those checks resolve to
+tobii games profile check              # what a check is: the full schema
+```
+
+The format, a worked example, and how to author the first profile for a game
+are in **[Game-Profiles](docs/wiki/Game-Profiles.md)**. In the hub, the same
+material is under *Head tracking for games* in the F1 help window.
 
 ### Five degrees of freedom, or six
 
@@ -970,9 +1014,9 @@ rm -f ~/.config/autostart/com.tobiilinux.Configuration.desktop
 #   (~/.local/share/icons/hicolor/icon-theme.cache; with no icons left under
 #   hicolor, that command deletes the cache — as it was before the install)
 
-# optional: settings, calibration, models and log — the names this program
-# writes, so anything of your own in these directories stays. A save that was
-# interrupted can also leave one of these names with .tmp added.
+# optional: settings, calibration, models, game profiles and log — the names
+# this program writes, so anything of your own in these directories stays. A
+# save that was interrupted can also leave one of these names with .tmp added.
 rm -f ~/.config/tobii-linux/config.toml ~/.config/tobii-linux/calibration.bin \
       ~/.config/tobii-linux/calibration.meta.toml ~/.config/tobii-linux/enabled_eye \
       ~/.config/tobii-linux/update_check ~/.config/tobii-linux/text_scale \
@@ -985,9 +1029,15 @@ rm -f ~/.config/tobii-linux/models/head-pose-0.5-small.onnx \
       ~/.config/tobii-linux/models/head-localizer.onnx \
       ~/.config/tobii-linux/models/head-localizer.onnx.partial \
       ~/.config/tobii-linux/models/head-localizer.onnx.download
+# game profiles: one per game, named by Steam app id, so this is a pattern
+# rather than a list. A note of your own kept here — a profiles/what-i-measured.md,
+# a profiles/359320.toml~ — is not matched and stays, exactly as --purge leaves it.
+rm -f ~/.config/tobii-linux/profiles/[1-9]*.toml \
+      ~/.config/tobii-linux/profiles/[1-9]*.toml.tmp
 rm -f ~/.local/state/tobii-linux/tobii.log ~/.local/state/tobii-linux/diagnostics.txt
 # then the directories: rmdir refuses one that still holds something, and says so
-rmdir ~/.config/tobii-linux/models ~/.config/tobii-linux ~/.local/state/tobii-linux
+rmdir ~/.config/tobii-linux/models ~/.config/tobii-linux/profiles \
+      ~/.config/tobii-linux ~/.local/state/tobii-linux
 
 # or instead, the directories with EVERYTHING in them — which also deletes any
 # backup of your own kept there, such as a copy of calibration.bin:
@@ -1286,6 +1336,8 @@ A Cargo workspace of focused crates, one acyclic dependency graph:
 | `tobii-gtk`      | The GTK4 hub, guided flows and gaze overlay. |
 | `tobii-output`   | Game output: the virtual joystick, opentrack/TrackIR encoding, the frame pipeline. |
 | `tobii-ipc`      | The local socket other programs read tracking from. |
+| `tobii-steam`    | Reads Steam's own files: installed titles, library folders, Proton prefixes. |
+| `tobii-gameconf` | Read-only readers for two game-configuration formats. Never writes. |
 | `tobii-recap`    | Decodes a usbmon pcap capture into a readable TTP op catalog. |
 </details>
 
@@ -1344,6 +1396,21 @@ not a missing test: the checksums are an integrity check, not a signature.
   registry work, the `status` report and the wineserver yield are all about
   what is *registered* and what does not break a launch, and none of them says
   a game will use the data.
+- **No per-game profile has ever been verified against a running game.** The
+  hub's *Set up a game…* window can report what a game's own configuration
+  files say, but only where a profile names a setting to look at — and **zero
+  profiles ship**, so that section is empty for every user of this build. The
+  two readers behind it were read off 30 real Elite Dangerous preset documents;
+  the *directory convention* was not. The one Elite install here has a
+  populated Proton prefix with no `Options` or `Bindings` directory in it at
+  all, so the path a real check would name has never been observed, and the
+  example path the program prints is a shape, not a location. Writing the first
+  verified profile is the next step, not a finished one — see
+  [Game-Profiles](docs/wiki/Game-Profiles.md).
+- **The bridge install offered inside that window has never been followed by a
+  real game launch.** It reports the prefix correctly and can copy the files
+  in; whether the game then loads them is the open question above about
+  `NPClient64.dll`, unchanged.
 - **A pitch calibration and a `tobii headpose` started during it do not
   cooperate.** The measurement holds the hub's device thread for about 13
   seconds without declaring itself exclusive, so the hub grants the lease,
@@ -1353,8 +1420,9 @@ not a missing test: the checksums are an integrity check, not a signature.
 
 The full list, per release, is in
 [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1,
-§11.3f and §11.3g for v0.4.1, and §11.3h–§11.3j for the help window, the
-wineserver lock and the prefix reads that no longer run wine.
+§11.3f and §11.3g for v0.4.1, §11.3h–§11.3j for the help window, the
+wineserver lock and the prefix reads that no longer run wine, and §11.3k for
+the per-game setup window and the profile format.
 
 **Reporting a problem:** `tobii debug` prints the report an issue asks for, and
 the hub's cogwheel can copy or save it. Since v0.4.1 it carries a **game

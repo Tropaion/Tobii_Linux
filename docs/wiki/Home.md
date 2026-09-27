@@ -65,5 +65,6 @@ The reverse-engineered ET5 USB protocol.
 | [[Select-Eyes]] | `enabled_eye` GET `0xc62` / SET `0xc58`, wire enum, calibration-time semantics |
 | [[Head-Pose]] | Head pose is NOT in the gaze frame — how it is derived host-side instead: the 5-DOF eye-origin fallback and the 6-DOF neural path |
 | [[Game-Output]] | Getting tracking into games: the virtual joystick, opentrack, TrackIR/FreeTrack over Wine, and why the TrackIR signature is not answered |
+| [[Game-Profiles]] | Setting one game up: the hub's game-setup window, the `tobii games profile` commands, the `[[check]]` file format, and how to author the first profile. **Zero profiles ship** |
 | [[Tools]] | The `tobii` CLI subcommands and the `tobii-recap` pcap decoder |
 | [[Reverse-Engineering-Methodology]] | How the protocol was mapped, taking a usbmon capture, contributing findings |
