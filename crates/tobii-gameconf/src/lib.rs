@@ -232,11 +232,16 @@ mod tests {
     /// guard lives here instead. `libtest` runs each test on a thread of its
     /// own, and a thread-local's destructor runs when that thread ends.
     ///
-    /// The one case it does not cover is a run pinned to a single thread,
-    /// where the tests run on the main thread and main thread locals are not
-    /// destroyed. That leaves the directories behind, which is what used to
-    /// happen on every run: a crate whose subject is not writing where it
-    /// should not had filled the temporary directory with them.
+    /// Measured at nothing left behind, with `--test-threads=1` as well as in
+    /// parallel — counted by the process id in the directory names, because
+    /// other things on a developer's machine run these tests too and a count
+    /// of the whole `/tmp` glob measures those runs as much as this one.
+    ///
+    /// What it rests on is that the tests do not run on the main thread, whose
+    /// locals are not destroyed. Were a harness ever to run them there, this
+    /// would leave behind what it used to, which is what filled the temporary
+    /// directory with them in a crate whose subject is not writing where it
+    /// should not.
     struct Sweep(Vec<PathBuf>);
 
     impl Drop for Sweep {

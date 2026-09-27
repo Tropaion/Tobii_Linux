@@ -2921,8 +2921,15 @@ fn list_steam_games() -> CmdResult {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("HOME is not set, so Steam's libraries cannot be found")?;
-    let libs = steam_libraries(&home);
-    let missing = steam_libraries_missing(&home);
+    list_steam_games_in(&home)
+}
+
+/// The body of [`list_steam_games`], with the home named rather than read out
+/// of the environment, so that both of its refusals can be put to a test:
+/// `$HOME` is process-global and these tests run in parallel.
+fn list_steam_games_in(home: &Path) -> CmdResult {
+    let libs = steam_libraries(home);
+    let missing = steam_libraries_missing(home);
     if libs.is_empty() {
         return Err(with_missing("no Steam libraries found".to_string(), &missing).into());
     }
@@ -2934,9 +2941,12 @@ fn list_steam_games() -> CmdResult {
     if !missing.is_empty() {
         println!("{missing}");
     }
-    let apps = tobii_steam::apps(&home);
+    let apps = tobii_steam::apps(home);
     if apps.is_empty() {
-        return Err(with_missing("no installed Steam games found".to_string(), &missing).into());
+        // Bare, unlike the refusal above it: that one returns before the block
+        // is printed, this one after, and naming the absent library twice
+        // reads as two different libraries.
+        return Err("no installed Steam games found".into());
     }
     println!();
     for app in &apps {
@@ -2947,7 +2957,7 @@ fn list_steam_games() -> CmdResult {
         // `tobii_steam::looks_like_tool` could now filter out. Left alone: this
         // list is what it was before the move, and what it should be is the
         // maintainer's call, not a rewiring's.
-        let mark = if tobii_steam::prefix(&home, &app.appid).is_some() {
+        let mark = if tobii_steam::prefix(home, &app.appid).is_some() {
             "proton"
         } else {
             "  --  "
@@ -6277,6 +6287,29 @@ exit 0
                 gone.display()
             )
         );
+    }
+
+    /// `games` prints the absent library with the library list and then
+    /// refuses, so the refusal must not carry it a second time: the same path
+    /// under two sentences reads as two drives that are gone, and the count is
+    /// the whole point of the block.
+    ///
+    /// The refusal above it in the function returns *before* that block is
+    /// printed and so does carry it — which is why these two cannot share a
+    /// sentence, and why this is worth pinning.
+    #[test]
+    fn games_names_an_absent_library_once_when_it_has_already_printed_it() {
+        let home = steam_home("gamesdup", &[]);
+        // Under this test's own scratch home: a path reached by walking up out
+        // of it is how a fixture escapes into real files.
+        let gone = home.join("run/media/nobody/ExternalSSD/steam");
+        std::fs::write(
+            home.join(".steam/steam/steamapps/libraryfolders.vdf"),
+            format!("\t\"path\"\t\t\"{}\"\n", gone.display()),
+        )
+        .expect("vdf");
+        let err = list_steam_games_in(&home).expect_err("nothing is installed");
+        assert_eq!(err.to_string(), "no installed Steam games found");
     }
 
     /// An empty list is its own sentence: "installed:" followed by nothing
