@@ -420,8 +420,12 @@ impl<T: Transport> Connection<T> {
     }
 
     /// Ask the device to enumerate its own streams. Returns the raw reply
-    /// payload; the encoding is not yet known well enough to model.
-    /// See [`OP_STREAM_CATALOG`] — this may simply not be a real op.
+    /// payload, which `tobii_protocol::commands::parse_stream_catalog` decodes
+    /// into `(id, name)` pairs — this layer stays bytes-in, bytes-out because
+    /// the USB crate does not depend on the protocol crate's models.
+    ///
+    /// The op is real: **[CONFIRMED]** live 2026-08-09, a 509-byte reply
+    /// listing nine streams.
     pub fn stream_catalog(&mut self) -> Result<Option<Vec<u8>>, UsbError> {
         self.request(OP_STREAM_CATALOG, &[])
     }

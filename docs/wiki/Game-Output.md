@@ -26,7 +26,7 @@ device itself (`UsbTransport::open`, then `Connection::connect`), builds a
 `games.toml` asks for them — and streams until it is stopped. The tracker is lit
 for exactly as long as the command runs, because that process holds the USB
 session. Where a hub is running it asks that hub to stand down first
-(`lease_the_tracker`, `crates/tobii-cli/src/main.rs:2112`) rather than failing
+(`lease_the_tracker`, `crates/tobii-cli/src/main.rs:2115`) rather than failing
 under it, and gives the device back when it ends; with no hub it opens the
 device directly and waits for nothing. For the **opentrack UDP** route this is
 the whole story: opentrack's
@@ -53,7 +53,9 @@ That gap is the whole reason `tobii game` exists. It transports nothing: it
 connects to the hub's socket, subscribes to pose for the lifetime of the child
 process, and drops the connection when the child exits — the wrapper is a
 `DemandGuard` with a launcher's sense of timing. Any program that holds that
-subscription does the same job.
+subscription wakes the tracker the same way — but only `tobii game` also puts
+`TOBII_BRIDGE_PORT` into the child's environment (`main.rs:201-203`), which is
+the only way the Wine-side DLL learns a non-default `bridge_port`.
 
 Which left, through v0.4.0, exactly one route that worked unattended — the
 opentrack watch below — and three that did not. The two that close the rest of
@@ -62,7 +64,7 @@ held by `GameSide` on the device thread rather than by the socket thread
 (`crates/tobii-gtk/src/device.rs`). That placement is deliberate:
 `outputs::spawn` returns *before* it spawns its thread when `Server::bind()`
 fails, so a hold parked there would be missing precisely on the second
-`tobii serve`, while `GameSide` already re-reads `games.toml` once a second in
+a second hub, while `GameSide` already re-reads `games.toml` once a second in
 both the idle wait and inside a session, and already owns the joystick handle.
 
 * **`wake_for_joystick`** (default on) — `GameSide::sync_joystick` ends by
@@ -363,7 +365,7 @@ uinput           /dev/uinput MISSING — the uinput module is not loaded …
 uinput           /dev/uinput NOT WRITABLE — … install 60-tobii.rules and log out …
 ```
 
-## X-Plane 11/12 — already works, no extra sink
+## X-Plane 11/12 — no extra sink needed
 
 The X-Plane plugin Linux users actually run is
 [`amyinorbit/headtrack`](https://github.com/amyinorbit/headtrack) (MIT), whose
@@ -379,8 +381,11 @@ already default to. So install the plugin and run:
 tobii headpose                    # sends to 127.0.0.1:4242 until you stop it
 ```
 
-and it works — no opentrack, no bridge, no hub, no new code. The plugin binds
-the port and this command sends to it; nothing else is in the path.
+and it should work with no opentrack, no bridge, no hub and no new code — the
+plugin documents that port and that payload, and the sink already emits both.
+**This has not been observed here:** no X-Plane has been run against it, the
+same gap §11.3e records for opentrack. The plugin binds the port and this
+command sends to it; nothing else is in the path.
 
 Through the hub instead — worth it when the same session should also drive a
 joystick or the Wine bridge — the sink is on by default and only has to be
@@ -407,7 +412,7 @@ answer at all: turned off, or an opentrack address on another machine, where
 wrapper is `keep_awake`. The standalone `tobii headpose` route
 needs neither, because it holds the USB session itself — taking it from the hub
 where there is one, by asking for the lease first (`lease_the_tracker`,
-`crates/tobii-cli/src/main.rs:2112`).
+`crates/tobii-cli/src/main.rs:2115`).
 
 This matters because the virtual joystick genuinely *cannot* reach X-Plane:
 Laminar's own developer documentation is explicit that a joystick axis cannot be
@@ -465,7 +470,7 @@ lines of `system.reg`). Both now decide from `user.reg` whenever the wineserver
 lock says nothing is serving the prefix, which is the case where the file *is*
 the registry; wine is started only once the run has decided it is going to write
 — something it was going to do anyway (`settled_keys`,
-`crates/tobii-cli/src/bridge.rs:1032-1086`). Measured on the merged tree, with a
+`crates/tobii-cli/src/bridge.rs:1091-1107`). Measured on the merged tree, with a
 `wine` that wrecks the prefix if it runs at all: a refused install and a no-op
 uninstall leave the prefix byte-for-byte as it was and never spawn it
 (`a_refused_install_runs_no_wine_and_leaves_the_prefix_as_it_was`,
@@ -523,7 +528,7 @@ the character is decoded exactly and shown.
 into `$WINEPREFIX` or `~/.wine`, writing both discovery keys. Each subcommand
 now names the flags it reads, and anything else stops the command before a
 prefix is resolved, a directory created or a key written (`reject_unknown_flags`
-and `SUBS`, `crates/tobii-cli/src/bridge.rs:2679-2706` and `:2720-2742`).
+and `SUBS`, `crates/tobii-cli/src/bridge.rs:2969-2998` and `:3013-3031`).
 Refused, checked on the built binary: an unknown `--flag`; `-h` and every other
 single-dash token; `--prefix=PATH`, which would pass a name check and then be
 ignored because every reader compares whole tokens; a flag with nothing after it; and **a bare
@@ -584,10 +589,14 @@ and the FSX generation are 32-bit. Closing it means building the two client
 crates for `i686-pc-windows-gnu` as well; the install directory and both
 registry keys are shared, so nothing else about the design changes.
 
-### [UNTESTED] Flatpak and Snap Steam
+### [UNTESTED] Flatpak Steam — and Snap Steam is not looked for at all
 
-`--steam` finds a Flatpak Steam prefix (`~/.var/app/com.valvesoftware.Steam`)
-and will install into it. What is *not* verified is the other half: inside the
+`--steam` finds a Flatpak Steam prefix (`~/.var/app/com.valvesoftware.Steam/data/Steam`)
+and will install into it. **Snap Steam it cannot find at all**: `STEAM_ROOTS`
+(`crates/tobii-cli/src/bridge.rs`) is four paths — `.steam/steam`,
+`.local/share/Steam`, `.steam/root` and the Flatpak one — and Snap's
+`~/snap/steam/...` is none of them, so `--steam` never resolves a Snap library.
+What is *not* verified is the other half of the Flatpak case: inside the
 sandbox the host's `tobii` is not on `PATH`, and `$XDG_RUNTIME_DIR` is the
 app's rather than the host's, so the `tobii game -- %command%` launch option
 this prints may not resolve or may not reach the hub's socket. If you run
@@ -608,17 +617,29 @@ records the version that built it, and a different wine touching it runs
 registry values could rewrite a Proton prefix out from under the game that owns
 it.
 
+Since v0.5.0 `install` does not only prefer the right wine, it **refuses the
+wrong one**. A `--steam` prefix was found through Steam's `compatdata`, so it
+was made by a Proton build by construction and the host's wine is by
+construction not that build: where which build made it cannot be read out of
+it, `install` stops before anything is copied or any key is written and says
+what would have happened (`refuse_unverified_wine_for_steam`,
+`crates/tobii-cli/src/bridge.rs:1562`, called from `install` at `:1606`). Three
+things get past it and nothing else does — `--wine <Proton>/files/bin/wine`, a
+prefix whose own runner resolves, or `--force`. `run` and `uninstall` print the
+same warning and go on: stopping an uninstall would strand somebody taking our
+files back out, and `run` is a user asking in so many words to start wine there.
+
 ### The discovery keys are not ours to overwrite
 
 `HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location` and
 `HKCU\Software\Freetrack\FreeTrackClient` (`NP_KEY`/`FT_KEY`,
-`crates/tobii-cli/src/bridge.rs:74,77`) are how *any* head-tracking client in a
+`crates/tobii-cli/src/bridge.rs:86,89`) are how *any* head-tracking client in a
 prefix is found, ours included. So the installer treats them as shared state
 rather than as its own:
 
 * **`install` reads before it writes**, and **refuses** when a key holds
-  something it cannot account for — `bridge.rs:1258`, message built by
-  `refusal` at `bridge.rs:1121`. The error names each key, what it holds and
+  something it cannot account for — `bridge.rs:1644-1663`, message built by
+  `refusal` at `bridge.rs:1465`. The error names each key, what it holds and
   whose it looks like, and prints the exact
   `WINEPREFIX=… wine reg delete … /v Path /f` to clear it if it is stale. The
   refusal happens before anything is copied and before any key is touched, so a
@@ -627,17 +648,18 @@ rather than as its own:
   whose Linux opentrack has since been removed.
 * **What it will not refuse over** is a key that already holds, byte for byte,
   the value this run would write with nothing on record either way
-  (`bridge.rs:1246-1249`). That is precisely what v0.4.0 left behind on a
+  (`stops_install`, `bridge.rs:1168-1188`). That is precisely what v0.4.0 left behind on a
   machine with opentrack installed, and refusing there would refuse the upgrade
   path over a write that changes nothing, in a sentence blaming another program
   for a value this program wrote. The cost is stated in `is_ours`'
-  **[LIMITATION]** (`bridge.rs:885`, doc comment from 870): such a key is then recorded as ours and
+  **[LIMITATION]** (`bridge.rs:1138`, doc comment from 1109): such a key is then recorded as ours and
   comes out on the way out.
 * **`--force` goes through and promises nothing.** The installer writes down
   only the values it wrote itself (`RECORD_FILE`, `registered.txt`), so there
   is no previous value to put back — the refusal text says so in those words.
   It prints what it replaced.
-* **`uninstall` is the same rule from the other side** (`bridge.rs:1644`): a key
+* **`uninstall` is the same rule from the other side** (`undo_keys`, `bridge.rs:2172`, deciding
+  with `undo_for` at `bridge.rs:2093`): a key
   is deleted only while it still points at our own install directory or holds
   exactly what the record says we wrote; anything else is left in place and
   named. A blind `reg delete` here would take opentrack's own registration with
@@ -646,7 +668,7 @@ rather than as its own:
 
 Every file `install` puts in the prefix — both DLLs, the exe and the record —
 is written to a staging name beside the target and renamed into place
-(`staging_name`, `bridge.rs:977`, used at `1284` and `991`). The name carries
+(`staging_name`, `bridge.rs:1275`, used at `1289` and `1688`). The name carries
 the writing process's pid, `.<artifact>.<pid>.new`, so two installs into one
 prefix cannot stage over each other, and a half-written record is never read
 back as a record with a line missing.

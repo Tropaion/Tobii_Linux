@@ -11,8 +11,10 @@
 >
 > The old `[CONFIRMED]` on `0x408` cited our own source file, which is circular and
 > against this project's own rule that `[CONFIRMED]` needs a capture or a hardware
-> round-trip. The replacements are **[HYPOTHESIS]** until a run on this hardware
-> shows a compute over one second and a blob that changes.
+> round-trip. The replacements were confirmed on 2026-08-24: compute took
+> **1.115 s** and the retrieved blob was **324,437 bytes** and changed between
+> runs, against ~230 ms and an unchanging 1,480-byte stub from the old ops.
+> **[CONFIRMED]** — `frame.rs::OP_CAL_ADD_POINT`.
 
 Master table of every known TTP op code. Op constants live in
 `crates/tobii-protocol/src/frame.rs`; the name table is
@@ -29,6 +31,8 @@ Master table of every known TTP op code. Op constants live in
 | `0x776` | 1910 | realm_response | host→dev | `00 00` + u32(realm_id) + u32(field_210) + 16-byte HMAC-MD5 | ack | **[CODE-VERIFIED]** | `realm.rs` |
 | `0x77b` | 1915 | close_realm | host→dev | `00 00` + u32(realm_id) | ack | **[CODE-VERIFIED]** | `realm.rs::build_close_realm` |
 | `0x4c4` | 1220 | subscribe | host→dev | 20 B, stream_id BE at payload[9..10] | ack | **[CONFIRMED]** | `commands.rs::subscribe_payload` |
+| `0x4ce` | 1230 | unsubscribe | host→dev | same 20 B as subscribe | ack | **[UNCONFIRMED]** — the +10 pattern and third-party use agree, but no stream has been watched falling silent | `frame.rs` `OP_UNSUBSCRIBE`, `connection.rs::unsubscribe_stream` |
+| `0x4b0` | 1200 | stream_catalog | host→dev | empty | 509 B: the catalog object id then one record per stream, `u32 id` + name string | **[CONFIRMED]** live 2026-08-09 | `commands.rs::parse_stream_catalog`, `tobii streams` |
 
 ## Display area (platmod property, msg-class `0x51`)
 
@@ -50,9 +54,8 @@ Master table of every known TTP op code. Op constants live in
 | `0x42f` | 1071 | ~~cal_compute~~ `CALIBRATE_EYE_APPLY` — **do not use**: leaves the model unchanged | host→dev | `00 00` | ack | **[HYPOTHESIS]** | shipped here in error until 2026-08-15 |
 | `0x44c` | 1100 | cal_retrieve | host→dev | `00 00` | opaque blob | **[CONFIRMED]** | `connection.rs`, real blob testdata |
 | `0x456` | 1110 | cal_apply | host→dev | `00 00` + raw blob | ack | **[CODE-VERIFIED]** | `calibration.rs::cal_apply_payload` |
-| `0x438` | 1080 | cal_discard_point (discard_data_2d) | host→dev | `00 00` + Q42(x) + Q42(y) | ack | **[CODE-VERIFIED]** | memory `et5-calibration-protocol` (not in `frame.rs` consts) |
-
-| `0x460` | 1120 | cal_stimulus_points_get | host→dev | quality: per-point L/R precision+bias | — | **[CODE-VERIFIED]** | memory `et5-calibration-protocol` |
+| `0x438` | 1080 | cal_discard_point (discard_data_2d) | host→dev | `00 00` + Q42(x) + Q42(y) | ack | **[CODE-VERIFIED]** | `frame.rs` `OP_CAL_DISCARD_POINT`, `calibration.rs::cal_discard_point_payload`, `connection.rs::discard_calibration_point` |
+| `0x460` | 1120 | cal_points_get (the docs' `stimulus_points_get` is misleading — it reports collected points, it does not supply points to present) | host→dev | `00 00` | 713 B after a calibration: object id `0x3390` then one 7-element record per point (normalized x/y + two fixed-point triples of **[HYPOTHESIS]** meaning); an empty list in a fresh session | **[CONFIRMED]** live 2026-08-24 | `frame.rs` `OP_CAL_STIMULUS_POINTS`, `tobii cal-points` |
 
 ## Enabled eye ("Select eyes to detect", platmod property)
 
@@ -101,7 +104,7 @@ op catalog still counts them as mapping targets.
 | Op (hex) | Name | Payload | Conf | Source |
 |---------|------|---------|------|--------|
 | `0x500` | gaze_notify | ~1692 B, 39 XDS columns, ~33 Hz | **[CONFIRMED]** | `gaze.rs`; see [[Gaze-Stream]] |
-| `0x501` / `0x50e` | eye-camera image (probable) | ~78 KB, ~33 Hz | **[HYPOTHESIS]** | live probe 2026-07-22; see [[Streams]] |
+| `0x501` / `0x50e` | NIR camera image — the device's own `image` / `primary_camera_image`, the SAME image twice, not a stereo pair | ~78 KB, ~33 Hz, 280×280 8-bit | **[CONFIRMED]** | `camera.rs::decode_camera_frame`; catalog 2026-08-09; see [[Streams]] |
 | `0x504` | state-change event (probable) | 69 B, 2 columns, one-shot on subscribe | one-shot **[CONFIRMED]**, meaning **[HYPOTHESIS]** | live probe |
 
 ## Unmapped / targets
@@ -110,8 +113,10 @@ Any op not named above is a **mapping target**. `tobii-recap` prints these as
 `?unknown` in its timeline (`opnames.rs::op_label`), or `?3p:…` for the
 third-party-labelled ids. Known open targets:
 
-- The **head-pose** subscription/notify op, if one exists — never observed. See
-  [[Head-Pose]]. **[HYPOTHESIS]**
+- ~~The **head-pose** subscription/notify op~~ — **settled, there is none.** The
+  vendor computes pose host-side from the camera images; the device's own
+  `0x4b0` catalog lists nine streams and no pose stream. See [[Head-Pose]].
+  **[CONFIRMED]**
 - Streams `0x502`, `0x503`, `0x505`..`0x50d`, `0x50f`..`0x520`: all **ACK** a
   subscribe but streamed no data in a 5 s window. **[CONFIRMED]** ack, purpose
   unknown. See [[Streams]].

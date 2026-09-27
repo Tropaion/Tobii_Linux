@@ -26,7 +26,7 @@ on `[dev+0x1a0] >= 0x10007`; older firmware returns NOT_SUPPORTED (err 2), and
 ## Wire enum (1-based)
 
 ```
-1 = LEFT      2 = RIGHT      3 = BOTH        (0 folds to BOTH)
+1 = LEFT      2 = RIGHT      3 = BOTH        (0 is not a value — `from_wire(0)` is `None`)
 ```
 
 This is the C-API `tobii_enabled_eye_t {LEFT=0, RIGHT=1, BOTH=2}` **plus 1** —

@@ -75,12 +75,13 @@ Not negotiable, and most of them are the device's doing rather than ours.
                         └───┬───────────┬──────┘
                             │           │
              X/Wayland display     GitHub releases API + raw.githubusercontent
-             (EDID, geometry,      (update check; head-pose model download —
-              layer-shell overlay)  both only when asked, and both opt-out-able)
+             (EDID, geometry,      (update check: unprompted at launch,
+              layer-shell overlay)  opt-out-able; head-pose model download:
+                                    only on an explicit click)
                             │
                      ~/.config/tobii-linux/
                 (geometry, calibration blob, eye selection, pitch offset,
-                 update-check preference, hub text size, models/)
+                 update-check preference, hub text size, games.toml, models/)
 ```
 
 **In scope:** speaking the ET5 protocol, deriving screen geometry, running
@@ -88,9 +89,9 @@ calibration, deriving head pose, presenting all of it, and keeping itself
 updated.
 
 **Explicitly out of scope:** being a gaze-input method (no cursor control, no
-dwell clicking); supporting other Tobii devices; a daemon with an IPC API — the
-background session exists only to keep the device configured, not to serve other
-processes.
+dwell clicking); supporting other Tobii devices; a *general-purpose* IPC API — the
+socket the background session serves carries tracking data, leases and recentre
+requests for this project's own clients, and is not a public service interface.
 
 ---
 
@@ -125,24 +126,26 @@ Five decisions that shape everything else. Each is expanded in
 
 ### Level 1 — the workspace
 
-Nine crates, one acyclic dependency graph, ~33,600 lines. Counts measured with
-`find crates -name '*.rs' | xargs wc -l`, September 2026 — every figure in this
-diagram had gone stale before, which is what a hand-maintained count does.
+Eleven crates, one acyclic dependency graph, ~75,700 lines. Counts measured
+with `find crates -name '*.rs' | xargs wc -l`, September 2026 — every figure in
+this diagram had gone stale before, which is what a hand-maintained count does.
 
 ```
-                    tobii-protocol  (3,437)  no dependencies at all
-                     ▲    ▲     ▲
-        ┌────────────┘    │     └──────────────┐
-   tobii-usb (2,281)  tobii-config (1,856)  tobii-recap (1,600)
+                    tobii-protocol  (3,549)  no dependencies at all
+                     ▲    ▲     ▲                tobii-ipc (1,917)
+        ┌────────────┘    │     └──────────────┐  no dependencies either
+   tobii-usb (2,342)  tobii-config (2,677)  tobii-recap (1,600)
         ▲                ▲     ▲
         │      ┌─────────┘     └──────────┐
-        │  tobii-headpose (4,559)   tobii-update (3,647)
-        │      ▲                          ▲
-        │      │              tobii-diagnostics (1,334)
-        │      │                          ▲
-        └──────┴──────────┬───────────────┘
-                          │
-          tobii-cli (2,272)   tobii-gtk (12,619)
+        │  tobii-headpose (5,659)   tobii-update (5,956)
+        │      ▲      ▲                   ▲
+        │      │  tobii-output (7,010)    │
+        │      │      ▲      ▲            │
+        │      │      │   tobii-diagnostics (2,308)
+        │      │      │            ▲
+        └──────┴──────┴────────────┴──────┐
+                          │                │
+          tobii-cli (18,166)      tobii-gtk (24,483)
 ```
 
 | Crate | Responsibility | Notable |
@@ -153,9 +156,11 @@ diagram had gone stale before, which is what a hand-maintained count does.
 | `tobii-headpose` | 5-DOF geometric pose, the ONNX 6-DOF backend, the model store, opentrack output. | The two paths are fused, not alternatives: position from the eyes, rotation from the model. A frame with one tracked eye is reconstructed from the last measured interocular offset (≤300 ms, rotation *held*), and the smoothing filter is an EMA behind a gate that holds a sample whose position teleports. |
 | `tobii-update` | Release checking, download integrity, installation with rollback. | All network access funnels through `net.rs`. No signature — see [[Quality-and-Risks]]. |
 | `tobii-diagnostics` | The `tobii debug` report, its redaction, and the log the report quotes. | Its own tests fail if a home path, hostname or raw monitor id reaches the output. |
-| `tobii-cli` | The `tobii` binary: user commands *and* the protocol diagnostics used to do the reverse engineering. | Single file, hand-rolled argument matching. |
-| `tobii-gtk` | The hub, the guided flows, the overlay, and the one device thread. | 38% of the workspace. |
+| `tobii-cli` | The `tobii` binary: user commands *and* the protocol diagnostics used to do the reverse engineering. | Five modules since the Wine bridge and `tobii uninstall` landed (`main.rs`, `bridge.rs`, `userreg.rs`, `wineserver.rs`, `uninstall.rs`); hand-rolled argument matching throughout. |
+| `tobii-gtk` | The hub, the guided flows, the overlay, and the one device thread. | 32% of the workspace. |
 | `tobii-recap` | Decodes a usbmon pcap into a TTP op catalog. | Offline tool; how the protocol was mapped in the first place. |
+| `tobii-ipc` | The socket the hub serves tracking data on: its path, the framed codec, the server and the client. | No workspace dependencies at all, so both ends of the socket share one codec. |
+| `tobii-output` | Game output: the `games.toml` settings, the compose pipeline (Extended View, neutral, recentre), the opentrack port watch, and the sinks — UDP, virtual joystick, TrackIR/FreeTrack bridge. | Cross-compiles to `x86_64-pc-windows-gnu` for the Wine bridge, which is why the `/proc` watch is behind `cfg(target_os = "linux")`. |
 
 ### Level 2 — the pieces that carry the design
 
@@ -188,16 +193,30 @@ session and replays it; see [[Development]].
                                             │  SyncSender(1), drops when full
                                             └──► head-pose worker thread
                                                  (ONNX, ~12.4 ms/frame)
+
+  socket thread (one, started by `device::spawn`)
+  ──────────────────────────────────────────────
+  serves $XDG_RUNTIME_DIR/tobii-linux/tracker.sock — subscriptions, leases,
+  recentre requests — and rides `PortWatch` on its own timer
 ```
 
-Three threads, and the boundaries are deliberate. The device thread owns the
+Four threads carry the device path, and the boundaries are deliberate. (The
+IPC server adds an accept thread and a reader/writer pair per client —
+`crates/tobii-ipc/src/server.rs:117`, `:128` — and the updater two more, §6.5.)
+The device thread owns the
 connection and never blocks the UI. The head-pose worker runs the neural model
 off the device thread on a **one-slot channel that drops rather than queues** —
-a backlog of stale frames is worse than a skipped one.
+a backlog of stale frames is worse than a skipped one. The socket thread is
+started unconditionally by `device::spawn` (`crates/tobii-gtk/src/outputs.rs`),
+so it exists on every launch shape including `--background`; it starts no
+thread at all when another hub already holds the socket, which is degradation
+rather than failure. §5 below is what it serves.
 
 `Demand` is the reference count on the USB session. Consumers take a
 `DemandGuard`: the hub while its window has focus, the gaze overlay while
-shown, a calibration or setup flow while it runs, and a **socket client** for
+shown, a calibration or setup flow while it runs, the `--accuracy` diagnostic
+for the life of its process (`crates/tobii-gtk/src/lib.rs:818`), and a
+**socket client** for
 as long as it stays subscribed to pose, gaze or camera
 (`outputs::Holds::hello`) — which is all `tobii game` is. One more consumer
 needs no client at all: `outputs::PortWatch` holds a guard while a socket is

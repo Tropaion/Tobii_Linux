@@ -193,7 +193,7 @@ Verbatim first bytes of a physical-device capture
 05 00 00 00 04 00 27 0b b8     xds_row: tag=0x00270bb8 -> count = 0x27 = 39 columns
 05 00 00 00 04 00 02 0b b9     xds_column prolog (tag 0x00020bb9)
 02 00 00 00 04 00 00 00 01     column id = 0x01  (timestamp)
-06 00 00 00 08 00 00 00 00 45 e1 3a 79   s64 value = 0x45e13a79 = 1 172 363 897 (timestamp, µs)
+06 00 00 00 08 00 00 00 00 45 e1 3a 79   s64 value = 0x45e13a79 = 1 172 388 473 (timestamp, µs)
 05 00 00 00 04 00 02 0b b9     next xds_column prolog
 02 00 00 00 04 00 00 00 11     column id = 0x11
 02 00 00 00 04 00 00 00 04     u32 value = 4
@@ -218,7 +218,7 @@ Its leading bytes decode as: **[CONFIRMED]** structure / **[HYPOTHESIS]** meanin
 06 00 00 00 08 [8-byte s64]    timestamp value
 05 00 00 00 04 00 02 0b b9     xds_column prolog
 02 00 00 00 04 00 00 00 02     column id = 0x02
-02 00 00 00 04 [4-byte u32]    a small u32 value
+01 00 00 00 04 [4-byte enum]   a type-0x01 enum4 (observed value 2)
 ```
 
 Total = 2 (prefix) + 9 (row) + [9 + 9 + 13] (timestamp col) + [9 + 9 + 9]

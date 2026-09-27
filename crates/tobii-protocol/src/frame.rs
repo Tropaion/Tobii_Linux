@@ -27,9 +27,12 @@ pub const OP_SUBSCRIBE: u32 = 0x4c4;
 /// have not watched a stream actually fall silent after sending it.
 pub const OP_UNSUBSCRIBE: u32 = 0x4ce;
 /// Ask the device to enumerate its own streams (id → name).
-/// **[UNCONFIRMED]** — the op number comes from a third-party middleware
-/// emulator's canned reply, not from a capture of real hardware. `tobii streams`
-/// exists to settle it.
+///
+/// **[CONFIRMED]** live 2026-08-09 against real hardware: a 509-byte reply
+/// listing nine streams, which `commands::parse_stream_catalog` models and
+/// `commands`'s own tests pin against the captured bytes. The op number did
+/// first come from a third-party middleware emulator's canned reply; `tobii
+/// streams` settled it, which is what that command was for.
 pub const OP_STREAM_CATALOG: u32 = 0x4b0;
 pub const OP_SET_DISPLAY_AREA: u32 = 0x5a0;
 pub const OP_GET_DISPLAY_AREA: u32 = 0x596;

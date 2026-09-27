@@ -50,10 +50,15 @@ plane are all consistent with the descriptor, and we have tested none of them.
 
 Open procedure (`UsbTransport::open`): open by VID/PID, best-effort detach of any
 kernel driver on interface 0, `claim_interface(0)`, then a **vendor control
-transfer** to open the session (below). Bulk writes and reads use a 1000 ms
-libusb timeout; reads of length 0 or a libusb timeout are treated as "no data
-this call". The read buffer used by the driver is 16384 bytes
-(`connection.rs` `READ_BUF`). **[CONFIRMED]**
+transfer** to open the session (below), which itself uses a 1000 ms timeout.
+Bulk **writes** use a 2000 ms timeout (`transport.rs` `WRITE_TIMEOUT` — 1 s was
+seen to time out mid-blob on real hardware); bulk **reads** take the caller's
+timeout (`connection.rs`: `RECV_TIMEOUT` 100 ms for the request drain,
+`GAZE_TIMEOUT` 1000 ms for streaming). Reads of length 0 or a libusb timeout are
+treated as "no data this call". The driver uses two read buffers: 16384 bytes
+for handshake and request drains (`connection.rs` `READ_BUF`) and 262144 bytes
+for the streaming path (`STREAM_READ_BUF`, allocated once and reused by
+`read_notifications`). **[CONFIRMED]**
 
 ## Vendor session control transfers
 
@@ -72,7 +77,8 @@ close-on-Drop. **[CODE-VERIFIED]**
 
 ## Outbound USB envelope (host → device)
 
-Every frame the host sends is `[envelope:8][ttp header:24][payload]`:
+A frame of 8192 bytes or fewer goes out as one transfer,
+`[envelope:8][ttp header:24][payload]`:
 
 ```
 byte 0        : 0x00     direction = OUT
@@ -84,6 +90,12 @@ bytes 8..     : TTP header (24 bytes, big-endian) + payload
 
 `build_out_frame` (`frame.rs`) builds exactly this. **[CONFIRMED]** — pinned by
 `frame.rs::out_frame_layout` (e.g. a 3-byte payload gives `len_LE = 27` = 24+3).
+
+Anything longer is split by `chunk_frame` (`transport.rs`, `CHUNK` = 8192) into
+several bulk transfers: the first keeps the TTP header but has its envelope
+length rewritten to describe only its own bytes, and every continuation is a
+bare 8-byte envelope plus payload. This is the path a ~324 KB `cal_apply` takes
+— sent whole, the apply simply fails.
 
 ## Inbound USB envelope (device → host)
 

@@ -49,8 +49,10 @@ tobii-recap tobii-<action>.pcap [--limit N] [--gaze-columns]
 
 It reassembles TTP frames, prints a REQ/RSP/NOTIFY timeline with op names, and
 flags unmapped ops as `?unknown` — those are your next mapping targets. See
-[[Tools]]. For live exploration on real hardware use `tobii probe-streams`,
-`tobii probe-stream`, and `tobii columns` ([[Streams]], [[Head-Pose]]).
+[[Tools]]. For live exploration on real hardware start with `tobii streams` —
+the device enumerates its own streams, so prefer it to guessing a range — then
+`tobii probe-streams`, `tobii probe-stream`, `tobii log` and `tobii columns`
+([[Streams]], [[Head-Pose]]).
 
 ## Decompiling the Tobii MSI (for op names)
 
@@ -79,10 +81,15 @@ this way and only some were later confirmed live.
    software — ground truth for the corner triple, tilt model, and whether the
    original compensates for curvature (we believe it does not; see
    [[Display-Area]]).
-2. **A full calibration with timings** — settles the `add_point`-blocks-vs-acks
-   disagreement ([[Calibration]]) and whether the original reads
-   `stimulus_points_get` (`0x460`).
-3. **The head-pose stream**, if any — the decisive open question ([[Head-Pose]]).
+2. **A full calibration with timings** from Tobii's own software — the
+   `add_point`-blocks-vs-acks question is already settled here (it acks
+   immediately, [[Calibration]]) and `0x460` answers us directly (713 bytes,
+   `tobii cal-points`), so what a vendor capture would still add is the real
+   per-point dwell the native SDK enforces, which no decompile exposes.
+3. ~~**The head-pose stream**~~ — **settled**: there is none. Tobii computes
+   pose host-side from the camera images, and the device's own stream catalog
+   (`tobii streams`, op `0x4b0`) lists nine streams with no pose among them.
+   See [[Head-Pose]].
 4. **Select-eyes toggling** — capture what Left/Right/Both actually sends and
    whether a standard calibration applies it ([[Select-Eyes]]).
 

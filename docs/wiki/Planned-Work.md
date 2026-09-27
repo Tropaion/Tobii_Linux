@@ -347,8 +347,11 @@ otherwise get. `tobii game` transports nothing: it exists only to tell the hub
 that something wants data (see [Game-Output](Game-Output.md)). For the opentrack
 route, the receiver is already announcing itself — it has bound the port, and the
 kernel will say so — so the hub can hold its own demand and the launch option is
-no longer needed. The joystick and the Wine bridge keep needing the wrapper,
-because neither receiver binds anything the hub can see.
+no longer needed. The Wine bridge keeps needing the wrapper,
+because its receiver binds nothing the hub can see. The joystick stopped
+needing it in v0.4.1: `wake_for_joystick` (default on) holds the tracker
+whenever game output is enabled and the uinput node really opened, which is a
+signal the hub has directly, with nothing bound anywhere.
 
 **The trade, stated plainly.** A bound socket is not a request:
 
@@ -386,19 +389,13 @@ watch only runs for somebody who already turned game output on.
 nothing else could be holding the device) against a config with game output on:
 **0** USB file descriptors with nothing listening, **1** within four seconds of
 a socket binding `127.0.0.1:4242`, and **0** again after it closed and the three
-second linger elapsed. Its IPC socket was already owned by another hub at the
-time, which the log said — so the watch does not depend on the socket server
-binding.
+second linger elapsed. The watch rides the socket thread, so it runs only in a
+hub that owns the tracking socket: `outputs::spawn` returns before creating that
+thread if `Server::bind` fails (`crates/tobii-gtk/src/outputs.rs:697`). Which
+hub held the device in the run above was therefore not established.
 
 ## Smaller candidates
 
-- **Label the per-output validity columns** in [Gaze-Stream](Gaze-Stream.md).
-  Upstream labels `0x1d` as combined-2D-valid, `0x1e`/`0x1f` as per-eye-2D-valid,
-  `0x21` unfiltered-valid, and `0x23`/`0x26`/`0x28` display-space-valid. This
-  project's decoder reads them as U32 and skips them by kind. Decoding the
-  committed no-eyes frame shows all of them `0` while validity is `4`, which is
-  consistent with those labels. Add them tagged as an unverified third-party
-  reading. Ten minutes.
 - **Add X4: Foundations to [Game-Output](Game-Output.md).** It reportedly has a
   built-in opentrack UDP listener (Options → Controls), which would make it a
   direct-listener case like X-Plane, needing no opentrack application. **Verify

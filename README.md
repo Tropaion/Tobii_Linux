@@ -51,7 +51,9 @@ device properly, or to put head tracking into a game.
   instead and Alt-Tab is the way back.
 - **The tracker is off unless something is asking for it.** The infrared
   illuminators are lit only while a USB session is open, and one is opened only
-  while a window, an overlay, a flow or a game wants data.
+  while a window, an overlay, a flow, a game, the virtual joystick or a program
+  bound to the opentrack address wants data — or, with *Keep the tracker awake*
+  switched on, for as long as the hub runs.
 
 <!-- Screenshots still wanted, each needing someone at the tracker:
      docs/images/calibration.png — the follow-the-dot flow mid-run, one group of
@@ -207,7 +209,10 @@ can be copied into a bug report.
 It is nine topics in a list, with a **search box** the window opens focused, so
 you can type the question rather than find it: the search reads every heading
 and the whole of every topic, and a word off the control in front of you —
-"joystick", "cogwheel", "pitch" — is usually enough. Every word you type has to
+"joystick", "recentre", "standby", "tray" — is usually enough. Not every
+caption is in that text, though: if a word off a control finds nothing, type
+what the control does rather than what it is called — the three strength
+presets are the known case. Every word you type has to
 appear in the same topic, so a second word narrows rather than widens, and a
 query nothing answers says so rather than going blank. **Down** moves from the
 box into the list and the arrow keys walk it, with the topic beside it changing
@@ -336,8 +341,11 @@ exactly as long as the command runs. (From a build tree, that is
 `./target/release/tobii`.)
 
 **The hub is the other route**, and the one to use if you want the virtual
-joystick, the Wine bridge and opentrack fed at once: only one process can claim
-the ET5 over USB, so they all have to come from the same place.
+joystick, the Wine bridge and opentrack fed at once without turning game output
+on from the command line: only one process can claim the ET5 over USB, so they
+all have to come from the same place. With `tobii games set enabled true`,
+`tobii headpose` feeds all three itself — skipping the joystick when a hub
+already presents one.
 
 ### Five degrees of freedom, or six
 
@@ -410,8 +418,10 @@ again afterwards — so the hub knows exactly how long a game lasts. It is
 transparent to whatever launched it, exiting with the game's own code and
 reporting a killed game as 128 + the signal, and it **never stops the game
 starting**: with no hub running it prints a note and launches anyway. Any
-program that connects to that socket and asks for pose does the same job; the
-wrapper is just the one that knows exactly how long a game lasts. Steam's
+program that connects to that socket and asks for pose wakes the tracker the
+same way; the wrapper is the one that knows exactly how long a game lasts, and
+the only one that puts `TOBII_BRIDGE_PORT` into the game's environment — which
+is how the Wine-side DLL learns a `bridge_port` you have changed. Steam's
 `%command%`, Lutris's and Heroic's wrapper fields and a plain shell script all
 work, which is why this is a wrapper rather than a setting.
 
@@ -534,6 +544,12 @@ answer.
 `install --steam` finds the prefix from Steam's own library files and writes the
 registry with **the Proton build the prefix records**, not whatever `wine` is on
 your `$PATH` — a foreign wine would upgrade the prefix out from under the game.
+When that build cannot be read out of the prefix, `install --steam` **refuses**
+rather than falling back to the host's wine: a Proton prefix was made by a
+Proton build, so the system `wine` is by construction not it. Name the build
+with `--wine <Proton>/files/bin/wine`, or `--force` to go ahead knowing it will
+upgrade the prefix first. Only `install` refuses; `uninstall` does not, because
+refusing there would strand somebody taking our files back out.
 
 **TrackIR is pointed at an already-installed client** (opentrack's, if you have
 it) rather than at ours, because games verify NaturalPoint's signature and a
@@ -710,9 +726,10 @@ Stored under `$XDG_CONFIG_HOME/tobii-linux/` (default `~/.config/tobii-linux/`):
 `config.toml` (display geometry), `calibration.bin` and `calibration.meta.toml`,
 `enabled_eye`, `headpose_pitch_offset`, `update_check`, `setup_monitor_id`,
 `text_scale` (the hub's text size, as a bare number — delete it to get back to
-100%), `games.toml`, `report_salt` (32 random bytes, mode 0600, which is what
-makes the monitor id in a diagnostics report meaningless to anyone else), and
-`models/` (the fetched head-pose model).
+100%), `games.toml`, `accuracy.csv` (written by `tobii-gtk --accuracy`),
+`report_salt` (32 random bytes, mode 0600, which is what makes the monitor id
+in a diagnostics report meaningless to anyone else), and `models/` (the fetched
+head-pose model).
 
 The **log** is not there: it is at `$XDG_STATE_HOME/tobii-linux/tobii.log`
 (default `~/.local/state/…`), because the XDG spec puts logs in state. The
@@ -1067,7 +1084,7 @@ banner appears, so the button you see fits the copy you have:
 - **A copy in a folder you cannot write but can fix yourself** — your own
   folder with its write permission off, or a folder in your home that another
   account owns, which that same older `sudo ./install.sh ~/.local/bin` made
-  when the folder did not exist yet — gets no button. The banner shows the one
+  when the folder did not exist yet — gets nothing to download. The banner shows the one
   command, `chmod u+w <that folder>` or
   `sudo chown <your uid>:<your gid> <that folder>` (that folder alone, not what
   is in it), selectable so you can copy it. Its button quits the hub, because
@@ -1288,8 +1305,8 @@ the listing and asset-selection halves have run against two real published
 releases. What is still unproven is the *install* half against a release
 downloaded from GitHub rather than built locally; the **Download** path for
 package-managed copies, which nobody has clicked through against a real release;
-and the new update buttons, which first appear when a release after v0.3.1
-exists. Only the pacman branch of the package-ownership query has ever run
+and the new update buttons, which have never been clicked through against a
+real release. Only the pacman branch of the package-ownership query has ever run
 against a real package database — `dpkg` and `rpm` are unit-tested only, and
 they are what decides which button a Debian or Fedora user is shown. The trust model is the honest limitation,
 not a missing test: the checksums are an integrity check, not a signature.
@@ -1332,7 +1349,7 @@ not a missing test: the checksums are an integrity check, not a signature.
   seconds without declaring itself exclusive, so the hub grants the lease,
   cannot let go in time, and the command reports the hub as unresponsive before
   failing the way it did before the lease existed. Two further lease
-  interactions are listed with it, none of them fixed in v0.4.1.
+  interactions are listed with it, and none of the three is fixed as of v0.5.0.
 
 The full list, per release, is in
 [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1,
@@ -1371,7 +1388,7 @@ it with no tracker attached.
 Everything else a contributor needs is in the wiki:
 [Development](docs/wiki/Development.md) for the test suite, conventions and the
 protocol traps; [Architecture](docs/wiki/Architecture.md) for how the crates and
-the three threads fit together;
+the four threads of the device path fit together;
 [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) for the measured numbers and
 the known defects.
 

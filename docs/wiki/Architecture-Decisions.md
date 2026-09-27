@@ -44,10 +44,13 @@ program that cannot write its log must still run. The **autostart entry** is at
 
 ### 8.4 Threading
 
-One device thread owning the connection; one optional head-pose worker on a
+One device thread owning the connection; one socket thread serving clients,
+leases and the opentrack port watch; one optional head-pose worker on a
 **one-slot channel that drops rather than queues**; the GTK main thread touching
-neither except through `Arc<Mutex<DeviceState>>` and a command `Sender`. No
-widget is ever touched off the main thread.
+none of them except through `Arc<Mutex<DeviceState>>` and a command `Sender`.
+The device and socket threads share two more locks between themselves —
+`Arc<Mutex<Lease>>` and `Recentring` — and nothing else. No widget is ever
+touched off the main thread.
 
 ### 8.5 User consent
 
@@ -103,7 +106,11 @@ arbitrary: closing makes the device reboot, so the next connect must re-apply
 everything in decision 5. Unplanned and now load-bearing benefit: while the hub
 wants nothing the device is free, so `tobii headpose` can claim it for a game
 without closing the hub — a complete route that needs neither the hub nor a
-wrapper. A socket client subscribed to pose is itself one of the references, and
+wrapper. Since v0.4.1 the hub can also want it permanently (`wake_for_joystick`,
+default on, and `keep_awake`), so the reference count alone is no longer enough:
+the lease is an **override** on the device thread's wait, not another weight in
+it (`must_wait`, `crates/tobii-gtk/src/device.rs:229`). A socket client
+subscribed to pose is itself one of the references, and
 that is the whole of `tobii game`: it transports nothing, it only tells the hub
 that something wants data for as long as the game runs. Commit `39c1547`.
 

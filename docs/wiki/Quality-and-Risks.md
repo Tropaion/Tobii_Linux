@@ -119,8 +119,10 @@ is the pinned alternative on Arch: its PKGBUILD pins the release tarball's sha25
 taken from the release's own `SHA256SUMS` — an integrity check, not a signature,
 like every checksum in this project.
 
-**The binaries ship unstripped**, about 9 MB of symbol table each — a 34 MB
-binary strips to 25 MB (measured with `strip` on both, September 2026).
+**The binaries ship unstripped**, about 10 MB of symbol table each — `tobii`
+is 37.1 MB and strips to 27.1 MB, `tobii-gtk` 37.8 MB to 27.4 MB (measured with
+`strip` on both, September 2026; decimal MB, which is why a file manager
+showing MiB says 35 and 36).
 Deliberate:
 release builds carry no debug info, so the symbol table is the only thing that
 makes a panic in a bug report name a function rather than an address, and this
@@ -602,7 +604,9 @@ because the reasoning is worth more than the tidiness.
 - **It sees only this host, in this network namespace.** A configured opentrack
   address that is not local answers `Unknown`, never `No`, and `Unknown` takes no
   hold — so sending to another machine, or to a receiver in its own namespace,
-  behaves exactly as it did before and still needs a wrapper or a focused hub.
+  behaves exactly as it did before and still needs a wrapper, a focused hub, or
+  one of §11.3f's two standing holds (`keep_awake`, or `wake_for_joystick` with
+  the joystick sink on).
 - **The decode assumes a little-endian host.** `/proc/net/udp` prints the address
   as a `__be32` in host order; on a big-endian machine the addresses would come
   out byte-swapped and simply never match, so the watch would be inert rather
@@ -635,7 +639,8 @@ fault.
   visibility that pays for it — the header's **ALWAYS ON** badge, the switch's
   off-state sentence, the `can wake it now` line in `tobii debug`, the close
   line in the log — is therefore not decoration, and removing any of it
-  re-opens the bargain. - **What is measured.** The linger is **3.00 s**,
+  re-opens the bargain.
+- **What is measured.** The linger is **3.00 s**,
   timed, which is the "3 to 5 seconds" of the report. The joystick's uinput
   node **persists while the tracker is dark**: `GameSide::poll` →
   `sync_joystick` runs from the device thread's idle loop as well as from a
@@ -648,22 +653,26 @@ fault.
   more identical row in `/proc/*/fd`. The hold's placement was decided by
   reading `outputs::spawn`, which returns *before* `std::thread::spawn` when
   `Server::bind()` fails — a waker parked on the socket thread would be missing
-  on precisely the second `tobii serve` — so it lives on `GameSide`, which
-  already polls at 1 Hz in both loops. - **What is not measured: nobody has run
+  on precisely the second hub — so it lives on `GameSide`, which
+  already polls at 1 Hz in both loops.
+- **What is not measured: nobody has run
   a tracker lit for eight hours.** There is no soak test of either hold, no
   thermal measurement, and nothing is known about what continuous illumination
   does to an ET5 over a night beyond the obvious. The "overnight" case in every
-  warning above is reasoned, not observed. - **No real game has been watched
+  warning above is reasoned, not observed.
+- **No real game has been watched
   reading unfrozen axes.** The hold is proven by unit tests over `GameSide`
   (the claim exists exactly when the handle does, released on the setting, on
   losing the device, and on game output going off) and the lease behaviour by
   tests over `must_wait` and `EXCLUSIVE`. What has not been done is: turn it
-  on, start a game, alt-tab, and watch the view still follow. - **The close
+  on, start a game, alt-tab, and watch the view still follow.
+- **The close
   line's emission site is untested.** `standby_notice`'s wording has a test;
   the `log::info` call that emits it does not, because `device_session` opens
   `UsbTransport` directly and is not generic over `Transport` the way
   `device_tick` is. Making it generic was judged a larger change than the bug
-  needed. - **`keep_awake` lives in `games.toml`, which is the wrong-sounding
+  needed.
+- **`keep_awake` lives in `games.toml`, which is the wrong-sounding
   file for it.** It is there because that is the only config the hub re-reads
   once a second, in the idle wait *and* in a session, so the GUI and the CLI
   both take effect within a second in either state; `config.toml` is read once
@@ -672,7 +681,8 @@ fault.
   comment and in the field's docs. The failure direction is at least the safe
   one: a `games.toml` that cannot be read at all falls back to
   `OutputConfig::default()`, where `keep_awake` is off — a corrupt file cannot
-  leave somebody's illuminators lit. - **The GUI half is tested on both sides
+  leave somebody's illuminators lit.
+- **The GUI half is tested on both sides
   of the display line**, which it was not when it briefly had a store of its
   own. Headless, in CI: `the_switch_writes_the_bit_the_device_thread_reads`
   (`crates/tobii-gtk/src/lib.rs`) writes through the switch's own save path and
@@ -690,12 +700,15 @@ fault.
   field `sync_keep_awake` takes the hold from. It needs no tracker. The header
   geometry is still the older, separate measurement: `.measure()` on a replica
   header, 40 px with the badge hidden and 40 px shown — no added height — and a
-  clean `load_css()`. - **The settings popover now clips sooner.** Its natural
-  height went from 814 px to 942 px with the new row, and it has no
-  `ScrolledWindow`. At the hub's text size multiplier that already cut off the
+  clean `load_css()`.
+- **The settings popover now clips sooner.** Its natural
+  height went from 814 px to 942 px with the new row, and v0.5.0's Help row and
+  its hairline (`help_row`, `crates/tobii-gtk/src/lib.rs:2518`, appended at
+  `lib.rs:2455`) have since added a further row on top of that, unmeasured. It
+  has no `ScrolledWindow`. At the hub's text size multiplier that already cut off the
   bottom row on a 1080p screen at about 1.3×; this makes a pre-existing bug
-  roughly 128 px worse. Left alone rather than redesigned inside a bug fix. -
-  **The two permanent holds made `tobii headpose` unrunnable, and the fix ends
+  roughly 128 px worse. Left alone rather than redesigned inside a bug fix.
+- **The two permanent holds made `tobii headpose` unrunnable, and the fix ends
   in a three-second guess against an older hub.** `wake_for_joystick` ships on,
   so a user with game output on, **and a joystick device the hub could actually
   create**, has the hub holding libusb interface 0 for its whole lifetime — and
@@ -718,7 +731,8 @@ fault.
   the lease term of `must_wait` is an override and not a weighing, the idle
   wait sets `ConnStatus::Idle`, and the eye-position panel renders a closed
   session as **tracker off** rather than *not detected* — but it was read out
-  of the code, not seen on a screen. - **Three interactions between the lease
+  of the code, not seen on a screen.
+- **Three interactions between the lease
   and the hub's own flows are known and are NOT fixed in this release.** All
   three were found by reading the merged code in the pre-release check; none
   was found by use, and none has been run on hardware. They are written down
@@ -737,15 +751,15 @@ fault.
   lease check (`device.rs:1556`) comes round again. The Pitch-zero dialog takes
   no `Demand` hold at all — `hold_while_open` is called with "display setup",
   "the gaze preview" and "calibration" only
-  (`crates/tobii-gtk/src/lib.rs:1063`, `1088`, `1185`, `1265`, `1714`, `1737`)
+  (`crates/tobii-gtk/src/lib.rs:1118`, `1143`, `1246`, `1350`, `1873`, `1896`)
   — so `wants_exclusive` is false, the refusal branch at
   `crates/tobii-gtk/src/outputs.rs:309-319` is skipped and the lease is granted
   at `outputs.rs:320-326`. Press **Start** in Pitch zero and run `tobii
   headpose` within the next 13 s: the hub sets `Lease::Requested` and cannot
   reach `announce_release`, the CLI's `LEASE_WAIT` of 3 s
-  (`crates/tobii-cli/src/main.rs:2026`) expires, and it prints *the hub did not
+  (`crates/tobii-cli/src/main.rs:2029`) expires, and it prints *the hub did not
   answer the request for the tracker within 3s; opening it anyway*
-  (`main.rs:2164-2167`) — a sentence whose premise is a wedged or older hub,
+  (`main.rs:2167-2170`) — a sentence whose premise is a wedged or older hub,
   which this one is not — before failing with the same *already claimed by
   another process* the lease was added to remove. - *A command queued while a
   lease is out now waits silently instead of failing.* `stand_by` no longer
@@ -788,28 +802,29 @@ fault.
 whoever got there first. The six commits that fixed that (`2d394ac`, then
 `2e4dc20`, `1729622`, `e0b4723`, `95259c0` and `b9d0487`) are the bulk of this
 release: the non-test half of `crates/tobii-cli/src/bridge.rs` went from 781
-lines at v0.4.0 to 1821 at HEAD. The design is written up in [[Game-Output]];
+lines at v0.4.0 to 1821 at v0.4.1 (3050 at v0.5.0). The design is written up in [[Game-Output]];
 what belongs here is how little of it has been run against a prefix that was not
 built for the purpose.
 
 - **The three properties the design rests on**, so that a later change can be
   told from a later mistake. `install` reads both keys before it writes, copies
   or creates anything, and refuses rather than clobbering
-  (`crates/tobii-cli/src/bridge.rs:1224-1259`) — a refused prefix comes out
+  (`crates/tobii-cli/src/bridge.rs:1644-1663`) — a refused prefix comes out
   with nothing of ours in it: no directory created, no key touched. That is a
   promise about this installer's writes and not about wine's: reading the keys
   runs wine against the prefix, and wine will bootstrap a directory that is not
   a prefix yet (`system.reg`, `user.reg`, `dosdevices/`, `.update-timestamp`)
   before it can answer at all. `uninstall` deletes a key's `Path` value only
   while it still holds what the record says this program put there, and
-  otherwise leaves it alone and names it (`undo_for`, `bridge.rs:1522-1530`,
-  driven from `undo_keys`, `bridge.rs:1601-1626`) — or our own install
+  otherwise leaves it alone and names it (`undo_for`, `bridge.rs:2093-2101`,
+  driven from `undo_keys`, `bridge.rs:2172-2197`) — or our own install
   directory, which counts as ours whatever the record says, the limitation two
   bullets below. And the record holds **only values this program computed**: a
   value read out of the registry is compared and dropped, never stored and
   never written back (`render_record`'s own header says so in the file it
-  writes, `bridge.rs:897-905`). The third is what the other two are built on,
-  and it is the one that is easy to undo by accident. - **It took five rounds
+  writes, `bridge.rs:1195-1203`). The third is what the other two are built on,
+  and it is the one that is easy to undo by accident.
+- **It took five rounds
   of review to get there, and two of the fixes recreated the fault they were
   sent after.** The first version (`2d394ac`) read before writing *and*
   remembered the value it displaced so it could put it back; the first review
@@ -825,9 +840,10 @@ built for the purpose.
   words that it promises nothing about the old value. The three rounds after
   that (`e0b4723`, `95259c0`, `b9d0487`) found no defect in that property and
   four, two and four defects in the reading, the recording order and the
-  line-splitting underneath it. - **What was exercised.** 57 unit tests in
-  `bridge.rs`, 23 of them driving a *stateful* fake wine (`FAKE_WINE`,
-  `bridge.rs:2205-2237`): a shell script that keeps the two `Path` values in
+  line-splitting underneath it.
+- **What was exercised.** 57 unit tests in `bridge.rs` at v0.4.1 (94 at
+  v0.5.0), 23 of them driving a *stateful* fake wine (`FAKE_WINE`,
+  `bridge.rs:3698-3756`): a shell script that keeps the two `Path` values in
   files and applies `reg add` and `reg delete` to them, so a test can install,
   let another program claim a key, and uninstall — the faults here all live in
   the gap between what a key said at install and what it says at uninstall, and
@@ -840,21 +856,23 @@ built for the purpose.
   still recorded `np wrote <path>` and a later uninstall deleted a registration
   another program had since made there (`e0b4723`). And, twice, by accident:
   the maintainer's own `~/.wine`, which is the prefix `resolve_prefix` falls
-  back to when none is named (`bridge.rs:562`), and which is how the missing
-  flag gate was found at all. - **What was NOT exercised: a Proton prefix
+  back to when none is named (`bridge.rs:636`), and which is how the missing
+  flag gate was found at all.
+- **What was NOT exercised: a Proton prefix
   belonging to a running game.** Every live run was a throwaway prefix made for
   the run. No real third-party registration — a Windows opentrack installed
   inside a game's prefix — has been through the refusal, the `--force` path or
   the uninstall rule; the closest is the fake wine holding a foreign value,
   which proves the branch and not the registry it would meet. The staged-rename
-  argument for the DLLs (`staging_name`, `bridge.rs:963-979`) is likewise
+  argument for the DLLs (`staging_name`, `bridge.rs:1260-1277`) is likewise
   reasoned from `fs::rename` being atomic within a directory, not measured
-  against a game that has the DLL mapped. - **A key that already holds our own
+  against a game that has the DLL mapped.
+- **A key that already holds our own
   path, with nothing recorded, is treated as ours — including when it is not.**
-  `is_ours` (`bridge.rs:885-890`) answers yes for `C:\tobii-bridge` whatever
+  `is_ours` (`bridge.rs:1138-1143`) answers yes for `C:\tobii-bridge` whatever
   the record says, and `install` skips a key it calls ours before it reaches
-  the identical-value test (`bridge.rs:1247-1249`). The [LIMITATION] block on
-  `is_ours` (`bridge.rs:871-884`) states the cost in both directions: a
+  the identical-value test (`stops_install`, `bridge.rs:1168-1188`). The
+  [LIMITATION] block on `is_ours` (`bridge.rs:1124-1137`) states the cost in both directions: a
   third-party client that registers itself at the path we pointed a key at,
   *after* we pointed it there, is indistinguishable from our own work and comes
   out on our way out; and a registration another program made at our install
@@ -862,7 +880,8 @@ built for the purpose.
   deleted by `uninstall`. Refusing instead would refuse every upgrade from
   v0.4.0 — which wrote that value and recorded nothing — on every machine with
   opentrack installed. Neither answer can tell the two apart, and this one
-  fails towards a prefix the user can re-register in one command. - **The flag
+  fails towards a prefix the user can re-register in one command.
+- **The flag
   gate was added because the install had already written into a real prefix,
   and three spellings still got past it afterwards.** `tobii bridge install
   --help` did not print help: it ignored the flag and performed a real install
@@ -874,7 +893,7 @@ built for the purpose.
   which passed the name check and was then ignored, because every reader is
   `flag_value` and that compares the whole token; and `--prefix` with nothing
   after it, which falls back the same way. All three are refused at HEAD
-  (`reject_unknown_flags`, `bridge.rs:1756-1779`), checked on the built binary
+  (`reject_unknown_flags`, `bridge.rs:2969-2998`), checked on the built binary
   against a throwaway prefix. The point for this register is not the fix: it is
   that **all four holes — the original and these three — were found by
   reviewers, and the first of them only by a reviewer running the command on a
@@ -946,7 +965,7 @@ touchscreen, and two cards' guidance is now in exactly that position.
   gaze to a game." (`lib.rs:1403-1410`). Both were deliberately kept — the
   first carries a comment saying why — and a later pass that cut *either* of
   them for another 26px would leave two cards whose titles differ only by "for
-  games". The test that would notice is `tests/help_window.rs:1560-1572`, which
+  games". The test that would notice is `tests/help_window.rs:1858-1874`, which
   requires the set of cards with no description to be exactly
   `["Select eyes to detect", "Preview my gaze"]`.
 - **The window is a topic list, a search box and one topic at a time**, not
@@ -965,8 +984,9 @@ touchscreen, and two cards' guidance is now in exactly that position.
   `help.rs:1189-1196` as a known gap rather than asserted, because closing it
   means naming the presets FROM that constant instead of retyping them. The
   test beside it does hold the line for the words the window advertises: the
-  four the "Keyboard" topic tells a user to try, and six words printed on the
-  hub, each of which must open a topic that really contains it.
+  four the "Keyboard" topic tells a user to try, which since `a7186cc` are the
+  same four words printed on the hub, each of which must open a topic that
+  really contains it.
 - **The folding sidebar leaked the entire window, twice.** Below 520px the
   topic list folds behind a "Topics" button; pressing it and picking a topic
   left 80 of 87 widgets and 127 of 143 event controllers alive after the window
@@ -978,7 +998,7 @@ touchscreen, and two cards' guidance is now in exactly that position.
   to be taken through the sequence that leaks**: the first leak census in this
   file ran over a window that was only ever wide and reported zero. There are
   now two, and the narrow one asserts it weak-ref'd at least 40 widgets before
-  it asserts none survived (`tests/help_window.rs:1125-1155`).
+  it asserts none survived (`tests/help_window.rs:1396-1418`).
 - **What is measured:** the whole window, end to end on the real `build_hub`,
   748px natural height before and 692px after at an unchanged natural width of
   1241px; cards 142/142/96/194/94/204 against 180/161/141/213/120/204. A
@@ -1045,7 +1065,7 @@ means for a real game is not.
   not be.
 - **A `SIGTERM` aimed at `tobii` alone orphans the wine child.** `run` installs
   no signal handler; the only thing that kills the child is the yield path
-  (`stop`, `crates/tobii-cli/src/bridge.rs:1774-1789`). The child is
+  (`stop`, `crates/tobii-cli/src/bridge.rs:1965-1980`). The child is
   deliberately left in this process's group so that a Ctrl-C at the terminal
   reaches wine too, which is the case a user is actually in — but a `kill
   <tobii pid>`, or a supervisor that signals one pid, leaves a wine process
@@ -1056,8 +1076,16 @@ means for a real game is not.
   `supervise` is checked against a real child with an injected waiter — but the
   wiring between them (the lock file's inode reaching the parser, on a real
   prefix, under a real launch) is covered only by the manual run above, not by
-  a test. Staging a blocked POSIX waiter needs a forked process, which a
-  threaded test binary cannot do safely.
+  a test. What a test *does* cover is the inode reaching the parser against text
+  the kernel really printed: `stage_a_blocked_waiter`
+  (`crates/tobii-cli/src/wineserver.rs:816`) blocks a real waiter with two open
+  file descriptions and `F_OFD_SETLKW` on a thread — no fork, which a threaded
+  test binary could not do safely — and
+  `the_device_compared_is_the_one_the_kernel_prints_for_a_real_waiter`
+  (`wineserver.rs:725`) asserts `blocked_waiter` names that waiter on the
+  temporary directory, `/var/tmp` and the build directory in turn. What is still
+  missing is the rest of the wiring: a real prefix, a real wine launch, and the
+  lock path `lock_for` derives from it.
 - **The provider's flag parsing has no automated test at all.** `bridge/` is a
   separate workspace that cross-compiles to `x86_64-pc-windows-gnu` and has no
   host test runner — its crates call `advapi32`/`kernel32` directly, so a host
@@ -1082,13 +1110,13 @@ wine) 2744 lines of `system.reg` rewritten and the stamp overwritten. So
 (`crates/tobii-cli/src/userreg.rs`), and an install that refuses or an
 uninstall with nothing of ours to remove decides from the same file whenever
 the wineserver lock says nothing is serving the prefix (`settled_keys`,
-`crates/tobii-cli/src/bridge.rs:1032-1086`). The design is in [[Game-Output]];
+`crates/tobii-cli/src/bridge.rs:1091-1107`). The design is in [[Game-Output]];
 what belongs here is how much of it is measured and how much is reasoning.
 
 - **What is measured, and how.** Three tests hand the command a `wine` that
   *wrecks* the prefix if it runs at all — `.update-timestamp` and `system.reg`
   overwritten, `drive_c/windows` deleted (`WRECKING_WINE`,
-  `bridge.rs:3253-3269`) — and compare the whole prefix tree before and after,
+  `bridge.rs:3769-3774`) — and compare the whole prefix tree before and after,
   every path with its size, its mtime to the nanosecond and a digest of its
   bytes (`status_runs_no_wine_and_leaves_the_prefix_byte_for_byte_as_it_was`,
   `a_refused_install_runs_no_wine_and_leaves_the_prefix_as_it_was`,
@@ -1107,7 +1135,7 @@ what belongs here is how much of it is measured and how much is reasoning.
   value, a header with one trailing separator naming the same key (and the
   three sharper separators that kill the wineserver instead), indented lines,
   whitespace around the `=`, and the `\x` padding rule that makes an escape
-  decodable. 22 tests in that file, 88 in `bridge.rs`, 25 in `wineserver.rs`.
+  decodable. 22 tests in that file, 94 in `bridge.rs`, 25 in `wineserver.rs`.
 - **The reimplementation is the risk, and it has already bitten seven times.**
   Everything above is agreement with **one build on one machine**. Nothing
   re-checks it when wine changes, and the whole surface exists to answer a
@@ -1129,7 +1157,7 @@ what belongs here is how much of it is measured and how much is reasoning.
   last written back; a wineserver holds changes in memory until the last
   process on the prefix exits. `status` says so whenever it finds a live
   wineserver and says nothing of the sort when it does not, since the file is
-  then the registry (`staleness`, `bridge.rs:2256-2286`). The commands that
+  then the registry (`staleness`, `bridge.rs:2503-2533`). The commands that
   *act* do not get that luxury and fall through to wine in the same case. The
   window between the lock probe and the write is not closed by any of this —
   it exists for the wine read too, and nothing here holds the prefix.
@@ -1153,8 +1181,8 @@ what belongs here is how much of it is measured and how much is reasoning.
   way. The verified route is still FreeTrack, on a real Elite Dangerous Proton
   prefix — see [[Game-Output]].
 - **The flag gate now also refuses a bare positional**, before anything is
-  resolved or written (`reject_unknown_flags`, `bridge.rs:2679-2706`, driven
-  from the one `SUBS` table at `bridge.rs:2720-2742` so a subcommand cannot be
+  resolved or written (`reject_unknown_flags`, `bridge.rs:2969-2998`, driven
+  from the one `SUBS` table at `bridge.rs:3013-3031` so a subcommand cannot be
   checked against one list of flags and run by another). `tobii bridge install
   /games/pfx` used to drop the path and install into `$WINEPREFIX` or
   `~/.wine`, saying so nowhere. This is the fifth hole found in that one gate
@@ -1184,8 +1212,10 @@ what belongs here is how much of it is measured and how much is reasoning.
 - **Half of the release workflow has never run.** `release.yml` built and
   published v0.1.0 to v0.3.0 (four runs; the first, for v0.1.0, failed and was
   fixed). Its `arch` job, the tag's own install-script checks and the
-  pre-release flag came after v0.3.0, and `aur.yml` has never run, so the v0.3.1
-  tag is their first execution. Nothing records whether the updater's
+  pre-release flag came after v0.3.0 and have run on every tag from v0.3.1 on
+  (v0.3.1, v0.4.0, v0.4.1, v0.5.0). `aur.yml` fires only when a draft release is
+  published by hand; whether it has ever run is not recorded here. Nothing
+  records whether the updater's
   download-and-install path has run against a real release. `ci.yml` has run
   (and failed once, usefully, on a clippy lint the maintainer's toolchain was
   too old to see).
@@ -1199,28 +1229,20 @@ what belongs here is how much of it is measured and how much is reasoning.
 
 ## 12. Glossary
 
-| Term | Meaning | |---|---| | **TTP** | The device's framing: a 24-byte header
-(magic, seq, op) inside an 8-byte USB envelope. Note the envelope length field
-is asymmetric — outbound it excludes the envelope, inbound it includes it. | |
-**TLV** | Type-length-value payload encoding. Three variants exist in this
-codebase; see §11.2. | | **Q42** | Fixed-point: a signed 64-bit integer scaled
-by 2⁴². How the device sends reals. | | **XDS row/column** | The tagged table
-structure a gaze frame is built from — 39 columns. | | **Realm** | The device's
-authentication scope. Opening one may require an HMAC-MD5 response to a
-challenge; `realm_type == 0` means no auth. | | **Trackbox** | The volume in
-which the device can see eyes. Eye position within it is normalised `[0,1]` in
-x, y **and z** — z is normalised depth, *not* millimetres. | | **Display area**
-| The three tracker-space corners (TL, TR, BL) defining the screen. The fourth
-is implied. Wiped on every device reboot. | | **Demand** | The reference count
-on the USB session. While it is zero the tracker is off and the device is free
-for another process. | | **Linger** | The 3 s after the last `DemandGuard`
-drops before the session closes. | | **Present bit vs validity** | A present
-bit means the column was sent, **not** that the data is good. A no-eyes frame
-carries eye origins present and set to `[0,0,0]` with validity 4. Gate on both.
-| | **opentrack datagram** | **Six** little-endian `f64` (48 bytes): x, y, z in
-centimetres, then yaw, pitch, roll in degrees. | | **Capture** | A recorded USB
-session (`tobii record`) replayed in tests. A photograph, not a specification.
-|
+| Term | Meaning |
+|---|---|
+| **TTP** | The device's framing: a 24-byte header (magic, seq, op) inside an 8-byte USB envelope. Note the envelope length field is asymmetric — outbound it excludes the envelope, inbound it includes it. |
+| **TLV** | Type-length-value payload encoding. Three variants exist in this codebase; see §11.2. |
+| **Q42** | Fixed-point: a signed 64-bit integer scaled by 2⁴². How the device sends reals. |
+| **XDS row/column** | The tagged table structure a gaze frame is built from — 39 columns. |
+| **Realm** | The device's authentication scope. Opening one may require an HMAC-MD5 response to a challenge; `realm_type == 0` means no auth. |
+| **Trackbox** | The volume in which the device can see eyes. Eye position within it is normalised `[0,1]` in x, y **and z** — z is normalised depth, *not* millimetres. |
+| **Display area** | The three tracker-space corners (TL, TR, BL) defining the screen. The fourth is implied. Wiped on every device reboot. |
+| **Demand** | The reference count on the USB session. While it is zero the tracker is off and the device is free for another process. |
+| **Linger** | The 3 s after the last `DemandGuard` drops before the session closes. |
+| **Present bit vs validity** | A present bit means the column was sent, **not** that the data is good. A no-eyes frame carries eye origins present and set to `[0,0,0]` with validity 4. Gate on both. |
+| **opentrack datagram** | **Six** little-endian `f64` (48 bytes): x, y, z in centimetres, then yaw, pitch, roll in degrees. |
+| **Capture** | A recorded USB session (`tobii record`) replayed in tests. A photograph, not a specification. |
 
 ---
 

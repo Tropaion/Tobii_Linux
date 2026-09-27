@@ -23,6 +23,13 @@ nothing. **[CONFIRMED]** — live probe 2026-07-22/23.
 | `0x50e` | 78577 B | ~33 Hz | **NIR camera image** — the SAME image as `0x501`, not a second view | **[CONFIRMED]** |
 | `0x504` | 69 B (2 cols) | once | state-change **event** — fires exactly once on subscribe, not again; XDS row with a timestamp + one small value. Likely user-presence / tracking-state change | one-shot **[CONFIRMED]**; meaning **[HYPOTHESIS]** |
 | `0x502`, `0x503`, `0x505`–`0x50d`, `0x50f`–`0x520` | — | — | ACK the subscribe but produced no data in a 5 s window | ACK **[CONFIRMED]**; purpose unknown |
+| `0x1770` | 38 B | ~133 Hz | `algodbg` — one u32 column, constant `0`; carries no data | **[CONFIRMED]** live |
+| `0x1771` | 73 B | — | `is5_sync_stream` — two s64 clock stamps, the second consistently earlier; a device↔host clock reference | **[CONFIRMED]** live |
+| `0x1772` | varies | — | `log` — the device's own text log as type-`0x14` strings; `tobii log` prints it | **[CONFIRMED]** live |
+| `0x1774` | — | — | `custom` — never subscribed | **[UNCONFIRMED]** |
+
+The `0x177x` ids sit outside the `0x501..=0x520` sweep and were found only by
+asking the device (op `0x4b0`). See [[Gaze-Stream]] §Sibling streams.
 
 The two ~78 KB streams carry the **same** near-infrared image of the whole face,
 wide-angle (the tracker sits below the monitor and looks up, so the face appears
@@ -51,19 +58,28 @@ image-blob]`; the `0x05` blob is a 4-byte prefix (`00 01 ..`) followed by
 model** (see [[Head-Pose]]). The `0x504` one-shot-on-subscribe behavior marks it
 as an event notification, not a periodic sample. **[CONFIRMED]**.
 
-## Head pose is NOT a known stream
+## Head pose is NOT a stream at all — [CONFIRMED]
 
 None of `0x501..=0x520` delivered anything resembling head orientation, and head
 pose is definitively **not** inside the `0x500` gaze frame either (see
-[[Head-Pose]] for the six-axis evidence). If a dedicated head-pose stream exists
-it is outside the probed range or uses a subscribe variant we have not observed.
-The remaining way to settle it is a USB capture of Tobii's own Windows software
-(see [[Reverse-Engineering-Methodology]]). **[HYPOTHESIS]**
+[[Head-Pose]] for the six-axis evidence). Nor is it anywhere else: the device's
+own stream catalog (op `0x4b0`, `tobii streams`) enumerates nine streams and
+none is a pose stream, and the Tobii MSI decompile showed the vendor computes
+pose **host-side** with an OpenVINO model over the camera images. There is no
+head-pose stream on the wire. **[CONFIRMED]** — see [[Head-Pose]].
 
 ## How to probe for more streams
 
-Two CLI diagnostics (`tobii-cli`):
+CLI diagnostics (`tobii-cli`). **Start with `tobii streams`** — the device
+enumerates its own streams, so you find what exists rather than only what you
+thought to probe for; brute-forcing `0x501..=0x520` is how `0x1770`-`0x1774`
+went unnoticed:
 
+- **`tobii streams`** — sends op `0x4b0` and prints each stream id with the
+  firmware's own name for it. **[CONFIRMED]** — `main.rs::stream_catalog`,
+  `commands.rs::parse_stream_catalog`.
+- **`tobii log [SECS]`** — prints the device's own text log (stream `0x1772`).
+  **[CONFIRMED]** — `main.rs::device_log`.
 - **`tobii probe-streams [START] [END]`** — baselines the gaze-only notify ops,
   subscribes across a range of candidate ids (default `0x501..=0x520`), then
   reports which notify ops **newly appear**. A new op = a stream the device

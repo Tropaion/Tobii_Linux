@@ -151,8 +151,10 @@ The `0x1771` pair is a device↔host clock reference: the two stamps sat
 latency and is the tool to reach for before blaming the display for "lag".
 We do not subscribe it today.
 
-Op `0x04ce` is used as unsubscribe/stream-disable by `njmill/tobii-linux`; we
-have no equivalent and have not exercised it. **[UNCONFIRMED]** here.
+Op `0x04ce` is used as unsubscribe/stream-disable by `njmill/tobii-linux`, and
+`Connection::unsubscribe_stream` sends it here too (`frame.rs::OP_UNSUBSCRIBE`),
+but no stream has been watched actually falling silent after one.
+**[UNCONFIRMED]**.
 
 ## No separate user-position stream
 

@@ -10,7 +10,7 @@ Background in [[Architecture]]; the reasoning behind these shapes is in
 
 ### 6.1 Cold start of the GUI — launch to first live gaze frame
 
-`main.rs` is two lines; everything is in `lib.rs:run`.
+`main.rs` is three lines; everything is in `lib.rs:run`.
 
 1. **`--version` is answered before GTK exists.** Deliberately first, so the
    binary is probe-able on a machine with no display — the updater runs exactly
@@ -42,7 +42,8 @@ immediately for the first activation only**.
 **The device thread** (`device::spawn`) returns immediately and parks in:
 
 ```rust
-while !demand.active() && pending.is_empty() { /* … 120 ms … */ }
+while must_wait(demand.active(), pending.is_empty(), lease_blocks) { /* … 120 ms … */ }
+// (!demand_active && pending_empty) || lease_blocks
 ```
 
 `DeviceState::status` is `Idle`, which the hub renders as **"Tracker off"** —
@@ -161,17 +162,19 @@ the tracker is lit for exactly as long as the command runs, and the `tobii game`
 wrapper has nothing to do here. That wrapper is a socket client and nothing
 else — it exists for the hub's route, where the sink plumbing takes no
 `DemandGuard` of its own and so cannot light the tracker for a game that never
-connects. Since v0.4.1 the hub
-can be told to hold the session anyway, by `wake_for_joystick` or `keep_awake`,
-but those hold it for as long as a setting says so while the wrapper holds it
-for exactly as long as the child process lives (§6.2, and [[Game-Output]]).
+connects. Since v0.4.1 the hub holds the
+session for the virtual joystick **by default** — `wake_for_joystick` ships on,
+so the hold is taken the moment game output is enabled and the uinput device
+really opens, with no setting changed and no wrapper — and on request for
+`keep_awake`. Both hold it for as long as a setting says so, while the wrapper
+holds it for exactly as long as the child process lives (§6.2, and [[Game-Output]]).
 
 1. Resolve `--udp` (default `127.0.0.1:4242`) and `--rate` (default 60 Hz).
 2. Bind an ephemeral local socket; opentrack only ever receives.
 3. Load the ONNX model if installed and apply the saved pitch zero. Without a
    model this prints a 5-DOF notice and continues — pitch reads zero.
 4. **Ask the hub for the tracker** (`lease_the_tracker`,
-   `crates/tobii-cli/src/main.rs:2112`) — deliberately *after* the model load,
+   `crates/tobii-cli/src/main.rs:2115`) — deliberately *after* the model load,
    because a granted lease puts the hub's tracker out and loading weights can
    take seconds. Three answers: the socket will not connect (no hub — the
    ordinary case, open directly); a `LeaseReply { ok: true }` (the hub has
@@ -331,7 +334,7 @@ sequence from §6.1, which is why an unplug/replug is invisible to the user.
    ~/.config/tobii-linux/…                        │  (BINARIES ONLY — the
    ~/.local/share/tobii-linux/installs            │   updater never touches
    ~/.local/state/tobii-linux/tobii.log           │   config or the rule)
-   $XDG_RUNTIME_DIR/tobii-linux/icons             │
+   $XDG_RUNTIME_DIR/tobii-linux/{tracker.sock,icons} │
    ~/.config/autostart/…  (optional)              │
    /etc/udev/rules.d/60-tobii.rules  ─────────────┘
 ```

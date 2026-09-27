@@ -11,8 +11,10 @@
 >
 > The old `[CONFIRMED]` on `0x408` cited our own source file, which is circular and
 > against this project's own rule that `[CONFIRMED]` needs a capture or a hardware
-> round-trip. The replacements are **[HYPOTHESIS]** until a run on this hardware
-> shows a compute over one second and a blob that changes.
+> round-trip. The replacements were confirmed on 2026-08-24: compute took
+> **1.115 s** and the retrieved blob was **324,437 bytes** and changed between
+> runs, against ~230 ms and an unchanging 1,480-byte stub from the old ops.
+> **[CONFIRMED]** — `frame.rs::OP_CAL_ADD_POINT`.
 
 Per-user gaze calibration improves accuracy by sampling where the user looks at
 known on-screen stimulus dots and computing a personal model. Source of truth:
@@ -55,9 +57,11 @@ standalone and the device keeps streaming afterward).
 | `0x438` discard_point | `cal_discard_point_payload(x, y)` | `00 00` + Q42(x) + Q42(y) — no eye arg |
 
 `x`/`y` are normalized display coordinates in `[0,1]`. `eye` is
-**`0 = both, 1 = left, 2 = right`** (NB: this is a *different* enum from the
-`enabled_eye` property — see [[Select-Eyes]]). The `add_point` payload is **two
-bare Q42 fields, not a point2d prolog**. **[CONFIRMED]** —
+**a mask: `1 = left, 2 = right, 3 = both`** (the *same* encoding as the
+`enabled_eye` property — `calibration::CAL_EYE_*`; see [[Select-Eyes]]). There is
+no zero-means-both: eye `0` selects nothing and the device acks the point and
+discards it. The `add_point` payload is **two bare Q42 fields, not a point2d
+prolog**. **[CONFIRMED]** —
 `calibration.rs::add_point_payload_is_exact` (a `(0.25, 0.75, 0)` payload is
 exactly 37 bytes → a 69-byte frame).
 
@@ -103,10 +107,11 @@ a live `gaze_point_2d` reading (already streamed by the device, no personal
 calibration required first) is checked against a proximity zone around the
 current point (`focus::zone_radius`/`closest_focused_point`); `add_point` is
 only sent once gaze has been continuously confirmed in that zone for
-`SETTLE_TICKS` (~330 ms, tolerating brief gaps up to `GAZE_GAP_TOLERANCE_TICKS`
-so a blink doesn't reset progress); if gaze leaves the zone again while waiting
-for the device's ack, `discard_point` (`0x438`) is sent and the same point
-retries from scratch rather than silently keeping a bad sample. `CAL_POINT_TIMEOUT`
+`SETTLE_TICKS` (30 ticks at the 33 ms cadence, ~990 ms — raised from ~330 ms
+after hands-on comparison with the real product; tolerating brief gaps up to
+`GAZE_GAP_TOLERANCE_TICKS` so a blink doesn't reset progress); if gaze leaves
+the zone again while waiting for the device's ack, `discard_point` (`0x438`) is
+sent and the same point retries from scratch rather than silently keeping a bad sample. `CAL_POINT_TIMEOUT`
 = 30 s in `connection.rs` remains a defensive upper bound (rarely reached), not
 evidence of device-side blocking. See `crates/tobii-gtk/src/calibrate_flow.rs`'s
 `Phase::Collecting` and `crates/tobii-gtk/src/focus.rs`.
@@ -181,8 +186,14 @@ add/compute/retrieve is proven. **[CONFIRMED]** — memory,
 
 `retrieve` (`0x44c`) returns an **opaque** blob (verbatim response payload,
 `CalibrationBlob`). Persist it and re-apply with `apply` (`0x456`,
-`00 00` + raw blob). A real captured blob round-trips through `apply` unmodified
-and is ≤ 4096 bytes. **[CONFIRMED]** —
-`calibration.rs::real_device_calibration_blob_is_sane`,
+`00 00` + raw blob). A real blob is on the order of **hundreds of kilobytes**:
+324,437 bytes on the run that confirmed the corrected ops, ~414 KB measured
+elsewhere. **[CONFIRMED]** — `frame.rs::OP_CAL_ADD_POINT`, which records that
+run. `Connection::apply_calibration` refuses anything under `MIN_PLAUSIBLE_BLOB`
+= 4096 bytes as a leftover stub from before the op codes were corrected — so the
+1,480-byte `testdata/real-calibration.blob` that
+`calibration.rs::real_device_calibration_blob_is_sane` round-trips is one of
+those stubs, and its own `<= 4096` assertion is not evidence about a real blob's
+size. The round-trip itself is still checked:
 `connection.rs::apply_calibration_sends_prefixed_blob_and_acks`. CLI:
 `tobii calibrate` (run) / `tobii calibrate --apply` (re-apply saved).

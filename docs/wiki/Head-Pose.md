@@ -14,14 +14,21 @@ inventory of all 39 columns, every data kind), captured across all six head axes
 time. Result: **no head orientation is anywhere in the `0x500` gaze frame.**
 
 - **point3d columns are all eye geometry.** `0x02`/`0x08` eye origins,
-  `0x17`/`0x18` raw origins, and the higher pair `0x22`/`0x24` (~45 mm above,
-  ~15 mm behind the eyes) are all **positions** — they give clean position + yaw
-  + roll but no pitch. `0x04`/`0x0a` are per-eye **gaze directions** (x tracks
-  yaw, y tracks pitch — where you *look*, not head facing). `0x25`/`0x27` stay
-  ~zero.
-- **scalar columns carry no orientation.** Every unmapped u32
-  (`0x15 0x16 0x1b 0x1d 0x1e 0x1f 0x21 0x23 0x26 0x28`) had range 0 across both
-  rotations — constant flags. `0x06`/`0x0c` are pupil diameters, `0x01`
+  `0x17`/`0x18` raw origins, and the pair `0x22`/`0x24` (the same eye origins in
+  display space — `0x02`/`0x08` rotated exactly −20.00° about x and translated,
+  max residual 0.000 mm over 589 samples; an earlier reading put them at
+  "~45 mm above, ~15 mm behind the eyes") are all **positions** — they give
+  clean position + yaw + roll but no pitch. `0x04`/`0x0a` are per-eye **gaze directions** (x tracks
+  yaw, y tracks pitch — where you *look*, not head facing). `0x25`/`0x27` are the
+  normalized display-space trackbox, tracking `0x03`/`0x09` to within ~0.003 —
+  an earlier reading called them "~zero", which was an artefact of a capture in
+  which no eyes were ever detected.
+- **scalar columns carry no orientation.** The unmapped u32 columns
+  (`0x15 0x16 0x1b 0x1d 0x1e 0x1f 0x21 0x23 0x26 0x28`) were later identified,
+  from a 400-frame capture with a user in view, as eye-present, binocular and
+  validity flags (see [[Gaze-Stream]]) — `{0,1}` state, not orientation. An
+  earlier reading here called them constant, which was an artefact of a capture
+  in which no eyes were ever detected. `0x06`/`0x0c` are pupil diameters, `0x01`
   timestamp, `0x14` frame counter.
 - **No Euler angles, no quaternion.** Pitch is **not recoverable** from the point
   geometry: the `0x22`→eye vector tilted *more* on translation than on an actual
@@ -230,7 +237,7 @@ of it is collected in `onnx::Signs` so a fix is a constant, not a rewrite:
 | unknown | how to settle it |
 |---|---|
 | yaw sign, roll sign | `tobii headpose --check` prints the model's yaw and roll beside `pose_from_eyes`'s. Turn your head one axis at a time: they must move **together**. If a pair anti-correlates, flip that sign. |
-| absolute pitch zero | Sit square-on to the screen with `--check` running. Whatever pitch reads is the offset — cancel it with `Signs::pitch_offset_deg`. Two constants are folded in here that cannot be separated from one frame: the training set's own convention, and the ET5's physical camera tilt (its mounting rotation is **−20.00°**, measured by the gaze pipeline). |
+| absolute pitch zero | Run **`tobii headpose --calibrate-pitch [SECS]`** once: it asks you to sit square-on and hold still, averages the model's *raw* pitch, and saves the offset, which every later run loads through `model_store::pitch_offset()` into `Signs::pitch_offset_deg`. Two constants are folded in here that cannot be separated from one frame — the training set's own convention, and the ET5's physical camera tilt (its mounting rotation is **−20.00°**, measured by the gaze pipeline) — which is why one measurement settles them together. Until it is run, `tobii headpose` says "pitch has no zero yet". |
 | `DEFAULT_FOCAL_PX = 355` | The perspective correction is worth 12–16° of pitch, and omitting it makes pitch a function of where the head sits in frame (~28° swing). `focal_from_eye_origins` computes the real value from the glint separation and the metric eye origins — both already on the wire. Cross-check: report pitch with the head high and low in frame; with the right `f` they agree. |
 | whether the 0.15 gate generalises | It was calibrated on one face. Log sigma over 30 s with glasses, one eye occluded, gaze far off-axis, and a reflective object behind the head; check the 0.18–0.42 band is still empty. |
 
@@ -245,7 +252,7 @@ redistribution under GPL-3.0-only, so the model is the user's to obtain:
 | | |
 |---|---|
 | model | `head-pose-0.5-small.onnx`, 12,919,981 bytes |
-| source | `https://raw.githubusercontent.com/opentrack/opentrack/master/tracker-neuralnet/models/head-pose-0.5-small.onnx` |
+| source | `https://raw.githubusercontent.com/opentrack/opentrack/03a0e69b02a11c425e2f07c728686ff7f2d6517a/tracker-neuralnet/models/head-pose-0.5-small.onnx` — pinned to a commit, not `master`: opentrack replaces these files in place, and a different model would need its pose conventions, its pitch zero and its confidence scale re-measured |
 | sha256 | `7c14f84114fb9eca89759d8a36350c6faae2b4187258cae07afb77a93c2d7eec` |
 | installs to | `$XDG_CONFIG_HOME/tobii-linux/models/` (default `~/.config/…`) |
 

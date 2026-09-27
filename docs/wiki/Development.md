@@ -92,12 +92,12 @@ pinned; see [[Architecture-Decisions]] §18.
 | `tobii-headpose` | 112 (+7 ignored) | The ignored ones need the 13 MB model |
 | `tobii-update` | 104 | 96 unit + 8 install end-to-end |
 | `tobii-diagnostics` | 28 | The report and the log; a test fails if it leaks a home path |
-| `tobii-cli` | 219 | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, the Wine-bridge registry against a stateful fake `wine` (and, for the commands that must not run one at all, against a `wine` that wrecks the prefix if it runs), the `user.reg` reader against files real wine wrote, and the wineserver lock's `/proc/locks` parsing |
+| `tobii-cli` | 225 | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, the Wine-bridge registry against a stateful fake `wine` (and, for the commands that must not run one at all, against a `wine` that wrecks the prefix if it runs), the `user.reg` reader against files real wine wrote, and the wineserver lock's `/proc/locks` parsing |
 | `tobii-ipc` | 42 | 33 unit + 9 in `tests/roundtrip.rs` |
 | `tobii-output` | 142 (+1 ignored) | Unit |
 | `tobii-gtk` | 308 (+5 ignored) | Inline; pure logic split out from widget code. The ignored five need a display — four of them whole integration tests (`tests/`), including the one that drives the real hub and the real help window |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
-| **Total** | **1193 (+13 ignored)** | |
+| **Total** | **1199 (+13 ignored)** | |
 
 Counted with `cargo test -p <crate>`, not from memory: this table said "41 unit
 + 6 replay" for `tobii-usb` long after both numbers had moved, which is the
