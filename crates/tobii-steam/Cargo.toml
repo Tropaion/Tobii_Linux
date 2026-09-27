@@ -1,0 +1,12 @@
+[package]
+name = "tobii-steam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reading Steam's own files: libraries, installed applications, and Proton prefixes."
+
+# Deliberately dependency-free, external and internal both. Everything here is
+# reading Valve's files off disk and deciding things about the strings in them,
+# which needs nothing — and keeping it that way is what lets the GTK hub depend
+# on it without dragging the CLI's world along.
+[dependencies]

@@ -1547,6 +1547,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tobii-steam"
+version = "0.5.0"
+
+[[package]]
 name = "tobii-update"
 version = "0.5.0"
 dependencies = [
