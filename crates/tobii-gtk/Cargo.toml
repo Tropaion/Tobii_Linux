@@ -25,5 +25,12 @@ tobii-update = { path = "../tobii-update" }
 tobii-ipc = { path = "../tobii-ipc" }
 # The routing layer: Extended View, the sinks, and the shared compose pipeline.
 tobii-output = { path = "../tobii-output" }
+# What Steam says is installed, and where a game's Proton prefix is. Read-only,
+# zero dependencies of its own.
+tobii-steam = { path = "../tobii-steam" }
+# The readers for a game's OWN configuration files. It never writes, and the
+# game-setup window is a caller that keeps the same promise one layer up: there
+# is no button anywhere in it that changes a game's files.
+tobii-gameconf = { path = "../tobii-gameconf" }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
 gtk4-layer-shell = "0.8"
