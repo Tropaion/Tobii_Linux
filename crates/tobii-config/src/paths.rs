@@ -27,13 +27,14 @@
 //! rule is unchanged where it matters — what `--purge` deletes is decided in
 //! one place per directory, and everything else is reported.
 //!
-//! It asks `tobii-headpose`. It does not yet ask [`crate::profiles`]: the
-//! predicate is here and `tobii uninstall` has not been taught to look in
-//! this directory at all. A `--purge` today walks past it and reports the
-//! directory itself as "not written by this program", which is the one
-//! sentence there that is untrue of it. Nothing is deleted that should not
-//! be — the failure is in the other direction — but it is a gap, not a
-//! policy, and it is the uninstaller's to close.
+//! It asks `tobii-headpose`. Whether it asks [`crate::profiles`] is
+//! `tobii uninstall`'s business; what this module owes it either way is the
+//! predicate, and that is here. If the uninstaller does not look in the
+//! profiles directory, a `--purge` reports the directory itself as "not
+//! written by this program", which is the one sentence there that is untrue
+//! of it: nothing is deleted that should not be — the failure is in the
+//! other direction — but it is a gap, not a policy, and it is the
+//! uninstaller's to close.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -78,12 +79,16 @@ pub const MODELS_DIR: &str = "models";
 /// A subdirectory rather than a name, for the same reason [`MODELS_DIR`] is:
 /// what is in it is one file per thing the user has, so it cannot be a list
 /// here. What that module contributes to the rule at the top of this file
-/// instead is [`crate::profiles::is_profile_file`], a predicate over a name —
-/// `<appid>.toml`, and the temporary an interrupted write leaves. A purge is
-/// to filter the directory through it and report whatever else is in there,
-/// so that an `<appid>.toml~` a text editor left survives exactly as a
-/// `config.toml.bak` beside the config does. See the module docs for what is
-/// wired and what is not.
+/// instead is [`crate::profiles::is_profile_file`], a predicate over a name.
+/// It answers one question — did this program write it? — and two names pass:
+/// `<appid>.toml`, and the `<appid>.toml`[`ATOMIC_TMP_SUFFIX`] an interrupted
+/// write leaves. A purge is to filter the directory through it and report
+/// whatever else is in there, so that an `<appid>.toml~` a text editor left
+/// survives exactly as a `config.toml.bak` beside the config does.
+///
+/// That predicate is the only one: `crate::profiles::list_from` sorts the
+/// directory with it too, so a listing cannot call a file of this program's
+/// somebody else's. See the module docs there.
 pub const PROFILES_DIR: &str = "profiles";
 
 /// Every file this program writes directly into [`config_dir`].

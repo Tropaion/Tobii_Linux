@@ -18,6 +18,33 @@
 //! that it never writes. A
 //! profile cannot ask for something the reader it names is unable to do.
 //!
+//! # A check names something inside the Proton prefix, and only that
+//!
+//! [`Check::path`] is relative to the prefix — the directory holding
+//! `drive_c` — and [`parse`] refuses a leading `/`, a `..` component and a
+//! backslash. That is a containment property and not a formatting
+//! preference: a profile is a file one person may hand another, and a path
+//! that could climb out of the prefix would let a stranger point this
+//! program's readers at anything on the machine.
+//!
+//! It is also a real limit, and a profile author meets it as a refusal, so
+//! it is worth naming here what cannot be expressed. **A game's shipped
+//! files are not under the prefix.** They are under the Steam library, in
+//! `steamapps/common/<game>/`, and no check can name one of them. Elite
+//! Dangerous keeps its thirty stock control schemes there, in
+//! `Products/elite-dangerous-odyssey-64/ControlSchemes/`, and a profile
+//! cannot ask what one of them says. What a check can reach is what the game
+//! wrote for this user *inside its own prefix*, wherever that turns out to
+//! be — and for Elite specifically, where that is has not been established
+//! here: see `tobii_gameconf::binds`, which says plainly that the one
+//! install on this machine has written no such directory yet.
+//!
+//! Nothing treats that as temporary. A check that has to read a shipped file
+//! needs a second root — the library path for that app id — and a second
+//! root is a grammar change, which means a [`VERSION`] bump and old builds
+//! declining the file by name. Until a game needs it, one root that cannot
+//! be escaped is the safer thing to have.
+//!
 //! # This ships zero profiles, and that is the intended state
 //!
 //! `BUILTIN` is empty. Nobody has yet played a game with this program's
@@ -28,6 +55,11 @@
 //! the wizard detects games, detects prefixes, sets this program's settings
 //! and installs the bridge, and checks a game's own options only where a
 //! profile says what to check.
+//!
+//! More than one screen in this program says that sentence to a user. Each
+//! of them asks [`ships_profiles`] rather than carrying a `false` somebody
+//! typed: the day the first profile lands, a hardcoded sentence becomes
+//! untrue and nothing fails.
 //!
 //! # The app id is the file name, and it is not in the file
 //!
@@ -76,6 +108,47 @@
 //! `Profile::is_empty` is there for the caller that wants to say *this
 //! profile asks for nothing*.
 //!
+//! # Writing a profile back does not lose what somebody wrote in it
+//!
+//! A profile is hand-edited, and the useful half of a hand-edited file is
+//! often the half a parser throws away. *Measured 2026-10-01, verified on
+//! Odyssey 4.0* is a comment or it is nowhere — there is no field for it,
+//! and a field would be the wrong shape for it if there were.
+//!
+//! So [`save_to`] does not write [`Profile::to_toml`] over a file that is
+//! already there. It reads that file first and writes
+//! [`Profile::to_toml_over`], which puts every `#` line back beside the
+//! thing it was beside — above the key, table or check it sat above, or at
+//! the end of the same line. Nothing here reorders a profile, so a comment's
+//! place is a position and stays one.
+//!
+//! A comment whose anchor is *gone* — above a check the new profile does not
+//! have, beside a setting that has been removed — stops the write, as
+//! [`CommentLoss`], and nothing is written at all. There is no honest place
+//! for such a comment: dropping it is the thing this exists to stop, and
+//! putting it anywhere else attaches somebody's sentence to a fact they did
+//! not write it about. The caller is told which line and what it sat beside,
+//! and the person decides.
+//!
+//! Blank lines are the one thing that is not kept. A comment comes back
+//! attached to its anchor, not to the spacing around it.
+//!
+//! # What is in the profiles directory, in one answer
+//!
+//! [`is_profile_file`] is the only predicate over a name in
+//! [`profiles_dir`], and it answers one question: **did this program write
+//! it?** Two names pass — `<appid>.toml`, a profile, and `<appid>.toml.tmp`,
+//! what an interrupted [`crate::write_atomic`] leaves beside one. `tobii
+//! uninstall --purge` deletes exactly what it accepts, which is why the
+//! temporary has to be in it: a leftover of this program's own write is this
+//! program's to clean up, not somebody's file to report and leave.
+//!
+//! [`list_from`] asks that same predicate, so the two cannot disagree about
+//! one name. A temporary is not a profile and is not a stray either; it is
+//! [`Listing::leftovers`]. Filing it under strays told a user that a file
+//! this program wrote was *not written by this program* — the same untruth
+//! `--purge` exists to avoid, one level down.
+//!
 //! # Why the parser is here and hand-written
 //!
 //! These files are hand-edited, so a refusal has to say which line and what it
@@ -111,6 +184,17 @@ pub const FILE_SUFFIX: &str = ".toml";
 /// anybody's file; [`load_from`] takes the first and does not pretend to
 /// choose.
 pub const BUILTIN: &[(&str, &str)] = &[];
+
+/// Whether this build has a profile for any game compiled in.
+///
+/// The one place that answers it. Several screens tell a user that this
+/// build ships none; each of them asks here rather than carrying the answer
+/// as a `false` in its own sentence, because the day [`BUILTIN`] grows an
+/// entry every one of those sentences is wrong at once and a hardcoded one
+/// would go on being printed.
+pub const fn ships_profiles() -> bool {
+    !BUILTIN.is_empty()
+}
 
 // ------------------------------------------------------------------- the type
 
@@ -184,6 +268,11 @@ pub struct Check {
     /// backslash is refused too — it would be a literal character in a Linux
     /// path, so a Windows-style path would not fail, it would silently name
     /// nothing.
+    ///
+    /// The prefix is the **only** root a check has, which puts a game's
+    /// shipped files out of reach: those are under the Steam library, in
+    /// `steamapps/common/<game>/`, and nothing a profile can write names
+    /// them. See the module docs for what that costs and why it stays.
     pub path: String,
     /// What to ask for inside it: an element name for [`Format::BindsDir`]
     /// (`HeadlookMode` names `<HeadlookMode Value="…"/>`), an attribute name
@@ -289,12 +378,15 @@ impl Profile {
         out
     }
 
-    /// This profile as a profile file.
+    /// This profile as a profile file, with no comments in it.
     ///
     /// Round-trips: [`parse`] of this text gives back an equal `Profile`, for
     /// every string any field can hold — see `a_profile_survives_a_round_trip`
-    /// in the tests below. That is the property the GUI needs, since it will
-    /// read a file a user wrote, change one field and write it back.
+    /// in the tests below.
+    ///
+    /// This is what to write where there is no file yet. Over a file somebody
+    /// already has, use [`Self::to_toml_over`]: this one carries no comments,
+    /// so writing it over a file that has some destroys them.
     ///
     /// Every value goes out quoted, including a setting that reads as a number
     /// or a boolean. A hand-written `enabled = true` is accepted — see
@@ -303,31 +395,134 @@ impl Profile {
     /// sometimes did not would have to decide which, on a value it is not
     /// entitled to have an opinion about.
     pub fn to_toml(&self) -> String {
-        let mut s = String::from("# tobii-linux game profile\n");
-        s.push_str(&format!("version = {VERSION}\n"));
+        self.render(&Comments::default())
+            .expect("nothing was read, so there is no comment that could fail to be placed")
+    }
+
+    /// This profile as a profile file, keeping the comments of `existing` —
+    /// the text of the file it is about to replace.
+    ///
+    /// Every `#` line of `existing` comes out again beside the thing it was
+    /// beside: above the key, table or `[[check]]` it sat above, or at the end
+    /// of that same line. Nothing here reorders a profile, so a comment's
+    /// place is a position and stays one — a check keeps its place in the file
+    /// because it keeps its index in [`Self::checks`].
+    ///
+    /// Blank lines are not kept: a comment comes back attached to its anchor,
+    /// not to the spacing around it.
+    ///
+    /// [`Err`] when a comment has nowhere to go — see [`CommentLoss`]. The
+    /// caller is then holding a file it must not write, which is the point:
+    /// the alternatives are losing somebody's sentence or moving it onto
+    /// something they did not write it about.
+    pub fn to_toml_over(&self, existing: &str) -> Result<String, CommentLoss> {
+        if parse(existing).is_err() {
+            // Nothing in a file this build cannot read can be located, so no
+            // comment in it can be put back. Refuse if there is one to lose.
+            for (i, raw) in existing.lines().enumerate() {
+                if let (_, Some(c)) = split_comment(raw) {
+                    return Err(CommentLoss::Unplaceable {
+                        line: i + 1,
+                        comment: c.trim_end().to_string(),
+                    });
+                }
+            }
+            return Ok(self.to_toml());
+        }
+        self.render(&comments_of(existing))
+    }
+
+    /// Every line this profile is, each with the thing a comment could be
+    /// attached to. The order is the file's order, and is the whole reason a
+    /// comment's position is stable.
+    fn lines(&self) -> Vec<(Anchor, String)> {
+        let mut v = vec![(
+            Anchor::Top("version".into()),
+            format!("version = {VERSION}"),
+        )];
         if let Some(n) = &self.name {
-            s.push_str(&format!("name = {}\n", quote(n)));
+            v.push((Anchor::Top("name".into()), format!("name = {}", quote(n))));
         }
         match self.bridge {
             Bridge::Unstated => {}
-            Bridge::Required => s.push_str("bridge = true\n"),
-            Bridge::NotNeeded => s.push_str("bridge = false\n"),
+            Bridge::Required => v.push((Anchor::Top("bridge".into()), "bridge = true".into())),
+            Bridge::NotNeeded => v.push((Anchor::Top("bridge".into()), "bridge = false".into())),
         }
         if !self.settings.is_empty() {
-            s.push_str("\n[settings]\n");
-            for (k, v) in &self.settings {
-                s.push_str(&format!("{k} = {}\n", quote(v)));
+            v.push((Anchor::Settings, "[settings]".into()));
+            for (k, val) in &self.settings {
+                v.push((Anchor::Setting(k.clone()), format!("{k} = {}", quote(val))));
             }
         }
-        for c in &self.checks {
-            s.push_str("\n[[check]]\n");
-            s.push_str(&format!("format = {}\n", quote(c.format.as_str())));
-            s.push_str(&format!("path = {}\n", quote(&c.path)));
-            s.push_str(&format!("setting = {}\n", quote(&c.setting)));
-            s.push_str(&format!("wants = {}\n", quote(&c.wants)));
-            s.push_str(&format!("tell = {}\n", quote(&c.tell)));
+        for (i, c) in self.checks.iter().enumerate() {
+            v.push((Anchor::Check(i), "[[check]]".into()));
+            for (k, val) in [
+                ("format", c.format.as_str()),
+                ("path", c.path.as_str()),
+                ("setting", c.setting.as_str()),
+                ("wants", c.wants.as_str()),
+                ("tell", c.tell.as_str()),
+            ] {
+                v.push((
+                    Anchor::CheckKey(i, k.into()),
+                    format!("{k} = {}", quote(val)),
+                ));
+            }
         }
-        s
+        v
+    }
+
+    /// This profile written out with `kept` put back where it came from.
+    fn render(&self, kept: &Comments) -> Result<String, CommentLoss> {
+        let mut used = vec![false; kept.at.len()];
+        let mut s = String::from(HEADER);
+        s.push('\n');
+        for (anchor, line) in self.lines() {
+            // The blank line goes before the comment block, so a note written
+            // above a `[[check]]` comes back above it and not above the gap.
+            if matches!(anchor, Anchor::Settings | Anchor::Check(_)) {
+                s.push('\n');
+            }
+            let mut trailing = None;
+            if let Some(i) = kept.at.iter().position(|a| a.anchor == anchor) {
+                used[i] = true;
+                for (_, c) in &kept.at[i].leading {
+                    // The header is written above, so a file this program
+                    // wrote does not grow a second one on every save.
+                    if c != HEADER {
+                        s.push_str(c);
+                        s.push('\n');
+                    }
+                }
+                trailing = kept.at[i].trailing.as_deref();
+            }
+            s.push_str(&line);
+            if let Some(t) = trailing {
+                s.push(' ');
+                s.push_str(t);
+            }
+            s.push('\n');
+        }
+        // In file order, so the line named is the first one that would go.
+        for (i, a) in kept.at.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            let (line, comment) = match a.leading.first() {
+                Some((l, c)) => (*l, c.clone()),
+                None => (a.line, a.trailing.clone().unwrap_or_default()),
+            };
+            return Err(CommentLoss::Orphaned {
+                line,
+                comment,
+                about: a.anchor.describe(),
+            });
+        }
+        for (_, c) in &kept.end {
+            s.push_str(c);
+            s.push('\n');
+        }
+        Ok(s)
     }
 }
 
@@ -564,13 +759,26 @@ pub struct Listing {
     /// What was in the directory and is not a usable profile, in the order the
     /// directory was read.
     pub problems: Vec<LoadError>,
-    /// Names in the directory that are not profile files at all, sorted.
+    /// Names in the directory that this program did not write and that are
+    /// not profiles, sorted.
     ///
     /// Separate from [`Self::problems`]: an editor's `<appid>.toml~` is not a
     /// broken profile, it is somebody's backup, and `--purge` will say the
     /// same thing about it. A caller may reasonably print these more quietly,
     /// or not at all.
+    ///
+    /// Judged by [`is_profile_file`], the same predicate `--purge` deletes
+    /// by, so nothing this program writes can land here. What this program
+    /// wrote and is not a profile goes in [`Self::leftovers`].
     pub strays: Vec<String>,
+    /// `<appid>.toml.tmp`: what an interrupted [`crate::write_atomic`] left
+    /// behind, sorted.
+    ///
+    /// Not a profile, and not somebody else's file either — this program
+    /// wrote it, `--purge` deletes it, and a report that called it a stray
+    /// would be telling a user the opposite. Usually empty; a name here means
+    /// a save was cut short.
+    pub leftovers: Vec<String>,
 }
 
 /// List every profile under `dir`, with `builtin` behind it.
@@ -612,7 +820,14 @@ pub fn list_from(dir: &Path, builtin: &[(&str, &str)]) -> Listing {
     names.sort();
     for name in names {
         let Some(appid) = name.strip_suffix(FILE_SUFFIX).filter(|s| is_appid(s)) else {
-            out.strays.push(name);
+            // One predicate decides who wrote a name here, and it is the one
+            // `--purge` deletes by. A `.tmp` of ours is not a profile, but
+            // calling it a stray would say this program did not write it.
+            if is_profile_file(&name) {
+                out.leftovers.push(name);
+            } else {
+                out.strays.push(name);
+            }
             continue;
         };
         match load_from(dir, &[], appid) {
@@ -638,6 +853,7 @@ fn sorted(mut l: Listing) -> Listing {
     l.profiles
         .sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
     l.strays.sort();
+    l.leftovers.sort();
     l
 }
 
@@ -646,6 +862,197 @@ pub fn list() -> Listing {
     list_from(&profiles_dir(), BUILTIN)
 }
 
+// ------------------------------------------------------------------ comments
+
+/// The line every profile this program writes starts with.
+const HEADER: &str = "# tobii-linux game profile";
+
+/// What a comment in a profile file sits beside.
+///
+/// A position, not an identity: these files are written in one fixed order
+/// and nothing reorders them, so a check's index is its place in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Anchor {
+    /// A key before any table: `version`, `name`, `bridge`.
+    Top(String),
+    /// The `[settings]` header.
+    Settings,
+    /// A key under `[settings]`.
+    Setting(String),
+    /// The n-th `[[check]]` header, counting from zero.
+    Check(usize),
+    /// A key of the n-th `[[check]]`.
+    CheckKey(usize, String),
+}
+
+impl Anchor {
+    /// What to call this in the sentence a person reads when their comment
+    /// has nowhere to go.
+    fn describe(&self) -> String {
+        match self {
+            Anchor::Top(k) => format!("`{k}`"),
+            Anchor::Settings => "`[settings]`".to_string(),
+            Anchor::Setting(k) => format!("the setting `{k}`"),
+            Anchor::Check(i) => format!("the check in position {}", i + 1),
+            Anchor::CheckKey(i, k) => format!("`{k}` of the check in position {}", i + 1),
+        }
+    }
+}
+
+/// One thing in a file that has a comment attached to it.
+///
+/// Only things that do: a profile is mostly lines nobody wrote a note about,
+/// and carrying those would make "which comments went nowhere" a search
+/// rather than a look.
+#[derive(Debug)]
+struct Attached {
+    anchor: Anchor,
+    /// The 1-based line the anchor's own text is on.
+    line: usize,
+    /// Whole-line comments immediately above it, with their lines.
+    leading: Vec<(usize, String)>,
+    /// The comment at the end of the anchor's own line.
+    trailing: Option<String>,
+}
+
+/// Every comment in one profile file, by what it sits beside.
+#[derive(Debug, Default)]
+struct Comments {
+    /// In file order, which is why the first orphan reported is the first one
+    /// in the file.
+    at: Vec<Attached>,
+    /// Comments after the last line that anchors anything. These can never be
+    /// orphaned: every profile has an end.
+    end: Vec<(usize, String)>,
+}
+
+/// One line split into what it says and the comment on the end of it.
+///
+/// The `#` has to be found outside the strings — `tell = "press # twice"` is
+/// one value and no comment. The parser settles that a value at a time, in
+/// [`unquote`], which reports where a string ended; this asks it of a whole
+/// line at once, for a line whose value it does not otherwise need.
+///
+/// Byte-wise is safe: every byte compared against is ASCII, and no byte of a
+/// multi-byte character can equal one, so a `#` this stops on is always a
+/// character boundary.
+fn split_comment(raw: &str) -> (&str, Option<&str>) {
+    let b = raw.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                in_string = !in_string;
+                i += 1;
+            }
+            b'\\' if in_string => i += 2,
+            b'#' if !in_string => return (&raw[..i], Some(&raw[i..])),
+            _ => i += 1,
+        }
+    }
+    (raw, None)
+}
+
+/// Every comment in `text`, attached to what it is about.
+///
+/// `text` must be something [`parse`] accepted: this walks the same shapes
+/// and takes each line to be a table header or a `key = value`, which is what
+/// having parsed guarantees.
+fn comments_of(text: &str) -> Comments {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut out = Comments::default();
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    let mut table = Table::Top;
+    let mut checks = 0usize;
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let (content, comment) = split_comment(raw);
+        let comment = comment.map(|c| c.trim_end().to_string());
+        let t = content.trim();
+        if t.is_empty() {
+            if let Some(c) = comment {
+                pending.push((line, c));
+            }
+            continue;
+        }
+        let anchor = if t.starts_with("[[") {
+            table = Table::Check;
+            checks += 1;
+            Anchor::Check(checks - 1)
+        } else if t.starts_with('[') {
+            table = Table::Settings;
+            Anchor::Settings
+        } else {
+            let key = t.split_once('=').map_or(t, |(k, _)| k.trim()).to_string();
+            match table {
+                Table::Top => Anchor::Top(key),
+                Table::Settings => Anchor::Setting(key),
+                // `checks` is at least one: a parsed file cannot be inside a
+                // `[[check]]` without having had its header.
+                Table::Check => Anchor::CheckKey(checks.saturating_sub(1), key),
+            }
+        };
+        let leading = std::mem::take(&mut pending);
+        if !leading.is_empty() || comment.is_some() {
+            out.at.push(Attached {
+                anchor,
+                line,
+                leading,
+                trailing: comment,
+            });
+        }
+    }
+    out.end = pending;
+    out
+}
+
+/// A comment in the file being replaced that the new profile has no place
+/// for, and so a write that did not happen.
+///
+/// Two ways that comes about, and they need different sentences: the file
+/// cannot be read at all, or it can and the thing the comment is about is
+/// being removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentLoss {
+    /// The file being replaced is not one this build can read, so nothing in
+    /// it can be located and nothing in it can be put back.
+    Unplaceable { line: usize, comment: String },
+    /// The comment sits beside something the profile being written does not
+    /// have.
+    Orphaned {
+        line: usize,
+        comment: String,
+        /// What it sat beside, as [`Anchor::describe`] spells it.
+        about: String,
+    },
+}
+
+impl fmt::Display for CommentLoss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CommentLoss::Unplaceable { line, comment } => write!(
+                f,
+                "line {line} is a comment — {comment} — in a file this build cannot read as a \
+                 profile, so there is nowhere to put it back. Nothing was written: fix the file, \
+                 or move it aside."
+            ),
+            CommentLoss::Orphaned {
+                line,
+                comment,
+                about,
+            } => write!(
+                f,
+                "line {line} — {comment} — is a comment about {about}, which the profile being \
+                 written does not have. Nothing was written: take the comment out, or keep what \
+                 it is about."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CommentLoss {}
+
 // ------------------------------------------------------------------- writing
 
 /// Write a profile into `dir`, creating it if need be.
@@ -653,6 +1060,13 @@ pub fn list() -> Listing {
 /// Atomic, like every other file this program writes: a half-written profile
 /// would be refused on the next read, and the user would be told their own
 /// file is malformed by a program that malformed it.
+///
+/// Over a file that is already there this is a read-modify-write, so that the
+/// comments in it survive — see [`Profile::to_toml_over`]. A comment that
+/// cannot be put back stops the write whole, as an
+/// [`io::ErrorKind::InvalidInput`] carrying [`CommentLoss`]'s sentence; so
+/// does a file that is there and cannot be read, rather than that file being
+/// overwritten by a program that could not say what was in it.
 pub fn save_to(dir: &Path, appid: &str, profile: &Profile) -> io::Result<()> {
     if !is_appid(appid) {
         // Before the path is built, not after: `path_in` would happily make a
@@ -662,7 +1076,22 @@ pub fn save_to(dir: &Path, appid: &str, profile: &Profile) -> io::Result<()> {
             format!("{appid:?} is not a Steam app id"),
         ));
     }
-    crate::write_atomic(&path_in(dir, appid), profile.to_toml().as_bytes())
+    let path = path_in(dir, appid);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => Some(t),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let body = match &text {
+        Some(t) => profile.to_toml_over(t).map_err(|loss| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{}: {loss}", path.display()),
+            )
+        })?,
+        None => profile.to_toml(),
+    };
+    crate::write_atomic(&path, body.as_bytes())
 }
 
 /// Write a profile into this user's config.
@@ -1099,7 +1528,9 @@ fn check_path(p: &str, line: usize) -> Result<(), ParseError> {
     if p.starts_with('/') {
         return Err(ParseError::at(
             line,
-            "`path` is relative to the Proton prefix, so it does not start with `/`",
+            "`path` is relative to the Proton prefix, so it does not start with `/`. The prefix \
+             is the only place a check can reach: a file the game ships, under \
+             `steamapps/common/`, cannot be checked by this build.",
         ));
     }
     if p.contains('\\') {
@@ -1112,7 +1543,9 @@ fn check_path(p: &str, line: usize) -> Result<(), ParseError> {
     if p.split('/').any(|part| part == "..") {
         return Err(ParseError::at(
             line,
-            "`path` may not have a `..` component: it is joined onto a prefix and then opened",
+            "`path` may not have a `..` component: it is joined onto a prefix and then opened. \
+             A check can only ever name something inside the prefix; a file the game ships, \
+             under `steamapps/common/`, cannot be checked by this build.",
         ));
     }
     Ok(())
@@ -1628,6 +2061,10 @@ mod tests {
     #[test]
     fn nothing_is_shipped_and_a_bad_builtin_is_still_reported() {
         assert!(BUILTIN.is_empty(), "this build ships no game profiles");
+        assert!(
+            !ships_profiles(),
+            "the answer every sentence about this asks for"
+        );
 
         let dir = scratch("builtin");
         let bad: &[(&str, &str)] = &[(FAKE, "version = 1\nnot_a_key = 1\n")];
@@ -1647,6 +2084,33 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A `<appid>.toml.tmp` is what an interrupted write of ours leaves. It
+    /// is not a profile and it is not somebody else's file, and the two
+    /// places that decide have to agree: `--purge` deletes by the predicate,
+    /// so a listing that called it a stray would be printing "not written by
+    /// this program" about a file this program wrote.
+    #[test]
+    fn an_interrupted_write_of_ours_is_not_somebody_elses_file() {
+        let dir = scratch("leftover");
+        std::fs::write(path_in(&dir, FAKE), "version = 1\n").expect("write");
+        let tmp = format!("{FAKE}{FILE_SUFFIX}{}", paths::ATOMIC_TMP_SUFFIX);
+        std::fs::write(dir.join(&tmp), "version = 1\n").expect("write");
+        std::fs::write(dir.join("notes.txt"), "hello").expect("write");
+        std::fs::write(dir.join(format!("{FAKE}{FILE_SUFFIX}~")), "backup").expect("write");
+
+        assert!(is_profile_file(&tmp), "the predicate `--purge` deletes by");
+        let l = list_from(&dir, &[]);
+        assert_eq!(l.leftovers, vec![tmp], "written by this program");
+        assert_eq!(
+            l.strays,
+            vec![format!("{FAKE}{FILE_SUFFIX}~"), "notes.txt".to_string()],
+            "and nothing this program wrote is among what it did not write"
+        );
+        assert_eq!(l.profiles.len(), 1);
+        assert!(l.problems.is_empty(), "{:?}", l.problems);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // --------------------------------------------------------------- writing
 
     #[test]
@@ -1656,6 +2120,141 @@ mod tests {
         let got = load_from(&dir, &[], FAKE).expect("ok").expect("found");
         assert_eq!(got.profile, full());
         assert_eq!(got.origin, Origin::File(path_in(&dir, FAKE)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole reason to preserve comments: the only place a fact somebody
+    /// measured can live in a profile is a `#` line, and a save has to be
+    /// survivable or nobody will write one down.
+    ///
+    /// Written as the whole file, not as a search for fragments: where each
+    /// comment lands is the property, and a `contains` would pass with every
+    /// one of them dumped at the bottom.
+    #[test]
+    fn a_save_keeps_the_comments_it_found() {
+        let dir = scratch("save-comments");
+        let before = "\
+# tobii-linux game profile
+# measured 2026-10-01, verified on Odyssey 4.0
+version = 1
+name = \"A Game\" # the launcher calls it this
+bridge = true
+
+[settings]
+# gaze steering was too strong at 1.0
+enabled = \"true\"
+
+[[check]]
+# the preset directory, not a file in it
+format = \"binds-dir\"
+path = \"drive_c/x\"
+setting = \"HeadlookMode\"
+wants = \"1\"
+tell = \"Set head look to toggle.\"
+# nothing below this anchors it
+";
+        let after = "\
+# tobii-linux game profile
+# measured 2026-10-01, verified on Odyssey 4.0
+version = 1
+name = \"A Game\" # the launcher calls it this
+bridge = true
+
+[settings]
+# gaze steering was too strong at 1.0
+enabled = \"true\"
+rate_hz = \"60\"
+
+[[check]]
+# the preset directory, not a file in it
+format = \"binds-dir\"
+path = \"drive_c/x\"
+setting = \"HeadlookMode\"
+wants = \"1\"
+tell = \"Set head look to toggle.\"
+# nothing below this anchors it
+";
+        std::fs::write(path_in(&dir, FAKE), before).expect("write");
+        let mut p = parse(before).expect("parses");
+        p.settings.push(("rate_hz".into(), "60".into()));
+
+        save_to(&dir, FAKE, &p).expect("save");
+        let back = std::fs::read_to_string(path_in(&dir, FAKE)).expect("read");
+        assert_eq!(back, after);
+
+        // And a save that changes nothing changes nothing — the header a
+        // profile of ours starts with is not a comment to preserve on top of
+        // the one being written.
+        save_to(&dir, FAKE, &p).expect("save again");
+        assert_eq!(
+            std::fs::read_to_string(path_in(&dir, FAKE)).expect("read"),
+            after
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the promise. A comment about a check that is being
+    /// removed has no honest place, so the file is left alone and the person
+    /// is told which line and what it was about.
+    #[test]
+    fn a_comment_about_what_is_going_stops_the_save() {
+        let dir = scratch("save-orphan");
+        let before = "version = 1\n\n[[check]]\n# measured on Odyssey 4.0\n                      format = \"binds-dir\"\npath = \"a\"\nsetting = \"X\"\n                      wants = \"1\"\ntell = \"t\"\n";
+        std::fs::write(path_in(&dir, FAKE), before).expect("write");
+        let mut p = parse(before).expect("parses");
+        p.checks.clear();
+
+        let e = save_to(&dir, FAKE, &p).expect_err("refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let shown = e.to_string();
+        assert!(shown.contains("# measured on Odyssey 4.0"), "{shown}");
+        assert!(shown.contains("line 4"), "{shown}");
+        assert!(shown.contains("check in position 1"), "{shown}");
+        assert_eq!(
+            std::fs::read_to_string(path_in(&dir, FAKE)).expect("read"),
+            before,
+            "nothing was written"
+        );
+
+        // Keep the check and the same save goes through.
+        let p = parse(before).expect("parses");
+        save_to(&dir, FAKE, &p).expect("save");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `#` inside a value is part of the value, not a comment to move.
+    #[test]
+    fn a_hash_in_a_value_is_not_a_comment_a_save_relocates() {
+        let p = Profile {
+            name: Some("# not a comment".into()),
+            settings: vec![("tell".into(), "press # twice".into())],
+            ..Profile::default()
+        };
+        let text = p.to_toml();
+        assert_eq!(
+            p.to_toml_over(&text).expect("nothing to place"),
+            text,
+            "a file of ours written over itself is itself"
+        );
+        assert_eq!(parse(&text), Ok(p));
+    }
+
+    /// A file this build cannot read is not overwritten by a build that
+    /// cannot say what was in it — the same rule `load_from` follows for
+    /// reading, on the writing side.
+    #[test]
+    fn a_file_that_cannot_be_read_is_not_written_over() {
+        let dir = scratch("save-unreadable");
+        let before = "# somebody wrote this\nversion = 9\n";
+        std::fs::write(path_in(&dir, FAKE), before).expect("write");
+        let e = save_to(&dir, FAKE, &full()).expect_err("refused");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("# somebody wrote this"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(path_in(&dir, FAKE)).expect("read"),
+            before,
+            "nothing was written"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
