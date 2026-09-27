@@ -63,7 +63,10 @@ fn bindings(dir: &Path, setting: &str) {
             for active in &b.presets {
                 println!("preset {}", active.name);
                 match &active.found {
-                    binds::Found::Unmatched(why) => println!("  no file: {why}"),
+                    binds::Found::Absent(why) => println!("  no file: {why}"),
+                    binds::Found::Rejected(why) => {
+                        println!("  could not be placed: {why}")
+                    }
                     binds::Found::Read { file, preset } => {
                         println!("  file: {}", file.display());
                         say("version", &preset.version);
