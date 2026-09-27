@@ -38,7 +38,11 @@ use crate::outputs::{recentre_decision, Recentring};
 /// question — how far should the view swing when I look at the edge — is one a
 /// person answers by trying it, not by choosing a number. The two axes differ
 /// because a screen subtends far more horizontal angle than vertical.
-const STRENGTHS: [(&str, f64, f64); 3] = [
+///
+/// `pub(crate)` because [`crate::game_setup`] names the selected strength in a
+/// sentence of its own and must read it from here: one table with two readers,
+/// never two tables.
+pub(crate) const STRENGTHS: [(&str, f64, f64); 3] = [
     ("Subtle", 25.0, 15.0),
     ("Normal", 45.0, 25.0),
     ("Strong", 70.0, 40.0),
@@ -286,6 +290,17 @@ pub(crate) const JOYSTICK_TOOLTIP: &str =
      head-tracking support. Works in native and Proton games without Wine \
      or opentrack.";
 
+/// What the game-setup window is for.
+///
+/// `pub(crate)` because the help window quotes it rather than copying it:
+/// a tooltip is invisible to a keyboard and to a touch user, so the same
+/// sentence has to be somewhere they can read it, and two copies of it are
+/// two sentences that will one day disagree. See [`crate::help`].
+pub(crate) const GAME_SETUP_TOOLTIP: &str =
+    "Pick an installed Steam game and see the three things it needs set up: these \
+     settings, the Wine bridge inside that game's Proton prefix, and the game's own \
+     options. It reads a game's own files and never changes them.";
+
 /// The tooltip for the row around the Recentre button: what recentring is,
 /// plus — while the button is refusing to be pressed — the reason it is.
 ///
@@ -348,12 +363,13 @@ fn check_row(text: &str) -> (CheckButton, gtk::Box) {
 /// Read the settings, change them, write them back.
 ///
 /// Every write re-reads the file first. Three controls edit the same config —
-/// and `tobii games` in a terminal edits it too — so holding a copy in each
-/// would make whichever was touched second overwrite the other's change.
+/// and `tobii games` in a terminal edits it too, and now so does
+/// [`crate::game_setup`] — so holding a copy in each would make whichever was
+/// touched second overwrite the other's change.
 ///
 /// `what` names the setting in the warning, so a failed write says which
 /// control the user just touched did not take.
-fn edit_config(what: &str, change: impl FnOnce(&mut OutputConfig)) {
+pub(crate) fn edit_config(what: &str, change: impl FnOnce(&mut OutputConfig)) {
     let mut cfg = load_output_config();
     change(&mut cfg);
     if let Err(e) = save_output_config(&cfg) {
@@ -541,6 +557,50 @@ impl GamesRow {
             });
         }
 
+        // The door to the game-setup window.
+        //
+        // Its own row, and that is a measurement rather than taste. `second`
+        // is already a checkbox, its label and a button, so a third child
+        // there takes this card past `crate::COLUMN_WIDTH` — and that is not a
+        // local cost, because the widest column sets `three_col_min`
+        // (`lib.rs`), and `three_col_min` sets the hub's opening width for
+        // every user, including the ones who never press this.
+        //
+        // Measured on this hub on 2026-09-27, GTK 4.22 at text scale 1.0, in a
+        // nested `kwin_wayland --virtual`, with `hub.measure(Orientation::
+        // Horizontal, -1)`: **1241px as this stands, 1373px with the button
+        // appended to `second` instead** — and the opening width follows it,
+        // because `default_width` is derived from the same measure. On a row
+        // of its own it costs **0px** of width; what it costs is height, in
+        // the one column that is already the tallest, in a window that
+        // scrolls.
+        //
+        // Re-take it by printing `hub.measure(Orientation::Horizontal, -1)`
+        // and `hub.default_width()` from a timeout inside
+        // `tests/game_setup_window.rs`, once as this stands and once with
+        // `second.append(&setup_game)` in place of the row below. The absolute
+        // numbers are this machine's font metrics and are not worth pinning in
+        // a test; the 132px difference between the two placements is the fact.
+        //
+        // No accent, and not `.quiet` either. `crate::CSS`'s own rule is that
+        // the base button is quiet because the hub is co-equal settings and the
+        // banner is the one place the accent is spent; `.quiet` is reserved for
+        // housekeeping beside a real action, the way `head_model`'s Check for
+        // updates sits beside Remove. This is the card's second real action,
+        // like the button above it.
+        let setup_game = crate::widget::button("Set up a game…");
+        setup_game.set_tooltip_text(Some(GAME_SETUP_TOOLTIP));
+        setup_game.connect_clicked(|b| {
+            // Nothing captured: the window and the application are both found
+            // from the button at click time, the way `lib.rs`'s help button
+            // does it, so this handler cannot be half of a cycle.
+            if let Some(w) = b.root().and_downcast::<gtk::Window>() {
+                if let Some(app) = w.application() {
+                    crate::game_setup::open(&app, &w);
+                }
+            }
+        });
+
         let controls = gtk::Box::new(Orientation::Vertical, 8);
         let top = gtk::Box::new(Orientation::Horizontal, 16);
         top.append(&sw);
@@ -550,6 +610,13 @@ impl GamesRow {
         second.append(&joy_row);
         second.append(&recentre);
         controls.append(&second);
+        // The button is never made insensitive: `game_setup::open` presents the
+        // window that is already open, the way `help::open` does, which is
+        // strictly better than a `set_sensitive(false)` guard and removes the
+        // need for a second tooltip explaining the grey.
+        let third = gtk::Box::new(Orientation::Horizontal, 16);
+        third.append(&setup_game);
+        controls.append(&third);
         controls.append(&status);
 
         let row = GamesRow {

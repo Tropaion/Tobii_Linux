@@ -13,6 +13,7 @@ pub mod device;
 pub mod eye_preview;
 pub mod eyeview;
 pub mod focus;
+pub mod game_setup;
 pub mod games;
 pub mod head_model;
 pub mod help;
@@ -2037,6 +2038,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             // handler on purpose: minimising leaves this window mapped, and a
             // minimised hub is one click away, so help may stay up beside it.
             help::close();
+            // And the game-setup window, for the same reason and with one more
+            // of its own: it is modal over this window, and a modal left
+            // floating with nothing behind it to be modal over is a window a
+            // compositor has no good answer for.
+            game_setup::close();
         });
     }
 

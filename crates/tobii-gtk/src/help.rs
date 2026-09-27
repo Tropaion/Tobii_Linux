@@ -268,11 +268,19 @@ pub fn topics() -> Vec<Topic> {
                  More than one thing can be holding the tracker at once, and then \
                  the tooltip names them all in the same sentence rather than one \
                  at a time — so what you read there may be a longer sentence than \
-                 any of these four.",
+                 any of these four.\n\n\
+                 Set up a game… — {game_setup}\n\n\
+                 It opens a window with one section per thing that has to be \
+                 configured. The third of them, the game's own options, is \
+                 read-only: this program reports what those files say and never \
+                 writes them. It checks them only where a profile says what to \
+                 look at, and this build ships no profiles at all, so on a fresh \
+                 install that section says so rather than guessing.",
                 switch = switch,
                 strength = crate::games::STRENGTH_TOOLTIP,
                 joystick = crate::games::JOYSTICK_TOOLTIP,
                 recentre = crate::games::RECENTRE_TOOLTIP,
+                game_setup = crate::games::GAME_SETUP_TOOLTIP,
                 refusals = refusals,
             ),
         ),
@@ -1053,6 +1061,7 @@ mod tests {
             crate::games::STRENGTH_TOOLTIP.to_string(),
             crate::games::JOYSTICK_TOOLTIP.to_string(),
             crate::games::RECENTRE_TOOLTIP.to_string(),
+            crate::games::GAME_SETUP_TOOLTIP.to_string(),
         ];
         // And the reasons the Recentre button greys itself out, which the
         // pointer user reads in the row's tooltip and nobody else could.
