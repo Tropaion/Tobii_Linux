@@ -177,15 +177,27 @@ fn value(document: &xml::Document<'_>, name: &str) -> Lookup {
 
 /// Read the attributes file at `path`, asking what `name` holds.
 ///
-/// [`Source::Unwritten`] means the file is not there — a game that has never
-/// saved its options — and is separated from [`Source::Rejected`] for the
-/// reason [`Source`] gives.
+/// [`Source::Unwritten`] means the file is not there, and is separated from
+/// [`Source::Rejected`] for the reason [`Source`] gives. What it does *not*
+/// mean is "a game that has never saved its options": the file is also not
+/// there when the path leads onto a disk this machine has not mounted, and
+/// the two are one `ENOENT`. So the sentence comes from
+/// [`crate::binds::nothing_at`], which names the missing part of the path and
+/// stops short of the promise — the same sentence [`crate::binds::read`] gets
+/// for a preset directory, because it is the same question about the same
+/// kind of disk.
 pub fn read(path: &Path, name: &str) -> Source<Attributes> {
     match crate::read(path) {
         Source::Read(bytes) => Source::Read(parse(&bytes, name)),
-        Source::Unwritten(why) => {
-            Source::Unwritten(format!("{why}: nothing has saved these settings here"))
-        }
+        // The reason `crate::read` built named the file and nothing above it,
+        // which is the half of the answer that is never in doubt. It is
+        // rebuilt rather than extended because how much of the path is there
+        // decides the whole sentence, not a clause hung off the end of it.
+        Source::Unwritten(_) => Source::Unwritten(crate::binds::nothing_at(
+            "file",
+            path,
+            "nothing has saved these settings here",
+        )),
         Source::Rejected(why) => Source::Rejected(why),
     }
 }
@@ -300,13 +312,54 @@ mod tests {
         }
     }
 
+    /// A file that is not there because nothing above it is there either may
+    /// be on a disk this machine has not mounted, and the report must not
+    /// claim the settings were never saved.
+    ///
+    /// `/run/media/tropaion` is the real shape of this: a Steam library named
+    /// in `libraryfolders.vdf` whose mount point does not exist. The bare
+    /// sentence — *nothing has saved these settings here* — is then a
+    /// confident negative about a disk this reader never looked at.
+    #[test]
+    fn a_file_under_a_missing_directory_does_not_claim_the_settings_were_never_saved() {
+        let dir = scratch("attrs-unmounted");
+        let deep = dir
+            .join("not-mounted")
+            .join("Options")
+            .join("attributes.xml");
+        match read(&deep, "HeadtrackingSource") {
+            Source::Unwritten(why) => {
+                assert!(
+                    why.contains("has not mounted"),
+                    "the part of the path that is missing is above the file, \
+                     so the sentence has to stop short of the promise: {why}"
+                );
+                assert!(
+                    why.contains("not-mounted"),
+                    "and it has to name which part: {why}"
+                );
+            }
+            other => panic!("a file that is not there is not a reading: {other:?}"),
+        }
+    }
+
     /// A game that has never saved its options has no file, and that is its
     /// own answer — not "the setting is unset", and not "something is wrong".
+    ///
+    /// Everything above the file is there, so this is the case where the
+    /// confident sentence is a fact and nothing is hedged.
     #[test]
     fn a_file_that_is_not_there_says_so() {
         let dir = scratch("attrs");
         match read(&dir.join("attributes.xml"), "HeadtrackingSource") {
-            Source::Unwritten(why) => assert!(why.contains("attributes.xml"), "{why}"),
+            Source::Unwritten(why) => {
+                assert!(why.contains("attributes.xml"), "{why}");
+                assert!(
+                    !why.contains("has not mounted"),
+                    "the directory holding it is there, so there is nothing to \
+                     hedge about: {why}"
+                );
+            }
             other => panic!("a file that is not there is not a reading: {other:?}"),
         }
         std::fs::write(dir.join("attributes.xml"), REAL).expect("fixture");
