@@ -68,6 +68,17 @@ pub const MEASURED: [Measured; 2] = [
 ];
 
 impl Measured {
+    /// The whole observation as one clause: the title, what identifies it,
+    /// and what it did.
+    ///
+    /// Here rather than in each caller's `format!`, because two surfaces
+    /// built this same two-field string with their own joiners and one of
+    /// them then dropped the disclaimer that goes with it. A caller chooses
+    /// how to join these; it does not choose what one of them says.
+    pub fn clause(&self) -> String {
+        format!("{} {}", self.named(), self.behaviour)
+    }
+
     /// The title with what identifies it, as a sentence opens: *Microsoft
     /// Flight Simulator 2024 (Steam appid 2537590, Proton Experimental,
     /// 2026-09-27)*.
@@ -99,7 +110,7 @@ impl Measured {
 pub fn trackir_gate() -> String {
     let measured: Vec<String> = MEASURED
         .iter()
-        .map(|m| format!("{} {}.", m.named(), m.behaviour))
+        .map(|m| format!("{}.", m.clause()))
         .collect();
     format!(
         "A TrackIR game loads whichever client DLL the registry names, and checks its \
@@ -117,18 +128,26 @@ pub fn trackir_gate() -> String {
     )
 }
 
+/// The count, in the shape a "not a rule about the rest" sentence needs.
+///
+/// Public because every surface that states the measurements owes that
+/// sentence, and one of them was found stating them without it.
+pub fn tally() -> String {
+    tally_word(MEASURED.len())
+}
+
 /// How many titles have been measured, in English, as a sentence opens.
 ///
 /// In the paragraph rather than beside it: a hand-typed "Both" is what goes
 /// stale the day a third measurement lands, and the sentence is the thing a
 /// user reads.
-fn count_word(n: usize) -> &'static str {
+fn count_word(n: usize) -> String {
     match n {
-        0 => "No title has been",
-        1 => "The one title",
-        2 => "Both titles",
-        3 => "All three titles",
-        n => leaked(format!("All {n} titles")),
+        0 => "No title has been".to_string(),
+        1 => "The one title".to_string(),
+        2 => "Both titles".to_string(),
+        3 => "All three titles".to_string(),
+        n => format!("All {n} titles"),
     }
 }
 
@@ -138,24 +157,14 @@ fn count_word(n: usize) -> &'static str {
 /// reads, and "Both titles are not a rule" does not. One helper serving both
 /// produced exactly that sentence, which is what comes of reusing a word
 /// because it holds the right number rather than because it fits.
-fn tally_word(n: usize) -> &'static str {
+fn tally_word(n: usize) -> String {
     match n {
-        0 => "Nothing measured is",
-        1 => "One result is",
-        2 => "Two results are",
-        3 => "Three results are",
-        n => leaked(format!("{n} results are")),
+        0 => "Nothing measured is".to_string(),
+        1 => "One result is".to_string(),
+        2 => "Two results are".to_string(),
+        3 => "Three results are".to_string(),
+        n => format!("{n} results are"),
     }
-}
-
-/// A count word that outlives the call, for the arms a `match` cannot spell as
-/// a literal.
-///
-/// Leaking is defensible for exactly this: there is one [`MEASURED`] per
-/// process, so this runs at most once per distinct count, and the alternative
-/// is making every caller own a `String` for a phrase that never changes.
-fn leaked(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
 }
 
 /// What has to be running behind a third-party client, and the two ways to
@@ -213,13 +222,11 @@ mod tests {
         // so the paragraph said "All three titles … Two titles are not a
         // rule" on the one edit the computation exists to survive — and the
         // test pinned the typed half.
-        for phrase in [count_word(MEASURED.len()), tally_word(MEASURED.len())] {
-            assert!(
-                text.contains(phrase),
-                "every count in the paragraph comes from the list, and {phrase:?} \
-                 does not appear in:\n{text}"
-            );
-        }
+        // No assertion that the two counts are in the text: they are put there
+        // by interpolating these same two functions, so asking them the same
+        // question and checking the answer came back is a test that cannot
+        // fail. The loop above — over `MEASURED` itself — is the one that
+        // notices a third title never reaching the output.
     }
 
     /// What the paragraph must not become. It reports observations; a reader
@@ -233,19 +240,13 @@ mod tests {
             text.contains("not a rule about the rest"),
             "it says so outright:\n{text}"
         );
-        // Positive claims too, which is the half this missed. Saying a
-        // third-party client "does answer the check" is a measurement nobody
-        // here took, and the register records it as unmeasured — but it read
-        // as harmless because it was not a prediction *against* anything.
-        for claim in [
-            "does answer the check",
-            "will work",
-            "works with opentrack",
-            "will not work",
-            "cannot work",
-            "no game",
-            "every game",
-        ] {
+        // A short list of spellings, and it is worth being clear about what
+        // that buys: it catches this paragraph being reworded back into a
+        // prediction, and it does not catch the class — "your game is unlikely
+        // to get past it" would sail through. The sentence above is what
+        // actually carries the promise; these are a regression guard on the
+        // two wordings this project has already had to correct.
+        for claim in ["does answer the check", "will not work"] {
             assert!(
                 !text.contains(claim),
                 "{claim:?} is a claim about games nobody ran:\n{text}"

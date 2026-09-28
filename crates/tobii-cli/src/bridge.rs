@@ -325,8 +325,17 @@ const REQUIRED_ARTIFACT: &str = "freetrackclient64.dll";
 /// Closing it means building the two client crates for `i686-pc-windows-gnu` as
 /// well and adding them here; the registry key and install directory are shared,
 /// so nothing else changes.
+/// The provider's file name, in the one place `ARTIFACTS` and everything that
+/// looks for it can share.
+///
+/// `proton` stats this to decide whether to act, names it in what it starts,
+/// and names it again in what it reaps — so a rename here that did not reach
+/// there would leave a reap aimed at a program that no longer exists, which is
+/// the wineserver hang that module exists to avoid.
+pub(crate) const PROVIDER_EXE: &str = "tobii-bridge.exe";
+
 const ARTIFACTS: [(&str, bool); 3] = [
-    ("tobii-bridge.exe", false),
+    (PROVIDER_EXE, false),
     ("freetrackclient64.dll", true),
     ("NPClient64.dll", false),
 ];
@@ -2069,7 +2078,7 @@ fn stop(child: &mut std::process::Child) {
 fn run(args: &[String]) -> CmdResult {
     let (prefix, _) = resolve_prefix(args)?;
     let (wine, _) = resolve_wine(&prefix, args)?;
-    let exe = prefix.join(INSTALL_SUBDIR).join("tobii-bridge.exe");
+    let exe = prefix.join(INSTALL_SUBDIR).join(PROVIDER_EXE);
     if !exe.is_file() {
         return Err(format!(
             "the bridge is not installed in {} — run `tobii bridge install` first",
@@ -2522,7 +2531,7 @@ struct Status {
 fn status_caveat() -> String {
     let measured: Vec<String> = tobii_config::signature::MEASURED
         .iter()
-        .map(|m| format!("{} {}", m.named(), m.behaviour))
+        .map(|m| m.clause())
         .collect();
     format!(
         "{}\n",
@@ -2530,9 +2539,10 @@ fn status_caveat() -> String {
             &format!(
                 "This says what is installed and registered in this prefix. It does not say \
                  whether a game will use it. Put to NaturalPoint's signature check with our \
-                 own DLL registered for TrackIR: {}. Nothing here knows what any other title \
-                 does.",
-                measured.join("; ")
+                 own DLL registered for TrackIR: {}. {} not a rule about the rest, and \
+                 nothing here knows what any other title does.",
+                measured.join("; "),
+                tobii_config::signature::tally(),
             ),
             "",
             78,
@@ -6227,19 +6237,25 @@ exit 0
     /// symptom the second user actually had.
     #[test]
     fn status_names_both_titles_measured_against_the_signature_check() {
-        let fw = FakeWine::new("status-two-measurements");
-        install(&fw.args("install", &[])).expect("install");
-        let out = render_status(&gather_status(&fw.status_args(&[])).expect("status"));
-        for measured in [
-            "Star Citizen (2026-08-15)",
-            "Microsoft Flight Simulator 2024",
-            "2026-09-27",
-        ] {
-            assert!(out.contains(measured), "{out}");
+        let caveat = status_caveat();
+        let flat = caveat.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Over the list, not over titles typed here: this test's sibling was
+        // converted for that reason and this one was left naming two, so a
+        // third measurement would reach `bridge status`'s output and leave the
+        // test asserting two, green.
+        for m in tobii_config::signature::MEASURED {
+            assert!(
+                flat.contains(&m.clause()),
+                "{} is missing from the report:\n{caveat}",
+                m.title
+            );
         }
+        // The clause this surface was the one to drop. `bridge status` is what
+        // people paste into issues, so it was stating the measurements without
+        // the sentence saying they are not a rule.
         assert!(
-            !out.contains("Star Citizen aside"),
-            "one measurement was all there was, and it is not all there is: {out}"
+            flat.contains("not a rule about the rest"),
+            "the disclaimer goes with the measurements:\n{caveat}"
         );
     }
 

@@ -4668,32 +4668,13 @@ mod tests {
     /// tests use: two suites sharing a directory name is two suites able to
     /// delete each other's fixtures.
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tobii-cliprof-{tag}-{}", std::process::id()));
-        // A tag is a name, not a hint: this clears the directory before
-        // handing it over, so two tests sharing one tag are two tests where
-        // whichever starts second deletes the other's fixture mid-run. That
-        // happened, and it read as an intermittent bug in `profile_list`.
-        //
-        // The check has to be process-wide, not thread-local like the cleanup
-        // below: libtest gives each test its own thread, so a per-thread list
-        // is exactly the one that cannot see the collision.
-        static TAKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        // The guard is dropped before the assert, and the lock is taken
-        // through `into_inner` on a poisoned mutex, for one reason: asserting
-        // while holding it poisons it, so the collision this is here to name
-        // would be followed by every later `scratch()` panicking with "the tag
-        // list" — the one useful message buried under a dozen unrelated ones.
-        let seen = {
-            let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
-            let seen = taken.iter().any(|t| t == tag);
-            taken.push(tag.to_string());
-            seen
-        };
-        assert!(
-            !seen,
-            "two tests share the scratch tag {tag:?}, and this one would \
-             delete the other's fixture while it is running"
-        );
+        // `unique()` rather than the tag alone. This clears the directory
+        // before handing it over, so two tests sharing a tag had the second
+        // delete the first's fixture mid-run — which happened, and read as an
+        // intermittent bug in `profile_list`. A per-call uniquifier makes that
+        // impossible instead of detectable: the same helper's own doc, four
+        // hundred lines up, already says why the pid alone is not enough.
+        let dir = std::env::temp_dir().join(format!("tobii-cliprof-{tag}-{}", unique()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("scratch");
         SCRATCH.with_borrow_mut(|dirs| dirs.0.push(dir.clone()));
@@ -6156,7 +6137,7 @@ mod tests {
     /// straight into it.
     #[test]
     fn a_value_wider_than_its_column_is_still_followed_by_a_space() {
-        let dir = scratch("listing-wide-space");
+        let dir = scratch("listing-wide");
         write_profile(
             &dir,
             "359320",

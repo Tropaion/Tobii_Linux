@@ -126,9 +126,9 @@ const VERB: &str = "waitforexitandrun";
 
 /// The provider, inside the prefix.
 ///
-/// The directory it sits in is [`crate::bridge::INSTALL_WIN_DIR`], taken from
-/// the module that put it there rather than spelled again here.
-const PROVIDER: &str = "tobii-bridge.exe";
+/// The provider, taken from the module that installs it rather than spelled
+/// again here — as the directory beside it already is.
+const PROVIDER: &str = crate::bridge::PROVIDER_EXE;
 
 /// What the wrapper decided to do with the command it was handed.
 #[derive(Debug, Clone, PartialEq, Eq)]

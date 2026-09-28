@@ -1460,12 +1460,8 @@ and none of what follows was run by anybody on this project.
   nothing here has watched `FT_SharedMem` cross that boundary. That a
   signature-gated title then *uses* the data: an answering client and a filled
   mapping are two conditions and we have measured neither together.
-- **This entry describes a launcher we read, not code we ship.** The wrapper
-  group is building this project's own sequencing in the same round as this
-  entry; at the time of writing their result is not in front of me, so nothing
-  here claims anything about it.
-- **It was built, and here is the line that entry asked for. It does not
-  ship — read the two bullets below before this one.**
+- **We built the same shape ourselves, and it does not work.** The bullets
+  below are that attempt and its measurement, in the order it happened.
   `crates/tobii-cli/src/proton.rs` *was written to* have
   `tobii game -- %command%` recognise a Proton launch by Proton's own argument
   pair — a program named `proton` followed by the verb `waitforexitandrun` —
@@ -1512,14 +1508,13 @@ and none of what follows was run by anybody on this project.
   measured against plain wine, and plain wine is not the thing that runs the
   target — Proton's own helper is, and it was never in the test. Two steps were
   listed as unmeasured and one of them was the step that decided the outcome.
-- **What it delivered is not known.** No game has been launched through it.
-  Two steps between the measured ordering and a game receiving anything are
-  unwatched: that Proton accepts a batch file as its target at all (only plain
-  wine was tested, not the Steam Linux Runtime's container), and that the
-  provider then shares the wineserver session the game is in. The wrapper's own
-  note says what it did and not what it achieved, and this entry says the same.
-  **A demonstration is still owed**, and the shape of it is one Proton title
-  launched this way with `tobii bridge status` and a spike log either side.
+- **What is still unknown, after all of that.** Whether a provider started
+  inside a game's own Proton invocation shares the wineserver session the game
+  is in. The batch shape could not answer it, because Proton never waited long
+  enough for the question to arise; an `.exe` target would have to demonstrate
+  it, and the shape of that demonstration is one Proton title launched that way
+  with `tobii bridge status` and a spike log either side. Everything else this
+  entry set out to settle, it settled.
 
 ### 11.4 Environmental
 
