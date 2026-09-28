@@ -132,9 +132,14 @@ pub enum NpSource {
     /// A separately-installed one, named by its containing directory.
     ///
     /// Needed because TrackIR clients are gated by NaturalPoint's
-    /// `NP_GetSignature` anti-clone check, which a clean-room DLL cannot answer:
-    /// measured on 2026-08-15, Star Citizen calls it, gets nothing it
-    /// recognises, and never asks for data again. An already-installed client
+    /// `NP_GetSignature` anti-clone check, which a clean-room DLL cannot
+    /// answer. Both titles measured against it stop there, by different
+    /// routes: Star Citizen (2026-08-15) calls it once, gets nothing it
+    /// recognises, and never asks for data again; Microsoft Flight Simulator
+    /// 2024 (Steam appid 2537590, Proton Experimental, 2026-09-27) calls it
+    /// 104 times in 1m45s, calls nothing else at all, and never proceeds — so
+    /// one title loses its tracking and the other loses its tracking and
+    /// retries the check for as long as it runs. An already-installed client
     /// can answer it, and reads the same `FT_SharedMem` our provider writes —
     /// so it is used through its published interface, with our data behind it.
     Installed(PathBuf),
@@ -145,7 +150,13 @@ pub enum NpSource {
 /// Prefers an installed third-party client when one is present, because that is
 /// the only configuration in which a TrackIR game actually receives anything.
 /// `--npclient ours` forces ours, which is the right choice for a game that does
-/// not check the signature.
+/// not check the signature — a FreeTrack title, or a TrackIR one that never
+/// asks.
+///
+/// Honoured rather than second-guessed, because nothing here can tell those
+/// games from the gated ones. What says the choice has a cost is
+/// [`ours_for_trackir`], which `install` prints whenever the TrackIR key ends
+/// up pointing at our own DLL — including when the flag asked for it.
 pub fn choose_npclient(
     explicit: Option<&str>,
     installed: Option<PathBuf>,
@@ -181,6 +192,53 @@ fn find_installed_npclient() -> Option<PathBuf> {
         .iter()
         .map(PathBuf::from)
         .find(|d| d.join("NPClient64.dll").is_file())
+}
+
+/// What `install` says when the TrackIR key is about to point at our own DLL.
+///
+/// Printed whichever way the run got there, the run that asked for it by name
+/// included. It used to be withheld from exactly that run, on the reading that
+/// somebody passing `--npclient ours` had chosen it already — but the flag
+/// picks a DLL, it does not say the cost of that DLL is understood, and a user
+/// who reached for it on advice got the losing configuration with nothing said
+/// about it. It still does not refuse: a FreeTrack title, or a TrackIR one
+/// that never checks, is a real case and ours is right for it.
+///
+/// What it may say is what was measured. Two titles are two titles and not a
+/// rule about TrackIR games, and nothing here can tell which kind a user's
+/// game is — so it names them, dates them, and stops.
+fn ours_for_trackir(explicit: bool, installed: Option<&Path>) -> String {
+    let opening = match (explicit, installed) {
+        (true, Some(dir)) => format!(
+            "--npclient ours registers our own DLL for TrackIR, and there is a\n      \
+             third-party one installed in {}\n      \
+             — which is the one that can answer the check.",
+            dir.display()
+        ),
+        (true, None) => "--npclient ours registers our own DLL for TrackIR. No \
+             third-party\n      client was found here either, so it was the only one \
+             available."
+            .to_string(),
+        (false, _) => "no third-party NPClient64.dll was found, so our own is \
+             registered\n      for TrackIR."
+            .to_string(),
+    };
+    format!(
+        "note: {opening}\n      \
+         Ours cannot answer NaturalPoint's signature check, and the material\n      \
+         that would answer it is theirs: reproducing it is not this project's\n      \
+         to do.\n      \
+         Both titles ever measured against that check stop at it:\n        \
+         Star Citizen (2026-08-15) rejects ours and never asks for data again.\n        \
+         Microsoft Flight Simulator 2024 (Steam appid 2537590, Proton\n        \
+         Experimental, 2026-09-27) calls the check 104 times in 1m45s, calls\n        \
+         nothing else at all, and goes on retrying for as long as it runs.\n      \
+         Two titles are not a rule about the rest, and nothing here knows what your\n      \
+         game does. Installing opentrack provides a client that answers the check,\n      \
+         which `--npclient auto` then registers with our data behind it. FreeTrack\n      \
+         has no signature check, so a game that speaks FreeTrack works with ours\n      \
+         today."
+    )
 }
 
 /// The one artifact without which there is no installation — also what
@@ -1752,15 +1810,13 @@ fn install(args: &[String]) -> CmdResult {
     match &np_source {
         NpSource::Ours => {
             registered = format!("registered {INSTALL_WIN_DIR} for TrackIR and FreeTrack");
-            if explicit_np != Some("ours") {
-                println!(
-                    "\nnote: no third-party NPClient64.dll was found. Games that verify\n      \
-                     NaturalPoint's signature — Star Citizen among them — will load our\n      \
-                     DLL, reject it, and never ask for data again. Installing opentrack\n      \
-                     provides a client that passes. FreeTrack has no signature check,\n      \
-                     so a game that speaks FreeTrack works with ours today."
-                );
-            }
+            println!(
+                "\n{}",
+                ours_for_trackir(
+                    explicit_np == Some("ours"),
+                    find_installed_npclient().as_deref()
+                )
+            );
         }
         NpSource::Installed(_) => {
             let win = np_target.as_str();
@@ -2444,21 +2500,27 @@ struct Status {
     unreadable: Option<String>,
 }
 
-/// The two sentences that say what this report is *not*.
+/// The sentences that say what this report is *not*.
 ///
-/// Whether a game accepts what is registered is unknown to this project: the
-/// only title ever measured against NaturalPoint's signature check is Star
-/// Citizen — see [`NpSource::Installed`], measured 2026-08-15 — and what that
-/// one measurement established is a *rejection*: it calls `NP_GetSignature`,
-/// gets nothing it recognises from a clean-room DLL, and never asks for data
-/// again. Nothing here knows what any other title does. So this report says
-/// what is registered and stops. A "ready" or "working" line would be a claim
-/// nobody has earned, and a user pasting this into an issue would be pasting
-/// our guess back at us as though it were a measurement.
+/// Whether a game accepts what is registered is unknown to this project. Two
+/// titles have ever been measured against NaturalPoint's signature check — see
+/// [`NpSource::Installed`] — and both stop at it, by routes different enough
+/// that neither predicts the other: one rejects our DLL and gives up, the
+/// other never stops asking. Two measurements are not a rule, and nothing here
+/// knows what a third title does. So this report says what is registered,
+/// names what was measured with the dates on it, and stops. A "ready" or
+/// "working" line would be a claim nobody has earned, and a user pasting this
+/// into an issue would be pasting our guess back at us as though it were a
+/// measurement.
 const STATUS_CAVEAT: &str = "\
      This says what is installed and registered in this prefix. It does not say\n\
-     whether a game will use it: which titles accept our client DLL is not\n\
-     something this project has measured, Star Citizen aside.\n";
+     whether a game will use it. Two titles have been measured against\n\
+     NaturalPoint's signature check, with our own DLL registered for TrackIR, and\n\
+     both stop at it: Star Citizen (2026-08-15) rejects it and never asks for data\n\
+     again; Microsoft Flight Simulator 2024 (Steam appid 2537590, Proton\n\
+     Experimental, 2026-09-27) calls the check over and over and never gets past\n\
+     it. Two titles are not a rule about the rest, and nothing here knows what any\n\
+     other title does.\n";
 
 /// What the prefix's wineserver lock says, in one entry.
 ///
@@ -2634,6 +2696,17 @@ fn render_status(s: &Status) -> String {
                      \x20            over it rather than overwrite what it could not read\n",
                 );
             }
+        }
+        // The one line here that tells a user in the losing configuration that
+        // they are in it, while there is still something to do about it. Read
+        // off the value rather than off the classification: what decides it is
+        // that the TrackIR key names our own DLL, which is as true of a key
+        // somebody else pointed there as of one we wrote.
+        if k.key == NP_KEY && matches!(&k.current, Reading::Plain(v) if v == INSTALL_WIN_DIR) {
+            o.push_str(
+                "             that is our own DLL, which cannot answer NaturalPoint's\n\
+                 \x20            signature check — see the note below\n",
+            );
         }
     }
     // Said under the heading, before the reason, because an empty `registry`
@@ -3702,6 +3775,56 @@ mod tests {
         assert_eq!(
             choose_npclient(Some("ours"), Some(p("/usr/libexec/opentrack"))).expect("resolves"),
             NpSource::Ours
+        );
+    }
+
+    /// The flag says which DLL to register. It does not say the person who
+    /// passed it knows what that DLL cannot do — and the note used to be
+    /// withheld from exactly the run that named it, so the one install that
+    /// chose ours deliberately was the one install told nothing about the
+    /// check. A user who passed it on advice spent an evening there.
+    #[test]
+    fn asking_for_ours_by_name_is_still_told_what_it_costs() {
+        for explicit in [true, false] {
+            let note = ours_for_trackir(explicit, None);
+            assert!(
+                note.contains("NaturalPoint's signature check"),
+                "explicit={explicit}: {note}"
+            );
+            for measured in [
+                "Star Citizen (2026-08-15)",
+                "Microsoft Flight Simulator 2024",
+                "2026-09-27",
+            ] {
+                assert!(note.contains(measured), "explicit={explicit}: {note}");
+            }
+            // It says what was measured, not what this user's game will do.
+            assert!(
+                note.contains("nothing here knows what your"),
+                "explicit={explicit}: {note}"
+            );
+        }
+    }
+
+    /// When the flag turns down a client that is sitting right there, the note
+    /// names that client and the flag value that would use it — and still does
+    /// not refuse, because a FreeTrack title is a real reason to have asked.
+    #[test]
+    fn the_note_names_the_client_that_ours_was_chosen_over() {
+        let note = ours_for_trackir(true, Some(Path::new("/usr/libexec/opentrack")));
+        assert!(note.contains("/usr/libexec/opentrack"), "{note}");
+        assert!(note.contains("--npclient auto"), "{note}");
+
+        // Auto reaches ours only because there is nothing else, so there is
+        // nothing to have been chosen over, and naming one would invent it.
+        let auto = ours_for_trackir(false, None);
+        assert!(
+            !auto.contains("over the client"),
+            "nothing was turned down here: {auto}"
+        );
+        assert!(
+            auto.contains("no third-party NPClient64.dll was found"),
+            "{auto}"
         );
     }
 
@@ -6008,8 +6131,8 @@ exit 0
         out.join("\n")
     }
 
-    /// Whether a game accepts our DLL is unknown to this project — one title
-    /// has ever been measured against NaturalPoint's signature check — so the
+    /// Whether a game accepts our DLL is unknown to this project — two titles
+    /// have ever been measured against NaturalPoint's signature check — so the
     /// report may describe the prefix and must never predict the game. A
     /// "ready" line here would come back to us in an issue as though it were
     /// evidence.
@@ -6029,6 +6152,56 @@ exit 0
             out.contains("It does not say"),
             "it must say what it is not saying: {out}"
         );
+    }
+
+    /// Two titles have been measured against the signature check now, and the
+    /// second does not behave like the first: one rejects our DLL and gives
+    /// up, the other asks again forever. A report that still said "Star
+    /// Citizen aside" would be withholding the measurement that explains the
+    /// symptom the second user actually had.
+    #[test]
+    fn status_names_both_titles_measured_against_the_signature_check() {
+        let fw = FakeWine::new("status-two-measurements");
+        install(&fw.args("install", &[])).expect("install");
+        let out = render_status(&gather_status(&fw.status_args(&[])).expect("status"));
+        for measured in [
+            "Star Citizen (2026-08-15)",
+            "Microsoft Flight Simulator 2024",
+            "2026-09-27",
+        ] {
+            assert!(out.contains(measured), "{out}");
+        }
+        assert!(
+            !out.contains("Star Citizen aside"),
+            "one measurement was all there was, and it is not all there is: {out}"
+        );
+    }
+
+    /// [`FakeWine::args`] pins `--npclient ours`, so this prefix is in exactly
+    /// the configuration a TrackIR game gets nothing out of: the key pointing
+    /// at a DLL that cannot answer the check. The report is the last place
+    /// that can say so before the game is launched, and it costs one line.
+    #[test]
+    fn status_says_when_the_trackir_key_points_at_our_own_dll() {
+        let fw = FakeWine::new("status-trackir-is-ours");
+        install(&fw.args("install", &[])).expect("install");
+        let out = render_status(&gather_status(&fw.status_args(&[])).expect("status"));
+        assert!(out.contains("that is our own DLL"), "{out}");
+        // Under the one key it is true of. FreeTrack is registered to the same
+        // directory and has no signature check to fail.
+        assert_eq!(out.matches("that is our own DLL").count(), 1, "{out}");
+
+        // The control, on the same command with the other client: a TrackIR
+        // key pointing at a third-party DLL is not that configuration and must
+        // not be described as it.
+        let other = FakeWine::new("status-trackir-is-theirs");
+        let np = other.npclient_dir().display().to_string();
+        install(&other.args("install", &["--npclient", &np])).expect("install");
+        let out = render_status(
+            &gather_status(&other.status_args(&["--npclient", &np])).expect("status"),
+        );
+        assert!(!out.contains("that is our own DLL"), "{out}");
+        assert!(out.contains(NP_KEY), "{out}");
     }
 
     /// The report is written to be pasted into an issue, so it has to end with
