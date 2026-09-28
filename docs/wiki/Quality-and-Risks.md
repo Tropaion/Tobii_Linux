@@ -1246,14 +1246,49 @@ what is tested and what is known.
   prefix does exercise is the case a user most often hits first: a game that
   has saved nothing must be reported as exactly that, with a sentence, and
   never as a game whose settings are fine.
-- **A check can never reach a game's install directory, by construction.**
-  `path` is relative to the prefix, and `check_path` refuses a leading `/`, a
-  `..` component and a backslash at the line that held it. Elite's 30 shipped
-  presets live under `steamapps/common/`, which is the Steam library and not
-  the prefix, so **no profile this build can parse can name one of them.** That
-  is a deliberate containment choice — a profile is a hand-edited file whose
-  path is joined onto a prefix and then opened — and its cost is that the files
-  which would prove the Accumulate default are exactly the files out of reach.
+- **A containment property this project claimed and did not have — found by
+  review, before release.** Four surfaces said, in four wordings, that a check
+  can only ever reach inside the prefix: the module docs and `Check::path` in
+  `profiles.rs`, **two `ParseError` messages a user reads**, [[Game-Profiles]]
+  under a heading "`path` cannot escape the prefix", and this bullet, which
+  called it "a deliberate containment choice". The premise was right —
+  `check_path` does refuse a leading `/`, a `..` component and a backslash, and
+  the prefix is the only root. The conclusion was wrong, because **a prefix is
+  a wine prefix**: `dosdevices/` maps drive letters onto the machine, `z:` is
+  `/` in every prefix wine makes, and Steam adds `s:` pointing at the library
+  root. Verified on this machine's Elite prefix on 2026-09-28 — both links are
+  there. `dosdevices/z:/etc/hostname` has no `..`, no leading `/` and no
+  backslash; the parser accepts it and the reader opens the file. Three halves
+  were demonstrated: `check where` resolved and stat'd outside the prefix, the
+  `attrs` reader parsed a file at an arbitrary absolute path through such a
+  check, and a `binds-dir` check on
+  `dosdevices/s:/steamapps/common/Elite Dangerous/…/ControlSchemes` read the
+  full 30-document census.
+- **It was closed by deleting the claim, not the capability.** Refusing
+  `dosdevices` would have made the sentence true and removed something a
+  profile author legitimately wants: Elite's 30 shipped presets live under
+  `steamapps/common/`, this project counted them itself, and `s:` is how a
+  check names them. So all four surfaces now say what is true — **a check
+  reaches what the prefix reaches** — and the three guards are documented as
+  what they are, a rule that keeps the path *relative* so a profile is portable
+  between machines and `path_under` has something well-defined to join. The
+  regression test is `a_check_path_reaches_what_the_prefix_reaches`
+  (`profiles.rs`), which builds a fixture prefix with `s:` and `z:` links and
+  fails if either the parser or `path_under` takes the capability back.
+- **What actually bounds a profile, and it is the real guarantee.** The readers
+  only read; a check names one file and one `setting` and gets back one value
+  or a refusal; there is no grammar for writing, for listing, or for returning
+  a file's contents. So a profile from a stranger can make this program **read
+  a file you could already read and tell you what one attribute of it says** —
+  no more, and no less, which is why a `path` starting `dosdevices/z:` is worth
+  looking at before running somebody else's profile. That bound is stated on
+  [[Game-Profiles]] where a profile author will meet it.
+- **Still untested about all of this:** no `tobii-config` test opens a real
+  Proton prefix, and no test covers what `check where` prints for a path that
+  resolves outside one — the fixture above stands in for both. The cost of the
+  old claim is unchanged in one respect: the 30 presets that prove the
+  Accumulate default are still not read by anything in CI, because CI has no
+  copy of them.
 - **The bridge-install path inside this window has never run against a real
   game launch.** The window can install the bridge into a prefix, and block 2's
   reporting was corrected this round so that the page and the install report
