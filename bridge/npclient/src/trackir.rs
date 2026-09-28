@@ -37,18 +37,22 @@ pub fn game_id() -> i32 {
     feeder::GAME_ID.load(Ordering::Relaxed)
 }
 
-/// Fill `out` from the mapping.
+/// Fill `out` from the mapping, reporting whether anything was written.
 ///
-/// Leaves `out` alone when there is nothing to report, which covers a mapping
-/// that has never been written as well as one that does not exist: advancing
-/// the signature over an all-zero frame would present a live tracker frozen at
-/// dead centre. Both, and the once-only open behind them, are
-/// `feeder::published_frame`.
+/// `false` leaves `out` alone, which covers a mapping that has never been
+/// written as well as one that does not exist: advancing the signature over an
+/// all-zero frame would present a live tracker frozen at dead centre. Both, and
+/// the once-only open behind them, are `feeder::published_frame`. The caller
+/// turns it into `NP_ERR_NO_DATA`, because a buffer nobody wrote is not a
+/// success.
 #[cfg(not(feature = "spike-log"))]
-pub fn fill(out: &mut TrackIrData) {
+pub fn fill(out: &mut TrackIrData) -> bool {
     let Some(raw) = feeder::published_frame() else {
-        return;
+        return false;
     };
-    let sig = FRAME_SIGNATURE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let sig = FRAME_SIGNATURE
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
     from_ft_heap(&raw, sig, out);
+    true
 }
