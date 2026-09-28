@@ -197,9 +197,7 @@ fn synthetic(apps: Vec<tobii_steam::App>) -> game_setup::Scan {
         // window that touches nothing real.
         steam: std::rc::Rc::new(tobii_steam::Steam::at(&home)),
         profiles_dir: PathBuf::from("/nonexistent/tobii-game-setup-test/profiles"),
-        home,
         apps,
-        missing: Vec::new(),
     }
 }
 

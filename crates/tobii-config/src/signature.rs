@@ -108,6 +108,13 @@ impl Measured {
 /// spelling installs which client is the installer's business, and a window
 /// with no flags should not be quoting them.
 pub fn trackir_gate() -> String {
+    // Built once. It is a pure function of a `const` array, and the game page
+    // calls it on every refresh.
+    static TEXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(build_gate);
+    TEXT.clone()
+}
+
+fn build_gate() -> String {
     let measured: Vec<String> = MEASURED
         .iter()
         .map(|m| format!("{}.", m.clause()))
@@ -183,6 +190,11 @@ fn tally_word(n: usize) -> String {
 /// the second. A screen that offers an install and names only the first would
 /// be making that mistake in front of somebody.
 pub fn provider_note() -> String {
+    static TEXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(build_provider_note);
+    TEXT.clone()
+}
+
+fn build_provider_note() -> String {
     [
         "A client that answers the check only reads the shared mapping —",
         "something has to be filling it. Today that is `tobii bridge run` in a",

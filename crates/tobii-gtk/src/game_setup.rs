@@ -135,21 +135,10 @@ pub const PAGE_NOTHING: &str = "nothing";
 /// only ever be tested on somebody's laptop.
 #[derive(Debug, Clone)]
 pub struct Scan {
-    /// The home the libraries were read from. Every later filesystem question
-    /// about a game goes through this and never through `$HOME` a second time,
-    /// so one window is one machine's worth of answers.
-    pub home: PathBuf,
     /// Where per-game profiles are read from.
     pub profiles_dir: PathBuf,
     /// What Steam says is installed, in the order [`tobii_steam::apps`] gives.
     pub apps: Vec<App>,
-    /// The libraries `libraryfolders.vdf` names that are not on this machine.
-    ///
-    /// Carried so that every sentence about something not being found can say
-    /// this is one of the reasons it might not have been found. It is the
-    /// shape of every genuinely user-visible bug this project has found in
-    /// itself: an unmounted drive reported as "the game never saved this".
-    pub missing: Vec<PathBuf>,
     /// The walk `apps` and `missing` were taken off, kept so that every later
     /// prefix answer comes from the same one.
     ///
@@ -172,10 +161,8 @@ pub struct Scan {
 pub fn scan(home: &Path, profiles_dir: &Path) -> Scan {
     let steam = Rc::new(tobii_steam::Steam::at(home));
     Scan {
-        home: home.to_path_buf(),
         profiles_dir: profiles_dir.to_path_buf(),
         apps: steam.apps(),
-        missing: steam.missing_libraries().to_vec(),
         steam,
     }
 }
@@ -717,8 +704,8 @@ impl Action {
 }
 
 /// Stat the prefix. The only filesystem call in block 2.
-fn bridge_state(steam: &tobii_steam::Steam, appid: &str) -> BridgeState {
-    match steam.prefix(appid) {
+fn bridge_state(prefix: Option<&Path>, _appid: &str) -> BridgeState {
+    match prefix.map(Path::to_path_buf) {
         None => BridgeState::NoPrefix,
         Some(prefix) => {
             let dir = prefix.join(BRIDGE_SUBDIR);
@@ -865,15 +852,8 @@ fn absent_sentence(dir: &Path, present: &[&'static str]) -> String {
 /// This used to rebuild `compatdata/<appid>/pfx` out of the library list
 /// itself, a second copy of a path shape `tobii-steam` already knew and that
 /// nothing over there could hold this to.
-fn other_prefixes(
-    steam: &tobii_steam::Steam,
-    appid: &str,
-    chosen: Option<&Path>,
-) -> Vec<(PathBuf, bool)> {
-    steam
-        .prefixes(appid)
-        .into_iter()
-        .filter(|p| Some(p.as_path()) != chosen)
+fn other_prefixes(rest: Vec<PathBuf>) -> Vec<(PathBuf, bool)> {
+    rest.into_iter()
         .map(|p| {
             let has = p.join(BRIDGE_SUBDIR).join(BRIDGE_ARTIFACT).is_file();
             (p, has)
@@ -2239,6 +2219,16 @@ pub fn open(
     parent: &impl IsA<gtk::Window>,
     joystick: Arc<Mutex<JoystickStatus>>,
 ) -> gtk::Window {
+    // Asked before the disk is read, not after. `open_with` returns the window
+    // that is already up if one is, and building the `Scan` first meant every
+    // press of a button that is already showing its window read four
+    // `libraryfolders.vdf` files and twenty-nine manifests — measured at about
+    // 400 µs and 81 filesystem calls — and threw the answer away, on the main
+    // loop.
+    if let Some(win) = OPEN.with(|c| c.borrow().upgrade()) {
+        win.present();
+        return win;
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -2289,14 +2279,12 @@ pub fn open_with(
     // asked of every installed title — 29 walks to open one window, on a
     // machine one of whose libraries is on a drive that is not plugged in.
     //
-    // Derived from `scan.home` rather than carried in `Scan`, because a `Scan`
-    // is plain data a test can write down; this is what that home turns out to
-    // hold.
-    let steam = Rc::clone(&scan.steam);
 
     // The list, in the order the page shows it, with the prefix question
     // answered for each row. Neither depends on what gets typed.
-    let catalog = Rc::new(Catalog::new(&scan.apps, &|id| steam.prefix(id).is_some()));
+    let catalog = Rc::new(Catalog::new(&scan.apps, &|id| {
+        scan.steam.prefix(id).is_some()
+    }));
 
     // Before the pick page, because the lead above the list says what this
     // window will do for a game and one of the two things it does needs this.
@@ -2359,7 +2347,7 @@ pub fn open_with(
     nothing_head.set_halign(Align::Start);
     nothing_head.set_xalign(0.0);
     nothing_head.add_css_class("dialog-heading");
-    let nothing_body = wrapped(&nothing_text(&scan.missing));
+    let nothing_body = wrapped(&nothing_text(scan.steam.missing_libraries()));
     nothing.append(&nothing_head);
     nothing.append(&nothing_body);
 
@@ -2565,17 +2553,20 @@ pub fn open_with(
             }
 
             // --- block 2
-            let state = bridge_state(&steam, &app.appid);
-            let chosen = match &state {
-                BridgeState::NoPrefix => None,
-                BridgeState::Absent { prefix, .. } | BridgeState::Files { prefix, .. } => {
-                    Some(prefix.as_path())
-                }
-            };
-            let others = other_prefixes(&steam, &app.appid, chosen);
+            //
+            // One walk for both questions. `prefixes` leads with the one
+            // `prefix` would pick, so taking the head and keeping the tail
+            // answers "which prefix" and "what else is there" off a single
+            // pass — where two calls re-stat every library's manifest and
+            // every candidate `drive_c`, and the second then filtered out
+            // exactly the element the first had returned.
+            let mut all = scan.steam.prefixes(&app.appid);
+            let chosen = (!all.is_empty()).then(|| all.remove(0));
+            let state = bridge_state(chosen.as_deref(), &app.appid);
+            let others = other_prefixes(all);
             let (mut text, action) = bridge_block(
                 &state,
-                &scan.missing,
+                scan.steam.missing_libraries(),
                 &others,
                 tobii.as_deref(),
                 beside.as_deref(),
@@ -2626,7 +2617,7 @@ pub fn open_with(
             // rows that were read out of it.
             if let Some(n) = checked_prefix_note(
                 profile.map(|p| p.checks.len()).unwrap_or(0),
-                chosen,
+                chosen.as_deref(),
                 &others,
             ) {
                 p_text.push_str("\n\n");
@@ -2638,7 +2629,7 @@ pub fn open_with(
             }
             if let Some(loaded) = profile {
                 for check in &loaded.checks {
-                    let (rows, note) = run_check(check, chosen);
+                    let (rows, note) = run_check(check, chosen.as_deref());
                     for r in &rows {
                         rows_box.append(&small(&row_text(r)));
                     }
@@ -2791,7 +2782,7 @@ pub fn open_with(
         let list_w = list.downgrade();
         let (placeholder, census) = (placeholder.clone(), census.clone());
         Rc::new(move |q: &str| {
-            let p = picker(&catalog, &scan.missing, q);
+            let p = picker(&catalog, scan.steam.missing_libraries(), q);
             *ids.borrow_mut() = p.rows.iter().map(|r| r.appid.clone()).collect();
             if let Some(list) = list_w.upgrade() {
                 while let Some(c) = list.first_child() {
@@ -5594,7 +5585,12 @@ mod tests {
             "the library holding the manifest owns the prefix: {chosen:?}"
         );
 
-        let others = other_prefixes(&steam, "359320", Some(&chosen));
+        // The window's own shape: one walk, head is the chosen one, tail is
+        // the rest. A `filter` against `chosen` would be dropping element 0.
+        let mut all = steam.prefixes("359320");
+        assert_eq!(all[0], chosen, "`prefixes` leads with what `prefix` picks");
+        all.remove(0);
+        let others = other_prefixes(all);
         assert_eq!(others.len(), 1, "the other library's prefix: {others:?}");
         assert!(others[0].0.starts_with(&one), "{others:?}");
         assert!(
@@ -5615,8 +5611,10 @@ mod tests {
         // second value here would be dead work, and a comment saying it could
         // not see the new prefix would teach the opposite of that type's
         // contract.
-        let only_one = steam.prefix("220").expect("one prefix");
-        assert!(other_prefixes(&steam, "220", Some(&only_one)).is_empty());
+        let mut one_only = steam.prefixes("220");
+        assert_eq!(one_only.len(), 1, "one prefix: {one_only:?}");
+        one_only.remove(0);
+        assert!(other_prefixes(one_only).is_empty());
 
         let _ = std::fs::remove_dir_all(&home);
     }
