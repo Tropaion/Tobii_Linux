@@ -735,15 +735,31 @@ fn present_sentence(dir: &Path, present: &[&'static str]) -> String {
 /// still be unable to load anything. Over that prefix the flat plural "the
 /// bridge's files are not in it" names an absence that is not there, which is
 /// [`present_files`]' own bug shape read backwards.
+///
+/// # What the empty branch is allowed to claim
+///
+/// `present` is [`present_files`]', and that is three `is_file()` calls. An
+/// empty `present` therefore means *no regular file of those three names*,
+/// which is not the same as *nothing of those names*: a directory called
+/// `NPClient64.dll`, or a symlink pointing at nothing, is on disk and is not
+/// a file. This branch used to read "none of the other 2 is there either" —
+/// an absence asserted about something that is there, which is
+/// [`present_files`]' own doc comment describing the bug it was written
+/// against, one level up. It says what the stat established instead, and
+/// names the gap, because a user staring at a `NPClient64.dll` in their file
+/// manager while this window says there is none has been told the window is
+/// wrong about everything else too.
 fn absent_sentence(dir: &Path, present: &[&'static str]) -> String {
     if present.is_empty() {
         return format!(
-            "The bridge's files are not in it: there is no {req} under {dir}, and none of \
-             the other {n} {is} there either.",
+            "The bridge's files are not in it: there is no {req} under {dir}, and no file \
+             of the other {n} {name} either. All three are stats for a regular file, so a \
+             name there that is a directory, or a link pointing at nothing, is counted \
+             here as not present.",
             req = BRIDGE_ARTIFACT,
             dir = dir.display(),
             n = BRIDGE_FILES.len() - 1,
-            is = plural(BRIDGE_FILES.len() - 1, "is", "are"),
+            name = plural(BRIDGE_FILES.len() - 1, "name", "names"),
         );
     }
     format!(
@@ -843,11 +859,18 @@ pub(crate) fn other_prefixes_note(others: &[(PathBuf, bool)]) -> Option<String> 
 /// the page says what to type instead. It is named on the page because this
 /// window is the hub and `tobii` is a separate program on its own version —
 /// the premise of everything else block 2 reports.
+///
+/// `beside` is [`Search::beside`], and it only matters when `tobii` is
+/// [`None`]: [`no_binary_text`] needs it to say whether the directory beside
+/// this program was examined at all. It is carried through rather than worked
+/// out here so that the sentence and the stat cannot be about different
+/// directories.
 pub(crate) fn bridge_block(
     state: &BridgeState,
     missing: &[PathBuf],
     others: &[(PathBuf, bool)],
     tobii: Option<&Path>,
+    beside: Option<&Path>,
     appid: &str,
 ) -> (String, Option<Action>) {
     let (mut text, action) = match state {
@@ -916,7 +939,7 @@ pub(crate) fn bridge_block(
         }
         (None, Some(a)) => {
             text.push_str("\n\n");
-            text.push_str(&no_binary_text(*a, appid));
+            text.push_str(&no_binary_text(*a, beside, appid));
             return (text, None);
         }
         (None, None) => {}
@@ -1270,13 +1293,46 @@ pub(crate) fn tobii_binary(
     exe: Option<&Path>,
     exists: &dyn Fn(&Path) -> bool,
     on_path: &dyn Fn(&str) -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(beside) = exe.and_then(Path::parent).map(|d| d.join("tobii")) {
-        if exists(&beside) {
-            return Some(beside);
+) -> Search {
+    let beside = exe.and_then(Path::parent).map(Path::to_path_buf);
+    if let Some(dir) = &beside {
+        let candidate = dir.join("tobii");
+        if exists(&candidate) {
+            return Search {
+                found: Some(candidate),
+                beside,
+            };
         }
     }
-    on_path("tobii")
+    Search {
+        found: on_path("tobii"),
+        beside,
+    }
+}
+
+/// What [`tobii_binary`] found, **and where it looked**.
+///
+/// Two fields rather than the `Option<PathBuf>` this used to return, because
+/// the paragraph printed when nothing is found opens by reporting on the
+/// directory beside this program — and that directory does not always exist
+/// to report on. `std::env::current_exe` reads `/proc/self/exe` on Linux and
+/// can fail; a path it returns can have no parent. In either case
+/// [`tobii_binary`] has nowhere to stand beside and skips that half of the
+/// search entirely, and a sentence saying "`tobii` is not beside this one"
+/// would then be naming a place nothing examined. [`beside`](Self::beside) is
+/// [`None`] exactly in those cases, and [`no_binary_text`] branches on it.
+///
+/// It is returned by the search rather than worked out again by the caller
+/// for the obvious reason: two computations of "the directory beside this
+/// program" can disagree, and then the sentence is about a different place
+/// from the stat.
+pub(crate) struct Search {
+    /// The `tobii` to run, or [`None`] when neither place had one.
+    pub(crate) found: Option<PathBuf>,
+    /// The directory that was stat'd for a `tobii` beside this program, or
+    /// [`None`] when this program could not work out where its own file is
+    /// and so never looked there.
+    pub(crate) beside: Option<PathBuf>,
 }
 
 /// What to say when there is no `tobii` to run.
@@ -1308,13 +1364,39 @@ pub(crate) fn tobii_binary(
 /// the terminal cannot find it either: every install route this project has
 /// puts `tobii` and this program in one directory, so the answer there is not
 /// a `$PATH` line, it is a reinstall.
-pub(crate) fn no_binary_text(action: Action, appid: &str) -> String {
-    let head = "The command-line program `tobii` is not beside this one, and it is not on \
-                the PATH this window was started with — which is not necessarily the one \
-                your terminal has. This project's installer puts both programs in \
-                `~/.local/bin` by default, and that directory is usually added to the PATH \
-                by a shell rc, which a window started from the app menu never reads. So try \
-                the command below in a terminal: it may simply work.";
+///
+/// # And whose "beside this one" this is about
+///
+/// `beside` is [`Search::beside`] — the directory [`tobii_binary`] actually
+/// stat'd, or [`None`] when it had none to stat. The head used to open "is
+/// not beside this one" unconditionally, while [`tobii_binary`] skips the
+/// beside-check whenever `current_exe` gives it nothing to stand beside: on
+/// such a machine the first sentence the user read reported on a place that
+/// was never examined. It is the same shape as the `$PATH` sentence above it,
+/// one clause to the left.
+pub(crate) fn no_binary_text(action: Action, beside: Option<&Path>, appid: &str) -> String {
+    // The first clause is the one that used to be printed over a place
+    // nothing had looked at. `tobii_binary` only stats the directory beside
+    // this program when it knows which directory that is; when `current_exe`
+    // gives it nothing, it goes straight to `$PATH`, and the sentence has to
+    // say so rather than report a stat that never happened.
+    let looked = match beside {
+        Some(dir) => format!(
+            "The command-line program `tobii` is not in {}, beside this one, and it is not \
+             on the PATH this window was started with",
+            dir.display()
+        ),
+        None => "The command-line program `tobii` is not on the PATH this window was \
+                 started with, and this program could not work out where its own file is, \
+                 so it has not looked beside itself either"
+            .to_string(),
+    };
+    let head = format!(
+        "{looked} — which is not necessarily the one your terminal has. This project's \
+         installer puts both programs in `~/.local/bin` by default, and that directory is \
+         usually added to the PATH by a shell rc, which a window started from the app menu \
+         never reads. So try the command below in a terminal: it may simply work."
+    );
     let tail = "If the terminal cannot find `tobii` either, it is not installed on this \
                 machine. It is not a separate download — every install route this project \
                 has puts it in the same directory as this program — so the fix is to \
@@ -1769,9 +1851,32 @@ fn from_lookup(l: &Lookup) -> Answer {
 ///
 /// The only place in this window that hands a path to `tobii-gameconf`, and
 /// the only place that reads a game's own files at all. The path comes from
-/// [`profiles::Check::path_under`], which can only ever land inside the prefix
-/// because the parser refused `..`, a backslash and a leading `/` when the
-/// file was read.
+/// [`profiles::Check::path_under`], which pushes the profile's relative,
+/// `..`-free path onto the prefix, so the result is *lexically* under it and
+/// nothing here canonicalises.
+///
+/// **Lexically under is not inside, and this comment used to say it was.** A
+/// Wine prefix maps the machine into itself under `dosdevices/`: `z:` is `/`,
+/// and a Steam prefix adds `s:` pointing at the library root. A check whose
+/// path begins `dosdevices/s:/steamapps/common/` therefore reaches a game's
+/// shipped files, and one beginning `dosdevices/z:/` reaches any file this
+/// user can read — through this function, by the readers below, exactly as a
+/// path under `drive_c` would be.
+/// This module's `a_check_read_through_a_drive_letter_lands_outside_the_prefix`
+/// runs that against this function and reads the bytes back;
+/// [`profiles::Check::path`] owns the rule and says why the capability is
+/// wanted rather than merely tolerated.
+///
+/// What does bound this function is the other half of the promise: every arm
+/// calls a `tobii-gameconf` reader, and those only read, and only the one
+/// [`profiles::Check::setting`] they were handed. `tobii-gameconf`'s own
+/// `tests/writes_nothing.rs` is what holds that — nothing in this file does.
+///
+/// The match on [`profiles::Format`] is exhaustive with no wildcard arm, on
+/// purpose. A format added to `tobii-config` has to be answered here or this
+/// file stops compiling, instead of falling into
+/// [`profiles::Format::Unknown`]'s sentence and being reported as a check
+/// this build cannot perform when in fact it can.
 fn run_check(check: &profiles::Check, prefix: Option<&Path>) -> (Vec<Row>, Option<String>) {
     let row = |preset: Option<String>, answer: Answer| Row {
         setting: check.setting.clone(),
@@ -1851,6 +1956,13 @@ thread_local! {
 /// and the lead promised two before the user had picked anything. The count is
 /// the one thing about it knowable before a game is picked, so it is the one
 /// thing this branches on; everything per-game is block 2's to say.
+///
+/// The `None` arm names only the `$PATH` half of the search. It used to open
+/// "which is not beside this one", which [`tobii_binary`] has not necessarily
+/// checked — see [`Search::beside`]. Block 2 has the directory and says which
+/// of the two places were looked at; this line, printed before a game is
+/// picked and with no room for the distinction, says the half that is true
+/// either way and leaves the rest to the page that can be precise about it.
 fn lead(tobii: Option<&Path>) -> &'static str {
     match tobii {
         Some(_) => {
@@ -1862,9 +1974,9 @@ fn lead(tobii: Option<&Path>) -> &'static str {
             "Everything Steam says is installed on this machine. Pick one and this window \
              will show the three things that have to be configured for it. It can set this \
              program's own settings; the Wine bridge needs the command-line program `tobii`, \
-             which is not beside this one and is not on the PATH this window was started \
-             with — a terminal's is often not the same — so for that one the window says \
-             what to type there instead."
+             which this window could not find — it is not on the PATH this window was \
+             started with, and a terminal's is often not the same — so for that one the \
+             window says what to type there instead."
         }
     }
 }
@@ -2087,7 +2199,7 @@ pub fn open_with(
 
     // Before the pick page, because the lead above the list says what this
     // window will do for a game and one of the two things it does needs this.
-    let tobii: Rc<Option<PathBuf>> = Rc::new({
+    let search = {
         let exists = |p: &Path| p.is_file();
         let path_lookup = on_path(&exists);
         tobii_binary(
@@ -2095,7 +2207,12 @@ pub fn open_with(
             &exists,
             &path_lookup,
         )
-    });
+    };
+    // Both halves of one answer, kept together: `beside` is the directory
+    // that search stat'd, and block 2's sentence about a missing `tobii` is
+    // only allowed to name a place because this is it.
+    let beside: Rc<Option<PathBuf>> = Rc::new(search.beside);
+    let tobii: Rc<Option<PathBuf>> = Rc::new(search.found);
 
     // ---- the pick page
 
@@ -2260,7 +2377,7 @@ pub fn open_with(
     // would be a cycle between two siblings, which GTK never breaks and which a
     // test that weak-refs only the window cannot see.
     let refresh: Rc<dyn Fn()> = {
-        let (scan, sel, running, outcome, report, wrote, tobii, joystick) = (
+        let (scan, sel, running, outcome, report, wrote, tobii, beside, joystick) = (
             scan.clone(),
             sel.clone(),
             running.clone(),
@@ -2268,6 +2385,7 @@ pub fn open_with(
             report.clone(),
             wrote.clone(),
             tobii.clone(),
+            beside.clone(),
             joystick.clone(),
         );
         let (g_title, g_sub, s_body, br_body, b_report, p_body, rows_box) = (
@@ -2354,8 +2472,14 @@ pub fn open_with(
                 }
             };
             let others = other_prefixes(&scan.home, &app.appid, chosen);
-            let (mut text, action) =
-                bridge_block(&state, &scan.missing, &others, tobii.as_deref(), &app.appid);
+            let (mut text, action) = bridge_block(
+                &state,
+                &scan.missing,
+                &others,
+                tobii.as_deref(),
+                beside.as_deref(),
+                &app.appid,
+            );
             if let Some(note) = profile.and_then(|p| profile_bridge_note(p.bridge)) {
                 text.push_str("\n\n");
                 text.push_str(&note);
@@ -2763,6 +2887,7 @@ mod tests {
             missing,
             others,
             Some(Path::new("/usr/bin/tobii")),
+            Some(Path::new("/opt/x")),
             "359320",
         )
     }
@@ -3336,6 +3461,7 @@ mod tests {
             &[],
             &[],
             Some(Path::new("/home/x/.local/bin/tobii")),
+            Some(Path::new("/opt/x")),
             "359320",
         );
         assert!(here.contains("/home/x/.local/bin/tobii"), "{here}");
@@ -3345,6 +3471,7 @@ mod tests {
             &[],
             &[],
             Some(Path::new("/usr/bin/tobii")),
+            Some(Path::new("/opt/x")),
             "359320",
         );
         assert!(there.contains("/usr/bin/tobii"), "{there}");
@@ -3372,13 +3499,16 @@ mod tests {
         let b = beside.clone();
         let exists = move |p: &Path| p == b;
         let on_path = |_: &str| Some(PathBuf::from("/usr/bin/tobii"));
+        let s = tobii_binary(
+            Some(Path::new("/opt/tobii/bin/tobii-gtk")),
+            &exists,
+            &on_path,
+        );
+        assert_eq!(s.found, Some(beside));
         assert_eq!(
-            tobii_binary(
-                Some(Path::new("/opt/tobii/bin/tobii-gtk")),
-                &exists,
-                &on_path
-            ),
-            Some(beside)
+            s.beside,
+            Some(PathBuf::from("/opt/tobii/bin")),
+            "the directory it stat'd, which the page is allowed to name"
         );
     }
 
@@ -3387,12 +3517,12 @@ mod tests {
         let exists = |_: &Path| false;
         let on_path = |_: &str| Some(PathBuf::from("/usr/bin/tobii"));
         assert_eq!(
-            tobii_binary(Some(Path::new("/opt/x/tobii-gtk")), &exists, &on_path),
+            tobii_binary(Some(Path::new("/opt/x/tobii-gtk")), &exists, &on_path).found,
             Some(PathBuf::from("/usr/bin/tobii"))
         );
 
         let nothing = |_: &str| None;
-        let found = tobii_binary(Some(Path::new("/opt/x/tobii-gtk")), &exists, &nothing);
+        let found = tobii_binary(Some(Path::new("/opt/x/tobii-gtk")), &exists, &nothing).found;
         assert_eq!(found, None);
         assert_ne!(
             found,
@@ -3403,12 +3533,72 @@ mod tests {
 
         // And the sentence that replaces the button says what to type.
         for a in [Action::Install, Action::Reinstall] {
-            let text = no_binary_text(a, "359320");
+            let text = no_binary_text(a, Some(Path::new("/opt/x")), "359320");
             assert!(
                 text.contains("tobii bridge install --steam 359320"),
                 "{a:?}: {text}"
             );
         }
+    }
+
+    /// **`tobii_binary` does not always look beside this program, and the
+    /// sentence printed when it finds nothing has to answer for that.**
+    ///
+    /// `std::env::current_exe` reads `/proc/self/exe` on Linux and can fail;
+    /// `open_with` hands its `.ok()` straight through, so `exe` arrives as
+    /// `None`. `tobii_binary` then has no directory to join `tobii` onto and
+    /// goes straight to `$PATH` — while `no_binary_text`'s head opened "is
+    /// not beside this one" whatever had happened, reporting a stat that was
+    /// never performed as a finding. That is the same shape as the `$PATH`
+    /// sentence the round before it, one clause to the left.
+    ///
+    /// What must break for this to fail: `tobii_binary` claiming a `beside`
+    /// it did not stat, or `no_binary_text` going back to naming the
+    /// beside-directory on the branch where there is none. Both halves are
+    /// asserted, because the sentence is only honest if the flag under it is.
+    #[test]
+    fn with_no_current_exe_nothing_looked_beside_this_program_and_the_page_says_so() {
+        // Half one: no exe, so no directory was stat'd. `exists` panics to
+        // prove it was never called rather than merely answering `false`.
+        let never = |p: &Path| panic!("nothing should have been stat'd, and {p:?} was");
+        let on_path = |_: &str| None;
+        let s = tobii_binary(None, &never, &on_path);
+        assert_eq!(s.found, None);
+        assert_eq!(s.beside, None, "there was nowhere to stand beside");
+
+        // A path with no parent is the same case: `/` has none.
+        assert_eq!(
+            tobii_binary(Some(Path::new("/")), &never, &on_path).beside,
+            None
+        );
+
+        // Half two: the sentence. It must not report on the place that was
+        // not looked at, and it must say that it was not looked at.
+        for a in [Action::Install, Action::Reinstall] {
+            let text = no_binary_text(a, None, "359320");
+            assert!(
+                !text.contains("beside this one"),
+                "{a:?} reported on a directory nothing stat'd: {text}"
+            );
+            assert!(
+                text.contains("could not work out where its own file is"),
+                "{a:?} has to say why it has no answer about that place: {text}"
+            );
+            assert!(
+                text.contains("PATH this window was started with"),
+                "the half it did look at is still named: {text}"
+            );
+        }
+
+        // And with one, it names the directory it stat'd — not "this one",
+        // which the user cannot check.
+        let named = no_binary_text(Action::Install, Some(Path::new("/opt/x")), "359320");
+        assert!(named.contains("/opt/x"), "{named}");
+        assert!(named.contains("beside this one"), "{named}");
+        assert!(
+            !named.contains("could not work out where"),
+            "it did work it out: {named}"
+        );
     }
 
     // ---------------------------------------------------------- the profile
@@ -4160,6 +4350,7 @@ mod tests {
             &[],
             &[],
             Some(Path::new("/usr/bin/tobii")),
+            Some(Path::new("/opt/x")),
             "359320",
         );
         assert!(
@@ -4167,7 +4358,14 @@ mod tests {
             "the button is on the page, so the sentence pointing at it is too: {with}"
         );
 
-        let (without, action) = bridge_block(&present(), &[], &[], None, "359320");
+        let (without, action) = bridge_block(
+            &present(),
+            &[],
+            &[],
+            None,
+            Some(Path::new("/opt/x")),
+            "359320",
+        );
         assert_eq!(action, None, "nothing to run: {without}");
         assert!(
             !without.contains("Details below is"),
@@ -4197,8 +4395,8 @@ mod tests {
     #[test]
     fn what_this_window_says_about_a_tobii_it_could_not_find_is_about_its_own_path() {
         for text in [
-            no_binary_text(Action::Install, "359320"),
-            no_binary_text(Action::Reinstall, "359320"),
+            no_binary_text(Action::Install, Some(Path::new("/opt/x")), "359320"),
+            no_binary_text(Action::Reinstall, Some(Path::new("/opt/x")), "359320"),
             lead(None).to_string(),
         ] {
             assert!(
@@ -4215,7 +4413,7 @@ mod tests {
         // The two that print a command say where it would be, and what it
         // means when the terminal cannot find it either — which no arm said.
         for action in [Action::Install, Action::Reinstall] {
-            let text = no_binary_text(action, "359320");
+            let text = no_binary_text(action, Some(Path::new("/opt/x")), "359320");
             assert!(
                 text.contains("~/.local/bin"),
                 "where this project's installer puts it: {text}"
@@ -4274,6 +4472,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().expect("drive_c"));
     }
 
+    /// **An empty stat is not evidence that nothing of those names is there.**
+    ///
+    /// `present_files` is three `is_file()` calls, and `is_file()` is false
+    /// for a directory of that name and false for a symlink pointing at
+    /// nothing — both of which are on disk, and both of which the user can
+    /// see in a file manager. `absent_sentence`'s empty branch read "and none
+    /// of the other 2 is there either", asserted straight out of the empty
+    /// vector, so over this prefix the window denied the existence of two
+    /// entries it had just stat'd. `present_files`' own doc comment names
+    /// this shape — "reporting an absence as a presence" — as the bug the
+    /// whole window is written against; this is it in the mirror.
+    ///
+    /// What must break for this to fail: the sentence going back to claiming
+    /// absence from `is_file()`, or dropping the clause that says what the
+    /// three stats were.
+    #[test]
+    fn the_empty_prefix_sentence_does_not_deny_a_name_that_is_there_but_is_not_a_file() {
+        let root = scratch("not-a-file");
+        let dir = root.join(BRIDGE_SUBDIR);
+        std::fs::create_dir_all(&dir).expect("fixture");
+        // Two of the three names, on disk, neither of them a regular file.
+        std::fs::create_dir(dir.join("NPClient64.dll")).expect("fixture");
+        std::os::unix::fs::symlink("nowhere", dir.join("tobii-bridge.exe")).expect("fixture");
+        assert!(
+            dir.join("NPClient64.dll").exists(),
+            "the fixture has to be a directory that is really there"
+        );
+        assert!(
+            dir.join("tobii-bridge.exe").symlink_metadata().is_ok(),
+            "and a link that is really there while its target is not"
+        );
+
+        let present = present_files(&dir);
+        assert!(present.is_empty(), "neither is a regular file: {present:?}");
+
+        let said = absent_sentence(&dir, &present);
+        assert!(
+            !said.contains("is there either") && !said.contains("are there either"),
+            "two of those names are in the directory this sentence just named: {said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "no file of the other {} names either",
+                BRIDGE_FILES.len() - 1
+            )),
+            "what the stat did establish is still said: {said}"
+        );
+        assert!(
+            said.contains("counted here as not present"),
+            "and the gap between the two, because the user can see these entries: {said}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The sentence that replaces the button names the job the button did.
     /// Written for `Install` and printed over a prefix that already holds the
     /// files, it told the user the bridge "cannot be installed from here"
@@ -4281,7 +4534,14 @@ mod tests {
     /// it replaced was *Reinstall*.
     #[test]
     fn the_sentence_replacing_the_button_names_what_the_button_did() {
-        let (files, action) = bridge_block(&present(), &[], &[], None, "359320");
+        let (files, action) = bridge_block(
+            &present(),
+            &[],
+            &[],
+            None,
+            Some(Path::new("/opt/x")),
+            "359320",
+        );
         assert_eq!(action, None, "nothing to run: {files}");
         assert!(
             !files.contains("cannot be installed from here"),
@@ -4293,21 +4553,41 @@ mod tests {
             "Details is gone for the same reason, so the page says what it ran: {files}"
         );
 
-        let (absent, _) = bridge_block(&absent(), &[], &[], None, "359320");
+        let (absent, _) = bridge_block(
+            &absent(),
+            &[],
+            &[],
+            None,
+            Some(Path::new("/opt/x")),
+            "359320",
+        );
         assert!(absent.contains("cannot be installed from here"), "{absent}");
         assert_ne!(
-            no_binary_text(Action::Install, "359320"),
-            no_binary_text(Action::Reinstall, "359320"),
+            no_binary_text(Action::Install, Some(Path::new("/opt/x")), "359320"),
+            no_binary_text(Action::Reinstall, Some(Path::new("/opt/x")), "359320"),
             "two jobs, two sentences"
         );
 
         // No button at all, and so no sentence about one: a prefix that does
         // not exist is not a machine missing a program.
-        let (none, action) = bridge_block(&BridgeState::NoPrefix, &[], &[], None, "359320");
+        let (none, action) = bridge_block(
+            &BridgeState::NoPrefix,
+            &[],
+            &[],
+            None,
+            Some(Path::new("/opt/x")),
+            "359320",
+        );
         assert_eq!(action, None);
+        // Asserted on a phrase both arms of `no_binary_text`'s head share.
+        // The old assertion was `!none.contains("not beside this one")`,
+        // which stopped being a substring of either arm the moment the head
+        // learned to name the directory — a test that could no longer fail
+        // for the reason it was written for.
         assert!(
-            !none.contains("not beside this one"),
-            "there was no button here to replace: {none}"
+            !none.contains("PATH this window was started with"),
+            "there was no button here to replace, so no paragraph saying why it is gone: \
+             {none}"
         );
     }
 
@@ -4647,10 +4927,26 @@ mod tests {
     }
 
     /// A profile is a file a user may have been handed by a stranger, and the
-    /// path it names is joined onto a Proton prefix and opened. Two halves,
-    /// and this window owns both: the whole file is refused when a path could
-    /// climb out, and what the parser does accept is opened under the prefix
-    /// and nowhere else.
+    /// path it names is joined onto a Proton prefix and opened. Three shapes
+    /// of path, and this window owns what it says about each: a path that
+    /// could climb out takes the whole file with it; a path the parser
+    /// accepts is joined onto the prefix rather than onto whatever sits
+    /// beside it; and a path through a `dosdevices` drive letter reads a file
+    /// outside the prefix, which is not a bug —
+    /// `a_check_read_through_a_drive_letter_lands_outside_the_prefix` below
+    /// is that third one.
+    ///
+    /// # This test used to be named for a property the code has not got
+    ///
+    /// It was `this_window_opens_nothing_outside_the_prefix_it_was_given`,
+    /// and every assertion in it was lexical: `path_under(&prefix)
+    /// .starts_with(&prefix)` over three relative paths, plus a read that
+    /// landed on the copy under the prefix. All of that is true and none of
+    /// it is containment — a `dosdevices/z:` path passes both assertions and
+    /// still resolves to `/`. A test whose name claims a property its body
+    /// cannot see reads as evidence for the claim, which is worse than having
+    /// no test, so the name now says what the body actually checks and the
+    /// third test below states the property the old name denied.
     ///
     /// # What half one leans on, and who owns it
     ///
@@ -4668,26 +4964,15 @@ mod tests {
     /// digits" several hundred lines earlier. Deleting `check_path`'s
     /// backslash guard left this test green. Hence the assertion below that
     /// the refusal is not that one.
+    ///
+    /// What must break for this to fail: `check_path` accepting any of the
+    /// three shapes below, or this window reporting a refused profile as
+    /// anything other than a file none of which was used.
     #[test]
-    fn this_window_opens_nothing_outside_the_prefix_it_was_given() {
-        let root = scratch("stays-inside");
-        let prefix = root.join("pfx");
-        std::fs::create_dir_all(prefix.join("drive_c")).expect("fixture");
-        std::fs::write(
-            prefix.join("drive_c/here.xml"),
-            b"<Attributes><Attr name=\"S\" value=\"inside\"/></Attributes>",
-        )
-        .expect("fixture");
-        // The same name one level up: what a path built by walking out of the
-        // prefix would find instead. Inside this test's own directory, which
-        // is the only place it writes.
-        std::fs::create_dir_all(root.join("drive_c")).expect("fixture");
-        std::fs::write(
-            root.join("drive_c/here.xml"),
-            b"<Attributes><Attr name=\"S\" value=\"leaked\"/></Attributes>",
-        )
-        .expect("fixture");
-
+    fn a_path_that_could_climb_out_takes_the_whole_profile_with_it() {
+        // Nothing here touches the filesystem: the three shapes below never
+        // get as far as a prefix, and a test that made one would be implying
+        // they might.
         let profile = |path: &str| {
             format!(
                 "version = 1\n\n[[check]]\nformat = \"attributes-xml\"\npath = \"{path}\"\n\
@@ -4716,31 +5001,148 @@ mod tests {
             assert!(body.contains("/cfg/profiles/359320.toml"), "{bad}: {body}");
             assert!(body.contains("None of it has been used"), "{bad}: {body}");
         }
+    }
 
-        // Half two: what the parser accepts, this window opens under the
-        // prefix it was given. `.` and empty segments are not `..`, so they
-        // pass the parser and land here — and the answer has to come out of
-        // the copy inside, never the one beside it.
+    /// The other side of the parser's answer: `.` and empty segments are not
+    /// `..`, so they pass `check_path` and arrive here — and the file that
+    /// gets read is the one under the prefix this window was handed, not the
+    /// same name sitting beside it.
+    ///
+    /// This is a join, not a containment check. `path_under` pushes
+    /// components onto the prefix and canonicalises nothing, so the
+    /// `starts_with` below is a statement about the string it built, and it
+    /// is the only thing the assertion is allowed to mean — see
+    /// `a_check_read_through_a_drive_letter_lands_outside_the_prefix`, where
+    /// `starts_with` is true of a path that resolves to `/`.
+    ///
+    /// What must break for this to fail: `path_under` joining onto something
+    /// other than the prefix it is given, or `run_check` reading a path it
+    /// did not get from `path_under`. The `leaked` copy one level up is what
+    /// turns either into a wrong value rather than a missing file.
+    #[test]
+    fn an_odd_but_relative_path_is_read_from_under_the_prefix_not_from_beside_it() {
+        let root = scratch("joins-under");
+        let prefix = root.join("pfx");
+        std::fs::create_dir_all(prefix.join("drive_c")).expect("fixture");
+        std::fs::write(
+            prefix.join("drive_c/here.xml"),
+            b"<Attributes><Attr name=\"S\" value=\"inside\"/></Attributes>",
+        )
+        .expect("fixture");
+        // The same name one level up: what a path built by walking out of the
+        // prefix would find instead. Inside this test's own directory, which
+        // is the only place it writes.
+        std::fs::create_dir_all(root.join("drive_c")).expect("fixture");
+        std::fs::write(
+            root.join("drive_c/here.xml"),
+            b"<Attributes><Attr name=\"S\" value=\"leaked\"/></Attributes>",
+        )
+        .expect("fixture");
+
         for odd in [
             "drive_c/here.xml",
             "./drive_c/./here.xml",
             "drive_c//here.xml",
         ] {
-            let p = profiles::parse(&profile(odd))
+            let text = format!(
+                "version = 1\n\n[[check]]\nformat = \"attributes-xml\"\npath = \"{odd}\"\n\
+                 setting = \"S\"\nwants = \"1\"\ntell = \"t\"\n"
+            );
+            let p = profiles::parse(&text)
                 .unwrap_or_else(|e| panic!("{odd} has no `..`, no leading `/`, no `\\`: {e}"));
             let c = p.checks.first().expect("one check").clone();
             assert!(
                 c.path_under(&prefix).starts_with(&prefix),
-                "{odd}: {:?}",
+                "the string `path_under` built is the prefix plus components, and that is \
+                 all this asserts — {odd}: {:?}",
                 c.path_under(&prefix)
             );
             let answer = only(run_check(&c, Some(&prefix)).0);
             assert_eq!(
                 answer,
                 Answer::Text("inside".to_string()),
-                "{odd} was read somewhere other than under the prefix"
+                "{odd} was read from beside the prefix rather than under it"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **`run_check` reads files outside the prefix, and that is the point.**
+    ///
+    /// Five places in this project said a check can only ever reach inside
+    /// the prefix. Four were deleted in an earlier round; the fifth was the
+    /// doc comment on `run_check` itself, directly above the only line in
+    /// this window that hands a path to `tobii-gameconf`, and it survived
+    /// because the test named for the property never looked at a path that
+    /// could disprove it. This test is that path.
+    ///
+    /// Every Wine prefix maps the machine into itself under `dosdevices/`:
+    /// `z:` is `/`, and Steam's Proton prefixes add `s:` pointing at the
+    /// library root. `profiles::check_path` refuses `..`, a leading `/` and a
+    /// backslash, and none of those three has anything to say about
+    /// `dosdevices/z:/…` — so the path parses, joins lexically under the
+    /// prefix, and opens a file that is not under it at all. Profile authors
+    /// are told to use exactly this to reach a game's shipped files under
+    /// `steamapps/common/`, so the capability has to stay.
+    ///
+    /// What must break for this to fail: the doc comment's claim coming back
+    /// as code — `run_check` canonicalising and refusing, `path_under`
+    /// resolving symlinks, or `check_path` learning to refuse a drive letter.
+    /// Any of those takes the documented capability away, and this test is
+    /// where that has to be argued rather than assumed.
+    ///
+    /// `tobii-config`'s `a_check_path_reaches_what_the_prefix_reaches` proves
+    /// the same thing one layer down, about `path_under`. This one proves it
+    /// about the function whose comment made the claim, through the readers
+    /// the window actually calls.
+    #[test]
+    fn a_check_read_through_a_drive_letter_lands_outside_the_prefix() {
+        let root = scratch("reaches-out");
+        let prefix = root.join("pfx");
+        std::fs::create_dir_all(prefix.join("drive_c")).expect("fixture");
+        std::fs::create_dir_all(prefix.join("dosdevices")).expect("fixture");
+        // Nothing of this name exists under the prefix, so a read that
+        // answers with these bytes can only have come from out here.
+        let outside = root.join("library");
+        std::fs::create_dir_all(&outside).expect("fixture");
+        std::fs::write(
+            outside.join("shipped.xml"),
+            b"<Attributes><Attr name=\"S\" value=\"outside\"/></Attributes>",
+        )
+        .expect("fixture");
+        // Exactly what Steam puts in a Proton prefix, made inside this test's
+        // own scratch directory, which is the only place it writes.
+        std::os::unix::fs::symlink(&outside, prefix.join("dosdevices/s:")).expect("s:");
+
+        let text = "version = 1\n\n[[check]]\nformat = \"attributes-xml\"\n\
+                    path = \"dosdevices/s:/shipped.xml\"\n\
+                    setting = \"S\"\nwants = \"1\"\ntell = \"t\"\n";
+        let p = profiles::parse(text).expect("a drive letter is not a `..`");
+        let c = p.checks.first().expect("one check").clone();
+
+        // The lexical assertion the old test made is still true here — which
+        // is the whole point: it never could have caught this.
+        assert!(
+            c.path_under(&prefix).starts_with(&prefix),
+            "{:?}",
+            c.path_under(&prefix)
+        );
+        // And the resolved path is not under the prefix.
+        let real = std::fs::canonicalize(c.path_under(&prefix)).expect("the file out here");
+        let real_prefix = std::fs::canonicalize(&prefix).expect("canonicalize prefix");
+        assert!(
+            !real.starts_with(&real_prefix),
+            "{real:?} was expected to resolve outside {real_prefix:?}"
+        );
+
+        // The bytes, through `run_check` itself.
+        assert_eq!(
+            only(run_check(&c, Some(&prefix)).0),
+            Answer::Text("outside".to_string()),
+            "a check through `dosdevices/s:` has to read the file out there — that is what \
+             a profile author is told to use it for"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4834,7 +5236,8 @@ mod tests {
             prefix: PathBuf::from("/p/pfx"),
             present: vec![],
         };
-        let (text, action) = bridge_block(&state, &[], &[], None, "359320");
+        let (text, action) =
+            bridge_block(&state, &[], &[], None, Some(Path::new("/opt/x")), "359320");
         assert_eq!(action, None, "nothing to run it with: {text}");
         assert!(
             text.contains("tobii bridge install --steam 359320"),
@@ -4846,6 +5249,7 @@ mod tests {
             &[],
             &[],
             Some(Path::new("/home/x/.local/bin/tobii")),
+            Some(Path::new("/opt/x")),
             "359320",
         );
         assert_eq!(action, Some(Action::Install));
