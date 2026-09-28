@@ -186,7 +186,26 @@ pub fn control(
     // of at the next restart.
     let reload = {
         let cmd_tx = cmd_tx.clone();
+        let state = state.clone();
         move || {
+            // **Forget what the device thread last learned, first.** Everything
+            // that calls this has just changed the file on disk, so the
+            // published answer is about a file that is no longer there — and
+            // `HeadModel::Unasked` is exactly the state that means "nobody has
+            // tried this file yet", which sends the card back to reading the
+            // disk until the worker respawns and answers again.
+            //
+            // Without it the card reports the old answer over the new file for
+            // as long as the device thread does not get around to reloading —
+            // which, with the tracker unplugged, is forever: the command is
+            // dropped when the connect fails, the worker is only spawned on a
+            // connection, and the hub's tick refreshes this card only when the
+            // published value CHANGES. Removing the model then left "Working,
+            // with the up-and-down angle." over a deleted file with the
+            // *Get the model…* button hidden, for the rest of the session.
+            if let Ok(mut s) = state.lock() {
+                s.head_model = crate::device::HeadModel::Unasked;
+            }
             let _ = cmd_tx.send(crate::device::DeviceCommand::ReloadHeadModel);
         }
     };
@@ -383,8 +402,11 @@ pub fn control(
                 }
                 match std::fs::remove_file(model_store::path_of(SRC)) {
                     Ok(()) => {
-                        refresh();
+                        // `reload` before `refresh`, and that order is the fix:
+                        // `reload` clears the stale published answer and
+                        // `refresh` is what reads it.
                         reload();
+                        refresh();
                     }
                     Err(e) => status.set_text(&format!("Could not remove it: {e}")),
                 }
@@ -724,8 +746,10 @@ fn start_download<F: Fn() + Clone + 'static, R: Fn() + Clone + 'static>(
         }
         Ok(Ok(_)) => {
             btn.set_sensitive(true);
-            refresh();
+            // `reload` first: it clears the published answer that `refresh`
+            // reads, and that answer is about the file this download replaced.
             reload();
+            refresh();
             glib::ControlFlow::Break
         }
         Ok(Err(e)) => {

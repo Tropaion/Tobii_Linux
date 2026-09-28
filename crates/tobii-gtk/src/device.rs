@@ -397,6 +397,16 @@ pub struct DeviceState {
     /// `latest_gaze` directly.
     pub eye_view: Option<crate::eyeview::EyeView>,
     pub enabled_eye: Option<EnabledEye>,
+    /// How many eye-selection commands the device thread has FINISHED applying.
+    ///
+    /// An edge, so the hub can put the radios back in step with the tracker
+    /// without racing its own click. [`Self::enabled_eye`] alone is not enough:
+    /// between a radio being clicked and the device thread getting to the
+    /// command, it still holds the previous value, so a hub that re-seeded on
+    /// "it differs from the radio" would undo the click and then redo it a
+    /// frame later. This moves exactly once per command applied, whatever the
+    /// tracker answered, so "the answer is in" is a thing the hub can see.
+    pub enabled_eye_applied: u64,
     pub calibration: CalPhase,
     /// Whether the device *may* be inside an open calibration realm. Set
     /// pessimistically before `start_calibration` is issued (a deadline error
@@ -562,15 +572,39 @@ fn apply_command<T: Transport>(
             // The user's PREFERENCE is not lost by this: it is saved where the
             // radio is clicked, before the command is sent, and re-applied on
             // every connect. What is not recorded is the claim that it took.
-            match conn.set_enabled_eye(e) {
-                Ok(true) => state.lock().unwrap().enabled_eye = Some(e),
-                Ok(false) => tobii_diagnostics::log::warn(&format!(
-                    "the tracker did not acknowledge the eye selection ({e:?}); it may still \
-                     be detecting both"
-                )),
-                Err(err) => tobii_diagnostics::log::warn(&format!(
-                    "could not set the eye selection ({e:?}): {err}"
-                )),
+            let applied = match conn.set_enabled_eye(e) {
+                Ok(true) => Some(e),
+                Ok(false) => {
+                    tobii_diagnostics::log::warn(&format!(
+                        "the tracker did not acknowledge the eye selection ({e:?}); it may still \
+                         be detecting both"
+                    ));
+                    None
+                }
+                Err(err) => {
+                    tobii_diagnostics::log::warn(&format!(
+                        "could not set the eye selection ({e:?}): {err}"
+                    ));
+                    None
+                }
+            };
+            // Refused: ask the device what it IS set to, so the hub reports its
+            // answer rather than silently keeping the last one. A read that
+            // fails too leaves the field alone, which is the only honest
+            // remaining answer.
+            let now = match applied {
+                Some(e) => Some(e),
+                None => conn.get_enabled_eye().ok().flatten(),
+            };
+            {
+                let mut s = state.lock().unwrap();
+                if let Some(e) = now {
+                    s.enabled_eye = Some(e);
+                }
+                // Bumped on every path, refusals included: it says the command
+                // has been answered, not that it succeeded. The hub re-seeds
+                // its radios on this edge — see `crate::build_hub`'s tick.
+                s.enabled_eye_applied = s.enabled_eye_applied.wrapping_add(1);
             }
             // NOT saved here. The UI writes the preference where the user
             // chooses it, so it survives the tracker being unreachable; writing
@@ -2404,10 +2438,19 @@ mod tests {
                 &state,
                 DeviceCommand::SetEnabledEye(EnabledEye::Left),
             );
+            let s = state.lock().unwrap();
             assert_eq!(
-                state.lock().unwrap().enabled_eye,
-                want,
+                s.enabled_eye, want,
                 "{what}: the card reads this and says what the tracker is doing"
+            );
+            // And the edge, on BOTH paths. It says "the answer is in", not "it
+            // worked" — the hub re-seeds its radios on this and on nothing
+            // else, so a refusal that did not move it would leave the radio
+            // sitting on a selection the tracker declined, which is the whole
+            // of what the user sees.
+            assert_eq!(
+                s.enabled_eye_applied, 1,
+                "{what}: the device thread finished with this command and said so"
             );
         }
     }

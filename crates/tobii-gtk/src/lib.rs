@@ -1449,10 +1449,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         let caveat = eyes_caveat.downgrade();
         cb.connect_toggled(move |c| {
             // Before the seeding guard, and that is the point of it being here
-            // rather than beside the `cmd_tx.send` below: the tick re-seeds
-            // these radios from what the device reports, and a caveat that only
-            // followed a click would be missing on exactly the selection the
-            // device came back with.
+            // rather than beside the `cmd_tx.send` below: the tick puts these
+            // radios back in step with what the device reports — on connect,
+            // and on every eye command it finishes applying — and a caveat that
+            // only followed a click would be missing on exactly the selection
+            // the device came back with, including the one a refusal reverts to.
             if c.is_active() {
                 if let Some(l) = caveat.upgrade() {
                     match eye_caveat(eye) {
@@ -2230,6 +2231,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // or stopping — or `tobii games` run in a terminal — is reflected without
     // reopening the window, which is how somebody setting this up works.
     let tick_games = Rc::new(games_row);
+    let tick_restate_screen = restate_screen.clone();
+    // The last eye-selection command the device thread had finished applying
+    // when the radios were last put in step with it.
+    let eye_applied = Rc::new(Cell::new(0u64));
     // What the head-model card was last told, so the tick only redraws it when
     // the device thread's answer has actually changed.
     let last_head_model: Rc<RefCell<Option<device::HeadModel>>> = Rc::default();
@@ -2362,9 +2367,24 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                             {
                                 let cmd_tx = tick_cmd_tx.clone();
                                 let demand = tick_demand.clone();
+                                let restate = tick_restate_screen.clone();
                                 move |app| {
                                     let w = setup_flow::launch(app, cmd_tx.clone());
                                     hold_while_open(&demand, &w, "display setup");
+                                    // The OTHER door to this flow, and the one a
+                                    // first-run user comes through — the card's own
+                                    // button is the one that is easy to remember.
+                                    // Without this the card says "No display set up
+                                    // yet." over a display the user set up thirty
+                                    // seconds ago, for the rest of the session.
+                                    //
+                                    // A second handler on the same signal: the one
+                                    // `launch_forced` installs answers `Proceed`, so
+                                    // emission reaches this one too.
+                                    w.connect_close_request(move |_| {
+                                        restate();
+                                        glib::Propagation::Proceed
+                                    });
                                     w
                                 }
                             },
@@ -2410,8 +2430,22 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 // what the device reports afterwards is that preference.
                 eye_seeded.set(false);
             }
-            // Seed the eye-selection radios once from the device's current value.
-            if conn && !eye_seeded.get() {
+            // Put the eye-selection radios in step with the tracker, on two
+            // edges: once per connection, and once per command the device
+            // thread has finished applying.
+            //
+            // The second is the one that makes a refusal visible. It was only
+            // the first, and a latch that is already set cannot move anything —
+            // so a tracker that declined the selection left the radio sitting on
+            // the user's click for the whole connection, which is the opposite
+            // of what the help topic says happens and the opposite of what
+            // `apply_command` records. An edge on "the answer is in" rather than
+            // on "it differs from the radio", because between the click and the
+            // device thread reaching the command the published value is still
+            // the old one, and re-seeding on difference would undo the click and
+            // redo it a frame later.
+            let applied_moved = eye_applied.get() != snap.enabled_eye_applied;
+            if conn && (!eye_seeded.get() || applied_moved) {
                 if let Some(e) = snap.enabled_eye {
                     eye_seeding.set(true);
                     match e {
@@ -2422,6 +2456,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                     eye_seeding.set(false);
                     eye_seeded.set(true);
                 }
+                eye_applied.set(snap.enabled_eye_applied);
             }
             tick_games.refresh(conn);
 
