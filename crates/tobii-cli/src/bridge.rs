@@ -80,7 +80,12 @@ use crate::CmdResult;
 pub(crate) const INSTALL_SUBDIR: &str = "drive_c/tobii-bridge";
 
 /// The Windows spelling of the same directory.
-const INSTALL_WIN_DIR: &str = r"C:\tobii-bridge";
+///
+/// Shared with [`crate::proton`], which spells the provider's path into a batch
+/// file the game's own `cmd.exe` runs: a second copy of this string would let
+/// the two drift, and the launch would start nothing while `install` went on
+/// reporting a directory it had filled.
+pub(crate) const INSTALL_WIN_DIR: &str = r"C:\tobii-bridge";
 
 /// Registry key a TrackIR game reads to find its client DLL.
 const NP_KEY: &str = r"HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location";

@@ -16,6 +16,7 @@ use tobii_usb::{Connection, UsbTransport};
 type CmdResult = Result<(), Box<dyn std::error::Error>>;
 
 mod bridge;
+mod proton;
 mod uninstall;
 mod userreg;
 mod wineserver;
@@ -146,6 +147,14 @@ fn main() -> ExitCode {
 /// warning, not a failure. A user whose game refuses to launch because an eye
 /// tracker daemon is down would rightly remove the wrapper and never put it
 /// back; head tracking is worth less than the game starting.
+///
+/// # And, when it is a Proton launch, where the provider goes
+///
+/// A Proton title's head-tracking provider has to be inside the game's own
+/// wineserver session, and cannot be started beside it — see [`crate::proton`]
+/// for why, and for the rewrite that puts it there instead. That is strictly
+/// the second job: every decision it makes can come back "no", and every "no"
+/// runs the command exactly as it arrived.
 fn game(args: &[String]) -> ExitCode {
     let Some(cmd) = command_after_separator(args) else {
         eprintln!(
@@ -190,6 +199,14 @@ fn game(args: &[String]) -> ExitCode {
             None
         }
     };
+
+    // The second job, and only for a Proton launch [`proton::plan`] can account
+    // for: the provider has to be inside the game's own wineserver session, so
+    // it has to be started *by* the launch rather than beside it. The file is
+    // deliberately still in scope below the wait — dropping it is what takes
+    // the batch file away.
+    let compat = std::env::var_os("STEAM_COMPAT_DATA_PATH").map(std::path::PathBuf::from);
+    let (cmd, _launch_file) = proton::arrange(cmd, compat.as_deref());
 
     let mut child = std::process::Command::new(&cmd[0]);
     child.args(&cmd[1..]);
