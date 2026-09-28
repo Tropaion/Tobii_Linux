@@ -1324,6 +1324,13 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     //
     //   main @ 69cbc2e, one tab, "Set up a game…" on the card   1189 x 776
     //   two tabs, that row deleted                              1189 x 725
+    //   the games card's "n games set up" line added            1189 x 750
+    //
+    // The third row is 25px paid back for a row deleted in the second, and it
+    // buys the one thing the Tracker tab had nothing to say about: whether
+    // there is anything on the other tab. It is a line rather than a clause on
+    // the end of the status paragraph, and `games::set_up_clause` records the
+    // 19px measurement that decided that.
     //
     // **At text scale 1.0, and the test pins it there**, because this machine's
     // saved scale is 1.2 and `load_css` applies it: the same pair measured
@@ -1468,10 +1475,24 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         "",
         &sw_preview,
     ));
+    // How many games have a profile, for the games card's last sentence.
+    //
+    // A cell, counted here and re-counted when the Tracker tab becomes visible
+    // — which is the only moment the card that reads it is on screen. Not on
+    // the 33 ms tick, which is where every other thing this card reports comes
+    // from: that tick re-reads `games.toml`, one small file, and a `readdir` of
+    // the profiles directory beside it thirty times a second is a different
+    // order of cost for a number that changes when somebody runs `tobii games
+    // profile save` in a terminal.
+    let set_up = Rc::new(Cell::new(tobii_config::profiles::list().profiles.len()));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
     // tracker does, not about how this program behaves.
-    let games_row =
-        crate::games::GamesRow::build(joystick_status.clone(), recentring, demand.clone());
+    let games_row = crate::games::GamesRow::build(
+        joystick_status.clone(),
+        recentring,
+        demand.clone(),
+        set_up.clone(),
+    );
     col_games.append(&section(
         "Head tracking for games",
         // One line, and no instructions. Whatever this sentence said about how
@@ -1854,17 +1875,26 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         };
         REFIT.with(|c| *c.borrow_mut() = Some(fit.clone()));
 
-        // Consume a skipped re-fit on the way back to Tracker. Deliberately
-        // not a re-fit on every switch: this fires only when something asked
-        // while the other tab was up, so clicking between tabs still never
-        // moves the window.
+        // On the way back to Tracker: consume a skipped re-fit, and re-count
+        // the profiles the games card reports.
+        //
+        // The re-fit is deliberately not run on every switch — this fires only
+        // when something asked while the other tab was up, so clicking between
+        // tabs still never moves the window. The count is, and it is one
+        // `readdir` of a directory holding a handful of small files: this is
+        // the moment the card that reads it comes back on screen, and the
+        // moment after the one tab that shows what is in that directory was
+        // being looked at.
         {
             let fit = fit.clone();
             let fit_missed = Rc::clone(&fit_missed);
+            let set_up = set_up.clone();
             stack.connect_visible_child_name_notify(move |s| {
-                if s.visible_child_name().as_deref() == Some(TAB_TRACKER)
-                    && fit_missed.replace(false)
-                {
+                if s.visible_child_name().as_deref() != Some(TAB_TRACKER) {
+                    return;
+                }
+                set_up.set(tobii_config::profiles::list().profiles.len());
+                if fit_missed.replace(false) {
                     fit();
                 }
             });

@@ -226,6 +226,85 @@ fn missing_note(missing: &[PathBuf]) -> Option<String> {
 
 // ---------------------------------------------------------------- the picker
 
+/// Which of the list's three sections a row is in.
+///
+/// The order is the order they are shown in, and it is `Ord` for that: what a
+/// user came here to find out is *what have I set up*, so the answer is at the
+/// top and the machine's whole catalogue is under it.
+///
+/// [`Elsewhere`] is the reason this tab is worth building. A profile for a game
+/// on a drive that is not plugged in, or for one that has been uninstalled, is
+/// invisible everywhere else in this program: Steam does not list the title, so
+/// every list built from Steam's manifests leaves it out, and the file goes on
+/// sitting in the profiles directory being applied to nothing. It is also the
+/// one group whose rows cannot answer most of this page's questions, which is
+/// what the detail pane keys off.
+///
+/// [`Elsewhere`]: Group::Elsewhere
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Group {
+    /// A profile, and Steam lists the title as installed here.
+    SetUp,
+    /// Steam lists it and there is no profile.
+    NotSetUp,
+    /// A profile, and Steam does not list the title on this machine.
+    Elsewhere,
+}
+
+impl Group {
+    /// The heading the section sits under.
+    ///
+    /// Plain words and not a count: the count is the number of rows under it,
+    /// which is on screen directly below, and a heading that carried one would
+    /// be the same number twice and a second thing to get wrong when the search
+    /// box narrows the list.
+    pub(crate) fn heading(self) -> &'static str {
+        match self {
+            Group::SetUp => "Set up",
+            Group::NotSetUp => "Not set up",
+            Group::Elsewhere => "Set up, not installed here",
+        }
+    }
+}
+
+/// What a row of the *Set up* group can say about the bridge.
+///
+/// Three states and not a `bool`, because the third is the one a user acts on:
+/// a game that has never been launched under Proton has nowhere to install a
+/// bridge into, and "not installed" over it reads as something to go and press
+/// when there is nothing to press yet. Block 2 makes the same distinction; this
+/// is the one-word version of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowBridge {
+    /// No Proton prefix at all.
+    NeverLaunched,
+    /// A prefix, holding the artifact a game has to load.
+    Installed,
+    /// A prefix, without it.
+    NotInstalled,
+}
+
+impl RowBridge {
+    /// Read it off the same value block 2 is written from, so a row and the
+    /// page it opens cannot disagree about a prefix they both stat'd.
+    fn of(state: &BridgeState) -> Self {
+        match state {
+            BridgeState::NoPrefix => RowBridge::NeverLaunched,
+            BridgeState::Files { .. } => RowBridge::Installed,
+            BridgeState::Absent { .. } => RowBridge::NotInstalled,
+        }
+    }
+
+    /// The clause that follows "profile · " on a row.
+    fn clause(self) -> &'static str {
+        match self {
+            RowBridge::NeverLaunched => "never launched",
+            RowBridge::Installed => "bridge installed",
+            RowBridge::NotInstalled => "bridge not installed",
+        }
+    }
+}
+
 /// One row of the game list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PickRow {
@@ -236,6 +315,37 @@ pub(crate) struct PickRow {
     /// somebody is looking when they wonder why a game they just installed has
     /// nothing to install into.
     pub subtitle: String,
+    /// Which section this row is in.
+    pub group: Group,
+}
+
+impl PickRow {
+    /// What the detail pane needs, and nothing else.
+    ///
+    /// The pane used to be handed a [`tobii_steam::App`] found by app id in the
+    /// scan, which is exactly what a row of [`Group::Elsewhere`] has not got:
+    /// its title is not in Steam's manifests on this machine, and a lookup that
+    /// cannot fail became one that returns nothing and silently does not open
+    /// the page.
+    pub(crate) fn picked(&self) -> Picked {
+        Picked {
+            appid: self.appid.clone(),
+            name: self.name.clone(),
+            installed: self.group != Group::Elsewhere,
+        }
+    }
+}
+
+/// The game the detail pane is showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Picked {
+    pub appid: String,
+    pub name: String,
+    /// Whether Steam lists this title as installed on this machine.
+    ///
+    /// False suppresses the first two blocks — see [`not_installed_text`] for
+    /// what they would otherwise say and why it is not true.
+    pub installed: bool,
 }
 
 /// The pick page, as data.
@@ -254,6 +364,78 @@ pub(crate) struct Picker {
     /// own and got nothing back, which is the exact moment a silent list
     /// becomes a lie.
     pub no_match: Option<String>,
+    /// [`directory_notes`], carried through unchanged. One line each, under
+    /// the census, and usually none at all.
+    ///
+    /// Not filtered by the query, and that is deliberate: a file in the
+    /// profiles directory that could not be read is not a search result, and a
+    /// warning that disappeared when somebody typed would be a warning about
+    /// their typing.
+    pub notes: Vec<String>,
+}
+
+/// What is in the profiles directory and is not a profile this page can use.
+///
+/// Three claims, kept apart, because they are three different things and the
+/// CLI's own listing keeps them apart for the same reason: a broken profile is
+/// this program failing to read what it wrote, a stray is somebody else's file,
+/// and a leftover is a save of ours that was cut short. Folding them into one
+/// "some files could not be used" is how one gets read as another, and one of
+/// them accuses the user of something.
+///
+/// Counts and not names. The CLI prints every name, and it has a terminal's
+/// width and a scrollback to do it in; this is three quiet lines under a list,
+/// and the names are one command away — which is the command the last line
+/// gives. A label that grew a line per file would push the list off the bottom
+/// of a window to report something that is almost always empty.
+///
+/// Empty on nearly every machine, and that is the point of it being a `Vec`:
+/// nothing is shown at all until there is something to say.
+pub(crate) fn directory_notes(l: &profiles::Listing) -> Vec<String> {
+    let mut out = Vec::new();
+    let n = l.problems.len();
+    if n > 0 {
+        out.push(format!(
+            "{n} {thing} in the profiles directory could not be used.",
+            thing = plural(n, "profile", "profiles"),
+        ));
+    }
+    let n = l.strays.len();
+    if n > 0 {
+        out.push(format!(
+            "{n} {thing} in that directory {is} not a profile and {was} not written by this \
+             program.",
+            thing = plural(n, "file", "files"),
+            is = plural(n, "is", "are"),
+            was = plural(n, "was", "were"),
+        ));
+    }
+    let n = l.leftovers.len();
+    if n > 0 {
+        out.push(format!(
+            "{n} {thing} there {was} written by this program and {is} not a profile — a save \
+             that was cut short left {it} behind.",
+            thing = plural(n, "file", "files"),
+            was = plural(n, "was", "were"),
+            is = plural(n, "is", "are"),
+            it = plural(n, "it", "them"),
+        ));
+    }
+    if !out.is_empty() {
+        // The command that names them, always — and the one that deletes them
+        // only where there is something for it to delete. `--purge` removes
+        // what this program wrote, which is the leftovers and the profiles
+        // themselves; a stray is somebody else's file and it does not touch
+        // one. Offering it beside a line about strays alone would be this page
+        // promising to tidy up something it will leave exactly where it is.
+        let mut tail = "`tobii games profile list` names each of them".to_string();
+        if !l.leftovers.is_empty() {
+            tail.push_str(", and `tobii uninstall --purge` removes the ones this program wrote");
+        }
+        tail.push('.');
+        out.push(tail);
+    }
+    out
 }
 
 /// Every row the pick page can show, in the order it shows them, with the
@@ -273,12 +455,47 @@ pub(crate) struct Picker {
 /// had a prefix to the same end — a cache beside the list it described, which
 /// this is instead: one value, built once, that nothing can ask twice.
 pub(crate) struct Catalog {
-    /// The rows, ordered. Each carries the lowercased name beside it.
+    /// The rows, ordered by group and then within it. Each carries the
+    /// lowercased name beside it.
     rows: Vec<(PickRow, String)>,
+    /// How many titles Steam lists as installed here.
+    ///
+    /// Not `rows.len()`, which it was: the third group is rows this machine
+    /// has a profile for and Steam does **not** list, so counting the list
+    /// told a user with one such profile that they had one more game
+    /// installed than they have — in a sentence whose whole subject is what
+    /// Steam's manifests on this machine say.
+    installed: usize,
+    /// What is in the profiles directory and is not a profile this page can
+    /// use. Empty on almost every machine — see [`directory_notes`].
+    notes: Vec<String>,
 }
 
 impl Catalog {
-    pub(crate) fn new(apps: &[App], has_prefix: &dyn Fn(&str) -> bool) -> Self {
+    /// Every row, in three groups.
+    ///
+    /// `profiles` is [`tobii_config::profiles::Listing::profiles`] — the app ids
+    /// this machine has a profile for, whatever wrote it. Built-in and
+    /// user-written are one answer here on purpose: what the page does with a
+    /// profile does not depend on where it came from, and a group called *Set
+    /// up* that left out the games this build configures for you would be
+    /// telling somebody to set up what is already set up.
+    ///
+    /// **Two disk questions, asked of different rows**, and that is the whole
+    /// reason they are two closures rather than one. `has_prefix` is a manifest
+    /// lookup this scan has already paid for and is asked of everything Steam
+    /// lists. `bridge` stats three files inside a prefix and is asked of the
+    /// *Set up* group alone — usually a handful of rows, against a catalogue
+    /// that is 29 on this machine and can be hundreds. A single closure
+    /// answering both would quietly stat every installed title to write a
+    /// subtitle that says "app id 12345".
+    pub(crate) fn new(
+        apps: &[App],
+        listing: &profiles::Listing,
+        has_prefix: &dyn Fn(&str) -> bool,
+        bridge: &dyn Fn(&str) -> RowBridge,
+    ) -> Self {
+        let profiles = &listing.profiles;
         let mut sorted: Vec<&App> = apps.iter().collect();
         // Steam's own plumbing last, and still in the list. `looks_like_tool`
         // is a heuristic on the name and says so; hiding a row it gets wrong
@@ -291,22 +508,69 @@ impl Catalog {
                 a.appid.clone(),
             )
         });
+        let has_profile = |id: &str| profiles.iter().any(|(p, _)| p == id);
+
+        let mut rows: Vec<(PickRow, String)> = sorted
+            .iter()
+            .map(|a| {
+                let group = if has_profile(&a.appid) {
+                    Group::SetUp
+                } else {
+                    Group::NotSetUp
+                };
+                let subtitle = match group {
+                    Group::SetUp => format!("profile · {}", bridge(&a.appid).clause()),
+                    _ if has_prefix(&a.appid) => format!("app id {}", a.appid),
+                    _ => format!("app id {} · no Proton prefix yet", a.appid),
+                };
+                let row = PickRow {
+                    appid: a.appid.clone(),
+                    name: a.name.clone(),
+                    subtitle,
+                    group,
+                };
+                (row, a.name.to_lowercase())
+            })
+            .collect();
+
+        // The third group: a profile whose title Steam does not list here.
+        //
+        // Named from the profile when it says a name, and by its app id when it
+        // does not — which is the only name anything has for it, because the
+        // one place that knows what a title is called is the manifest that is
+        // not on this machine.
+        let mut elsewhere: Vec<(PickRow, String)> = profiles
+            .iter()
+            .filter(|(id, _)| !apps.iter().any(|a| &a.appid == id))
+            .map(|(id, loaded)| {
+                let name = loaded
+                    .profile
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("app id {id}"));
+                let lower = name.to_lowercase();
+                (
+                    PickRow {
+                        appid: id.clone(),
+                        name,
+                        subtitle: format!("app id {id} · not installed on this machine"),
+                        group: Group::Elsewhere,
+                    },
+                    lower,
+                )
+            })
+            .collect();
+        elsewhere.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.appid.cmp(&b.0.appid)));
+
+        // One stable sort by group, which leaves each group in the order it was
+        // built with: the catalogue order for the first two, name order for the
+        // third.
+        rows.extend(elsewhere);
+        rows.sort_by_key(|(r, _)| r.group);
         Self {
-            rows: sorted
-                .iter()
-                .map(|a| {
-                    let row = PickRow {
-                        appid: a.appid.clone(),
-                        name: a.name.clone(),
-                        subtitle: if has_prefix(&a.appid) {
-                            format!("app id {}", a.appid)
-                        } else {
-                            format!("app id {} · no Proton prefix yet", a.appid)
-                        },
-                    };
-                    (row, a.name.to_lowercase())
-                })
-                .collect(),
+            rows,
+            installed: sorted.len(),
+            notes: directory_notes(listing),
         }
     }
 }
@@ -333,10 +597,9 @@ pub(crate) fn picker(catalog: &Catalog, missing: &[PathBuf], query: &str) -> Pic
         .map(|(row, _)| row.clone())
         .collect();
 
-    // `rows` is the machine's whole list; a query narrows the `Vec` that
-    // `picker` returns, never this one. A separate count would be the same
-    // number kept twice.
-    let n = catalog.rows.len();
+    // The machine's whole count; a query narrows the `Vec` that `picker`
+    // returns, never this one.
+    let n = catalog.installed;
     let mut census = format!(
         "{n} {thing} installed, from Steam's own manifests on this machine.",
         thing = plural(n, "title", "titles")
@@ -366,7 +629,38 @@ pub(crate) fn picker(catalog: &Catalog, missing: &[PathBuf], query: &str) -> Pic
         census,
         census_warn,
         no_match,
+        notes: catalog.notes.clone(),
     }
+}
+
+/// What the detail pane says instead of the first two blocks, for a game this
+/// machine has a profile for and Steam does not list.
+///
+/// The one genuinely new paragraph the three groups need, and it exists because
+/// the honest answer to both of those blocks is *not from here*. Block 2 would
+/// run `bridge_state` over no prefix and print `NoPrefix`'s text, which tells
+/// somebody to launch the game once and come back — true for a game that is
+/// installed and never started, and false for a drive that is not plugged in.
+/// Block 1 reports settings that are global and would be word for word what
+/// every other row says, which on this page reads as an answer about this game.
+///
+/// Block 3 is not suppressed and does not need to be: its rows answer
+/// `Answer::NoPrefix` on their own, which is already the true thing to say
+/// about a file nothing here can open.
+pub(crate) fn not_installed_text(name: &str, appid: &str, missing: &[PathBuf]) -> String {
+    let mut s = format!(
+        "There is a profile for {name} (app id {appid}), and Steam does not list that title as \
+         installed on this machine.\n\n\
+         So the two things this page would otherwise report — where head tracking is being \
+         sent, and whether the Wine bridge is in the game's Proton prefix — have no answer \
+         from here. The profile is not lost: it is read whenever this program is asked about \
+         that app id, and it applies again the moment Steam lists the title."
+    );
+    if let Some(note) = missing_note(missing) {
+        s.push_str("\n\n");
+        s.push_str(&note);
+    }
+    s
 }
 
 /// What the detail pane says when Steam has nothing installed at all.
@@ -2273,6 +2567,26 @@ pub struct GamesTab {
     pub alive: Rc<Cell<bool>>,
 }
 
+/// Read the profiles directory and build the list from it.
+///
+/// Separate from [`Catalog::new`], which is pure and tested as such: this is
+/// the half that touches a disk, and it is called again every time the tab
+/// comes into view.
+///
+/// The bridge closure is the expensive one — three stats inside a prefix — and
+/// [`Catalog::new`] asks it only of the rows that have a profile. It is written
+/// over [`bridge_state`], the same function block 2 is worded from, so a row
+/// saying *bridge installed* and the page it opens cannot disagree.
+fn read_catalog(scan: &Scan) -> Catalog {
+    let listing = profiles::list_from(&scan.profiles_dir, profiles::BUILTIN);
+    Catalog::new(
+        &scan.apps,
+        &listing,
+        &|id| scan.steam.prefix(id).is_some(),
+        &|id| RowBridge::of(&bridge_state(scan.steam.prefix(id).as_deref(), id)),
+    )
+}
+
 /// Build the Games tab.
 ///
 /// Reads `$HOME` and this user's profile directory, and hands both to
@@ -2322,10 +2636,19 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     //
 
     // The list, in the order the page shows it, with the prefix question
-    // answered for each row. Neither depends on what gets typed.
-    let catalog = Rc::new(Catalog::new(&scan.apps, &|id| {
-        scan.steam.prefix(id).is_some()
-    }));
+    // answered for each row. None of it depends on what gets typed.
+    //
+    // In a cell rather than built once, because one of its three inputs can
+    // change while the hub is open and the other two cannot. Steam's manifests
+    // and this machine's prefixes are read by `scan` and by `scan.steam`, which
+    // are a walk each and are deliberately paid once. The profiles directory is
+    // a `readdir` of a handful of small files, and `tobii games profile save`
+    // in a terminal is the documented way to put something in it — so a list
+    // that grouped by profile and never looked again would answer "Not set up"
+    // about a game the user had just set up, on the page whose whole subject is
+    // what is set up. It is re-read when the tab comes into view, which is the
+    // first moment anybody could be looking at the answer.
+    let catalog = Rc::new(RefCell::new(read_catalog(&scan)));
 
     // Before the pick page, because the lead above the list says what this
     // window will do for a game and one of the two things it does needs this.
@@ -2371,9 +2694,16 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     list_scroll.set_child(Some(&list));
 
     let census = small("");
+    // Under the census and usually not there at all: what is in the profiles
+    // directory and is not a profile. Hidden rather than empty, so it takes no
+    // height on the machines — almost all of them — with nothing to say.
+    let notes = small("");
+    notes.add_css_class("section-warn");
+    notes.set_visible(false);
     pick.append(&search);
     pick.append(&list_scroll);
     pick.append(&census);
+    pick.append(&notes);
 
     // ---- the detail pane, state one: nothing picked yet
     //
@@ -2440,13 +2770,28 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     game.append(&g_title);
     game.append(&g_sub);
 
+    // What stands in for the first two blocks when Steam does not list the
+    // title here — a whole group of the list, and the one case where those two
+    // blocks have no true answer. See `not_installed_text`.
+    //
+    // A box of its own, with its own divider, so that showing it is one
+    // `set_visible` and hiding it is one more: three widgets toggled instead of
+    // five, and no chance of a divider left behind above nothing.
+    let away = gtk::Box::new(Orientation::Vertical, 14);
+    let away_body = wrapped("");
+    away.append(&away_body);
+    away.append(&divider());
+    away.set_visible(false);
+    game.append(&away);
+
     // No actions box, for the reason block 3 has never had one: this block
     // reports settings it does not own. The one editor of them is the games
     // card on the Tracker tab, and a second control here writing the same two
     // keys is the duplication the modal was modal to survive.
     let (b1, s_body) = block(1, "These settings");
+    let d1 = divider();
     game.append(&b1);
-    game.append(&divider());
+    game.append(&d1);
 
     let (b2, br_body) = block(2, "The Wine bridge");
     let b_actions = gtk::Box::new(Orientation::Horizontal, 10);
@@ -2454,8 +2799,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     b2.append(&b_actions);
     let b_report = small("");
     b2.append(&b_report);
+    let d2 = divider();
     game.append(&b2);
-    game.append(&divider());
+    game.append(&d2);
 
     // No actions box either, and that is the decision rather than an oversight:
     // this program never writes a game's own configuration files, so block 3
@@ -2502,8 +2848,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // hold: `crate::build_hub` gives the control rack `vexpand(false)` and
     // `valign(Start)`, so it stays its own height at the top of whatever it is
     // given; and the hub's opening height comes from `root.measure`, which does
-    // not consult expand at all. Measured either side of this line: 1189 x 725
-    // both times.
+    // not consult expand at all. Measured either side of this line when it was
+    // added: 1189 x 725 both times. The equality is the fact; the hub opens at
+    // 1189 x 750 since, and `crate::build_hub` records what changed.
     let content = gtk::Box::new(Orientation::Horizontal, 16);
     content.set_vexpand(true);
     content.append(&pick);
@@ -2529,7 +2876,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
 
     // ---- the state the page draws itself from
 
-    let sel: Rc<RefCell<Option<App>>> = Rc::default();
+    let sel: Rc<RefCell<Option<Picked>>> = Rc::default();
     // All three carry the app id their answer is about, and they carry it
     // because clearing them on a selection change was not enough. A job
     // outlives the selection it was started from: select a game, press *Install
@@ -2580,6 +2927,25 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             p_body.clone(),
             rows_box.clone(),
         );
+        // The four things a row of `Group::Elsewhere` turns off and the one it
+        // turns on. **Weak, every one of them**, and one of the five is the
+        // reason: `b2` contains `b_actions`, which contains the three buttons
+        // whose `clicked` handlers hold this very closure. Held strongly here
+        // that is `b2` -> `b_actions` -> `install_btn` -> handler -> this
+        // closure -> `b2`, a cycle between two parts of one subtree, which GTK
+        // never breaks — measured as 23 widgets and 45 event controllers still
+        // alive after the program quit. The other four carry no handler and
+        // could be strong; they are weak so that the rule at the top of this
+        // closure is what the code looks like rather than something a reader
+        // has to re-derive per widget.
+        let (away, away_body, b1, d1, b2, d2) = (
+            away.downgrade(),
+            away_body.downgrade(),
+            b1.downgrade(),
+            d1.downgrade(),
+            b2.downgrade(),
+            d2.downgrade(),
+        );
         let b_actions = b_actions.downgrade();
         let (install_w, details_w, wine_w) = (
             install_btn.downgrade(),
@@ -2592,6 +2958,28 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             };
             g_title.set_text(&app.name);
             g_sub.set_text(&format!("app id {}", app.appid));
+
+            // Steam does not list this title here, so the first two blocks have
+            // no answer about it and are not shown. Block 3 is, unchanged: its
+            // rows say `NoPrefix` on their own account, which is the true thing
+            // to say about a file nothing here can open.
+            if let Some(away) = away.upgrade() {
+                away.set_visible(!app.installed);
+            }
+            for w in [&b1, &d1, &b2, &d2] {
+                if let Some(w) = w.upgrade() {
+                    w.set_visible(app.installed);
+                }
+            }
+            if !app.installed {
+                if let Some(body) = away_body.upgrade() {
+                    body.set_text(&not_installed_text(
+                        &app.name,
+                        &app.appid,
+                        scan.steam.missing_libraries(),
+                    ));
+                }
+            }
 
             // Read before the blocks are worded, because two of them have
             // something to say about what it holds. A profile that named
@@ -2837,14 +3225,45 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
 
     // ---- the pick list
 
-    let ids: Rc<RefCell<Vec<String>>> = Rc::default();
+    // What each row of the list is, by position — and the list is rebuilt from
+    // scratch on every keystroke, so this is rewritten with it.
+    //
+    // The whole row and not the app id it used to be, for two readers. The
+    // section headings are drawn by `set_header_func`, which is handed a row
+    // and has to say what group sits above it — headings as rows was the other
+    // way, and it puts a selectable thing in the list that is not a game:
+    // `row_activated` is keyed on `row.index()`, so every heading shifts every
+    // id under it by one and a click opens the wrong game. And the detail pane
+    // is opened from here, which used to mean finding the app id in the scan —
+    // exactly what a row of `Group::Elsewhere` is not in.
+    let ids: Rc<RefCell<Vec<PickRow>>> = Rc::default();
+    {
+        let ids = ids.clone();
+        list.set_header_func(move |row, before| {
+            let ids = ids.borrow();
+            let group = |r: &gtk::ListBoxRow| ids.get(r.index().max(0) as usize).map(|p| p.group);
+            let Some(mine) = group(row) else {
+                return;
+            };
+            // Only where the group changes, which for the first row is always.
+            if before.and_then(group) == Some(mine) {
+                row.set_header(None::<&gtk::Widget>);
+                return;
+            }
+            let h = Label::new(Some(mine.heading()));
+            h.set_halign(Align::Start);
+            h.set_xalign(0.0);
+            h.add_css_class("eyebrow");
+            row.set_header(Some(&h));
+        });
+    }
     let rebuild: Rc<dyn Fn(&str)> = {
-        let (scan, catalog, ids) = (scan.clone(), catalog.clone(), ids.clone());
+        let (scan, catalog, ids, sel) = (scan.clone(), catalog.clone(), ids.clone(), sel.clone());
         let list_w = list.downgrade();
-        let (placeholder, census) = (placeholder.clone(), census.clone());
+        let (placeholder, census, notes) = (placeholder.clone(), census.clone(), notes.clone());
         Rc::new(move |q: &str| {
-            let p = picker(&catalog, scan.steam.missing_libraries(), q);
-            *ids.borrow_mut() = p.rows.iter().map(|r| r.appid.clone()).collect();
+            let p = picker(&catalog.borrow(), scan.steam.missing_libraries(), q);
+            *ids.borrow_mut() = p.rows.clone();
             if let Some(list) = list_w.upgrade() {
                 while let Some(c) = list.first_child() {
                     list.remove(&c);
@@ -2862,6 +3281,19 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                     b.append(&s);
                     list.append(&b);
                 }
+                // The selection survives the rebuild, by app id. The list is
+                // thrown away and built again on every keystroke and every time
+                // the tab is shown, and the detail pane beside it goes on
+                // showing the game that was picked — so without this the
+                // highlight came off the row the pane is about, and typing one
+                // letter made the page look like nothing was selected.
+                if let Some(picked) = sel.borrow().as_ref() {
+                    if let Some(i) = p.rows.iter().position(|r| r.appid == picked.appid) {
+                        if let Some(row) = list.row_at_index(i as i32) {
+                            list.select_row(Some(&row));
+                        }
+                    }
+                }
             }
             placeholder.set_text(p.no_match.as_deref().unwrap_or(""));
             census.set_text(&p.census);
@@ -2870,6 +3302,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             } else {
                 census.remove_css_class("section-warn");
             }
+            notes.set_text(&p.notes.join(" "));
+            notes.set_visible(!p.notes.is_empty());
         })
     };
     rebuild("");
@@ -2879,10 +3313,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     }
 
     {
-        let (refresh, sel, scan, ids, outcome, report) = (
+        let (refresh, sel, ids, outcome, report) = (
             refresh.clone(),
             sel.clone(),
-            scan.clone(),
             ids.clone(),
             outcome.clone(),
             report.clone(),
@@ -2906,13 +3339,14 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
         );
         let (s_w, br_w, p_w) = (s_body.downgrade(), br_body.downgrade(), p_body.downgrade());
         list.connect_row_activated(move |_, row| {
-            let Some(id) = ids.borrow().get(row.index().max(0) as usize).cloned() else {
+            let Some(picked) = ids
+                .borrow()
+                .get(row.index().max(0) as usize)
+                .map(PickRow::picked)
+            else {
                 return;
             };
-            let Some(app) = scan.apps.iter().find(|a| a.appid == id).cloned() else {
-                return;
-            };
-            *sel.borrow_mut() = Some(app);
+            *sel.borrow_mut() = Some(picked);
             // A different game's answers are not this game's — and clearing
             // them here is only half of that, because a job still running will
             // write its answer back after this line has run. The other half is
@@ -2949,20 +3383,44 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
         body.select_region(0, 0);
     }
 
-    // Re-read when the tab comes into view. Block 1 reports settings the other
-    // tab owns, and the sentence it added — "turning it on, on the Tracker tab"
-    // — is an instruction to go and change one of them. Without this, a user
-    // does exactly what it says, comes back, and reads the same sentence,
-    // now false, with nothing on screen looking wrong. The modal could not have
-    // this bug: it blocked the card, which was the whole of its modality
-    // argument. `refresh` re-reads `load_output_config` on every call, so only
-    // the trigger was missing.
+    // Re-read when the tab comes into view, both halves of the page.
     //
-    // Safe for the lifetime: `refresh` reaches every handler-carrying widget
+    // **The detail pane**, because block 1 reports settings the other tab owns
+    // and the sentence it adds — "turning it on, on the Tracker tab" — is an
+    // instruction to go and change one of them. Without this, a user does
+    // exactly what it says, comes back, and reads the same sentence, now false,
+    // with nothing on screen looking wrong. The modal could not have this bug:
+    // it blocked the card, which was the whole of its modality argument.
+    // `refresh` re-reads `load_output_config` on every call, so only the
+    // trigger was missing.
+    //
+    // **The list**, because `tobii games profile save <appid>` in a terminal is
+    // the documented way to write a profile, and which group a game is in is
+    // read off the profiles directory. A list built once would put a game the
+    // user had just set up under "Not set up" until the hub was restarted.
+    // Only the profile half is re-read — `read_catalog` does a `readdir` of a
+    // handful of small files and stats a prefix per profile, not the Steam walk
+    // behind it, which `scan` paid for once.
+    //
+    // The query is taken from the search box rather than reset, so coming back
+    // to a filtered list finds it as it was left.
+    //
+    // Safe for the lifetime: both closures reach every handler-carrying widget
     // through `downgrade()`, so nothing under `content` holds `content` back.
     {
-        let refresh = refresh.clone();
-        content.connect_map(move |_| refresh());
+        let (refresh, rebuild, catalog, scan) = (
+            refresh.clone(),
+            rebuild.clone(),
+            catalog.clone(),
+            scan.clone(),
+        );
+        let search_w = search.downgrade();
+        content.connect_map(move |_| {
+            *catalog.borrow_mut() = read_catalog(&scan);
+            let q = search_w.upgrade().map(|e| e.text().to_string());
+            rebuild(q.as_deref().unwrap_or(""));
+            refresh();
+        });
     }
 
     GamesTab {
@@ -2984,6 +3442,22 @@ mod tests {
             name: name.to_string(),
             buildid: None,
         }
+    }
+
+    /// A catalogue with no profiles at all — the two-argument `Catalog::new`
+    /// this used to be, which is what most of these tests want.
+    ///
+    /// The bridge closure panics, and that is an assertion rather than a stub.
+    /// `Catalog::new` promises to ask it only of the rows that have a profile,
+    /// because it stats three files inside a prefix and the other two groups
+    /// can be hundreds of rows long. With no profiles there are no such rows,
+    /// so a change that asked it of everything installed fails here — loudly,
+    /// and in every test in this module at once — instead of quietly costing a
+    /// user a second every time they open the tab.
+    fn catalog(apps: &[App], has_prefix: &dyn Fn(&str) -> bool) -> Catalog {
+        Catalog::new(apps, &profiles::Listing::default(), has_prefix, &|id| {
+            panic!("the bridge was stat'd for app id {id}, which has no profile")
+        })
     }
 
     /// An `OutputConfig` with all four things this window reads spelled out.
@@ -3152,6 +3626,298 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------ the groups
+
+    /// A `Listing` with a profile per app id given, each naming itself.
+    fn listed(entries: &[(&str, Option<&str>)]) -> profiles::Listing {
+        profiles::Listing {
+            profiles: entries
+                .iter()
+                .map(|(id, name)| {
+                    (
+                        (*id).to_string(),
+                        profiles::Loaded {
+                            origin: profiles::Origin::File(PathBuf::from(format!("/p/{id}.toml"))),
+                            profile: profiles::Profile {
+                                name: name.map(str::to_string),
+                                ..profiles::Profile::default()
+                            },
+                        },
+                    )
+                })
+                .collect(),
+            ..profiles::Listing::default()
+        }
+    }
+
+    /// The whole point of the three groups, in one assertion: what a user came
+    /// to this tab to find out is *what have I set up*, so it is at the top,
+    /// the machine's catalogue is under it, and the profiles Steam knows
+    /// nothing about are under that.
+    ///
+    /// The third group is the one that could not exist before. A profile for a
+    /// game on a drive that is not plugged in, or for one that has been
+    /// uninstalled, is in no list built from Steam's manifests — so the file
+    /// sat in the profiles directory being applied to nothing, and no screen in
+    /// this program said it was there.
+    #[test]
+    fn the_list_answers_what_is_set_up_before_it_answers_what_is_installed() {
+        let apps = [app("1", "Bravo"), app("2", "Alpha"), app("3", "Charlie")];
+        // A profile for one installed title, and one for a title that is not.
+        let listing = listed(&[("2", None), ("77", Some("Gone Fishing"))]);
+        let c = Catalog::new(&apps, &listing, &none, &|_| RowBridge::Installed);
+        let p = picker(&c, &[], "");
+        let seen: Vec<(&str, Group)> = p.rows.iter().map(|r| (r.name.as_str(), r.group)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("Alpha", Group::SetUp),
+                ("Bravo", Group::NotSetUp),
+                ("Charlie", Group::NotSetUp),
+                ("Gone Fishing", Group::Elsewhere),
+            ],
+            "the groups, in order, with each group in its own order: {p:#?}"
+        );
+        // And the headings the sections are drawn under, which are the only
+        // words on the list that say what any of this means.
+        assert_eq!(
+            [Group::SetUp, Group::NotSetUp, Group::Elsewhere].map(Group::heading),
+            ["Set up", "Not set up", "Set up, not installed here"],
+        );
+    }
+
+    /// The census counts what Steam says is installed, and the third group is
+    /// by definition not that.
+    ///
+    /// It was `rows.len()`, which was the same number until there was a third
+    /// group — and then a user with one profile for an uninstalled game was
+    /// told they had one more title installed than they have, in the one
+    /// sentence on the page whose whole subject is Steam's manifests.
+    #[test]
+    fn a_profile_for_a_game_that_is_not_here_is_not_counted_as_installed() {
+        let apps = [app("1", "Bravo")];
+        let c = Catalog::new(&apps, &listed(&[("77", None)]), &none, &|_| {
+            RowBridge::Installed
+        });
+        let p = picker(&c, &[], "");
+        assert_eq!(p.rows.len(), 2, "both rows are shown: {p:#?}");
+        assert!(
+            p.census.starts_with("1 title installed"),
+            "one is installed and the other is the reason this group exists: {}",
+            p.census
+        );
+    }
+
+    /// A row of the third group is named by the profile when the profile says a
+    /// name, and by its app id when it does not.
+    ///
+    /// There is no other source. The one place that knows what a title is
+    /// called is the manifest on the machine that has it, which is precisely
+    /// the machine this is not — so a row with no name in its profile has to
+    /// read as an app id rather than as a blank or as a guess.
+    #[test]
+    fn a_game_that_is_not_installed_here_is_named_by_its_profile_or_by_its_id() {
+        let c = Catalog::new(
+            &[],
+            &listed(&[("77", Some("Gone Fishing")), ("88", None)]),
+            &none,
+            &|_| RowBridge::Installed,
+        );
+        let rows = picker(&c, &[], "").rows;
+        let named: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.subtitle.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            // Name order, and "app id 88" is a name here: it is the only one
+            // that title has on this machine, so it sorts with the others
+            // rather than being pushed to an end of its own.
+            vec![
+                ("app id 88", "app id 88 · not installed on this machine"),
+                ("Gone Fishing", "app id 77 · not installed on this machine"),
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    /// The *Set up* subtitle says what there is to do next, and the three
+    /// states are three different answers.
+    ///
+    /// "Not installed" over a game that has never been launched reads as
+    /// something to go and press, and there is nothing to press: there is no
+    /// prefix to install into until Proton has made one. Block 2 draws the same
+    /// distinction in a paragraph; this is the one-word version, and it is read
+    /// off the same [`bridge_state`] so the two cannot disagree.
+    #[test]
+    fn a_set_up_row_says_which_of_the_three_bridge_states_it_is_in() {
+        let apps = [app("1", "One"), app("2", "Two"), app("3", "Three")];
+        let listing = listed(&[("1", None), ("2", None), ("3", None)]);
+        let c = Catalog::new(&apps, &listing, &none, &|id| match id {
+            "1" => RowBridge::Installed,
+            "2" => RowBridge::NotInstalled,
+            _ => RowBridge::NeverLaunched,
+        });
+        let subs: Vec<String> = picker(&c, &[], "")
+            .rows
+            .iter()
+            .map(|r| r.subtitle.clone())
+            .collect();
+        assert_eq!(
+            subs,
+            vec![
+                "profile · bridge installed",
+                "profile · never launched",
+                "profile · bridge not installed",
+            ],
+            "in name order — One, Three, Two"
+        );
+    }
+
+    /// The expensive question is asked of the rows that need it and of nothing
+    /// else.
+    ///
+    /// `bridge` stats three files inside a prefix. The *Set up* group is
+    /// usually a handful of rows; the catalogue is 29 on this machine and can
+    /// be hundreds, and asking all of them would put a per-title directory walk
+    /// in the path of opening a tab. The count, not just "it was not asked of a
+    /// row without a profile": once per row is also the promise, and a refresh
+    /// that asked twice would still pass a check that only looked for zero.
+    #[test]
+    fn the_bridge_is_stat_ed_once_for_a_set_up_row_and_never_for_any_other() {
+        let apps = [app("1", "One"), app("2", "Two"), app("3", "Three")];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let c = Catalog::new(&apps, &listed(&[("2", None)]), &none, &|id| {
+            asked.borrow_mut().push(id.to_string());
+            RowBridge::Installed
+        });
+        assert_eq!(
+            *asked.borrow(),
+            vec!["2".to_string()],
+            "only the row with a profile, and only once"
+        );
+        drop(c);
+    }
+
+    /// What the pane says for a game this machine has a profile for and Steam
+    /// does not list.
+    ///
+    /// The two blocks it replaces would both answer, and both answers would be
+    /// wrong in the same way: block 2 runs `bridge_state` over no prefix and
+    /// prints "launch it once and come back", which is true of an installed
+    /// game that has never been started and false of a drive that is not
+    /// plugged in.
+    #[test]
+    fn the_page_for_a_game_that_is_not_here_does_not_tell_you_to_launch_it() {
+        let t = not_installed_text("Gone Fishing", "77", &[]);
+        assert!(t.contains("Gone Fishing") && t.contains("77"), "{t}");
+        assert!(
+            t.contains("does not list that title as installed on this machine"),
+            "it says the one thing that is true: {t}"
+        );
+        assert!(
+            t.contains("The profile is not lost"),
+            "and that the file still counts, which is the reason somebody is \
+             looking at this row at all: {t}"
+        );
+        // The exact sentences block 2 would have printed. Not a class — a
+        // paragraph that said "install it and come back" would sail through —
+        // but these are the words a reader of this row would have been given,
+        // and the reason this paragraph exists.
+        for claim in ["run it once and come back", "No Proton prefix was found"] {
+            assert!(
+                !t.contains(claim),
+                "{claim:?} is block 2's answer over an absent prefix, and it is not \
+                 true of a drive that is not plugged in: {t}"
+            );
+        }
+        // And the missing-library sentence when there is one, because a drive
+        // that is not plugged in is the commonest way to land in this group.
+        let with = not_installed_text("Gone Fishing", "77", &[PathBuf::from("/mnt/games2")]);
+        assert!(with.contains("/mnt/games2"), "{with}");
+    }
+
+    // --------------------------------------------- the profiles directory
+
+    /// Three claims, kept apart, because they are three different things and
+    /// one of them accuses the user of something.
+    ///
+    /// A broken profile is this program failing to read what it wrote; a stray
+    /// is somebody else's file, which this program will not touch; a leftover
+    /// is a save of ours that was cut short. The CLI's own listing prints them
+    /// as three paragraphs for exactly this reason, and folding them together
+    /// here would be this page and that one disagreeing about what is in a
+    /// directory they both read.
+    #[test]
+    fn the_directory_notes_keep_the_three_claims_apart() {
+        assert!(
+            directory_notes(&profiles::Listing::default()).is_empty(),
+            "nothing to say on the machine almost everybody has"
+        );
+
+        let one = directory_notes(&profiles::Listing {
+            problems: vec![profiles::LoadError::Unreadable {
+                origin: profiles::Origin::File(PathBuf::from("/p/1.toml")),
+                why: "Permission denied".to_string(),
+            }],
+            strays: vec!["notes.txt".to_string()],
+            leftovers: vec!["2.toml.tmp".to_string()],
+            ..profiles::Listing::default()
+        });
+        assert_eq!(
+            one.len(),
+            4,
+            "three claims and where the names are: {one:#?}"
+        );
+        assert!(
+            one[0].contains("1 profile in the profiles directory"),
+            "{one:#?}"
+        );
+        assert!(
+            one[1].contains("not a profile and was not written by this program"),
+            "a stray is somebody else's file: {one:#?}"
+        );
+        assert!(
+            one[2].contains("written by this program") && one[2].contains("cut short"),
+            "and a leftover is ours: {one:#?}"
+        );
+        assert!(
+            one[3].contains("tobii games profile list") && one[3].contains("--purge"),
+            "the names are one command away, and with a leftover there is a second \
+             command that removes it: {one:#?}"
+        );
+
+        // And `--purge` is offered only where there is something for it to
+        // remove. A stray is somebody else's file and `--purge` leaves it
+        // exactly where it is, so naming it beside a line about strays alone
+        // would be this page promising a tidy-up that does not happen.
+        let strays_only = directory_notes(&profiles::Listing {
+            strays: vec!["notes.txt".to_string()],
+            ..profiles::Listing::default()
+        });
+        assert_eq!(strays_only.len(), 2, "{strays_only:#?}");
+        assert!(
+            !strays_only[1].contains("--purge"),
+            "`--purge` does not touch a file this program did not write: {strays_only:#?}"
+        );
+
+        // Plurals, because three sentences with four agreements between them is
+        // where "1 files is not a profile" comes from.
+        let many = directory_notes(&profiles::Listing {
+            strays: vec!["a".to_string(), "b".to_string()],
+            leftovers: vec!["c.toml.tmp".to_string(), "d.toml.tmp".to_string()],
+            ..profiles::Listing::default()
+        });
+        assert!(
+            many[0].contains("2 files in that directory are not a profile and were not"),
+            "{many:#?}"
+        );
+        assert!(
+            many[1].contains("2 files there were written by this program and are not"),
+            "{many:#?}"
+        );
+    }
+
     // ------------------------------------------------------------ the picker
 
     /// The moment a user has typed the name of a game they own and got nothing
@@ -3161,7 +3927,7 @@ mod tests {
     fn a_search_that_finds_nothing_still_names_the_library_that_is_not_here() {
         let apps = [app("1", "Something Else")];
         let missing = [PathBuf::from("/mnt/games2")];
-        let p = picker(&Catalog::new(&apps, &none), &missing, "Elite");
+        let p = picker(&catalog(&apps, &none), &missing, "Elite");
         let text = p
             .no_match
             .expect("nothing matched, so there is a no-match page");
@@ -3180,7 +3946,7 @@ mod tests {
     #[test]
     fn a_search_that_finds_nothing_with_every_library_present_invents_none() {
         let apps = [app("1", "Something Else")];
-        let p = picker(&Catalog::new(&apps, &none), &[], "Elite");
+        let p = picker(&catalog(&apps, &none), &[], "Elite");
         let text = p.no_match.expect("nothing matched");
         assert!(!text.contains("cannot rule out"), "{text}");
         assert!(!text.contains("not on this machine"), "{text}");
@@ -3200,7 +3966,7 @@ mod tests {
             app("2", "Protonaut"),
             app("3", "Elite Dangerous"),
         ];
-        let p = picker(&Catalog::new(&apps, &none), &[], "");
+        let p = picker(&catalog(&apps, &none), &[], "");
         let names: Vec<&str> = p.rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
@@ -3216,7 +3982,7 @@ mod tests {
     fn the_search_is_a_case_insensitive_substring_and_an_empty_box_is_not_a_search() {
         let apps = [app("359320", "Elite Dangerous"), app("220", "Half-Life 2")];
         let hits = |q: &str| -> Vec<String> {
-            picker(&Catalog::new(&apps, &none), &[], q)
+            picker(&catalog(&apps, &none), &[], q)
                 .rows
                 .iter()
                 .map(|r| r.appid.clone())
@@ -3236,7 +4002,7 @@ mod tests {
     #[test]
     fn a_row_says_whether_this_game_has_a_prefix_yet() {
         let apps = [app("1", "Launched"), app("2", "Never Launched")];
-        let p = picker(&Catalog::new(&apps, &|id| id == "1"), &[], "");
+        let p = picker(&catalog(&apps, &|id| id == "1"), &[], "");
         let by_name = |n: &str| {
             p.rows
                 .iter()
@@ -3283,7 +4049,7 @@ mod tests {
             app("5", "Alpha Elite"),
         ];
         let asked = std::cell::RefCell::new(Vec::new());
-        let catalog = Catalog::new(&apps, &|id: &str| {
+        let catalog = catalog(&apps, &|id: &str| {
             asked.borrow_mut().push(id.to_string());
             id == "1"
         });
@@ -4394,7 +5160,7 @@ mod tests {
     #[test]
     fn the_census_counts_the_titles_and_warns_only_when_a_library_is_gone() {
         let apps = [app("1", "One"), app("2", "Two")];
-        let quiet = picker(&Catalog::new(&apps, &none), &[], "");
+        let quiet = picker(&catalog(&apps, &none), &[], "");
         assert!(
             quiet.census.starts_with("2 titles"),
             "it counts every installed title, not the filtered rows: {}",
@@ -4403,25 +5169,21 @@ mod tests {
         assert!(!quiet.census_warn, "{}", quiet.census);
 
         // Filtered down to one row, and still a census of two.
-        let filtered = picker(&Catalog::new(&apps, &none), &[], "One");
+        let filtered = picker(&catalog(&apps, &none), &[], "One");
         assert_eq!(filtered.rows.len(), 1);
         assert_eq!(
             filtered.census, quiet.census,
             "the census is of the machine, not of the search"
         );
 
-        let one = picker(&Catalog::new(&apps[..1], &none), &[], "");
+        let one = picker(&catalog(&apps[..1], &none), &[], "");
         assert!(
             one.census.starts_with("1 title"),
             "singular: {}",
             one.census
         );
 
-        let warned = picker(
-            &Catalog::new(&apps, &none),
-            &[PathBuf::from("/mnt/games2")],
-            "",
-        );
+        let warned = picker(&catalog(&apps, &none), &[PathBuf::from("/mnt/games2")], "");
         assert!(
             warned.census_warn,
             "a library Steam names and this machine does not have is what the warning is \

@@ -113,6 +113,37 @@ pub fn strength_index(cfg: &OutputConfig) -> Option<usize> {
         .position(|(_, yaw, _)| (cfg.extended_view.yaw.output_max_deg - yaw).abs() < 0.01)
 }
 
+/// How many games have a profile.
+///
+/// On this card because this card is what a user reads to find out whether head
+/// tracking is set up, and "on, sending to a virtual joystick" answers that for
+/// the tracker and not for any particular game. The Games tab is the other half
+/// of the answer, and before this there was nothing on the Tracker tab that
+/// said it existed.
+///
+/// A count and not a list: which games they are is a list on the other tab, and
+/// the one thing this line has to do is say whether there is anything over
+/// there. Zero says so in words rather than by leaving the line out — a missing
+/// line is indistinguishable from a card that has not been told.
+///
+/// **A line of its own, and short enough to fit one.** It was a clause appended
+/// to [`status_text`], and that is measurably worse: a wrapping label is
+/// allocated whatever width it is given, so the status paragraph wraps at ~350
+/// px in the three-column layout the window opens in and at ~590 with room to
+/// spare, and lengthening it made those two wrap to a different number of lines
+/// — 19 px of card that appears only in the layout most people will ever see.
+/// `tests/help_window.rs` measures exactly that and caught it. A separate line
+/// that fits at the narrower width costs the same one line at both, which is a
+/// property of the wording rather than luck, so keep it under about 40
+/// characters.
+pub(crate) fn set_up_clause(n: usize) -> String {
+    match n {
+        0 => "No games set up yet.".to_string(),
+        1 => "1 game set up, on the Games tab.".to_string(),
+        n => format!("{n} games set up, on the Games tab."),
+    }
+}
+
 /// What the status line should say, given what is actually set up.
 ///
 /// Pure, so the wording can be tested — and the interesting cases are the
@@ -123,6 +154,10 @@ pub fn strength_index(cfg: &OutputConfig) -> Option<usize> {
 /// health check: with game output configured and nothing playing, the tracker is
 /// SUPPOSED to be off, and saying so is more useful than a green light that
 /// means nothing.
+///
+/// It says nothing about how many games are set up: that is [`set_up_clause`],
+/// on a line of its own, and its own documentation says why it is not a clause
+/// on the end of this one.
 pub fn status_text(cfg: &OutputConfig, tracker_on: bool, joystick: &JoystickStatus) -> String {
     if !cfg.enabled {
         // The switch's own consequence, said where the switch is and not only
@@ -403,6 +438,17 @@ pub struct GamesRow {
     /// reads `games.toml` itself is a second reader of the same file with its
     /// own idea of what it says.
     composing: Rc<Cell<bool>>,
+    /// The line [`set_up_clause`] writes.
+    set_up_line: Label,
+    /// How many games have a profile, for [`set_up_clause`].
+    ///
+    /// A cell the hub writes and this only ever reads, and **not** a
+    /// `profiles::list()` on the tick. This refresh runs every 33 ms; counting
+    /// the profiles directory here would be a `readdir` thirty times a second
+    /// for a number that changes when somebody runs a command in a terminal.
+    /// The hub re-counts when the Tracker tab becomes visible, which is the
+    /// only moment this card is on screen to read it — see `crate::build_hub`.
+    set_up: Rc<Cell<usize>>,
 }
 
 impl GamesRow {
@@ -416,6 +462,7 @@ impl GamesRow {
         joystick: Arc<Mutex<JoystickStatus>>,
         recentring: Recentring,
         demand: Demand,
+        set_up: Rc<Cell<usize>>,
     ) -> GamesRow {
         let cfg = load_output_config();
 
@@ -433,6 +480,16 @@ impl GamesRow {
         status.set_wrap(true);
         status.set_max_width_chars(44);
         status.add_css_class("section-desc");
+
+        // How many games are set up, on its own line under the status. See
+        // `set_up_clause` for why it is a line and not a clause on the end of
+        // the sentence above.
+        let set_up_line = Label::new(None);
+        set_up_line.set_halign(Align::Start);
+        set_up_line.set_xalign(0.0);
+        set_up_line.set_wrap(true);
+        set_up_line.set_max_width_chars(44);
+        set_up_line.add_css_class("section-desc");
 
         let strength_ctl = gtk::Box::new(Orientation::Horizontal, 16);
         strength_ctl.set_tooltip_text(Some(STRENGTH_TOOLTIP));
@@ -457,6 +514,7 @@ impl GamesRow {
             let status = status.clone();
             let joystick = Arc::clone(&joystick);
             let recentring = recentring.clone();
+            let (set_up, set_up_line) = (set_up.clone(), set_up_line.clone());
             move || {
                 let js = joystick.lock().unwrap().clone();
                 // What a recentre just said outranks the standing status for a
@@ -467,6 +525,7 @@ impl GamesRow {
                     None => status_text(&load_output_config(), false, &js),
                 };
                 status.set_text(&text);
+                set_up_line.set_text(&set_up_clause(set_up.get()));
             }
         };
 
@@ -573,6 +632,10 @@ impl GamesRow {
         // put on a row of its own to be. The full working is in
         // `crate::build_hub`, beside the columns.
         //
+        // 25px of that came back when `set_up_line` was added below the status
+        // — 1189 x 750 — and the same comment in `crate::build_hub` carries
+        // that row too.
+        //
         // Re-take it by printing `hub.measure(Orientation::Horizontal, -1)` and
         // the window's `default_height` from a timeout inside
         // `tests/games_tab.rs`, which pins the scale for exactly this reason.
@@ -586,10 +649,12 @@ impl GamesRow {
         second.append(&recentre);
         controls.append(&second);
         controls.append(&status);
+        controls.append(&set_up_line);
 
         let row = GamesRow {
             controls,
             status,
+            set_up_line,
             enabled: sw,
             joy,
             strength: buttons,
@@ -600,6 +665,7 @@ impl GamesRow {
             demand,
             tracker_on,
             composing,
+            set_up,
         };
         row.refresh(false);
         row
@@ -663,6 +729,7 @@ impl GamesRow {
             None => status_text(&cfg, tracker_on, &js),
         };
         self.status.set_text(&text);
+        self.set_up_line.set_text(&set_up_clause(self.set_up.get()));
     }
 }
 
@@ -945,6 +1012,49 @@ mod tests {
             !s.contains("no destination"),
             "a joystick is a destination: {s}"
         );
+    }
+
+    /// The card says how many games are set up, at every count — and says it
+    /// short enough to be one line.
+    ///
+    /// Zero says so in words rather than by leaving the line blank: a card with
+    /// nothing there is indistinguishable from a card that has not been told,
+    /// and this one is told by a cell the hub writes.
+    ///
+    /// The length is the other half, and it is a measurement rather than a
+    /// preference. A wrapping label is allocated whatever width it is given, so
+    /// this line wraps at about 350 px in the three-column layout the window
+    /// opens in and at about 590 with room to spare — and a sentence long
+    /// enough to wrap differently between the two costs a line of card in the
+    /// only layout most people will ever see. `tests/help_window.rs` measures
+    /// that on the whole card and caught exactly this sentence doing it, as a
+    /// clause on the end of the status line, at 19 px. Under 40 characters is
+    /// one line at both widths; the bound is asserted here because that test
+    /// needs a display and this one does not.
+    #[test]
+    fn the_card_says_how_many_games_are_set_up_in_one_line() {
+        for (n, want) in [
+            (0, "No games set up yet."),
+            (1, "1 game set up, on the Games tab."),
+            (4, "4 games set up, on the Games tab."),
+            (1234, "1234 games set up, on the Games tab."),
+        ] {
+            let line = set_up_clause(n);
+            assert_eq!(line, want, "with {n} set up");
+            assert!(
+                line.chars().count() <= 40,
+                "{line:?} is {} characters, which wraps at the width the window \
+                 opens at and not at the width it is measured at",
+                line.chars().count()
+            );
+        }
+        // And the status line above it says nothing about profiles, because
+        // saying it twice is two things to keep in step and one of them is the
+        // sentence that wraps.
+        for on in [true, false] {
+            let s = status_text(&joystick_only(), on, &JoystickStatus::Present);
+            assert!(!s.contains("set up"), "{s}");
+        }
     }
 
     /// The checkbox is a request, not an outcome: `/dev/uinput` is root-only on

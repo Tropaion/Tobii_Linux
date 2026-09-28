@@ -648,27 +648,39 @@ fn check(seen: &Seen) {
         "the switcher is not between the title and the status bar: {seen:#?}"
     );
 
-    // 6. Neither tab ADDS a claim on the tracker.
+    // 6. The Games tab ADDS no claim on the tracker, and the Tracker tab adds
+    //    at most the hub's own.
     //
-    //    A subset check, and in both directions, because one claim in this list
-    //    is not the tab's to control: the hub takes "the hub window" while it
-    //    has focus AND the Tracker tab is showing, so the number of claims can
-    //    legitimately go DOWN on the Games tab. What nothing here may do is add
-    //    one — which is what `hold_while_open` would do, and what
-    //    `tests/help_window.rs` and `tests/flows_release_the_tracker.rs` assert
-    //    about their own windows.
+    //    Two rules and not one, and the difference was found the hard way. The
+    //    single rule here was "neither tab adds a claim", and it rested on a
+    //    premise written into the comment beside it: that a window in a nested
+    //    compositor never becomes active, so the hub's own `"the hub window"`
+    //    hold could never be taken. That is not true — whether this window gets
+    //    the focus depends on what else the nested compositor has open, and the
+    //    same commit passed and then failed across a restart of `kwin_wayland`
+    //    with nothing in this repository changed between the two runs.
     //
-    //    That the claim is DROPPED on the Games tab is asserted where it can
-    //    fail: over `hub_wants_tracker`, headlessly, in `lib.rs`. A window in a
-    //    nested compositor is never active, so a check here would pass with the
-    //    condition deleted.
-    for (when, claims) in [
-        ("the tracker tab", &seen.claims_on_tracker),
-        ("the games tab", &seen.claims_on_games),
+    //    So the honest form is the one below. The hub holding the tracker while
+    //    it is focused and showing the Tracker tab is the designed behaviour,
+    //    not a leak; what nothing here may do is add anything ELSE, or add
+    //    anything at all from the Games tab — which is what `hold_while_open`
+    //    would do, and what `tests/help_window.rs` and
+    //    `tests/flows_release_the_tracker.rs` assert about their own windows.
+    //
+    //    That the claim is DROPPED on the Games tab is still asserted where it
+    //    can fail whatever the compositor does: over `hub_wants_tracker`,
+    //    headlessly, in `lib.rs`.
+    for (when, claims, allowed) in [
+        (
+            "the tracker tab",
+            &seen.claims_on_tracker,
+            &["the hub window"][..],
+        ),
+        ("the games tab", &seen.claims_on_games, &[][..]),
     ] {
         let added: Vec<&&str> = claims
             .iter()
-            .filter(|r| !seen.claims_before.contains(r))
+            .filter(|r| !seen.claims_before.contains(r) && !allowed.contains(r))
             .collect();
         assert!(
             added.is_empty(),

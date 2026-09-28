@@ -2041,6 +2041,11 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
         "the cards were never measured"
     );
     for (title, desc, at_min, roomy) in &seen.widths {
+        // Printed as well as asserted. The assertion is a comparison and
+        // travels; these two numbers are this machine's fonts at text scale
+        // 1.0, and they are what somebody re-taking the card heights after a
+        // wording change needs to see.
+        println!("CARD {title:?} min {at_min} roomy {roomy}");
         assert_eq!(
             at_min,
             roomy,

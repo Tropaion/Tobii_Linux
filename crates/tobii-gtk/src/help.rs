@@ -296,11 +296,25 @@ pub fn topics() -> Vec<Topic> {
         topic(
             "Games",
             format!(
-                "Pick an installed Steam game on the left and the page beside it \
+                "Pick a game on the left and the page beside it \
                  shows the three things that have to be configured for it: this \
                  program's own settings, the Wine bridge inside that game's \
                  Proton prefix, and the game's own options. It reads a game's own \
                  files and never changes them.\n\n\
+                 The list has three sections. {set_up} is every game there is a \
+                 profile for, with what the Wine bridge is doing under each. \
+                 {not_set_up} is the rest of what Steam says is installed. \
+                 {elsewhere} is the one section that is not about this machine: \
+                 a profile whose game Steam does not list here — an uninstalled \
+                 title, or one on a drive that is not plugged in. Those rows show \
+                 the game's own options and nothing else, because where the \
+                 tracking goes and what is in a Proton prefix have no answer from \
+                 a machine that has not got the game. The profile is not lost, \
+                 and it applies again the moment Steam lists the title.\n\n\
+                 Under the list, the count of what Steam has installed, and — on \
+                 the rare machine that has any — a line for anything in the \
+                 profiles directory that is not a profile this program can use. \
+                 `tobii games profile list` names those.\n\n\
                  The first section reports and never writes. {pointer} Showing \
                  this tab also stops the hub asking for the tracker, for the same \
                  reason looking at another window does: nothing here needs the \
@@ -364,6 +378,9 @@ pub fn topics() -> Vec<Topic> {
                 check = crate::game_setup::PROFILE_CHECK,
                 check_where = crate::game_setup::PROFILE_CHECK_WHERE,
                 pointer = crate::game_setup::TRACKER_TAB_POINTER,
+                set_up = crate::game_setup::Group::SetUp.heading(),
+                not_set_up = crate::game_setup::Group::NotSetUp.heading(),
+                elsewhere = crate::game_setup::Group::Elsewhere.heading(),
             ),
         ),
         topic(
