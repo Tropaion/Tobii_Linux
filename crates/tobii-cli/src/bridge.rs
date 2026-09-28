@@ -515,6 +515,13 @@ pub use tobii_steam::libraries as steam_libraries;
 /// answers `None` for an id it cannot find installed and would turn each of
 /// them into "no installed Steam game matches".
 ///
+/// Named for the decision it makes, not for the question it looks like: there
+/// is an `is_app_id` in `main.rs` too, and it answers the *other* question —
+/// whether a string is a well-formed app id — for which the empty string is
+/// plainly not one. Two functions of one name giving one input opposite
+/// answers in one binary is a trap, and this is the one that is not about
+/// well-formedness.
+///
 /// **The empty string passes this vacuously, and that is deliberate.** It is
 /// therefore the empty app id, which nothing is installed under and nothing
 /// has a prefix for, so `--steam ""` reaches the prefix paragraph.
@@ -528,7 +535,7 @@ pub use tobii_steam::libraries as steam_libraries;
 /// prefix. Better, and different enough to be somebody's decision rather than
 /// a side effect of this one: what a bare `--steam ""` should do is a question
 /// about this command's wording, and the wording is what this module owns.
-fn is_app_id(wanted: &str) -> bool {
+fn used_verbatim_as_app_id(wanted: &str) -> bool {
     wanted.chars().all(|c| c.is_ascii_digit())
 }
 
@@ -586,7 +593,7 @@ fn with_missing(head: String, missing: &str) -> String {
 /// matched rather than picking one.
 fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
     let apps = tobii_steam::apps(home);
-    let appid = if is_app_id(wanted) {
+    let appid = if used_verbatim_as_app_id(wanted) {
         wanted.to_string()
     } else {
         match tobii_steam::resolve(&apps, wanted) {
@@ -6598,7 +6605,7 @@ exit 0
     /// `--steam ""` is all-digits vacuously, so it is an app id — the empty
     /// one, which nothing is installed under and nothing has a prefix for. The
     /// answer is nonsense and it is the answer this command has always given;
-    /// see [`is_app_id`] for why the move onto `tobii_steam`, whose `resolve`
+    /// see [`used_verbatim_as_app_id`] for why the move onto `tobii_steam`, whose `resolve`
     /// calls the empty string a name matching everything, did not take that
     /// better answer along with it.
     #[test]

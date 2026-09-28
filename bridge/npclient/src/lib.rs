@@ -56,7 +56,7 @@ mod np {
     pub const NP_ERR_INTERNAL_DATA: i32 = 6;
 }
 
-use np::{NP_ERR_INTERNAL_DATA, NP_ERR_INVALID_ARG, NP_ERR_NO_DATA, NP_OK};
+use np::{NP_ERR_INTERNAL_DATA, NP_ERR_INVALID_ARG, NP_OK};
 
 /// The storage `NP_GetSignature` is handed: `DllSignature[200]` followed by
 /// `AppSignature[200]`, both fixed-size C strings.
@@ -83,11 +83,24 @@ macro_rules! trace {
 ///
 /// The one export that carries data, and the one whose encoding is unmeasured.
 ///
-/// `NP_ERR_NO_DATA` when nothing has been published — the ordinary state before
-/// the Linux side starts sending, and the permanent state of the spike build.
-/// `data` is left exactly as it arrived then, because a game polls every frame
-/// into a struct it keeps: leaving the last good pose standing beats zeroing
-/// it, and the return code is what says the pose is not new.
+/// `NP_OK` with `data` untouched when nothing has been published — the
+/// ordinary state before the Linux side starts sending, and the permanent
+/// state of the spike build.
+///
+/// **Not a failure code, deliberately.** This ABI already has a channel for
+/// "no new frame", and it is `wPFrameSignature`: a game polls every frame into
+/// a struct it keeps and compares that counter, which is why
+/// [`crate::trackir`] advances it on every fill and why
+/// `tobii_output::trackir` records "whether a game ignores a frame whose
+/// `wPFrameSignature` did not change" as assumed-yes. Answering a poll with an
+/// error instead would put the same fact on a second channel, and a poll loop
+/// reading `!= NP_OK` as fatal — an ordinary shape — would stop asking during
+/// the startup window and never resume. Nothing here has measured a game's
+/// reaction to either, so the one that cannot end tracking is the one to ship.
+///
+/// A null `data` is a different thing and does answer
+/// [`NP_ERR_INVALID_ARG`]: there is no struct to leave standing, and a caller
+/// that passed one by mistake is better told.
 ///
 /// # Safety
 /// `data` must be null or point to a writable [`TrackIrData`].
@@ -99,16 +112,12 @@ pub unsafe extern "system" fn NP_GetData(data: *mut TrackIrData) -> i32 {
     }
     #[cfg(not(feature = "spike-log"))]
     {
-        if trackir::fill(&mut *data) {
-            return NP_OK;
-        }
+        let _ = trackir::fill(&mut *data);
     }
-    // The spike build serves no data, so this is the only answer it ever gives
-    // here — but it is logged with its code all the same, because a reader
-    // working out why a game stopped asking should not have to know which
-    // build wrote the line.
-    trace!("NP_GetData(data={data:p}) -> {NP_ERR_NO_DATA}");
-    NP_ERR_NO_DATA
+    // Logged with its code, because a reader working out why a game stopped
+    // asking should not have to know which build wrote the line.
+    trace!("NP_GetData(data={data:p}) -> {NP_OK}");
+    NP_OK
 }
 
 /// NaturalPoint's anti-clone check, which this client cannot answer.
@@ -350,16 +359,28 @@ mod tests {
         assert_eq!(rc, NP_ERR_INVALID_ARG);
     }
 
-    /// The two answers `NP_GetData` has to tell apart, in the order they
-    /// happen: nothing published yet, then a frame arriving. One test rather
-    /// than two because the feeder is process-wide — a second test could not
-    /// know which side of that transition it was on.
+    /// `NP_GetData` answers `NP_OK` on both sides of the transition, and
+    /// `wPFrameSignature` is what changes — the channel this ABI uses to say a
+    /// frame is new, and the one a game is assumed to compare.
+    ///
+    /// One test rather than two because the feeder is process-wide: a second
+    /// test could not know which side of the transition it was on.
+    ///
+    /// Not built for the spike stub, which serves no data by design and would
+    /// wait out the deadline here. `cargo test --features spike-log` is a real
+    /// run of a real build; it should not fail on a test of the half that
+    /// build deliberately omits.
+    #[cfg(not(feature = "spike-log"))]
     #[test]
-    fn np_get_data_answers_no_data_until_a_frame_arrives() {
+    fn np_get_data_answers_ok_and_says_new_with_the_frame_signature() {
         std::env::set_var(tobii_bridge_core::feeder::PORT_ENV, TEST_PORT.to_string());
 
         let mut d = TrackIrData::default();
-        assert_eq!(unsafe { NP_GetData(&mut d) }, NP_ERR_NO_DATA);
+        assert_eq!(
+            unsafe { NP_GetData(&mut d) },
+            NP_OK,
+            "a poll before anything is published is not a failure"
+        );
         assert_eq!(d.wPFrameSignature, 0, "signature advanced over no frame");
 
         // That first call started the feeder, so something is listening now.

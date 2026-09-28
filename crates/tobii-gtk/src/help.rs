@@ -274,7 +274,7 @@ pub fn topics() -> Vec<Topic> {
                  configured. The third of them, the game's own options, is \
                  read-only: this program reports what those files say and never \
                  writes them. It checks them only where a profile says what to \
-                 look at, and this build ships no profiles at all, so on a fresh \
+                 look at, and this build ships {shipped}, so on a fresh \
                  install that section says so rather than guessing.\n\n\
                  A profile is a file per game in {profiles}, named by app id, and \
                  you write it from a terminal — that window prints the same two \
@@ -290,6 +290,9 @@ pub fn topics() -> Vec<Topic> {
                  taken as relative to.",
                 switch = switch,
                 profiles = tobii_config::profiles::profiles_dir().display(),
+                // Asked rather than asserted: this sentence, the hub's own
+                // and the CLI's all used to carry a hand-typed "ships none".
+                shipped = tobii_config::profiles::shipped_profiles(),
                 // The same constants the game-setup window types, so the two
                 // surfaces that name these commands cannot drift apart.
                 save = crate::game_setup::PROFILE_SAVE,

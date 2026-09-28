@@ -1592,8 +1592,13 @@ pub(crate) fn profile_intro(
              buys is the reading — this window telling you which setting is wrong before you \
              go hunting.\n\n\
              Profiles go in {dir}, one file per game, named by app id. This build ships \
-             none, so writing one is the only way this section ever says anything.\n\n{cmds}",
+             {shipped}, so writing one is the only way this section ever says \
+             anything.\n\n{cmds}",
             dir = profiles_dir.display(),
+            // Asked, not asserted. Three screens used to carry their own
+            // "ships none", so the day one ships they would all have gone on
+            // saying otherwise with nothing failing.
+            shipped = profiles::shipped_profiles(),
             cmds = write_a_profile_commands(appid),
         ),
         ProfileVerdict::TooNew { origin, found } => format!(
@@ -1814,13 +1819,16 @@ pub(crate) fn row_text(r: &Row) -> String {
 pub(crate) fn binds_note(b: &binds::Bindings) -> Option<String> {
     let mut parts = Vec::new();
     if b.start.is_none() {
+        // The tail is one choice rather than four, because "none of them" has
+        // no singular that fits the same slot: a directory shipping exactly
+        // one preset has to say "it is not in use", not "none of them is".
         parts.push(format!(
-            "nothing in this directory selects a preset, so {} below {} the {} the game \
-             ships and {} of them is in use",
-            plural(b.presets.len(), "the row", "the rows"),
-            plural(b.presets.len(), "is", "are"),
-            plural(b.presets.len(), "preset", "presets"),
-            plural(b.presets.len(), "it is not", "none"),
+            "nothing in this directory selects a preset, so {}",
+            plural(
+                b.presets.len(),
+                "the row below is the preset the game ships and it is not in use",
+                "the rows below are the presets the game ships and none of them is in use",
+            ),
         ));
     }
     if let Some(n) = b.schema {
@@ -3706,11 +3714,10 @@ mod tests {
     /// Day one, and the intended behaviour rather than a gap.
     #[test]
     fn the_day_one_page_says_nobody_has_recorded_this_game() {
-        assert!(
-            profiles::BUILTIN.is_empty(),
-            "the paragraph below says this build ships no profiles; the moment one ships, \
-             that sentence stops being true and has to change with it"
-        );
+        // No `BUILTIN.is_empty()` assertion here any more. The paragraph asks
+        // `shipped_profiles()` what this build ships rather than saying it, so
+        // a profile shipping changes the sentence instead of falsifying it —
+        // which is the whole reason that function exists.
         let text = profile_intro(
             &ProfileVerdict::None,
             "Elite Dangerous",
@@ -3725,8 +3732,9 @@ mod tests {
         assert!(text.contains("nothing has been guessed"), "{text}");
         assert!(text.contains("never writes"), "{text}");
         assert!(
-            text.contains("ships none"),
-            "and it says so rather than reading as a fault: {text}"
+            text.contains(&format!("ships {}", profiles::shipped_profiles())),
+            "it says what this build ships, from the one place that knows, \
+             rather than reading as a fault: {text}"
         );
         // And it does not end at where profiles go. This is the state every
         // user of this build is in, and the paragraph named a directory and
@@ -3901,6 +3909,54 @@ mod tests {
 
     /// The one assumption `binds` could not measure: a rolled-back game is read
     /// through the wrong start file and nothing else would say so.
+    /// The note for a directory nothing selects a preset in — the shape the
+    /// "thirty presets is not an absence" fix exists for, which had no test.
+    ///
+    /// Both counts, because the tail has no singular that fits the plural's
+    /// slot: one preset "is not in use", several give "none of them is".
+    #[test]
+    fn a_directory_that_selects_no_preset_says_so_at_either_count() {
+        let shipped = |n: usize| binds::Bindings {
+            start: None,
+            schema: None,
+            superseded: Vec::new(),
+            presets: (0..n)
+                .map(|i| binds::Active {
+                    name: format!("Preset{i}"),
+                    found: binds::Found::Absent(String::new()),
+                })
+                .collect(),
+        };
+
+        let one = binds_note(&shipped(1)).expect("a note");
+        assert!(
+            one.contains("the row below is the preset the game ships and it is not in use"),
+            "one preset reads as one: {one}"
+        );
+
+        let many = binds_note(&shipped(30)).expect("a note");
+        assert!(
+            many.contains(
+                "the rows below are the presets the game ships and none of them is in use"
+            ),
+            "thirty read as thirty: {many}"
+        );
+
+        // A directory that DOES select one says none of this.
+        let selected = binds_note(&binds::Bindings {
+            start: Some(PathBuf::from("/p/StartPreset.start")),
+            schema: None,
+            superseded: Vec::new(),
+            presets: Vec::new(),
+        });
+        assert!(
+            !selected
+                .unwrap_or_default()
+                .contains("nothing in this directory selects a preset"),
+            "a selected preset is not a shipped set"
+        );
+    }
+
     #[test]
     fn a_superseded_start_file_is_named_and_an_ordinary_one_says_nothing_extra() {
         let note = binds_note(&binds::Bindings {

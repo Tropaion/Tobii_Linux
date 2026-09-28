@@ -375,13 +375,12 @@ part of that, so this is deliberate machinery rather than luck.
   shape is unknown, and nothing in it can be handed back honestly either. Fix
   the file, or move it aside.
 
-> **Known gap, as of 2026-09-28:** a comment written *after a value on that
-> value's own line* — `format = "binds-dir" # a note` — is dropped by a removal
-> **without appearing in the report.** The reporting path only inspects
-> whole-line comments, so this one is lost silently. Until that is fixed, put
-> provenance notes on **their own line**, which is the form every command here
-> tells you to write and the form that is reported correctly. See
-> [[Quality-and-Risks]] §11.3k.
+A comment written *after a value on that value's own line* —
+`format = "binds-dir" # a note` — cannot be carried across a removal, because
+lifting it off would mean rewriting a line somebody else wrote. It is handed
+back like any other orphan, naming its line and what it sat beside. Notes on
+**their own line** are still the form every command here tells you to write,
+and the form that moves with what it is about.
 
 ## See also
 
