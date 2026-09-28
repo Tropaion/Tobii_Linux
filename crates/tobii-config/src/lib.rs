@@ -16,6 +16,8 @@
 /// The XDG autostart entry, shared by the hub and `tobii uninstall`.
 pub mod autostart;
 mod calibration_state;
+/// Games this machine has that Steam does not list: a name and a Wine prefix.
+pub mod custom_games;
 mod edid;
 /// Every name this program writes, and the XDG directories they go in.
 pub mod paths;

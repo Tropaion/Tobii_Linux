@@ -33,6 +33,16 @@
 //! It never spawns `wine`, on any path, and it never passes `--force` to the
 //! installer — see [`install_argv`].
 //!
+//! # The one thing it writes
+//!
+//! Its own list of games added by hand — a name and a Wine prefix each, in
+//! this program's config directory, through [`tobii_config::custom_games`].
+//! That is not a hole in the two promises above and it is worth saying why:
+//! it is not a game's file, and it is not a setting with an editor on the
+//! other tab. It is the list this page is drawn from, and the only way a game
+//! Steam has never heard of can be on it. `tobii uninstall --purge` knows its
+//! name.
+//!
 //! It never writes a game's own configuration file. The reading goes through
 //! `tobii-gameconf`, which is the crate that promises not to write; the
 //! promise this module has to keep is one layer up, and it is that **there is
@@ -249,6 +259,12 @@ pub(crate) enum Group {
     NotSetUp,
     /// A profile, and Steam does not list the title on this machine.
     Elsewhere,
+    /// Not Steam's at all: a game somebody pointed at a Wine prefix by hand.
+    ///
+    /// Last, because it is the smallest group on every machine and the only
+    /// one whose rows this program put there. See
+    /// [`tobii_config::custom_games`].
+    Custom,
 }
 
 impl Group {
@@ -263,6 +279,7 @@ impl Group {
             Group::SetUp => "Set up",
             Group::NotSetUp => "Not set up",
             Group::Elsewhere => "Set up, not installed here",
+            Group::Custom => "Added by hand",
         }
     }
 }
@@ -317,6 +334,9 @@ pub(crate) struct PickRow {
     pub subtitle: String,
     /// Which section this row is in.
     pub group: Group,
+    /// The Wine prefix, for a row of [`Group::Custom`] — the only kind whose
+    /// target is a path rather than an app id.
+    pub prefix: Option<PathBuf>,
 }
 
 impl PickRow {
@@ -329,9 +349,67 @@ impl PickRow {
     /// the page.
     pub(crate) fn picked(&self) -> Picked {
         Picked {
-            appid: self.appid.clone(),
             name: self.name.clone(),
-            installed: self.group != Group::Elsewhere,
+            target: match &self.prefix {
+                Some(p) => Target::Prefix(p.clone()),
+                None => Target::Steam(self.appid.clone()),
+            },
+            group: self.group,
+        }
+    }
+}
+
+/// What `tobii bridge` is pointed at.
+///
+/// The CLI has taken `--prefix PATH` as well as `--steam <appid>` since it
+/// shipped, so a game Steam has never heard of has never been out of reach from
+/// a terminal — this is the hub catching up. The flag pair is built here rather
+/// than at the three call sites so that adding a third kind of target is one
+/// match arm and not three, and so that no caller can pair `--steam` with a
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// A Steam title, by app id.
+    Steam(String),
+    /// A Wine prefix somebody named — see [`tobii_config::custom_games`].
+    Prefix(PathBuf),
+}
+
+impl Target {
+    fn push_flag(&self, v: &mut Vec<OsString>) {
+        match self {
+            Target::Steam(appid) => {
+                v.push("--steam".into());
+                v.push(appid.into());
+            }
+            Target::Prefix(p) => {
+                v.push("--prefix".into());
+                v.push(p.as_os_str().to_os_string());
+            }
+        }
+    }
+
+    /// What the running/outcome/report slots are keyed by.
+    ///
+    /// A string, and the same string for the life of a row: the slots outlive
+    /// the selection — a job started for one game finishes while another is on
+    /// screen — so they carry the key of the game they are about and the page
+    /// reads only its own. An app id is unique among Steam titles and a prefix
+    /// path is unique among everything, so the two cannot collide unless
+    /// somebody names a prefix `359320`, which is not a path.
+    pub(crate) fn key(&self) -> String {
+        match self {
+            Target::Steam(appid) => appid.clone(),
+            Target::Prefix(p) => p.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// The app id, for the parts of the page that are keyed by one — a
+    /// profile, and Steam's own answers about prefixes.
+    pub(crate) fn appid(&self) -> Option<&str> {
+        match self {
+            Target::Steam(appid) => Some(appid),
+            Target::Prefix(_) => None,
         }
     }
 }
@@ -339,13 +417,74 @@ impl PickRow {
 /// The game the detail pane is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Picked {
-    pub appid: String,
     pub name: String,
-    /// Whether Steam lists this title as installed on this machine.
-    ///
-    /// False suppresses the first two blocks — see [`not_installed_text`] for
-    /// what they would otherwise say and why it is not true.
-    pub installed: bool,
+    /// What `tobii bridge` would be pointed at for this row.
+    pub target: Target,
+    /// Which section it came from, which is what decides the shape of the
+    /// page — see [`blocks`].
+    pub group: Group,
+}
+
+impl Picked {
+    /// The app id, where there is one.
+    pub(crate) fn appid(&self) -> Option<&str> {
+        self.target.appid()
+    }
+
+    /// What the job slots are keyed by.
+    pub(crate) fn key(&self) -> String {
+        self.target.key()
+    }
+
+    /// The prefix, for a game added by hand.
+    pub(crate) fn prefix(&self) -> Option<&PathBuf> {
+        match &self.target {
+            Target::Prefix(p) => Some(p),
+            Target::Steam(_) => None,
+        }
+    }
+}
+
+/// Which of the three blocks have an answer for a row of this group.
+///
+/// Every block is suppressed somewhere, and each absence is a different
+/// sentence rather than a blank space:
+///
+/// * A game Steam does not list here ([`Group::Elsewhere`]) has no prefix on
+///   this machine and nothing to send tracking to from here, so the first two
+///   go — see [`not_installed_text`] for what block 2 would otherwise say and
+///   why it is not true.
+/// * A game somebody added by hand ([`Group::Custom`]) has no app id, and a
+///   profile is keyed by one. Block 3 reads a profile; with no profile
+///   possible there is nothing for it to report, and `ProfileVerdict::None`'s
+///   text would tell the reader to run `tobii games profile save <app id>`
+///   for a game that has not got one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Blocks {
+    pub settings: bool,
+    pub bridge: bool,
+    pub game: bool,
+}
+
+/// [`Blocks`] for a group.
+pub(crate) fn blocks(group: Group) -> Blocks {
+    match group {
+        Group::SetUp | Group::NotSetUp => Blocks {
+            settings: true,
+            bridge: true,
+            game: true,
+        },
+        Group::Elsewhere => Blocks {
+            settings: false,
+            bridge: false,
+            game: true,
+        },
+        Group::Custom => Blocks {
+            settings: true,
+            bridge: true,
+            game: false,
+        },
+    }
 }
 
 /// The pick page, as data.
@@ -492,6 +631,7 @@ impl Catalog {
     pub(crate) fn new(
         apps: &[App],
         listing: &profiles::Listing,
+        custom: &[tobii_config::custom_games::CustomGame],
         has_prefix: &dyn Fn(&str) -> bool,
         bridge: &dyn Fn(&str) -> RowBridge,
     ) -> Self {
@@ -528,6 +668,7 @@ impl Catalog {
                     name: a.name.clone(),
                     subtitle,
                     group,
+                    prefix: None,
                 };
                 (row, a.name.to_lowercase())
             })
@@ -555,6 +696,7 @@ impl Catalog {
                         name,
                         subtitle: format!("app id {id} · not installed on this machine"),
                         group: Group::Elsewhere,
+                        prefix: None,
                     },
                     lower,
                 )
@@ -562,10 +704,39 @@ impl Catalog {
             .collect();
         elsewhere.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.appid.cmp(&b.0.appid)));
 
+        // The fourth group: what somebody pointed at a prefix by hand. In the
+        // order the file gives, which is the order they were added — a list
+        // this short is one somebody remembers adding to, and re-sorting it
+        // would move a row out from under the pointer of the person who just
+        // made it.
+        let added: Vec<(PickRow, String)> = custom
+            .iter()
+            .map(|g| {
+                let here = g.exists();
+                (
+                    PickRow {
+                        // A row of this group is not keyed by an app id and has
+                        // none; the path is what identifies it everywhere.
+                        appid: String::new(),
+                        name: g.name.clone(),
+                        subtitle: if here {
+                            g.prefix.display().to_string()
+                        } else {
+                            format!("{} · not on this machine right now", g.prefix.display())
+                        },
+                        group: Group::Custom,
+                        prefix: Some(g.prefix.clone()),
+                    },
+                    g.name.to_lowercase(),
+                )
+            })
+            .collect();
+
         // One stable sort by group, which leaves each group in the order it was
         // built with: the catalogue order for the first two, name order for the
-        // third.
+        // third, and the file's own order for the fourth.
         rows.extend(elsewhere);
+        rows.extend(added);
         rows.sort_by_key(|(r, _)| r.group);
         Self {
             rows,
@@ -593,7 +764,20 @@ pub(crate) fn picker(catalog: &Catalog, missing: &[PathBuf], query: &str) -> Pic
     let rows: Vec<PickRow> = catalog
         .rows
         .iter()
-        .filter(|(row, name)| q.is_empty() || name.contains(&q) || row.appid.contains(&q))
+        .filter(|(row, name)| {
+            q.is_empty()
+                || name.contains(&q)
+                || (!row.appid.is_empty() && row.appid.contains(&q))
+                // The fourth group's rows have no app id, and what identifies
+                // one on screen is its path — so the path is what a query has
+                // to be able to reach, or a list of six hand-added games can be
+                // filtered down to nothing by typing part of the folder they
+                // are all in.
+                || row
+                    .prefix
+                    .as_ref()
+                    .is_some_and(|p| p.to_string_lossy().to_lowercase().contains(&q))
+        })
         .map(|(row, _)| row.clone())
         .collect();
 
@@ -661,6 +845,55 @@ pub(crate) fn not_installed_text(name: &str, appid: &str, missing: &[PathBuf]) -
         s.push_str(&note);
     }
     s
+}
+
+/// A first name for a prefix somebody has just picked.
+///
+/// The folder's own name, which for a Proton prefix is usually the app id and
+/// for everything else is usually the game — `star-citizen/pfx` gives `pfx`,
+/// which is useless, so a folder called `pfx` or `drive_c` takes its parent's
+/// name instead. Whatever comes out is a starting point: the list is a plain
+/// file and the name in it is display-only.
+pub(crate) fn name_for_prefix(dir: &Path) -> String {
+    let base = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let here = base(dir);
+    let up = match here.as_str() {
+        // The two names a prefix directory almost always has, neither of which
+        // is a game.
+        "pfx" | "drive_c" => dir.parent().map(base).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let chosen = if up.trim().is_empty() { here } else { up };
+    if chosen.trim().is_empty() {
+        dir.display().to_string()
+    } else {
+        chosen
+    }
+}
+
+/// What stands in for block 3 on a game somebody added by hand.
+///
+/// Block 3 reads a profile, a profile is a file named `<app id>.toml`, and one
+/// of these has no app id — so there is nothing to look up rather than nothing
+/// found, and `ProfileVerdict::None`'s text would tell the reader to run
+/// `tobii games profile save` with an app id they have not got.
+///
+/// The first two blocks are shown as usual: where head tracking is being sent
+/// is a global answer and true of any game, and the bridge is the whole reason
+/// this row exists.
+pub(crate) fn added_by_hand_text(name: &str) -> String {
+    format!(
+        "{name} was added by hand, so this page knows the Wine prefix and nothing else about \
+         it.\n\n\
+         The bridge below is installed into that prefix exactly as it is for a Steam game. What \
+         is missing is the third section: reading a game's own options needs a profile, a \
+         profile is a file named after a Steam app id, and this game has not got one. Nothing \
+         else on this page is affected."
+    )
 }
 
 /// What the detail pane says when Steam has nothing installed at all.
@@ -1313,14 +1546,13 @@ pub(crate) fn bridge_block(
 /// window.
 ///
 /// The first element is the program; the rest are its arguments.
-pub(crate) fn install_argv(tobii: &Path, appid: &str, wine: Option<&Path>) -> Vec<OsString> {
+pub(crate) fn install_argv(tobii: &Path, target: &Target, wine: Option<&Path>) -> Vec<OsString> {
     let mut v: Vec<OsString> = vec![
         tobii.as_os_str().to_os_string(),
         "bridge".into(),
         "install".into(),
-        "--steam".into(),
-        appid.into(),
     ];
+    target.push_flag(&mut v);
     if let Some(w) = wine {
         v.push("--wine".into());
         v.push(w.as_os_str().to_os_string());
@@ -1330,14 +1562,14 @@ pub(crate) fn install_argv(tobii: &Path, appid: &str, wine: Option<&Path>) -> Ve
 
 /// The argv for `tobii bridge status`, which starts nothing and only reads —
 /// which is why this window is allowed to run it behind a plain button.
-pub(crate) fn status_argv(tobii: &Path, appid: &str) -> Vec<OsString> {
-    vec![
+pub(crate) fn status_argv(tobii: &Path, target: &Target) -> Vec<OsString> {
+    let mut v: Vec<OsString> = vec![
         tobii.as_os_str().to_os_string(),
         "bridge".into(),
         "status".into(),
-        "--steam".into(),
-        appid.into(),
-    ]
+    ];
+    target.push_flag(&mut v);
+    v
 }
 
 /// What the action bar can do for the game on screen, and what to say when it
@@ -1370,22 +1602,34 @@ pub(crate) struct Actions {
     pub blocked: Option<&'static str>,
 }
 
+/// Whether the place this row points at can be worked on at all, before
+/// anything looks at what is in it.
+///
+/// Three answers and not a `bool`, because the two refusals are different facts
+/// about different kinds of row and a user can act on one of them. A game Steam
+/// does not list here is not coming back until Steam lists it; a folder
+/// somebody named that is not there right now is a drive to plug in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// There is a place to work on.
+    Reachable,
+    /// [`Group::Elsewhere`]: Steam does not list the title on this machine.
+    NotListedHere,
+    /// [`Group::Custom`]: the folder named is not on this machine right now.
+    FolderGone,
+}
+
 /// Decide the bar from what block 2 has just worked out.
 ///
-/// `installed_here` is false for a row of [`Group::Elsewhere`] — a profile for
-/// a game Steam does not list on this machine. Nothing on the bar can act on
-/// one, and the reason is not the same as having no prefix: a prefix appears
-/// when a game is launched, and this game cannot be launched from here at all.
-///
-/// The order of the three refusals is the order they have to be answered in.
-/// A game that is not here has no prefix either, and a machine with no `tobii`
-/// on its PATH would still have nothing to install into — reporting the second
-/// or third over the first tells somebody to fix the wrong thing.
+/// The order of the refusals is the order they have to be answered in. A game
+/// that is not here has no prefix either, and a machine with no `tobii` on its
+/// PATH would still have nothing to install into — reporting a later one over
+/// an earlier one tells somebody to fix the wrong thing.
 pub(crate) fn actions(
     state: &BridgeState,
     tobii: Option<&Path>,
     job: &JobView,
-    installed_here: bool,
+    reach: Reach,
 ) -> Actions {
     let none = |why: &'static str| Actions {
         primary: None,
@@ -1394,10 +1638,21 @@ pub(crate) fn actions(
         wine: false,
         blocked: Some(why),
     };
-    if !installed_here {
-        return none(
-            "Steam does not list this game on this machine, so there is no prefix here to              install into.",
-        );
+    match reach {
+        Reach::NotListedHere => {
+            return none(
+                "Steam does not list this game on this machine, so there is no prefix here to \
+                 install into.",
+            )
+        }
+        Reach::FolderGone => {
+            return none(
+                "The folder this game was added with is not on this machine right now — a drive \
+                 that is not plugged in, or one that has moved. Nothing here can be installed \
+                 into it until it is back.",
+            )
+        }
+        Reach::Reachable => {}
     }
     if matches!(state, BridgeState::NoPrefix) {
         return none(
@@ -1440,14 +1695,14 @@ pub(crate) fn bridge_action(state: &BridgeState) -> Option<Action> {
 /// are different verbs with different consequences and a boolean that chose
 /// between them would be one character away from removing what somebody meant
 /// to install.
-pub(crate) fn uninstall_argv(tobii: &Path, appid: &str) -> Vec<OsString> {
-    vec![
+pub(crate) fn uninstall_argv(tobii: &Path, target: &Target) -> Vec<OsString> {
+    let mut v: Vec<OsString> = vec![
         tobii.as_os_str().to_os_string(),
         "bridge".into(),
         "uninstall".into(),
-        "--steam".into(),
-        appid.into(),
-    ]
+    ];
+    target.push_flag(&mut v);
+    v
 }
 
 /// What a finished subprocess said.
@@ -2692,9 +2947,11 @@ pub struct GamesTab {
 /// saying *bridge installed* and the page it opens cannot disagree.
 fn read_catalog(scan: &Scan) -> Catalog {
     let listing = profiles::list_from(&scan.profiles_dir, profiles::BUILTIN);
+    let custom = tobii_config::custom_games::list();
     Catalog::new(
         &scan.apps,
         &listing,
+        &custom,
         &|id| scan.steam.prefix(id).is_some(),
         &|id| RowBridge::of(&bridge_state(scan.steam.prefix(id).as_deref(), id)),
     )
@@ -2813,10 +3070,23 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     let notes = small("");
     notes.add_css_class("section-warn");
     notes.set_visible(false);
+    // The one control on the list side, under it rather than beside the search
+    // box: it is not a way of finding a game, it is a way of adding one that
+    // searching can never find. `tobii bridge install --prefix PATH` has always
+    // worked from a terminal; what was out of reach from the hub was the list
+    // that remembers the path.
+    let add_btn = crate::widget::button("Add a game by folder…");
+    add_btn.add_css_class("quiet");
+    add_btn.set_halign(Align::Start);
+    add_btn.set_tooltip_text(Some(
+        "For a game Steam does not list — pick the Wine prefix it runs in, and this page can \
+         install the bridge into it like any other. Nothing is written to the game.",
+    ));
     pick.append(&search);
     pick.append(&list_scroll);
     pick.append(&census);
     pick.append(&notes);
+    pick.append(&add_btn);
 
     // ---- the detail pane, state one: nothing picked yet
     //
@@ -3023,6 +3293,17 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
          prefix and starts nothing.",
     ));
     let wine_btn = crate::widget::button("Choose the Proton build…");
+    // Only ever on a row of `Group::Custom`, and it removes the ROW rather than
+    // anything on disk. Named for what it does to this program's own list: an
+    // ambiguous caption beside *Uninstall* is one click from somebody expecting
+    // the bridge to come out of their prefix and getting the entry deleted
+    // instead.
+    let forget_btn = crate::widget::button("Remove from this list");
+    forget_btn.add_css_class("quiet");
+    forget_btn.set_tooltip_text(Some(
+        "Take this game out of the hub's list. It does not touch the prefix, the game, or a \
+         bridge already installed in it.",
+    ));
     let uninstall_btn = crate::widget::button("Uninstall");
     uninstall_btn.add_css_class("quiet");
     uninstall_btn.set_tooltip_text(Some(
@@ -3036,6 +3317,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     action_bar.append(&uninstall_btn);
     action_bar.append(&details_btn);
     action_bar.append(&wine_btn);
+    action_bar.append(&forget_btn);
 
     // ---- the state the page draws itself from
 
@@ -3101,48 +3383,66 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
         // could be strong; they are weak so that the rule at the top of this
         // closure is what the code looks like rather than something a reader
         // has to re-derive per widget.
-        let (away, away_body, b1, d1, b2, d2) = (
+        let (away, away_body, b1, d1, b2, d2, b3w) = (
             away.downgrade(),
             away_body.downgrade(),
             b1.downgrade(),
             d1.downgrade(),
             b2.downgrade(),
             d2.downgrade(),
+            b3.downgrade(),
         );
         let action_bar_w = action_bar.downgrade();
         let (bar_w, blocked_w) = (bar.downgrade(), blocked.downgrade());
-        let (install_w, uninstall_w, details_w, wine_w) = (
+        let (install_w, uninstall_w, details_w, wine_w, forget_w) = (
             install_btn.downgrade(),
             uninstall_btn.downgrade(),
             details_btn.downgrade(),
             wine_btn.downgrade(),
+            forget_btn.downgrade(),
         );
         Rc::new(move || {
             let Some(app) = sel.borrow().clone() else {
                 return;
             };
             g_title.set_text(&app.name);
-            g_sub.set_text(&format!("app id {}", app.appid));
+            g_sub.set_text(&match &app.target {
+                Target::Steam(appid) => format!("app id {appid}"),
+                Target::Prefix(p) => p.display().to_string(),
+            });
 
-            // Steam does not list this title here, so the first two blocks have
-            // no answer about it and are not shown. Block 3 is, unchanged: its
-            // rows say `NoPrefix` on their own account, which is the true thing
-            // to say about a file nothing here can open.
-            if let Some(away) = away.upgrade() {
-                away.set_visible(!app.installed);
-            }
-            for w in [&b1, &d1, &b2, &d2] {
+            // Which of the three blocks have an answer for this row, and the
+            // sentence that stands in for the ones that have not. Every block
+            // is suppressed somewhere and each absence is a different
+            // sentence — see `blocks`.
+            let shown = blocks(app.group);
+            for (w, on) in [
+                (&b1, shown.settings),
+                (&d1, shown.settings),
+                (&b2, shown.bridge),
+                (&d2, shown.bridge),
+                (&b3w, shown.game),
+            ] {
                 if let Some(w) = w.upgrade() {
-                    w.set_visible(app.installed);
+                    w.set_visible(on);
                 }
             }
-            if !app.installed {
-                if let Some(body) = away_body.upgrade() {
-                    body.set_text(&not_installed_text(
-                        &app.name,
-                        &app.appid,
-                        scan.steam.missing_libraries(),
-                    ));
+            let stand_in = match app.group {
+                Group::Elsewhere => Some(not_installed_text(
+                    &app.name,
+                    app.appid().unwrap_or_default(),
+                    scan.steam.missing_libraries(),
+                )),
+                Group::Custom => Some(added_by_hand_text(&app.name)),
+                _ => None,
+            };
+            if let (Some(away), Some(body)) = (away.upgrade(), away_body.upgrade()) {
+                match &stand_in {
+                    Some(text) => {
+                        body.set_text(text);
+                        away.set_visible(true);
+                    }
+                    None => away.set_visible(false),
                 }
             }
 
@@ -3151,11 +3451,18 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // settings, or that answered the bridge question, and was then
             // silently ignored would be this page telling somebody nothing
             // needs doing while something does.
-            let verdict = profile_verdict(profiles::load_from(
-                &scan.profiles_dir,
-                profiles::BUILTIN,
-                &app.appid,
-            ));
+            //
+            // `None` for a game added by hand: a profile is keyed by app id and
+            // one of these has not got one, so there is nothing to look up
+            // rather than nothing found.
+            let verdict = match app.appid() {
+                Some(appid) => profile_verdict(profiles::load_from(
+                    &scan.profiles_dir,
+                    profiles::BUILTIN,
+                    appid,
+                )),
+                None => ProfileVerdict::None,
+            };
             let profile = match &verdict {
                 ProfileVerdict::Ready(loaded) => Some(&loaded.profile),
                 _ => None,
@@ -3188,24 +3495,35 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // pass — where two calls re-stat every library's manifest and
             // every candidate `drive_c`, and the second then filtered out
             // exactly the element the first had returned.
-            let mut all = scan.steam.prefixes(&app.appid);
-            let chosen = (!all.is_empty()).then(|| all.remove(0));
-            let state = bridge_state(chosen.as_deref(), &app.appid);
-            let others = other_prefixes(all);
+            //
+            // A game added by hand skips the walk entirely: its prefix is the
+            // one somebody named, Steam has no manifest to consult about it,
+            // and asking for "the other prefixes this title has" of a title
+            // Steam does not have is a question with no meaning rather than one
+            // with an empty answer.
+            let (chosen, others) = match app.appid() {
+                Some(appid) => {
+                    let mut all = scan.steam.prefixes(appid);
+                    let chosen = (!all.is_empty()).then(|| all.remove(0));
+                    (chosen, other_prefixes(all))
+                }
+                None => (app.prefix().cloned(), Vec::new()),
+            };
+            let state = bridge_state(chosen.as_deref(), &app.key());
             let mut text = bridge_block(
                 &state,
                 scan.steam.missing_libraries(),
                 &others,
                 tobii.as_deref(),
                 beside.as_deref(),
-                &app.appid,
+                &app.key(),
             );
             if let Some(note) = profile.and_then(|p| profile_bridge_note(p.bridge)) {
                 text.push_str("\n\n");
                 text.push_str(&note);
             }
             let job = job_view(
-                &app.appid,
+                &app.key(),
                 running.borrow().as_ref(),
                 outcome.borrow().as_ref(),
                 report.borrow().as_ref(),
@@ -3216,7 +3534,17 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // The bar, from one value. `action` above is what block 2's
             // paragraph was worded from, and `acts.primary` is the same
             // function — see `bridge_action`.
-            let acts = actions(&state, tobii.as_deref(), &job, app.installed);
+            // Where this row points, which is not the same question as what is
+            // in it. A hand-added folder that is not on this machine right now
+            // is a drive to plug in, and `bridge_state` over it answers
+            // `Absent` — which would offer an install into a directory that is
+            // not there.
+            let reach = match app.group {
+                Group::Elsewhere => Reach::NotListedHere,
+                Group::Custom if !app.prefix().is_some_and(|p| p.is_dir()) => Reach::FolderGone,
+                _ => Reach::Reachable,
+            };
+            let acts = actions(&state, tobii.as_deref(), &job, reach);
             if let Some(btn) = install_w.upgrade() {
                 match acts.primary {
                     Some(a) => {
@@ -3234,6 +3562,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             }
             if let Some(btn) = wine_w.upgrade() {
                 btn.set_visible(acts.wine);
+            }
+            if let Some(btn) = forget_w.upgrade() {
+                btn.set_visible(app.group == Group::Custom);
             }
             if let Some(b) = action_bar_w.upgrade() {
                 b.set_sensitive(job.enabled);
@@ -3258,7 +3589,12 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             }
 
             // --- block 3
-            let mut p_text = profile_intro(&verdict, &app.name, &app.appid, &scan.profiles_dir);
+            let mut p_text = profile_intro(
+                &verdict,
+                &app.name,
+                app.appid().unwrap_or_default(),
+                &scan.profiles_dir,
+            );
             // The same `chosen` block 2 has just warned about, said over the
             // rows that were read out of it.
             if let Some(n) = checked_prefix_note(
@@ -3312,9 +3648,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 return;
             };
             *outcome.borrow_mut() = None;
-            let argv = install_argv(t, &app.appid, None);
-            let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.appid.clone());
-            start_job(argv, &app.appid, &alive, &running, move |o| {
+            let argv = install_argv(t, &app.target, None);
+            let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
+            start_job(argv, &app.key(), &alive, &running, move |o| {
                 *outcome2.borrow_mut() = Some((id.clone(), o));
                 refresh2();
             });
@@ -3340,9 +3676,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // is already keyed by app id, so an uninstall finishing after the
             // user has moved on lands on the right game or nowhere.
             *outcome.borrow_mut() = None;
-            let argv = uninstall_argv(t, &app.appid);
-            let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.appid.clone());
-            start_job(argv, &app.appid, &alive, &running, move |o| {
+            let argv = uninstall_argv(t, &app.target);
+            let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
+            start_job(argv, &app.key(), &alive, &running, move |o| {
                 *outcome2.borrow_mut() = Some((id.clone(), o));
                 refresh2();
             });
@@ -3363,14 +3699,10 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
                 return;
             };
-            let argv = status_argv(t, &app.appid);
-            let (refresh2, report2, id, t2) = (
-                refresh.clone(),
-                report.clone(),
-                app.appid.clone(),
-                t.clone(),
-            );
-            start_job(argv, &app.appid, &alive, &running, move |o| {
+            let argv = status_argv(t, &app.target);
+            let (refresh2, report2, id, t2) =
+                (refresh.clone(), report.clone(), app.key(), t.clone());
+            start_job(argv, &app.key(), &alive, &running, move |o| {
                 let mut s = String::new();
                 // A `tobii` with no `bridge status` answers with its usage and
                 // exits zero. Its words are still printed — they are the only
@@ -3422,10 +3754,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                     return;
                 };
                 *outcome.borrow_mut() = None;
-                let argv = install_argv(&t, &app.appid, Some(&path));
-                let (refresh2, outcome2, id) =
-                    (refresh.clone(), outcome.clone(), app.appid.clone());
-                start_job(argv, &app.appid, &alive, &running, move |o| {
+                let argv = install_argv(&t, &app.target, Some(&path));
+                let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
+                start_job(argv, &app.key(), &alive, &running, move |o| {
                     *outcome2.borrow_mut() = Some((id.clone(), o));
                     refresh2();
                 });
@@ -3499,7 +3830,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 // highlight came off the row the pane is about, and typing one
                 // letter made the page look like nothing was selected.
                 if let Some(picked) = sel.borrow().as_ref() {
-                    if let Some(i) = p.rows.iter().position(|r| r.appid == picked.appid) {
+                    if let Some(i) = p.rows.iter().position(|r| r.picked() == *picked) {
                         if let Some(row) = list.row_at_index(i as i32) {
                             list.select_row(Some(&row));
                         }
@@ -3521,6 +3852,108 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     {
         let rebuild = rebuild.clone();
         search.connect_search_changed(move |e| rebuild(&e.text()));
+    }
+
+    // ---- adding and forgetting a game of one's own
+    //
+    // The first thing on this tab that writes anything. The module docs promise
+    // the tab never writes a game's files and never writes a setting the
+    // Tracker tab owns, and both still hold: this writes a list of nicknames
+    // that belongs to this program, in this program's own config directory, and
+    // `tobii uninstall --purge` knows its name.
+    {
+        let (catalog, scan, rebuild, refresh) = (
+            catalog.clone(),
+            scan.clone(),
+            rebuild.clone(),
+            refresh.clone(),
+        );
+        let search_w = search.downgrade();
+        add_btn.connect_clicked(move |b| {
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Pick the game's Wine prefix");
+            dialog.set_modal(true);
+            let (catalog, scan, rebuild, refresh, search_w) = (
+                catalog.clone(),
+                scan.clone(),
+                rebuild.clone(),
+                refresh.clone(),
+                search_w.clone(),
+            );
+            // A FOLDER, and the prefix itself rather than the game's directory:
+            // that is what `tobii bridge install --prefix` takes, and it is the
+            // directory holding `drive_c`. `name_for_prefix` says so when the
+            // folder picked does not look like one — it does not refuse, because
+            // a prefix this program does not recognise is still a prefix if the
+            // user says so, and refusing would be this window overruling
+            // somebody about their own disk.
+            dialog.select_folder(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+                let Some(dir) = res.ok().and_then(|f| f.path()) else {
+                    return;
+                };
+                let mut games = tobii_config::custom_games::list();
+                let name = name_for_prefix(&dir);
+                if let Err(e) = tobii_config::custom_games::add(&mut games, &name, &dir) {
+                    tobii_diagnostics::log::warn(&format!("could not add {}: {e}", dir.display()));
+                    return;
+                }
+                if let Err(e) = tobii_config::custom_games::save(&games) {
+                    tobii_diagnostics::log::warn(&format!("could not save the game list: {e}"));
+                    return;
+                }
+                *catalog.borrow_mut() = read_catalog(&scan);
+                let q = search_w.upgrade().map(|e| e.text().to_string());
+                rebuild(q.as_deref().unwrap_or(""));
+                refresh();
+            });
+        });
+    }
+
+    {
+        let (catalog, scan, rebuild, sel) =
+            (catalog.clone(), scan.clone(), rebuild.clone(), sel.clone());
+        let search_w = search.downgrade();
+        // The pane goes back to having nothing picked, so the two halves of it
+        // swap back. Weak, both: they are siblings of the button this handler
+        // is on, under a box it is also under.
+        let (intro_w2, game_w2, bar_w2) = (intro.downgrade(), game.downgrade(), bar.downgrade());
+        forget_btn.connect_clicked(move |_| {
+            let Some(prefix) = sel.borrow().as_ref().and_then(|p| p.prefix().cloned()) else {
+                return;
+            };
+            let mut games = tobii_config::custom_games::list();
+            if !tobii_config::custom_games::remove(&mut games, &prefix) {
+                return;
+            }
+            if let Err(e) = tobii_config::custom_games::save(&games) {
+                tobii_diagnostics::log::warn(&format!("could not save the game list: {e}"));
+                return;
+            }
+            // The row it was showing is gone, so the pane goes back to having
+            // nothing picked rather than to a game that is no longer in the
+            // list. Everything keyed by the old row — a running job, an
+            // outcome, a report — is keyed by its prefix and simply stops being
+            // read; `refresh` is not called because it returns on the first
+            // line with nothing selected, and the widgets are what has to move.
+            //
+            // The intro comes back, which is the one place in this pane it
+            // does. Safe for the reason it was folded carefully in the first
+            // place: `help.rs` measured that a pane hidden with the FOCUS
+            // inside it holds its subtree for good, and the focus is on this
+            // button, which is on the bar and outside both.
+            *sel.borrow_mut() = None;
+            if let (Some(intro), Some(game), Some(bar)) =
+                (intro_w2.upgrade(), game_w2.upgrade(), bar_w2.upgrade())
+            {
+                game.set_visible(false);
+                intro.set_visible(true);
+                bar.set_visible(false);
+            }
+            *catalog.borrow_mut() = read_catalog(&scan);
+            let q = search_w.upgrade().map(|e| e.text().to_string());
+            rebuild(q.as_deref().unwrap_or(""));
+        });
     }
 
     {
@@ -3666,9 +4099,13 @@ mod tests {
     /// and in every test in this module at once — instead of quietly costing a
     /// user a second every time they open the tab.
     fn catalog(apps: &[App], has_prefix: &dyn Fn(&str) -> bool) -> Catalog {
-        Catalog::new(apps, &profiles::Listing::default(), has_prefix, &|id| {
-            panic!("the bridge was stat'd for app id {id}, which has no profile")
-        })
+        Catalog::new(
+            apps,
+            &profiles::Listing::default(),
+            &[],
+            has_prefix,
+            &|id| panic!("the bridge was stat'd for app id {id}, which has no profile"),
+        )
     }
 
     /// An `OutputConfig` with all four things this window reads spelled out.
@@ -3854,14 +4291,35 @@ mod tests {
     fn the_bar_always_answers_either_with_a_button_or_with_a_reason() {
         let tobii = Path::new("/usr/bin/tobii");
         let cases = [
-            ("not installed here", present(), Some(tobii), false),
-            ("no prefix", BridgeState::NoPrefix, Some(tobii), true),
-            ("no tobii", present(), None, true),
-            ("a prefix without it", absent(), Some(tobii), true),
-            ("a prefix with it", present(), Some(tobii), true),
+            (
+                "not installed here",
+                present(),
+                Some(tobii),
+                Reach::NotListedHere,
+            ),
+            (
+                "a folder that is gone",
+                present(),
+                Some(tobii),
+                Reach::FolderGone,
+            ),
+            (
+                "no prefix",
+                BridgeState::NoPrefix,
+                Some(tobii),
+                Reach::Reachable,
+            ),
+            ("no tobii", present(), None, Reach::Reachable),
+            (
+                "a prefix without it",
+                absent(),
+                Some(tobii),
+                Reach::Reachable,
+            ),
+            ("a prefix with it", present(), Some(tobii), Reach::Reachable),
         ];
-        for (what, state, t, here) in cases {
-            let a = actions(&state, t, &quiet_job(), here);
+        for (what, state, t, reach) in cases {
+            let a = actions(&state, t, &quiet_job(), reach);
             let has_button = a.primary.is_some() || a.uninstall || a.details || a.wine;
             assert_ne!(
                 has_button,
@@ -3886,14 +4344,20 @@ mod tests {
     /// thing. Each case below is true of every refusal after it.
     #[test]
     fn the_bar_names_the_first_reason_and_not_a_later_one() {
-        let no_tobii_no_prefix = actions(&BridgeState::NoPrefix, None, &quiet_job(), true);
+        let no_tobii_no_prefix =
+            actions(&BridgeState::NoPrefix, None, &quiet_job(), Reach::Reachable);
         assert!(
             no_tobii_no_prefix
                 .blocked
                 .is_some_and(|w| w.contains("No Proton prefix")),
             "a missing prefix outranks a missing program: {no_tobii_no_prefix:?}"
         );
-        let elsewhere = actions(&BridgeState::NoPrefix, None, &quiet_job(), false);
+        let elsewhere = actions(
+            &BridgeState::NoPrefix,
+            None,
+            &quiet_job(),
+            Reach::NotListedHere,
+        );
         assert!(
             elsewhere
                 .blocked
@@ -3912,15 +4376,187 @@ mod tests {
     #[test]
     fn taking_the_bridge_back_out_is_offered_exactly_where_there_is_something_to_remove() {
         let tobii = Path::new("/usr/bin/tobii");
-        assert!(actions(&present(), Some(tobii), &quiet_job(), true).uninstall);
-        assert!(!actions(&absent(), Some(tobii), &quiet_job(), true).uninstall);
-        assert!(!actions(&BridgeState::NoPrefix, Some(tobii), &quiet_job(), true).uninstall);
+        assert!(actions(&present(), Some(tobii), &quiet_job(), Reach::Reachable).uninstall);
+        assert!(!actions(&absent(), Some(tobii), &quiet_job(), Reach::Reachable).uninstall);
+        assert!(
+            !actions(
+                &BridgeState::NoPrefix,
+                Some(tobii),
+                &quiet_job(),
+                Reach::Reachable
+            )
+            .uninstall
+        );
         // And it is a different verb from install, not a flag on it.
-        let argv = uninstall_argv(tobii, "359320");
+        let argv = uninstall_argv(tobii, &Target::Steam("359320".to_string()));
         assert_eq!(
             argv.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
             vec!["/usr/bin/tobii", "bridge", "uninstall", "--steam", "359320"],
         );
+    }
+
+    // --------------------------------------------------- games added by hand
+
+    /// A game somebody pointed at a prefix is a row of its own group, keyed by
+    /// the path and not by an app id.
+    ///
+    /// The whole point of the fourth group: `tobii bridge install --prefix
+    /// PATH` has always worked from a terminal, and what the hub could not do
+    /// was remember the path. So the row has to carry it — an app id it has not
+    /// got cannot be what the page is keyed by.
+    #[test]
+    fn a_game_added_by_hand_is_keyed_by_its_prefix() {
+        let custom = [tobii_config::custom_games::CustomGame {
+            name: "Star Citizen".to_string(),
+            prefix: PathBuf::from("/games/sc/pfx"),
+        }];
+        let c = Catalog::new(&[], &profiles::Listing::default(), &custom, &none, &|_| {
+            RowBridge::Installed
+        });
+        let rows = picker(&c, &[], "").rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group, Group::Custom);
+        assert_eq!(Group::Custom.heading(), "Added by hand");
+
+        let picked = rows[0].picked();
+        assert_eq!(picked.appid(), None, "there is no app id to have");
+        assert_eq!(picked.key(), "/games/sc/pfx", "so the path is the key");
+        assert_eq!(picked.prefix(), Some(&PathBuf::from("/games/sc/pfx")));
+
+        // And that is what the installer is pointed at — `--prefix`, never
+        // `--steam` with a path after it.
+        let argv: Vec<String> = install_argv(Path::new("/usr/bin/tobii"), &picked.target, None)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/bin/tobii",
+                "bridge",
+                "install",
+                "--prefix",
+                "/games/sc/pfx"
+            ]
+        );
+    }
+
+    /// Each group shows the blocks that have an answer for it, and every
+    /// suppression is a sentence rather than a gap.
+    ///
+    /// Two different shapes, and they are nearly opposites — which is the
+    /// reason this is a function and not an `if` in the middle of `refresh`. A
+    /// game Steam does not list here loses the first two (no prefix on this
+    /// machine, nothing to send to it from here) and keeps the third, whose
+    /// rows answer `NoPrefix` truthfully. A game added by hand keeps the first
+    /// two and loses the third, because block 3 reads a profile and a profile
+    /// is named after an app id it has not got.
+    #[test]
+    fn every_group_shows_the_blocks_that_have_an_answer_for_it() {
+        for g in [Group::SetUp, Group::NotSetUp] {
+            assert_eq!(
+                blocks(g),
+                Blocks {
+                    settings: true,
+                    bridge: true,
+                    game: true
+                },
+                "{g:?}"
+            );
+        }
+        assert_eq!(
+            blocks(Group::Elsewhere),
+            Blocks {
+                settings: false,
+                bridge: false,
+                game: true
+            }
+        );
+        assert_eq!(
+            blocks(Group::Custom),
+            Blocks {
+                settings: true,
+                bridge: true,
+                game: false
+            }
+        );
+        // The stand-in for the third block says why it is not there, and does
+        // not send the reader off to write a profile they cannot name.
+        let t = added_by_hand_text("Star Citizen");
+        assert!(t.contains("Star Citizen"), "{t}");
+        assert!(
+            t.contains("named after a Steam app id"),
+            "the reason, not just the absence: {t}"
+        );
+        assert!(
+            !t.contains("tobii games profile save"),
+            "that command takes an app id, and this game has not got one: {t}"
+        );
+    }
+
+    /// A folder that is not on this machine right now is its own refusal.
+    ///
+    /// `bridge_state` over a prefix that is not there answers `Absent` — the
+    /// same as a prefix that exists and has no bridge in it — so without this
+    /// the bar offered *Install the bridge* into a directory that is not there,
+    /// and the install would have failed in a subprocess.
+    #[test]
+    fn a_hand_added_folder_that_is_gone_is_not_offered_an_install() {
+        let a = actions(
+            &absent(),
+            Some(Path::new("/usr/bin/tobii")),
+            &quiet_job(),
+            Reach::FolderGone,
+        );
+        assert_eq!(a.primary, None);
+        assert!(
+            a.blocked
+                .is_some_and(|w| w.contains("not on this machine right now")),
+            "and it reads as a drive to plug in, not as a game that is gone: {a:?}"
+        );
+    }
+
+    /// The name a picked folder starts with is the game's, not `pfx`.
+    ///
+    /// Every Proton prefix on a machine is called `pfx`, and a list of six
+    /// games all called `pfx` is a list nobody can use. It is a starting point
+    /// and nothing more — the file is plain text and the name in it is display
+    /// only.
+    #[test]
+    fn a_picked_folder_is_named_after_the_game_and_not_after_the_prefix() {
+        assert_eq!(
+            name_for_prefix(Path::new("/games/star-citizen/pfx")),
+            "star-citizen"
+        );
+        assert_eq!(
+            name_for_prefix(Path::new("/games/star-citizen/pfx/drive_c")),
+            "pfx"
+        );
+        assert_eq!(
+            name_for_prefix(Path::new("/games/Elden Ring")),
+            "Elden Ring"
+        );
+        // Nothing to take a name from at all still yields something to show.
+        assert_eq!(name_for_prefix(Path::new("/")), "/");
+    }
+
+    /// The fourth group's rows are reachable by what identifies them.
+    ///
+    /// They have no app id, so a search that only matched a name and an app id
+    /// could not reach one by the folder it is in — and the folder is the thing
+    /// on screen under the name.
+    #[test]
+    fn a_hand_added_game_is_findable_by_its_folder() {
+        let custom = [tobii_config::custom_games::CustomGame {
+            name: "Star Citizen".to_string(),
+            prefix: PathBuf::from("/mnt/big/sc/pfx"),
+        }];
+        let c = Catalog::new(&[], &profiles::Listing::default(), &custom, &none, &|_| {
+            RowBridge::Installed
+        });
+        assert_eq!(picker(&c, &[], "mnt/big").rows.len(), 1, "by its folder");
+        assert_eq!(picker(&c, &[], "citizen").rows.len(), 1, "and by its name");
+        assert!(picker(&c, &[], "elden").rows.is_empty());
     }
 
     // ------------------------------------------------------------ the groups
@@ -3962,7 +4598,7 @@ mod tests {
         let apps = [app("1", "Bravo"), app("2", "Alpha"), app("3", "Charlie")];
         // A profile for one installed title, and one for a title that is not.
         let listing = listed(&[("2", None), ("77", Some("Gone Fishing"))]);
-        let c = Catalog::new(&apps, &listing, &none, &|_| RowBridge::Installed);
+        let c = Catalog::new(&apps, &listing, &[], &none, &|_| RowBridge::Installed);
         let p = picker(&c, &[], "");
         let seen: Vec<(&str, Group)> = p.rows.iter().map(|r| (r.name.as_str(), r.group)).collect();
         assert_eq!(
@@ -3993,7 +4629,7 @@ mod tests {
     #[test]
     fn a_profile_for_a_game_that_is_not_here_is_not_counted_as_installed() {
         let apps = [app("1", "Bravo")];
-        let c = Catalog::new(&apps, &listed(&[("77", None)]), &none, &|_| {
+        let c = Catalog::new(&apps, &listed(&[("77", None)]), &[], &none, &|_| {
             RowBridge::Installed
         });
         let p = picker(&c, &[], "");
@@ -4017,6 +4653,7 @@ mod tests {
         let c = Catalog::new(
             &[],
             &listed(&[("77", Some("Gone Fishing")), ("88", None)]),
+            &[],
             &none,
             &|_| RowBridge::Installed,
         );
@@ -4050,7 +4687,7 @@ mod tests {
     fn a_set_up_row_says_which_of_the_three_bridge_states_it_is_in() {
         let apps = [app("1", "One"), app("2", "Two"), app("3", "Three")];
         let listing = listed(&[("1", None), ("2", None), ("3", None)]);
-        let c = Catalog::new(&apps, &listing, &none, &|id| match id {
+        let c = Catalog::new(&apps, &listing, &[], &none, &|id| match id {
             "1" => RowBridge::Installed,
             "2" => RowBridge::NotInstalled,
             _ => RowBridge::NeverLaunched,
@@ -4084,7 +4721,7 @@ mod tests {
     fn the_bridge_is_stat_ed_once_for_a_set_up_row_and_never_for_any_other() {
         let apps = [app("1", "One"), app("2", "Two"), app("3", "Three")];
         let asked = std::cell::RefCell::new(Vec::new());
-        let c = Catalog::new(&apps, &listed(&[("2", None)]), &none, &|id| {
+        let c = Catalog::new(&apps, &listed(&[("2", None)]), &[], &none, &|id| {
             asked.borrow_mut().push(id.to_string());
             RowBridge::Installed
         });
@@ -4586,7 +5223,11 @@ mod tests {
 
     #[test]
     fn the_installer_is_never_forced() {
-        let argv = install_argv(Path::new("/usr/bin/tobii"), "359320", None);
+        let argv = install_argv(
+            Path::new("/usr/bin/tobii"),
+            &Target::Steam("359320".to_string()),
+            None,
+        );
         assert!(
             !argv.iter().any(|a| a == "--force"),
             "--force overrides the refusal that stops the host's wine rewriting a game's \
@@ -4596,7 +5237,11 @@ mod tests {
 
     #[test]
     fn the_app_id_is_passed_and_the_name_is_not() {
-        let argv = install_argv(Path::new("/usr/bin/tobii"), "359320", None);
+        let argv = install_argv(
+            Path::new("/usr/bin/tobii"),
+            &Target::Steam("359320".to_string()),
+            None,
+        );
         assert_eq!(
             argv,
             ["/usr/bin/tobii", "bridge", "install", "--steam", "359320"]
@@ -4607,11 +5252,15 @@ mod tests {
 
     #[test]
     fn wine_is_passed_only_when_it_was_chosen() {
-        let bare = install_argv(Path::new("/usr/bin/tobii"), "1", None);
+        let bare = install_argv(
+            Path::new("/usr/bin/tobii"),
+            &Target::Steam("1".to_string()),
+            None,
+        );
         assert!(!bare.iter().any(|a| a == "--wine"), "{bare:?}");
         let chosen = install_argv(
             Path::new("/usr/bin/tobii"),
-            "1",
+            &Target::Steam("1".to_string()),
             Some(Path::new("/games/Proton 9.0/files/bin/wine")),
         );
         let tail: Vec<&OsString> = chosen.iter().rev().take(2).collect();
@@ -4621,7 +5270,10 @@ mod tests {
 
     #[test]
     fn status_reads_the_same_game_the_install_would_have_written() {
-        let s = status_argv(Path::new("/usr/bin/tobii"), "359320");
+        let s = status_argv(
+            Path::new("/usr/bin/tobii"),
+            &Target::Steam("359320".to_string()),
+        );
         assert_eq!(
             s,
             ["/usr/bin/tobii", "bridge", "status", "--steam", "359320"]
@@ -5912,7 +6564,7 @@ mod tests {
         // now: `bridge_block` writes the paragraph and says nothing about
         // buttons. Asserted here because this test is about the two agreeing.
         assert!(
-            actions(&present(), None, &quiet_job(), true)
+            actions(&present(), None, &quiet_job(), Reach::Reachable)
                 .primary
                 .is_none(),
             "nothing to run: {without}"
@@ -6093,7 +6745,7 @@ mod tests {
             "359320",
         );
         assert!(
-            actions(&present(), None, &quiet_job(), true)
+            actions(&present(), None, &quiet_job(), Reach::Reachable)
                 .primary
                 .is_none(),
             "nothing to run: {files}"
@@ -6133,9 +6785,11 @@ mod tests {
             Some(Path::new("/opt/x")),
             "359320",
         );
-        assert!(actions(&BridgeState::NoPrefix, None, &quiet_job(), true)
-            .primary
-            .is_none());
+        assert!(
+            actions(&BridgeState::NoPrefix, None, &quiet_job(), Reach::Reachable)
+                .primary
+                .is_none()
+        );
         // Asserted on a phrase both arms of `no_binary_text`'s head share.
         // The old assertion was `!none.contains("not beside this one")`,
         // which stopped being a substring of either arm the moment the head
@@ -6870,7 +7524,7 @@ mod tests {
         let text = bridge_block(&state, &[], &[], None, Some(Path::new("/opt/x")), "359320");
         // The button half is `actions`, which is the one decider: with no
         // `tobii` there is nothing to run, whatever the prefix holds.
-        let bar = actions(&state, None, &quiet_job(), true);
+        let bar = actions(&state, None, &quiet_job(), Reach::Reachable);
         assert_eq!(bar.primary, None, "nothing to run it with: {text}");
         assert!(
             bar.blocked
@@ -6894,7 +7548,7 @@ mod tests {
             &state,
             Some(Path::new("/home/x/.local/bin/tobii")),
             &quiet_job(),
-            true,
+            Reach::Reachable,
         );
         assert_eq!(bar.primary, Some(Action::Install));
         assert_eq!(bar.blocked, None, "{bar:?}");

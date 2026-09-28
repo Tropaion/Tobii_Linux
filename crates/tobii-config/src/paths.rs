@@ -92,8 +92,15 @@ pub const MODELS_DIR: &str = "models";
 /// somebody else's. See the module docs there.
 pub const PROFILES_DIR: &str = "profiles";
 
+/// The list of games somebody added by hand: a name and a Wine prefix each.
+///
+/// Not `.toml`, and the extension is the honest half of that: it is two
+/// tab-separated fields per line, because two free-text fields is not a grammar
+/// worth a parser. [`crate::custom_games`] has the argument.
+pub const CUSTOM_GAMES: &str = "custom-games.tsv";
+
 /// Every file this program writes directly into [`config_dir`].
-pub const CONFIG_FILES: [&str; 11] = [
+pub const CONFIG_FILES: [&str; 12] = [
     CONFIG_TOML,
     CALIBRATION_BIN,
     CALIBRATION_META,
@@ -105,6 +112,7 @@ pub const CONFIG_FILES: [&str; 11] = [
     GAMES_TOML,
     ACCURACY_CSV,
     REPORT_SALT,
+    CUSTOM_GAMES,
 ];
 
 /// What [`crate::write_atomic`] appends to a file name for its temporary.

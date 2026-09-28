@@ -329,7 +329,7 @@ pub fn topics() -> Vec<Topic> {
                  program's own settings, the Wine bridge inside that game's \
                  Proton prefix, and the game's own options. It reads a game's own \
                  files and never changes them.\n\n\
-                 The list has three sections. {set_up} is every game there is a \
+                 The list has four sections. {set_up} is every game there is a \
                  profile for, with what the Wine bridge is doing under each. \
                  {not_set_up} is the rest of what Steam says is installed. \
                  {elsewhere} is the one section that is not about this machine: \
@@ -339,6 +339,16 @@ pub fn topics() -> Vec<Topic> {
                  tracking goes and what is in a Proton prefix have no answer from \
                  a machine that has not got the game. The profile is not lost, \
                  and it applies again the moment Steam lists the title.\n\n\
+                 {custom} is the one section Steam has nothing to do with: press \
+                 \u{201c}Add a game by folder\u{2026}\u{201d} under the list and pick the Wine \
+                 prefix a game runs in — the folder holding `drive_c` — and the \
+                 bridge can be installed into it exactly as it is for a Steam \
+                 game. That is how a game Steam does not sell reaches this page \
+                 at all. Those rows have no app id, so they get the first two \
+                 sections of the page and not the third: reading a game's own \
+                 options needs a profile, and a profile is a file named after an \
+                 app id. \u{201c}Remove from this list\u{201d} takes the row out and \
+                 touches nothing on disk.\n\n\
                  Under the list, the count of what Steam has installed, and — on \
                  the rare machine that has any — a line for anything in the \
                  profiles directory that is not a profile this program can use. \
@@ -353,6 +363,12 @@ pub fn topics() -> Vec<Topic> {
                  calibration, or Keep the tracker awake, which is what an ALWAYS \
                  ON badge in the header means. With none of those it is dark \
                  three seconds later. Ctrl+Page Up comes back.\n\n\
+                 The buttons under the page act on the Wine bridge and on \
+                 nothing else. Install puts it into the prefix, Reinstall does it \
+                 again over what is there, Uninstall takes it back out, and \
+                 Details runs `tobii bridge status` and prints what it says \
+                 without starting anything. When there is nothing to press, the \
+                 bar says why instead of going blank.\n\n\
                  The third section, the game's own options, is read-only: this \
                  program reports what those files say and never writes them. It \
                  checks them only where a profile says what to look at, and this \
@@ -409,6 +425,7 @@ pub fn topics() -> Vec<Topic> {
                 set_up = crate::game_setup::Group::SetUp.heading(),
                 not_set_up = crate::game_setup::Group::NotSetUp.heading(),
                 elsewhere = crate::game_setup::Group::Elsewhere.heading(),
+                custom = crate::game_setup::Group::Custom.heading(),
             ),
         ),
         topic(
