@@ -1258,20 +1258,56 @@ what is tested and what is known.
   `/` in every prefix wine makes, and Steam adds `s:` pointing at the library
   root. Verified on this machine's Elite prefix on 2026-09-28 — both links are
   there. `dosdevices/z:/etc/hostname` has no `..`, no leading `/` and no
-  backslash; the parser accepts it and the reader opens the file. Three halves
-  were demonstrated: `check where` resolved and stat'd outside the prefix, the
-  `attrs` reader parsed a file at an arbitrary absolute path through such a
-  check, and a `binds-dir` check on
+  backslash; the parser accepts it and the reader opens the file. Two things
+  were demonstrated: `check where` resolved and stat'd outside the prefix, and
+  the `attrs` reader parsed a file at an arbitrary absolute path through such a
+  check.
+- **A third demonstration was written down here and never performed.** This
+  bullet claimed that *"a `binds-dir` check on
   `dosdevices/s:/steamapps/common/Elite Dangerous/…/ControlSchemes` read the
-  full 30-document census.
+  full 30-document census"*. It did not. What was run is
+  `cargo run -p tobii-gameconf --example read -- presets <ControlSchemes> …` —
+  a **mode of an example**, pointed straight at the directory, and not a
+  `profiles::Format` a check can name at all. Re-run on 2026-09-28, a
+  `binds-dir` check's own reader answers that directory with *"holds no
+  StartPreset file: nothing has saved a control scheme here"*, because
+  `binds-dir` resolves through the live-preset file and shipped presets have
+  none. What **is** demonstrated through such a path, measured the same day: a
+  check with that `path` parses, and `tobii games profile check where`
+  resolves it onto the real directory and reports *a directory, as binds-dir
+  needs*. Naming is not reading, and this file said it was. A demonstration
+  recorded in the risk register that nobody performed is the most expensive
+  wrong sentence this project can hold — every later reader takes it as the
+  thing they no longer have to check.
+- **The audit that closed it counted four surfaces; there were ten.** Six more
+  still said it when the bullet above declared the matter closed, found by
+  grep on 2026-09-28: `tobii games profile check`'s schema — the text
+  [[Game-Profiles]] designates **canonical** and tells readers to prefer over
+  any copy — both report lines that echo a check back (`profile show` and
+  `check add`, each closing with *"under the Proton prefix"* on the last line
+  an author reads), [[Game-Profiles]]'s five-key table, and two places in
+  `crates/tobii-gtk/src/game_setup.rs` (`run_check`'s doc comment, *"can only
+  ever land inside the prefix"*, and the doc of the test that pins it, *"opened
+  under the prefix and nowhere else"*). The first four are corrected in the
+  same change as this bullet; the two in `game_setup.rs` are another file's,
+  and are named here so that the count is the count. The lesson is about the
+  count, not the wording: a claim that had been made in four places had been
+  made in ten, and "audited, four surfaces, closed" read as a finished job.
 - **It was closed by deleting the claim, not the capability.** Refusing
   `dosdevices` would have made the sentence true and removed something a
   profile author legitimately wants: Elite's 30 shipped presets live under
-  `steamapps/common/`, this project counted them itself, and `s:` is how a
-  check names them. So all four surfaces now say what is true — **a check
-  reaches what the prefix reaches** — and the three guards are documented as
+  `steamapps/common/`, this project counted them itself (with the example —
+  see above), and `s:` is how a check **names** them. So eight of the ten
+  surfaces now say what is true — **a check reaches what the prefix reaches** —
+  and the three guards are documented as
   what they are, a rule that keeps the path *relative* so a profile is portable
   between machines and `path_under` has something well-defined to join. The
+  canonical schema now teaches the two spellings that leave the prefix
+  (`dosdevices/s:/steamapps/common/…`, `dosdevices/z:/…`) — the same ones
+  `check_path`'s refusal recommends, and a test compares the two texts rather
+  than asserting each alone — and both report lines say *relative to* the
+  Proton prefix and add a line, for a `dosdevices/` path only, saying it leaves
+  it. The
   regression test is `a_check_path_reaches_what_the_prefix_reaches`
   (`profiles.rs`), which builds a fixture prefix with `s:` and `z:` links and
   fails if either the parser or `path_under` takes the capability back.

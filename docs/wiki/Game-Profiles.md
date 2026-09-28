@@ -107,7 +107,7 @@ because that is what you will actually find on disk.
 | Key | What it is |
 |---|---|
 | `format` | Which reader answers this, and so what `path` names. `binds-dir` or `attributes-xml`. |
-| `path` | Where that sits **under the Proton prefix** — the directory holding `drive_c`. |
+| `path` | Where that sits, written **relative to** the Proton prefix — the directory holding `drive_c`. Relative is not the same as contained: see below. |
 | `setting` | An element name for `binds-dir`, an attribute name for `attributes-xml`. |
 | `wants` | The value the game should have, spelled the way the game spells it. |
 | `tell` | The sentence shown to whoever has to go and change it by hand. Required. |
@@ -153,7 +153,7 @@ reader opens `/etc/hostname`. **A check reaches whatever the prefix reaches, and
 a wine prefix reaches the machine.** Measured on this project's own Elite prefix;
 pinned by `a_check_path_reaches_what_the_prefix_reaches` in `profiles.rs`.
 
-### That is a capability, and it is how you reach shipped files
+### That is a capability, and it is how you name shipped files
 
 It would be easy to close by refusing `dosdevices`, and that would be the wrong
 trade, because the files on the other side of it are ones a profile author
@@ -163,7 +163,9 @@ actually wants:
   `steamapps/common/Elite Dangerous/Products/elite-dangerous-odyssey-64/ControlSchemes/`.
   That is the **Steam library**, not the prefix — and a check names it as
   `dosdevices/s:/steamapps/common/Elite Dangerous/Products/elite-dangerous-odyssey-64/ControlSchemes`,
-  which parses, and which this project has read the whole census through.
+  which parses. Measured on 2026-09-28 on this project's own install:
+  `tobii games profile check where` resolved that path onto the real
+  directory and answered *a directory, as binds-dir needs.*
 - All 30 of those presets say `Bindings_HeadlookModeAccumulate` — counted, not
   sampled, and re-measured on 2026-09-28 with:
 
@@ -172,7 +174,30 @@ actually wants:
   ```
 
   So the setting a head tracker cares about is one every user starts on the
-  wrong side of, and a check *can* read the file that says so.
+  wrong side of.
+
+**Naming them and reading them are two different claims, and this page used to
+run them together.** It said a check "has read the whole census through" and
+"can read the file that says so". Neither was run. What was run is the command
+in the code block above, and `presets` there is a **mode of that example**, not
+a `format` a check can name — the format names are the ones
+`tobii games profile check` lists.
+
+The difference matters on exactly this directory. `binds-dir` resolves through
+the file that says which preset is **live**, and a directory of *shipped*
+presets has never had one saved into it, so on 2026-09-28, on that same path:
+
+```
+$ cargo run -q -p tobii-gameconf --example read -- binds <ControlSchemes> HeadlookMode
+nothing to read: <ControlSchemes> holds no StartPreset file: nothing has saved a
+control scheme here
+```
+
+Thirty saved control schemes are in that directory. Until `tobii-gameconf`
+answers differently there — it owns that half, and this page will not describe
+behaviour nobody has run — **a `binds-dir` check pointed at shipped presets
+gets that sentence**, and the example's `presets` mode is how you read them.
+[[Quality-and-Risks]] §11.3k is the record of which half is measured.
 
 Two cautions that come with using it. `s:` is a Steam convention, not a wine
 one, and it points at **one** library root — a game in a second library is not
