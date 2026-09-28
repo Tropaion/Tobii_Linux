@@ -603,43 +603,59 @@ mod tests {
 
     // --- the decision ---------------------------------------------------
 
-    /// A prefix on disk with our provider in it, and the compat directory Steam
-    /// would have named.
-    fn a_prefix(tag: &str, with_provider: bool) -> PathBuf {
-        let compat = std::env::temp_dir().join(format!(
-            "tobii-proton-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("a clock after 1970")
-                .as_nanos()
-        ));
-        let dir = compat.join("pfx").join(crate::bridge::INSTALL_SUBDIR);
-        std::fs::create_dir_all(&dir).expect("a scratch prefix");
-        if with_provider {
-            std::fs::write(dir.join(PROVIDER), b"not really an exe").expect("a provider");
+    /// A compat directory of the shape Steam names, holding a prefix that may
+    /// or may not have our provider in it.
+    ///
+    /// A guard rather than a bare path, following `bridge`'s own `FakeWine`: a
+    /// test that fails before its cleanup line otherwise leaves the tree
+    /// behind, and these run in CI as well as here.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str, with_provider: bool) -> Self {
+            let compat =
+                std::env::temp_dir().join(format!("tobii-proton-{tag}-{}", std::process::id()));
+            std::fs::remove_dir_all(&compat).ok();
+            let dir = compat.join("pfx").join(crate::bridge::INSTALL_SUBDIR);
+            std::fs::create_dir_all(&dir).expect("a scratch prefix");
+            if with_provider {
+                std::fs::write(dir.join(PROVIDER), b"not really an exe").expect("a provider");
+            }
+            Self(compat)
         }
-        compat
+
+        /// The value `$STEAM_COMPAT_DATA_PATH` would hold.
+        fn compat(&self) -> &Path {
+            &self.0
+        }
+
+        /// Where the batch file goes.
+        fn dir(&self) -> PathBuf {
+            self.0.join("pfx").join(crate::bridge::INSTALL_SUBDIR)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
     }
 
     #[test]
     fn a_non_steam_program_is_run_exactly_as_given() {
-        let compat = a_prefix("native", true);
-        let plan = plan(&args(&["./MyGame.x86_64", "-w"]), Some(&compat));
-        std::fs::remove_dir_all(&compat).ok();
+        let scratch = Scratch::new("native", true);
+        let plan = plan(&args(&["./MyGame.x86_64", "-w"]), Some(scratch.compat()));
         assert_eq!(plan, Plan::AsGiven);
     }
 
     #[test]
     fn a_proton_launch_with_the_provider_installed_is_rewritten() {
-        let compat = a_prefix("rewrite", true);
+        let scratch = Scratch::new("rewrite", true);
         let cmd = steam_command("/games/common/Thing/Thing.exe");
-        let plan = plan(&cmd, Some(&compat));
-        std::fs::remove_dir_all(&compat).ok();
-        match plan {
+        match plan(&cmd, Some(scratch.compat())) {
             Plan::Rewrite { target, dir, batch } => {
                 assert_eq!(cmd[target], "/games/common/Thing/Thing.exe");
-                assert_eq!(dir, compat.join("pfx").join(crate::bridge::INSTALL_SUBDIR));
+                assert_eq!(dir, scratch.dir());
                 assert!(
                     batch.contains(r"Z:\games\common\Thing\Thing.exe"),
                     "{batch}"
@@ -656,13 +672,14 @@ mod tests {
     /// nothing to start, and the launch is left alone.
     #[test]
     fn a_prefix_without_the_provider_is_declined_and_says_where_it_looked() {
-        let compat = a_prefix("bare", false);
-        let plan = plan(&steam_command("/games/Thing/Thing.exe"), Some(&compat));
-        std::fs::remove_dir_all(&compat).ok();
-        match plan {
+        let scratch = Scratch::new("bare", false);
+        match plan(
+            &steam_command("/games/Thing/Thing.exe"),
+            Some(scratch.compat()),
+        ) {
             Plan::Declined(why) => {
                 assert!(
-                    why.contains(&compat.join("pfx").display().to_string()),
+                    why.contains(&scratch.compat().join("pfx").display().to_string()),
                     "{why}"
                 );
                 assert!(why.contains("tobii bridge install"), "{why}");
@@ -683,10 +700,11 @@ mod tests {
 
     #[test]
     fn a_game_path_a_batch_cannot_spell_is_declined_rather_than_mangled() {
-        let compat = a_prefix("unicode", true);
-        let plan = plan(&steam_command("/games/Wéird/Thing.exe"), Some(&compat));
-        std::fs::remove_dir_all(&compat).ok();
-        match plan {
+        let scratch = Scratch::new("unicode", true);
+        match plan(
+            &steam_command("/games/Wéird/Thing.exe"),
+            Some(scratch.compat()),
+        ) {
             Plan::Declined(why) => assert!(why.contains("non-ASCII"), "{why}"),
             other => panic!("{other:?}"),
         }
@@ -715,46 +733,43 @@ mod tests {
 
     #[test]
     fn the_batch_is_written_for_one_launch_and_removed_with_it() {
-        let dir = std::env::temp_dir().join(format!("tobii-proton-once-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let scratch = Scratch::new("once", false);
         let path = {
-            let once = Once::write(&dir, "@echo off\r\n").expect("written");
+            let once = Once::write(&scratch.dir(), "@echo off\r\n").expect("written");
             let written = std::fs::read_to_string(once.path()).expect("the batch is on disk");
             assert_eq!(written, "@echo off\r\n");
             once.path().to_path_buf()
         };
         assert!(!path.exists(), "{} outlived the launch", path.display());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- arranging it ---------------------------------------------------
 
     #[test]
     fn arranging_a_proton_launch_points_it_at_the_batch_and_keeps_the_file_alive() {
-        let compat = a_prefix("arrange", true);
-        let (cmd, file) = arrange(steam_command("/games/Thing/Thing.exe"), Some(&compat));
+        let scratch = Scratch::new("arrange", true);
+        let (cmd, file) = arrange(
+            steam_command("/games/Thing/Thing.exe"),
+            Some(scratch.compat()),
+        );
         let file = file.expect("the batch file is handed back to be held");
         assert_eq!(cmd.last().map(PathBuf::from).as_deref(), Some(file.path()));
         assert!(file.path().is_file(), "it must exist while the game runs");
-        drop(file);
-        std::fs::remove_dir_all(&compat).ok();
     }
 
     /// The disk can refuse, and the answer to that is the launch Steam asked
     /// for — not a command line pointing at a file that was never written.
     #[test]
     fn a_batch_that_cannot_be_written_leaves_the_launch_exactly_as_it_was() {
-        let compat = a_prefix("unwritable", true);
+        let scratch = Scratch::new("unwritable", true);
         // A directory where the file goes: `write` fails with `EISDIR` for
         // root as much as for anybody, which a permission bit would not.
-        let blocked = compat
-            .join("pfx")
-            .join(crate::bridge::INSTALL_SUBDIR)
+        let blocked = scratch
+            .dir()
             .join(format!("launch-{}.bat", std::process::id()));
         std::fs::create_dir_all(&blocked).expect("something in the file's way");
         let original = steam_command("/games/Thing/Thing.exe");
-        let (cmd, file) = arrange(original.clone(), Some(&compat));
-        std::fs::remove_dir_all(&compat).ok();
+        let (cmd, file) = arrange(original.clone(), Some(scratch.compat()));
         assert_eq!(cmd, original);
         assert!(file.is_none());
     }
@@ -792,14 +807,13 @@ mod tests {
         let stubs = PathBuf::from(
             std::env::var("TOBII_PROTON_E2E").expect("TOBII_PROTON_E2E names the stub directory"),
         );
-        let scratch = std::env::temp_dir().join(format!("tobii-proton-e2e-{}", std::process::id()));
-        let prefix = scratch.join("pfx");
-        let dir = prefix.join(crate::bridge::INSTALL_SUBDIR);
-        std::fs::create_dir_all(&dir).expect("a scratch prefix");
+        let scratch = Scratch::new("e2e", false);
+        let prefix = scratch.compat().join("pfx");
+        let dir = scratch.dir();
         std::fs::copy(stubs.join(PROVIDER), dir.join(PROVIDER)).expect("the provider stub");
 
-        let helper_out = scratch.join("helper.txt");
-        let argv_out = scratch.join("argv.txt");
+        let helper_out = scratch.compat().join("helper.txt");
+        let argv_out = scratch.compat().join("argv.txt");
         // The battery from the module header, each one a character `cmd.exe`
         // would otherwise act on.
         let battery = args(&[
@@ -853,11 +867,12 @@ mod tests {
             }
         };
         drop(file);
+        // Before the tree goes: a wineserver still serving a directory being
+        // deleted is how a scratch prefix outlives its test.
         let _ = std::process::Command::new("wineserver")
             .env("WINEPREFIX", &prefix)
             .arg("-k")
             .status();
-        std::fs::remove_dir_all(&scratch).ok();
 
         assert!(helper, "the provider never started");
         assert_eq!(
