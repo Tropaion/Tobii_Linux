@@ -140,7 +140,7 @@ fn main() {
                 }
             }
         }
-        if received > 0 && received % 600 == 0 {
+        if received > 0 && received.is_multiple_of(600) {
             println!("{received} frames published, {rejected} rejected");
         }
     }

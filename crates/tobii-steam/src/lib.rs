@@ -236,7 +236,10 @@ fn scan(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
 /// 29 installed titles, which came to 31 walks and 124 reads of a
 /// `libraryfolders.vdf` to open one window, and is 2 and 8 now. One of the
 /// maintainer's libraries is on a drive that is not plugged in, and 93 of
-/// those 124 walks stat'd that path; 6 do now.
+/// those 124 reads were followed by a stat of that path; 6 are now. Whether
+/// such a stat is slow is not something this machine can say: that path's
+/// parent does not exist either, so every one of them returns ENOENT at once.
+/// The count fell; no latency was measured.
 ///
 /// # What it is a snapshot of
 ///

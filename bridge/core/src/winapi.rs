@@ -44,7 +44,8 @@ extern "system" {
         dwMaximumSizeLow: DWORD,
         lpName: LPCSTR,
     ) -> HANDLE;
-    pub fn OpenFileMappingA(dwDesiredAccess: DWORD, bInheritHandle: BOOL, lpName: LPCSTR) -> HANDLE;
+    pub fn OpenFileMappingA(dwDesiredAccess: DWORD, bInheritHandle: BOOL, lpName: LPCSTR)
+        -> HANDLE;
     pub fn MapViewOfFile(
         hFileMappingObject: HANDLE,
         dwDesiredAccess: DWORD,
@@ -66,11 +67,7 @@ extern "system" {
 
     pub fn GetLastError() -> DWORD;
 
-    pub fn GetModuleHandleExA(
-        dwFlags: DWORD,
-        lpModuleName: LPCSTR,
-        phModule: *mut HANDLE,
-    ) -> BOOL;
+    pub fn GetModuleHandleExA(dwFlags: DWORD, lpModuleName: LPCSTR, phModule: *mut HANDLE) -> BOOL;
 }
 
 // The registry lives in advapi32, which — unlike kernel32 — is not in the

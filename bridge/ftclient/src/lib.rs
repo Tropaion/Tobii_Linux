@@ -105,7 +105,7 @@ pub unsafe extern "system" fn FTGetData(data: *mut FtData) -> bool {
 /// not free it.
 #[no_mangle]
 pub unsafe extern "system" fn FTGetDllVersion() -> *const u8 {
-    b"1.0.0.0\0".as_ptr()
+    c"1.0.0.0".as_ptr().cast()
 }
 
 /// Who is providing the data.
@@ -114,7 +114,7 @@ pub unsafe extern "system" fn FTGetDllVersion() -> *const u8 {
 /// As [`FTGetDllVersion`].
 #[no_mangle]
 pub unsafe extern "system" fn FTProvider() -> *const u8 {
-    b"TobiiLinux\0".as_ptr()
+    c"TobiiLinux".as_ptr().cast()
 }
 
 /// A game announcing its profile id. Accepted and ignored.

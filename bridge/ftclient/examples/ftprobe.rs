@@ -10,6 +10,9 @@
 //! Built on demand, not shipped:
 //! `cargo build --release --target x86_64-pc-windows-gnu --example ftprobe`
 
+// The Windows types keep the header's spelling, as in `npprobe`.
+#![allow(clippy::upper_case_acronyms)]
+
 use std::ffi::c_void;
 
 type HMODULE = *mut c_void;
@@ -91,15 +94,14 @@ fn main() {
         String::from_utf8_lossy(std::slice::from_raw_parts(p, len)).into_owned()
     };
 
-    let version: extern "system" fn() -> *const u8 = unsafe {
-        std::mem::transmute(GetProcAddress(module, b"FTGetDllVersion\0".as_ptr()))
-    };
+    let version: extern "system" fn() -> *const u8 =
+        unsafe { std::mem::transmute(GetProcAddress(module, c"FTGetDllVersion".as_ptr().cast())) };
     let provider: extern "system" fn() -> *const u8 =
-        unsafe { std::mem::transmute(GetProcAddress(module, b"FTProvider\0".as_ptr())) };
+        unsafe { std::mem::transmute(GetProcAddress(module, c"FTProvider".as_ptr().cast())) };
     println!("version={} provider={}", cstr(version()), cstr(provider()));
 
     let get_data: extern "system" fn(*mut FtData) -> bool =
-        unsafe { std::mem::transmute(GetProcAddress(module, b"FTGetData\0".as_ptr())) };
+        unsafe { std::mem::transmute(GetProcAddress(module, c"FTGetData".as_ptr().cast())) };
 
     // Sample a few times so a moving DataID is visible — that is what a game
     // watches to tell a live feed from a frozen one.
