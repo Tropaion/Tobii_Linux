@@ -1671,6 +1671,15 @@ manifests that does not follow the search box.
   rows the filter excludes; that the class makes a row *look* different is
   `row.not-set-up .row-name` in the stylesheet, and nothing here renders a
   pixel. This is §11.3m's last bullet again, one surface further on.
+- **Two of the eight display tests do not pass on the machine this was written
+  on, and neither is this work's doing.** `games_tab`'s fourth assertion —
+  switching tabs must not resize the window — reports the Games page wanting
+  873px against the Tracker page's 794px, deterministically; it reports exactly
+  the same pair at `fdb2361`, before any of this. `keep_awake_switch` fails
+  intermittently and also fails at `fdb2361`. Both were bisected rather than
+  assumed. They are recorded here because CI runs none of these, so nothing else
+  would notice, and because "7 of 8 pass" is the honest number for this suite
+  rather than 8.
 - **`recheck` is wired and not exercised end to end.** A review found that a
   job finishing left the row it was about stale — the pane re-stats the prefix
   on every `refresh`, the rows carried what the catalogue said when the tab was
