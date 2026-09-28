@@ -426,8 +426,9 @@ pub(crate) const SET_UP_ONLY_GLYPH: &str = "\u{25b6}";
 pub const SET_UP_ONLY_NAME: &str = "gamesetup-setup-only";
 /// See [`DETAILS_TIP`].
 pub(crate) const SET_UP_ONLY_TIP: &str =
-    "Show only the games with the bridge installed. Every other row is drawn back rather \
-     than hidden, so this is for a machine with one set-up game among thirty.";
+    "Show only the games that are set up \u{2014} the ones with the bridge in their \
+     prefix \u{2014} and press again to bring the rest back. Without it the list holds \
+     everything, with whatever is not set up drawn back.";
 /// See [`DETAILS_TIP`].
 pub(crate) const FORGET_TIP: &str =
     "Take this game out of the hub's list. It does not touch the prefix, the game, or a bridge \
