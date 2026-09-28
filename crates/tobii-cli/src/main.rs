@@ -2324,6 +2324,42 @@ fn unusable_settings(settings: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
+/// How a check's `path` is joined onto a prefix, as both report lines say it.
+///
+/// Until 2026-09-28 both said *"under the Proton prefix"*, which is a
+/// containment claim `path`'s three rules do not make: no leading `/`, no
+/// `..`, no backslash keep the path **relative**, so a profile written on one
+/// machine names the same thing on another. Relative is not contained — see
+/// [`leaves_the_prefix`].
+const PATH_IS_RELATIVE: &str = "relative to the Proton prefix";
+
+/// The sentence a `path` through `dosdevices/` earns, or `""` for every other
+/// path.
+///
+/// A Wine prefix maps the machine into itself under `dosdevices/`: `z:` is
+/// `/`, and a Steam prefix adds an `s:` at the library root. So
+/// `dosdevices/s:/steamapps/common/<game>/...` is relative, has no `..` and
+/// no backslash — and names the Steam library, outside the prefix. That
+/// spelling is the one this program's own refusal of an absolute `path`
+/// recommends (`check_path`, `crates/tobii-config/src/profiles.rs`), so an
+/// author who took the advice was told on the very next line that what they
+/// had written was inside the prefix. Both lines that echo a check back say
+/// this instead, from here, so the two cannot come to disagree.
+///
+/// Returned as lines rather than a block because the two report lines indent
+/// their continuations by different amounts, and the caller owns its own
+/// margin.
+fn leaves_the_prefix(path: &str) -> &'static [&'static str] {
+    if path.split('/').next() == Some("dosdevices") {
+        &[
+            "through dosdevices/, so it leaves the prefix: a drive letter there",
+            "names the machine — s: the Steam library, z: the filesystem root.",
+        ]
+    } else {
+        &[]
+    }
+}
+
 /// What a profile leaves for a person to do, as a block to print under it.
 ///
 /// Shared by `show` and `apply` so the two cannot come to differ about what
@@ -2381,14 +2417,17 @@ fn left_for_you(p: &tobii_config::profiles::Profile, appid: &str) -> String {
         // Numbered because `tobii games profile check remove` takes a number,
         // and the list a person reads has to be the list they can point at.
         s.push_str(&format!(
-            "\n  {}. {} ({}, under the Proton prefix)\n     \
-             {} should be {:?}\n     {}\n",
+            "\n  {}. {} ({}, {PATH_IS_RELATIVE})\n",
             i + 1,
             c.path,
             c.format.as_str(),
-            c.setting,
-            c.wants,
-            c.tell
+        ));
+        for line in leaves_the_prefix(&c.path) {
+            s.push_str(&format!("     {line}\n"));
+        }
+        s.push_str(&format!(
+            "     {} should be {:?}\n     {}\n",
+            c.setting, c.wants, c.tell
         ));
     }
     s
@@ -2911,11 +2950,30 @@ Each check is a block in <profiles dir>/<app id>.toml, and looks like this:
                               naming which of them is live; `path` is the
                               directory
              attributes-xml   one flat <Attributes> document; `path` is the file
-  path     where that sits under the Proton prefix — the directory holding
-           drive_c. Relative, written with `/` and never `\\`, no `..` in it.
+  path     where that sits, written relative to the Proton prefix — the
+           directory holding drive_c. Never starting with `/`, written with
+           `/` and never `\\`, and with no `..` component.
   setting  an element name for binds-dir, an attribute name for attributes-xml
   wants    the value the game should have, spelled the way the game spells it
   tell     the sentence shown to whoever has to go and change it by hand
+
+Those three rules on `path` keep it relative, which is what makes a profile
+portable between machines whose prefixes sit in different places. They are
+NOT a containment rule, and a check is not confined to the prefix. A Wine
+prefix maps the machine into itself under dosdevices/, and those are ordinary
+directory entries, so both of these are relative paths this accepts:
+
+  dosdevices/s:/steamapps/common/<game>/...   the game's own installed files
+                                              (s: is the Steam library root,
+                                              and Steam is what puts it there)
+  dosdevices/z:/<absolute path>               anything else you can read
+                                              (z: is / in every Wine prefix)
+
+That is deliberate — a game's shipped files are not inside its prefix — and
+it is why a `path` beginning dosdevices/ is worth reading twice in a profile
+somebody handed you. What bounds a check is not the path but the reader: it
+opens the one file the path names, looks up the one `setting`, and answers
+with that one value or with a refusal.
 
 Every one of those is yours to assert. Nothing here opens a game's
 configuration to fill one in, and nothing here knows what any game wants.";
@@ -3045,14 +3103,16 @@ fn profile_check_add(
     }
     let c = &p.checks[n - 1];
     out.push_str(&format!(
-        "\ncheck {n}, as it will be read back:\n  \
-         {} ({}, under the Proton prefix)\n    \
-         {} should be {:?}\n    {}\n",
+        "\ncheck {n}, as it will be read back:\n  {} ({}, {PATH_IS_RELATIVE})\n",
         c.path,
         c.format.as_str(),
-        c.setting,
-        c.wants,
-        c.tell,
+    ));
+    for line in leaves_the_prefix(&c.path) {
+        out.push_str(&format!("    {line}\n"));
+    }
+    out.push_str(&format!(
+        "    {} should be {:?}\n    {}\n",
+        c.setting, c.wants, c.tell,
     ));
     if !c.format.is_known() {
         out.push_str(&format!(
@@ -5703,6 +5763,134 @@ mod tests {
         ] {
             assert!(e.contains(needle), "{needle:?} is missing from:\n{e}");
         }
+    }
+
+    /// [[Game-Profiles]] designates this the canonical spec and tells readers
+    /// to prefer it over any copy, and the hub's help window sends people here
+    /// too. It said `path` was "where that sits under the Proton prefix" and
+    /// nothing else — while the same binary's refusal of an absolute `path`
+    /// told the author to write `dosdevices/s:/steamapps/common/...`, which is
+    /// the Steam library and not the prefix. A canonical spec that does not
+    /// mention the spelling its own error messages recommend is not canonical.
+    ///
+    /// Compared against that refusal rather than spot-checked, so the day
+    /// `check_path` changes its advice this fails instead of going quietly out
+    /// of date.
+    #[test]
+    fn the_canonical_check_spec_teaches_the_path_its_own_refusal_recommends() {
+        let refusal = tobii_config::profiles::parse(
+            "version = 1\n\
+             \n[[check]]\n\
+             format = \"binds-dir\"\n\
+             path = \"/steamapps/common/Elite Dangerous\"\n\
+             setting = \"HeadlookMode\"\n\
+             wants = \"1\"\n\
+             tell = \"Set head look to toggle.\"\n",
+        )
+        .expect_err("an absolute path is refused")
+        .message;
+        let recommended = "dosdevices/s:/steamapps/common/";
+        assert!(
+            refusal.contains(recommended),
+            "this test's premise — the refusal recommends it: {refusal}"
+        );
+
+        let dir = scratch("check-schema-canonical");
+        let mut out = String::new();
+        profile_check_cmd(
+            &mut out,
+            &dir,
+            &[],
+            &args(&["tobii", "games", "profile", "check"]),
+        )
+        .expect("asking what a check is is not an error");
+        assert!(
+            out.contains(recommended),
+            "the canonical spec has to teach what the refusal recommends:\n{out}"
+        );
+        // And say what it is, not only how to spell it: an author who reads
+        // only this must not come away thinking a check stays inside.
+        for needle in ["dosdevices/z:/", "NOT a containment rule"] {
+            assert!(out.contains(needle), "{needle:?} is missing from:\n{out}");
+        }
+    }
+
+    /// The last line an author reads after writing a check is the check echoed
+    /// back, and both places that echo one closed the parenthesis with "under
+    /// the Proton prefix". Write the path this program's own refusal
+    /// recommends — `dosdevices/s:/steamapps/common/…`, the Steam library —
+    /// and that line called it a place inside the prefix.
+    ///
+    /// Both report lines are checked here because they are two separate format
+    /// strings that have already drifted once, and the note has to be earned:
+    /// a `drive_c/` path must not get it, or it says nothing.
+    #[test]
+    fn neither_report_line_calls_a_path_through_dosdevices_a_place_in_the_prefix() {
+        const OUTSIDE: &str = "dosdevices/s:/steamapps/common/Elite Dangerous/ControlSchemes";
+        let dir = scratch("dosdevices-report");
+        write_profile(
+            &dir,
+            "359320",
+            &format!(
+                "version = 1\n\
+                 \n[[check]]\n\
+                 format = \"binds-dir\"\n\
+                 path = \"drive_c/Bindings\"\n\
+                 setting = \"HeadlookMode\"\n\
+                 wants = \"1\"\n\
+                 tell = \"Set Head Look to Toggle.\"\n\
+                 \n[[check]]\n\
+                 format = \"binds-dir\"\n\
+                 path = \"{OUTSIDE}\"\n\
+                 setting = \"HeadlookMode\"\n\
+                 wants = \"1\"\n\
+                 tell = \"Set Head Look to Toggle.\"\n"
+            ),
+        );
+        let mut shown = String::new();
+        profile_show(&mut shown, &dir, &[], &game("359320", Some("Elite"))).expect("show");
+
+        let mut added = String::new();
+        profile_check_add(
+            &mut added,
+            &dir,
+            &[],
+            &game("999999", Some("Other")),
+            &add_argv(
+                "999999",
+                &[
+                    ("--format", "binds-dir"),
+                    ("--path", OUTSIDE),
+                    ("--setting", "HeadlookMode"),
+                    ("--wants", "1"),
+                    ("--tell", "Set head look to toggle."),
+                ],
+            ),
+        )
+        .expect("add");
+
+        for (what, text) in [("show", &shown), ("check add", &added)] {
+            assert!(
+                !text.contains("under the Proton prefix"),
+                "{what} still calls it a place under the prefix:\n{text}"
+            );
+            assert!(
+                text.contains(PATH_IS_RELATIVE),
+                "{what} has to say how the path is joined:\n{text}"
+            );
+            assert!(
+                text.contains("leaves the prefix"),
+                "{what} has to say where a dosdevices/ path lands:\n{text}"
+            );
+        }
+
+        // Earned, not unconditional: the first check in `show` is a plain
+        // `drive_c/` path, and a note printed on every line says nothing.
+        let (plain, _) = shown.split_once("2. ").expect("two checks are listed");
+        assert!(
+            plain.contains("drive_c/Bindings") && !plain.contains("leaves the prefix"),
+            "a path that does not leave the prefix must not be told it does:\n{plain}"
+        );
     }
 
     /// A profile with one check, a note written above it, and nothing else.

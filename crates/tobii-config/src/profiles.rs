@@ -42,11 +42,22 @@
 //! So the honest sentence is: **a check reaches what the prefix reaches**,
 //! and a Wine prefix reaches the machine. That is deliberate rather than
 //! merely tolerated — a game's *shipped* files are under the Steam library,
-//! in `steamapps/common/<game>/`, and reaching them is a thing a profile
-//! author legitimately wants. Elite Dangerous keeps its thirty stock control
-//! schemes there, in `Products/elite-dangerous-odyssey-64/ControlSchemes/`,
-//! this project counted them through exactly such a path, and refusing
-//! `dosdevices` would remove that capability to preserve a sentence.
+//! in `steamapps/common/<game>/`, and naming them is a thing a profile author
+//! legitimately wants. Elite Dangerous keeps its thirty stock control schemes
+//! there, in `Products/elite-dangerous-odyssey-64/ControlSchemes/`, and
+//! refusing `dosdevices` would remove that capability to preserve a sentence.
+//!
+//! Be exact about which half of that has been run, because an earlier draft of
+//! this paragraph was not. **What this module does was measured**: on
+//! 2026-09-28, on the maintainer's install, a check with
+//! `path = "dosdevices/s:/steamapps/common/Elite Dangerous/Products/elite-dangerous-odyssey-64/ControlSchemes"`
+//! parsed, and `tobii games profile check where` resolved it onto that real
+//! directory and reported *a directory, as binds-dir needs*. **Whether a
+//! reader then answers out of it is `tobii_gameconf`'s question, not this
+//! module's**, and the thirty-document count this paragraph cites was taken by
+//! that crate's `read` example in its `presets` mode, pointed straight at the
+//! directory — not by a check, and not through a profile. This module's claim
+//! stops at the path.
 //!
 //! # What actually bounds what a profile can do
 //!
