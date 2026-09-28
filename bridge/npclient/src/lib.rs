@@ -93,8 +93,8 @@ macro_rules! trace {
 /// `data` must be null or point to a writable [`TrackIrData`].
 #[no_mangle]
 pub unsafe extern "system" fn NP_GetData(data: *mut TrackIrData) -> i32 {
-    trace!("NP_GetData(data={data:p})");
     if data.is_null() {
+        trace!("NP_GetData(data={data:p}) -> {NP_ERR_INVALID_ARG}");
         return NP_ERR_INVALID_ARG;
     }
     #[cfg(not(feature = "spike-log"))]
@@ -103,6 +103,11 @@ pub unsafe extern "system" fn NP_GetData(data: *mut TrackIrData) -> i32 {
             return NP_OK;
         }
     }
+    // The spike build serves no data, so this is the only answer it ever gives
+    // here — but it is logged with its code all the same, because a reader
+    // working out why a game stopped asking should not have to know which
+    // build wrote the line.
+    trace!("NP_GetData(data={data:p}) -> {NP_ERR_NO_DATA}");
     NP_ERR_NO_DATA
 }
 
@@ -132,7 +137,7 @@ pub unsafe extern "system" fn NP_GetData(data: *mut TrackIrData) -> i32 {
 /// - **Star Citizen, 2026-08-15.** Called this, got nothing it recognised, and
 ///   never asked for data again. It rejects, and stops.
 /// - **Microsoft Flight Simulator 2024** (Steam appid 2537590) under Proton
-///   Experimental, **2026-09-28**, reported against v0.5.0's spike build: 104
+///   Experimental, **2026-09-27**, reported against v0.5.0's spike build: 104
 ///   calls to this and to *nothing else* in 1m45s — no
 ///   `NP_RegisterWindowHandle`, no `NP_RequestData`, no `NP_GetData` — at
 ///   intervals stretching from ~250 ms to several seconds, into a freshly
@@ -152,22 +157,30 @@ pub unsafe extern "system" fn NP_GetData(data: *mut TrackIrData) -> i32 {
 /// pair. All [`SIGNATURE_LEN`] bytes of it are written.
 #[no_mangle]
 pub unsafe extern "system" fn NP_GetSignature(sig: *mut c_void) -> i32 {
-    trace!("NP_GetSignature(sig={sig:p})");
-    if sig.is_null() {
-        return NP_ERR_INVALID_ARG;
-    }
-    std::ptr::write_bytes(sig.cast::<u8>(), 0, SIGNATURE_LEN);
-    NP_ERR_INTERNAL_DATA
+    let rc = if sig.is_null() {
+        NP_ERR_INVALID_ARG
+    } else {
+        std::ptr::write_bytes(sig.cast::<u8>(), 0, SIGNATURE_LEN);
+        NP_ERR_INTERNAL_DATA
+    };
+    // Logged after the call, with what it answered. A log of calls alone
+    // cannot show that this export's answer changed, and the one measurement
+    // this project has of a game's behaviour here is a log somebody else ran:
+    // a re-run that looks identical would be indistinguishable from a re-run
+    // that proved nothing happened.
+    trace!("NP_GetSignature(sig={sig:p}) -> {rc}");
+    rc
 }
 
 /// # Safety
 /// `version` must be null or point to a writable `u16`.
 #[no_mangle]
 pub unsafe extern "system" fn NP_QueryVersion(version: *mut u16) -> i32 {
-    trace!("NP_QueryVersion(version={version:p})");
     if version.is_null() {
+        trace!("NP_QueryVersion(version={version:p}) -> {NP_ERR_INVALID_ARG}");
         return NP_ERR_INVALID_ARG;
     }
+    trace!("NP_QueryVersion(version={version:p}) -> {NP_OK}");
     // 4.00. The established open client reports 5.00, but TIR5 also requires a
     // checksum computed over the head-pose data and relayed to the game, which
     // this does not compute — claiming the newer version without it may be

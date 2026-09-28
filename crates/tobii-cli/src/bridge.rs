@@ -194,6 +194,40 @@ fn find_installed_npclient() -> Option<PathBuf> {
         .find(|d| d.join("NPClient64.dll").is_file())
 }
 
+/// Everything `install` says about what it registered, in one string.
+///
+/// One function because the two halves have to be printed together and were
+/// not: the "registered …" lines were held in a local and the note about
+/// `--npclient ours` went out through a `println!` of its own, several lines
+/// earlier. Nothing could assert that `install` said both, so a guard put back
+/// around that `println!` left the whole suite green while reintroducing the
+/// silence that cost a user an evening.
+///
+/// `explicit_ours` is whether the user typed `--npclient ours` rather than
+/// having it fall out of `auto`, and `installed` is what
+/// [`find_installed_npclient`] found — both are [`ours_for_trackir`]'s to
+/// interpret, not this function's.
+fn registered_text(
+    np: &NpSource,
+    np_target: &str,
+    explicit_ours: bool,
+    installed: Option<&Path>,
+) -> String {
+    match np {
+        NpSource::Ours => format!(
+            "registered {INSTALL_WIN_DIR} for TrackIR and FreeTrack\n\n{}",
+            ours_for_trackir(explicit_ours, installed)
+        ),
+        NpSource::Installed(_) => format!(
+            "registered {INSTALL_WIN_DIR} for FreeTrack\n\
+             registered {np_target} for TrackIR\n\n\
+             TrackIR points at the client already installed there, because games\n\
+             verify NaturalPoint's signature and a clean-room DLL cannot answer it.\n\
+             Nothing was copied."
+        ),
+    }
+}
+
 /// What `install` says when the TrackIR key is about to point at our own DLL.
 ///
 /// Printed whichever way the run got there, the run that asked for it by name
@@ -1804,36 +1838,17 @@ fn install(args: &[String]) -> CmdResult {
     // Held rather than printed as we go: "registered X" is only true once every
     // write has landed, and printing it before the check put confident lines
     // above the failure that contradicted it.
-    let registered;
-
-    let mut third_party_np = false;
-    match &np_source {
-        NpSource::Ours => {
-            registered = format!("registered {INSTALL_WIN_DIR} for TrackIR and FreeTrack");
-            println!(
-                "\n{}",
-                ours_for_trackir(
-                    explicit_np == Some("ours"),
-                    find_installed_npclient().as_deref()
-                )
-            );
-        }
-        NpSource::Installed(_) => {
-            let win = np_target.as_str();
-            registered = format!(
-                "registered {INSTALL_WIN_DIR} for FreeTrack\n\
-                 registered {win} for TrackIR\n\n\
-                 TrackIR points at the client already installed there, because games\n\
-                 verify NaturalPoint's signature and a clean-room DLL cannot answer it.\n\
-                 Nothing was copied."
-            );
-            // Load-bearing, and easy to miss: a third-party client is a pure
-            // consumer of FT_SharedMem. Our DLLs create and feed that mapping,
-            // and a TrackIR-only game never loads ours — so this is the one
-            // configuration that still needs the provider running.
-            third_party_np = true;
-        }
-    }
+    let registered = registered_text(
+        &np_source,
+        np_target.as_str(),
+        explicit_np == Some("ours"),
+        find_installed_npclient().as_deref(),
+    );
+    // Load-bearing, and easy to miss: a third-party client is a pure consumer
+    // of FT_SharedMem. Our DLLs create and feed that mapping, and a
+    // TrackIR-only game never loads ours — so this is the one configuration
+    // that still needs the provider running.
+    let third_party_np = matches!(np_source, NpSource::Installed(_));
 
     // Nothing below here is true if the keys did not land, so it is not
     // printed. A game finds its client DLL through the registry and nowhere
@@ -3775,6 +3790,44 @@ mod tests {
         assert_eq!(
             choose_npclient(Some("ours"), Some(p("/usr/libexec/opentrack"))).expect("resolves"),
             NpSource::Ours
+        );
+    }
+
+    /// What `install` prints about the client it registered, asked of the
+    /// thing `install` actually prints.
+    ///
+    /// Its sibling below asks [`ours_for_trackir`] directly, which is a
+    /// weaker question: the defect a user hit was not a wrong note, it was a
+    /// correct note behind a gate, printed nowhere. Re-introducing that gate
+    /// has to fail something, and this is the something.
+    #[test]
+    fn what_install_says_it_registered_carries_the_note_about_our_own_client() {
+        let ours = registered_text(&NpSource::Ours, "ignored", true, None);
+        assert!(
+            ours.contains(&format!("registered {INSTALL_WIN_DIR} for TrackIR")),
+            "it still says what it registered:\n{ours}"
+        );
+        assert!(
+            ours.contains("NaturalPoint's signature check"),
+            "and what that costs, in the same breath:\n{ours}"
+        );
+
+        // The other source says nothing about our own DLL, because it did not
+        // register it for TrackIR — a note about its limits there would be
+        // about a configuration this install did not make.
+        let theirs = registered_text(
+            &NpSource::Installed(PathBuf::from("/opt/opentrack")),
+            r"C:\opentrack",
+            false,
+            None,
+        );
+        assert!(
+            !theirs.contains("NaturalPoint's signature check"),
+            "not in the installed-client case:\n{theirs}"
+        );
+        assert!(
+            theirs.contains(r"C:\opentrack"),
+            "which names where TrackIR points instead:\n{theirs}"
         );
     }
 
