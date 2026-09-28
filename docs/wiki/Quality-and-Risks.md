@@ -1582,12 +1582,12 @@ deleted.
 **What is not:**
 
 - **None of it runs in CI.** `ci.yml`, `release.yml` and `scripts/package.sh`
-  all run `cargo test --workspace --locked`, which compiles the eight ignored
+  all run `cargo test --workspace --locked`, which compiles the nine ignored
   tests and skips every one. `clippy --all-targets` keeps them from rotting
   syntactically, so nobody gets a warning; they simply never run.
   `scripts/display-tests.sh` is the one command that does run them, and it is
   run by a person. This is the same gap §11.3h recorded for the help window,
-  now carrying seven files instead of one.
+  now carrying eight files instead of one.
 - **The tab strip's appearance is unasserted.** That the selected tab merges
   into the page it stands on is CSS — a negative bottom margin landing on a
   border — and the tests assert the *structure* it depends on (the strip and
@@ -1599,7 +1599,7 @@ deleted.
   state, and the argv builders are asserted, but no test runs `tobii bridge` and
   no game has been started after one.
 - **A game added by hand has never had a bridge installed into it here.** The
-  list, the grouping, the `--prefix` argv and the four refusals are tested; the
+  list, the `--prefix` argv and the refusals are tested; the
   round trip is not. The nearest thing to evidence is that `--prefix` is the
   same flag the CLI has always taken and that `tobii-cli`'s own tests exercise
   against a stateful fake `wine`.
@@ -1615,6 +1615,74 @@ deleted.
   and read only by the hub. A user without a GUI cannot add one, and
   `tobii bridge install --prefix` remains their route, which works and is not
   remembered.
+
+---
+
+### 11.3n The Games list became one list (2026-09-28)
+
+The four sections — *Set up*, *Not set up*, *Set up, not installed here* and
+*Added by hand* — are gone. One list, sorted by name, holds every game this
+machine has; a row is drawn at full strength when the Wine bridge is installed
+in that game's prefix and dimmed when it is not, and a captionless toggle beside
+the search box narrows the list to the set-up rows. The list is no longer torn
+down and rebuilt per keystroke: it is built when the catalogue is read and
+narrowed by `set_filter_func`.
+
+**Three things changed under it, and each is a claim worth stating.**
+
+The row's key changed from *has a profile* to *has a bridge*. `profiles::BUILTIN`
+is empty, so this build ships no profiles and one exists only where somebody
+wrote it with `tobii games profile save` — which meant that on every fresh
+install the first section and the third were both empty and the list was already
+one flat run of *Not set up*, under four headings. The bridge is the question
+the tab exists to change the answer to.
+
+`Catalog::new` used to take two closures so that `bridge_state`'s three stats
+were paid only for rows with a profile, and the shared test fixture passed a
+closure that **panicked** if that promise was broken. The promise is gone
+deliberately, so the guard went with it; a guard kept over a promise nobody
+makes fails honest code. What replaced it is
+`the_bridge_is_asked_exactly_once_for_every_row`, which is the half that can
+still rot silently. The cost: unchanged prefix walks (one per Steam row, as
+before), plus three `is_file` calls per row that has a prefix at all — a title
+never launched under Proton still costs nothing — once per visit to the tab.
+
+`Scan`'s prefix memo went. It had a 0% hit rate: the two closures were mutually
+exclusive, so every app id was asked once, inserted once, and cleared by
+`forget_prefixes` at the top of the next read. Each row is still asked once, now
+by construction.
+
+**What is measured.** `tests/games_filter.rs` is new and is the only test that
+can reach the two GTK facts the rewrite rests on: that a filtered-out row is
+still found by `row_at_index` and only `is_child_visible` tells them apart, and
+that the paragraph explaining an empty list appears when the filter is what
+emptied it. Headlessly, `keeps` is asserted as the one predicate the filter and
+`picker` share, `nothing_showing` as two sentences for the two ways of emptying
+the list, and the census as a count of Steam's manifests that does not follow
+the search box.
+
+**What is not:**
+
+- **The dimming is unasserted as an appearance.** `tests/games_filter.rs`
+  asserts which rows the filter *keeps*; that a kept row looks different from a
+  dimmed one is `row.not-set-up .row-name` in the stylesheet, and nothing here
+  renders a pixel. This is §11.3m's last bullet again, one surface further on.
+- **The toggle has never been pressed by a person on a machine with a set-up
+  game.** The display test's set-up row is a directory this test creates and
+  fills; no Proton prefix was involved.
+- **The orphaned-profile count replaces rows nobody can now click.** A profile
+  for a game Steam does not list here used to be a row with a paragraph; it is
+  now one line under the list naming `tobii games profile show`. That line is
+  asserted, and that it says nothing on a machine with none is asserted. What is
+  not asserted is that anybody reads it — it is strictly less prominent than a
+  row was, and that is the deliberate cost of the change.
+- **`GtkListBox::set_placeholder` is no longer used, and the reason is a
+  limitation rather than a preference.** GTK parents the placeholder somewhere
+  `first_child`/`next_sibling` does not reach, so no test outside this crate can
+  ask whether it is showing. The paragraph is this program's own label under the
+  list instead. GTK's own placeholder may well have worked; nothing here could
+  check it, and a window that prints a paragraph explaining why it looks empty
+  should not rest on a claim about a toolkit that no test can make.
 
 ---
 

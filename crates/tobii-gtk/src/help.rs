@@ -329,19 +329,24 @@ pub fn topics() -> Vec<Topic> {
                  program's own settings, the Wine bridge inside that game's \
                  Proton prefix, and the game's own options. It reads a game's own \
                  files and never changes them.\n\n\
-                 The list has four sections. {set_up} is every game there is a \
-                 profile for, with what the Wine bridge is doing under each. \
-                 {not_set_up} is the rest of what Steam says is installed. \
-                 {elsewhere} is the one section that is not about this machine: \
-                 a profile whose game Steam does not list here — an uninstalled \
-                 title, or one on a drive that is not plugged in. Those rows show \
-                 the game's own options and nothing else, because where the \
-                 tracking goes and what is in a Proton prefix have no answer from \
-                 a machine that has not got the game. The profile is not lost, \
-                 and it applies again the moment Steam lists the title.\n\n\
-                 {custom} is the one section Steam has nothing to do with: press \
+                 The list is every game this machine has: what Steam says is \
+                 installed, plus anything added by hand. A row is drawn at full \
+                 strength when the Wine bridge is installed in that game's \
+                 prefix and drawn back when it is not, so what is left to do is \
+                 visible without reading. The second line of each row says which \
+                 it is, and tells apart the two ways of not being set up: a \
+                 prefix with no bridge in it is something to press Install on, \
+                 and a game never launched under Proton has no prefix to install \
+                 into yet.\n\n\
+                 The button beside the search box shows only the games that are \
+                 set up. It has no caption because it is the same play triangle \
+                 Steam's own library uses for the same question; resting a \
+                 pointer on it says so. On a machine with one set-up game among \
+                 thirty that button is how you find it, and pressing it again \
+                 brings the rest back.\n\n\
+                 A game Steam has nothing to do with gets in the same way: press \
                  \u{201c}{add_btn}\u{201d} under the list and pick the Wine \
-                 prefix a game runs in — the folder holding `drive_c` — and the \
+                 prefix it runs in — the folder holding `drive_c` — and the \
                  bridge can be installed into it exactly as it is for a Steam \
                  game. That is how a game Steam does not sell reaches this page \
                  at all. Those rows have no app id, so they get the first two \
@@ -349,10 +354,16 @@ pub fn topics() -> Vec<Topic> {
                  options needs a profile, and a profile is a file named after an \
                  app id. \u{201c}{forget}\u{201d} takes the row out and \
                  touches nothing on disk.\n\n\
-                 Under the list, the count of what Steam has installed, and — on \
-                 the rare machine that has any — a line for anything in the \
-                 profiles directory that is not a profile this program can use. \
-                 `tobii games profile list` names those.\n\n\
+                 Under the list, the count of what Steam has installed; on the \
+                 rare machine that has any, a line for anything in the profiles \
+                 directory that is not a profile this program can use; and, if \
+                 there are any, a count of the profiles here whose game Steam \
+                 does not list on this machine — an uninstalled title, or one on \
+                 a drive that is not plugged in. Those have no row, because there \
+                 is nothing on this page that could act on one, but the profile \
+                 is not lost and it applies again the moment Steam lists the \
+                 title. `tobii games profile show`, with no app id after it, \
+                 names every profile on the machine including those.\n\n\
                  The first section reports and never writes. {pointer} Showing \
                  this tab also stops the hub asking for the tracker, for the same \
                  reason looking at another window does: nothing here needs the \
@@ -430,10 +441,6 @@ pub fn topics() -> Vec<Topic> {
                 check = crate::game_setup::PROFILE_CHECK,
                 check_where = crate::game_setup::PROFILE_CHECK_WHERE,
                 pointer = crate::game_setup::TRACKER_TAB_POINTER,
-                set_up = crate::game_setup::Group::SetUp.heading(),
-                not_set_up = crate::game_setup::Group::NotSetUp.heading(),
-                elsewhere = crate::game_setup::Group::Elsewhere.heading(),
-                custom = crate::game_setup::Group::Custom.heading(),
                 add_btn = crate::game_setup::ADD_GAME_CAPTION,
                 details = crate::game_setup::DETAILS_CAPTION,
                 forget = crate::game_setup::FORGET_CAPTION,
@@ -1333,7 +1340,7 @@ mod tests {
             .find(|t| t.title == "Games")
             .expect("the Games topic");
         let text = games.text();
-        for (tip, facts) in [
+        let pairs: [(&str, &[&str]); 6] = [
             (
                 crate::game_setup::DETAILS_TIP,
                 &["tobii bridge status", "without starting anything"][..],
@@ -1354,7 +1361,16 @@ mod tests {
                 crate::game_setup::FORGET_TIP,
                 &[crate::game_setup::FORGET_CAPTION, "touches nothing on disk"],
             ),
-        ] {
+            // The only control on this tab with no caption at all, so the
+            // tooltip is not a second way of reading it — it is the first. If
+            // the help topic does not carry the same two facts, a keyboard or
+            // touch user has no way to learn what the button does.
+            (
+                crate::game_setup::SET_UP_ONLY_TIP,
+                &["only the games that are set up", "drawn back"],
+            ),
+        ];
+        for (tip, facts) in pairs {
             for fact in facts {
                 assert!(
                     text.contains(fact),
@@ -1363,11 +1379,15 @@ mod tests {
                 );
             }
         }
-        // And the list is the whole list, so a sixth tooltip cannot be added
-        // to that tab without this test being made to look at it.
+        // And the list is the whole list, so one more tooltip on that tab
+        // cannot be added without this test being made to look at it.
+        //
+        // Against the pairs above rather than against a number written here: a
+        // literal is one more thing to update, and updating it is exactly what
+        // somebody does instead of adding the pair.
         assert_eq!(
             crate::game_setup::TIPS.len(),
-            5,
+            pairs.len(),
             "a tooltip was added or removed on the Games tab; the pairs above are what \
              says whether the help window still carries its facts"
         );

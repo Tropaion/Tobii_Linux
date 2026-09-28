@@ -19,8 +19,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-TESTS=(games_tab games_tab_refreshes hub_lifetime help_window quit_action
-       flows_release_the_tracker keep_awake_switch)
+TESTS=(games_tab games_tab_refreshes games_filter hub_lifetime help_window
+       quit_action flows_release_the_tracker keep_awake_switch)
 if [ $# -gt 0 ]; then
     TESTS=("$@")
 fi

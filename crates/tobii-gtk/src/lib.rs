@@ -117,12 +117,6 @@ window { background-color: #0d1013; color: #e8ecef; }
 .app-title { font-size: 20px; font-weight: bold; letter-spacing: 0.01em; }
 .eyebrow { font-size: 10px; font-weight: bold; letter-spacing: 0.16em;
            color: #79838d; }
-/* The Games list's section headings. `.eyebrow`'s letterforms, one step
-   brighter and with room around them: these four words are the division the
-   whole list is sorted by — set up against not — and at `.eyebrow`'s grey they
-   were four more lines of small text in a column of small text. */
-.group-heading { font-size: 10px; font-weight: bold; letter-spacing: 0.16em;
-                 color: #aab4bd; margin-bottom: 4px; }
 .section-title { font-size: 14px; font-weight: bold; }
 .section-desc { font-size: 12px; color: #8a949d; }
 /* The same muted line, under a CONTROL rather than under a title. Identical to
@@ -187,6 +181,16 @@ menubutton.icon-btn > button:hover, button.icon-btn:hover {
     background-color: #1e242b; border-color: #3a444f; color: #e8ecef; }
 menubutton.icon-btn > button:checked, button.icon-btn:active {
     background-color: #1e242b; border-color: #3a444f; color: #e8ecef; }
+/* A toggle that is DOWN, which is a different thing from one being pressed and
+   from a menu button whose popover is open. The Games tab's filter is the only
+   one, and it has no caption — so its own outline is the whole of what says it
+   is on, and the generic `button:checked` further up would otherwise fill a
+   30px square with solid teal. Borrowed from the selected row instead, which
+   is the same this-is-the-one-that-is-on this window already means. */
+button.icon-btn:checked {
+    background-color: #14696b; border-color: #1f9ea0; color: #ffffff; }
+button.icon-btn:checked:hover {
+    background-color: #178082; border-color: #2ab6b8; color: #ffffff; }
 
 /* --- the settings popover ----------------------------------------------- */
 /* GTK draws a popover on its own surface, outside `window`, so it inherits
@@ -245,6 +249,24 @@ scrollbar slider { min-width: 8px; min-height: 8px; }
 .topic-list > row:hover { background-color: #1e242b; color: #e8ecef; }
 .topic-list > row:selected { background-color: #14696b; color: #ffffff; }
 .topic-list > row:focus-visible { outline: 1px solid #1f9ea0; outline-offset: -1px; }
+/* The Games list's rows, which are two labels rather than one. A game with no
+   bridge in its prefix is drawn back rather than left out, so the list is one
+   list and what is missing is visible as an absence — the toggle beside the
+   search box is how you ask for only the ones that are set up.
+
+   Their own classes and not `.section-desc`: `tests/help_window.rs` finds card
+   descriptions by that class to assert which cards have one, and a row of a
+   list is not a card description. The comment on `.control-note` records the
+   same lesson from the last time something borrowed it. */
+.row-name { color: #e8ecef; }
+.row-sub { font-size: 12px; color: #8a949d; }
+row.not-set-up .row-name { color: #828c95; }
+row.not-set-up .row-sub { color: #626b73; }
+/* Selection wins over both, in either state: an explicit colour on a child is
+   not overridden by the row's own, so without this the row a user just clicked
+   stays grey on teal. */
+.topic-list > row:selected .row-name,
+.topic-list > row:selected .row-sub { color: #ffffff; }
 entry.topic-search { background-image: none; background-color: #12161a;
                      border: 1px solid #2b333c; border-radius: 9px;
                      padding: 5px 8px; color: #e8ecef; }
@@ -901,19 +923,22 @@ pub fn apply_text_scale(scale: f64) {
     }
 }
 
-/// `s` as one shell word: single-quoted, each embedded `'` closed, escaped and
-/// reopened.
+/// `s` as one shell word.
 ///
 /// Every surface in this program that prints a command for somebody to copy
 /// owes this to every path in it. The update banner learned it first — a folder
 /// with a space in it split an unquoted word in two — and the Games tab's
 /// "what to type instead" paragraph was printing `--prefix /home/x/My Games/…`
-/// unquoted, which is four arguments in a shell and not one. Shared rather than
-/// written twice, because the second copy is where one of them stops being
-/// applied.
-pub(crate) fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
+/// unquoted, which is four arguments in a shell and not one.
+///
+/// Borrowed rather than written, because it had been written four times. This
+/// crate already links `tobii-update`, and `tobii-cli` reaches the same
+/// function under the same alias (`crates/tobii-cli/src/uninstall.rs`). A copy
+/// here made a fourth spelling of one rule, and the copies disagreed: this one
+/// quoted everything, so an ordinary path printed as `'/opt/x'` in the hub and
+/// `/opt/x` in `tobii uninstall`. The shared one leaves a word that needs no
+/// quoting alone, which is the reading somebody is more likely to trust.
+pub(crate) use tobii_update::install::shell_word as sh_quote;
 
 /// The primary monitor, if one can be resolved.
 fn primary_monitor() -> Option<gtk::gdk::Monitor> {
@@ -3397,6 +3422,30 @@ fn icon_button(icon: &str, glyph: &str, tooltip: &str) -> gtk::Button {
     // that knows how much vertical slack a tall glyph's ink needs here.
     // `set_icon_name` replaces that child when the theme does have the icon.
     let btn = crate::widget::button(glyph);
+    if gtk::gdk::Display::default().is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(icon))
+    {
+        btn.set_icon_name(icon);
+    }
+    btn.add_css_class("quiet");
+    btn.add_css_class("icon-btn");
+    btn.set_valign(Align::Center);
+    btn.set_tooltip_text(Some(tooltip));
+    btn
+}
+
+/// [`icon_button`], latched.
+///
+/// Same three moves — a glyph child that survives a theme with no such icon,
+/// the two CSS classes, a tooltip because there is no caption — on a
+/// [`gtk::ToggleButton`], which inherits `set_icon_name` from `GtkButton` and
+/// so replaces its child the same way.
+///
+/// A captionless control says what it is in exactly two places in this
+/// program: its tooltip, and the help window. The tooltip alone is unreachable
+/// by keyboard and by touch, which is why `help::tests` asserts that every fact
+/// a tooltip on that tab carries appears in the help topic too.
+pub(crate) fn icon_toggle(icon: &str, glyph: &str, tooltip: &str) -> gtk::ToggleButton {
+    let btn = crate::widget::toggle_button(glyph);
     if gtk::gdk::Display::default().is_some_and(|d| gtk::IconTheme::for_display(&d).has_icon(icon))
     {
         btn.set_icon_name(icon);

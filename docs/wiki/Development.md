@@ -88,18 +88,18 @@ pinned; see [[Architecture-Decisions]] §18.
 |---|---|---|
 | `tobii-protocol` | 82 | Inline unit tests over captured real frames |
 | `tobii-usb` | 51 | 43 unit + 8 replay (see below) |
-| `tobii-config` | 120 | Unit; SHA-256 cross-checked against coreutils. Includes the profile parser, writer and comment-anchoring, and the hand-added game list |
+| `tobii-config` | 145 | Unit; SHA-256 cross-checked against coreutils. Includes the profile parser, writer and comment-anchoring, the hand-added game list, and the `user.reg` reader against files real wine wrote |
 | `tobii-headpose` | 112 (+7 ignored) | The ignored ones need the 13 MB model |
 | `tobii-update` | 104 | 96 unit + 8 install end-to-end |
 | `tobii-diagnostics` | 28 | The report and the log; a test fails if it leaks a home path |
-| `tobii-cli` | 316 (+1 ignored) | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, the Wine-bridge registry against a stateful fake `wine` (and, for the commands that must not run one at all, against a `wine` that wrecks the prefix if it runs), the `user.reg` reader against files real wine wrote, and the wineserver lock's `/proc/locks` parsing |
+| `tobii-cli` | 296 (+1 ignored) | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, the Wine-bridge registry against a stateful fake `wine` (and, for the commands that must not run one at all, against a `wine` that wrecks the prefix if it runs), and the wineserver lock's `/proc/locks` parsing |
 | `tobii-ipc` | 42 | 33 unit + 9 in `tests/roundtrip.rs` |
 | `tobii-output` | 142 (+1 ignored) | Unit |
-| `tobii-gtk` | 413 (+8 ignored) | Inline; pure logic split out from widget code. The ignored eight need a display — seven of them whole integration tests in `tests/`, which drive the real hub: both tabs, the help window, the quit path, and two whole-tree censuses that assert nothing outlives the program |
+| `tobii-gtk` | 416 (+9 ignored) | Inline; pure logic split out from widget code. The ignored nine need a display — eight of them whole integration tests in `tests/`, which drive the real hub: both tabs, the Games list's filter, the help window, the quit path, and two whole-tree censuses that assert nothing outlives the program |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
 | `tobii-steam` | 20 | Unit, over Steam manifest and library-folder text |
 | `tobii-gameconf` | 52 | 51 unit + `tests/writes_nothing.rs`, one test that walks a fixture tree and fails if any byte of it moves |
-| **Total** | **1514 (+17 ignored)** | |
+| **Total** | **1522 (+18 ignored)** | |
 
 Every one of those passes as of 2026-09-28, `tobii-cli` included: the failure
 §11.3k recorded in that crate is gone, and one test there is `#[ignore]`d

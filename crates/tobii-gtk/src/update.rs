@@ -1110,7 +1110,7 @@ mod tests {
         );
         // The unpacked directory, not the archive, is what install.sh is in.
         assert!(
-            a.contains("cd 'tobii-linux-0.3.0-x86_64-unknown-linux-gnu' && ./install.sh"),
+            a.contains("cd tobii-linux-0.3.0-x86_64-unknown-linux-gnu && ./install.sh"),
             "{a}"
         );
     }
@@ -1129,7 +1129,7 @@ mod tests {
         assert!(
             p.contains(
                 "sudo pacman -U \
-                 '/home/u/Downloads/tobii-linux-0.3.0/tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst'"
+                 /home/u/Downloads/tobii-linux-0.3.0/tobii-linux-bin-0.3.0-1-x86_64.pkg.tar.zst"
             ),
             "{p}"
         );
@@ -1140,8 +1140,15 @@ mod tests {
 
     /// A folder with a space or an apostrophe in it is still one argument, in
     /// every branch: the whole point of the text is to be pasted.
+    ///
+    /// One argument, not "quoted" — those stopped being the same thing when
+    /// this crate dropped its own quoter for `tobii_update::install::shell_word`,
+    /// which leaves a word needing no quotes alone. Asserted through `q` so the
+    /// expectations follow that function rather than pinning its output, and
+    /// the two checks that matter are unchanged: the bare form appears nowhere
+    /// after a space, and the apostrophe survives.
     #[test]
-    fn every_printed_path_is_quoted_for_the_shell() {
+    fn every_printed_path_is_one_shell_word() {
         let dir = "/home/u/My Downloads/Bob's/tobii-linux-0.3.0";
         let q = |s: &str| sh_quote(s);
         let cases: [(Channel, &[&str], String); 5] = [
@@ -1178,9 +1185,10 @@ mod tests {
                 Channel::Archive,
                 &["tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz"],
                 format!(
-                    "cd {} && tar -xzf 'tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz' \
-                     && cd 'tobii-linux-0.3.0-x86_64-unknown-linux-gnu' && ./install.sh",
-                    q(dir)
+                    "cd {} && tar -xzf {} && cd {} && ./install.sh",
+                    q(dir),
+                    q("tobii-linux-0.3.0-x86_64-unknown-linux-gnu.tar.gz"),
+                    q("tobii-linux-0.3.0-x86_64-unknown-linux-gnu")
                 ),
             ),
         ];
@@ -1258,15 +1266,15 @@ mod tests {
             "{t}"
         );
         assert!(
-            t.contains("tar -xzf 'tobii-linux-0.3.1-x86_64-unknown-linux-gnu.tar.gz'"),
+            t.contains("tar -xzf tobii-linux-0.3.1-x86_64-unknown-linux-gnu.tar.gz"),
             "{t}"
         );
         assert!(
-            t.contains("cd 'tobii-linux-0.3.1-x86_64-unknown-linux-gnu'"),
+            t.contains("cd tobii-linux-0.3.1-x86_64-unknown-linux-gnu"),
             "{t}"
         );
         assert!(
-            t.contains("sudo ./install.sh --system '/usr/local/bin'"),
+            t.contains("sudo ./install.sh --system /usr/local/bin"),
             "{t}"
         );
         assert!(
@@ -1289,7 +1297,7 @@ mod tests {
                 "/home/u/Downloads/tobii-linux-0.3.1/tobii-linux-0.3.1-x86_64-unknown-linux-gnu.tar.gz",
             )],
         );
-        assert!(t.contains("&& ./install.sh '/home/u/.local/bin'"), "{t}");
+        assert!(t.contains("&& ./install.sh /home/u/.local/bin"), "{t}");
         assert!(
             !t.contains("sudo ./install.sh") && !t.contains("--system"),
             "{t}"
@@ -1312,7 +1320,7 @@ mod tests {
             saved(Channel::Archive, &archive),
             saved_for_system(Path::new("/usr/local/bin"), &archive),
         ] {
-            assert!(t.contains("to '.'") && t.contains("cd '.'"), "{t}");
+            assert!(t.contains("to .") && t.contains("cd . &&"), "{t}");
             assert!(!t.contains("''"), "{t}");
         }
     }

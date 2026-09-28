@@ -110,20 +110,23 @@ fn the_games_tab_re_reads_the_settings_when_it_comes_back_into_view() {
     // question on the page answers "none" without touching a real install.
     let empty_home = dir.join("home");
     std::fs::create_dir_all(&empty_home).unwrap();
-    let scan = game_setup::Scan::of(
-        dir.join("profiles"),
-        vec![tobii_steam::App {
+    // A struct literal since `Scan` stopped having a private field: the prefix
+    // memo it existed to keep private turned out never to have had a hit, and
+    // went with the four-group list.
+    let scan = game_setup::Scan {
+        profiles_dir: dir.join("profiles"),
+        apps: vec![tobii_steam::App {
             appid: "1".to_string(),
             name: "A Game".to_string(),
             buildid: None,
         }],
-        Rc::new(tobii_steam::Steam::at(&empty_home)),
+        steam: Rc::new(tobii_steam::Steam::at(&empty_home)),
         // A file of this test's own. The tab can WRITE this one, and a test
         // that let it reach `$XDG_CONFIG_HOME` would be a test that edits the
         // list of whoever runs the suite — which `Scan` exists to prevent for
         // every other input the tab has.
-        dir.join("custom-games.tsv"),
-    );
+        custom_games: dir.join("custom-games.tsv"),
+    };
 
     let app = gtk::Application::builder()
         .application_id("dev.tobii.test.gamestabrefresh")

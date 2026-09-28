@@ -368,21 +368,33 @@ already presents one.
 
 ### Setting a game up
 
-The hub's **Games** tab — Ctrl+Page Down, or the strip under the title — lists
-what Steam says is installed on this machine, in four sections:
+The hub's **Games** tab — Ctrl+Page Down, or the strip under the title — is one
+list of every game this machine has: what Steam says is installed, plus anything
+added by hand. A row is drawn at full strength when the Wine bridge is installed
+in that game's prefix and drawn back when it is not, so what is left to do is
+visible without reading. Its second line says which, and tells apart the two
+ways of not being set up — *no bridge yet* is something to press Install on, and
+*never launched* is a game Proton has not made a prefix for yet.
 
-- **Set up** — every game there is a profile for, with what the Wine bridge is
-  doing under each: *bridge installed*, *bridge not installed*, or *never
-  launched*.
-- **Not set up** — the rest of the catalogue.
-- **Set up, not installed here** — a profile whose game Steam does not list on
-  this machine: an uninstalled title, or one on a drive that is not plugged in.
-  Nowhere else in this program says those files are there.
-- **Added by hand** — a game Steam has never heard of. Press **Add a game by
-  folder…** under the list, pick the Wine prefix it runs in (the folder holding
-  `drive_c`), and the bridge installs into it exactly as for a Steam title. The
-  list of them is `~/.config/tobii-linux/custom-games.tsv`, and
-  `tobii uninstall --purge` removes it.
+The button beside the search box, a play triangle with no caption, shows only
+the games that are set up. On a machine with one set-up game among thirty that
+is how you find it; pressing it again brings the rest back.
+
+A game Steam has never heard of gets in the same way as any other: press **Add a
+game by folder…** under the list, pick the Wine prefix it runs in (the folder
+holding `drive_c`), and the bridge installs into it exactly as for a Steam
+title. The list of them is `~/.config/tobii-linux/custom-games.tsv`, and
+`tobii uninstall --purge` removes it. **Remove from this list** takes a row out
+and touches nothing on disk.
+
+Under the list: the count of what Steam has installed, anything in the profiles
+directory that is not a profile this program can use, and — if there are any — a
+count of the profiles here whose game Steam does not list on this machine, from
+an uninstalled title or a drive that is not plugged in. Those have no row,
+because there is nothing on this page that could act on one, but the profile is
+not lost and it applies again the moment Steam lists the title.
+`tobii games profile show`, with no app id after it, names every profile on the
+machine including those.
 
 Pick a game and the page beside it shows the three things that have to be
 configured for it, numbered:
@@ -400,12 +412,9 @@ configured for it, numbered:
 3. **The game's own settings** — and this one is **read-only in every state.**
    The program reports what those files say and never writes them.
 
-Which of the three a game gets depends on which section it came from. A game
-Steam does not list here loses the first two — there is no prefix on this
-machine and nothing to send tracking to from here — and keeps the third. A game
-added by hand keeps the first two and loses the third, because reading a game's
-own options needs a profile and a profile is a file named after a Steam app id.
-Each absence is a sentence on the page rather than a gap.
+A game added by hand keeps the first two and loses the third, because reading a
+game's own options needs a profile and a profile is a file named after a Steam
+app id. The absence is a sentence on the page rather than a gap.
 
 Block 3 needs a **profile** to know what to look at: which setting, in which
 file, and what it should say. **No profiles ship with this program**, so on a
