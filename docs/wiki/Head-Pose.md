@@ -268,8 +268,12 @@ Two front ends, one code path (`crates/tobii-headpose/src/model_store.rs`):
   then downloads (via `curl`, falling back to `wget`; no HTTP crate is linked
   in), verifies, and installs. `--model-status` reports what is installed.
 - **GUI** — the hub's **Head tracking** section
-  (`crates/tobii-gtk/src/head_model.rs`) shows the same status line, and its
-  button opens a dialog with the same terms. Agreeing runs the fetch on a
+  (`crates/tobii-gtk/src/head_model.rs`) shows what the *device thread* loaded
+  rather than what is on disk — `running_line`, not `status_line`, and the two
+  are not the same question: a model file of the right length that ONNX will
+  not load is `Status::Ready` to a `stat` and "not being used" to the card.
+  With no tracker connected yet nothing has tried, and the card falls back to
+  reading the file. Its button opens a dialog with the same terms. Agreeing runs the fetch on a
   worker thread with a progress line driven by the part-file's size; Escape and
   the default button both mean "no".
 

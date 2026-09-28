@@ -56,7 +56,7 @@ Not negotiable, and most of them are the device's doing rather than ours.
 | **The protocol is undocumented.** Everything is inferred from captures and disassembly. | Confidence markers ([CONFIRMED] / [CODE-VERIFIED] / [HYPOTHESIS]) are part of the source. A claim without evidence is treated as a defect. |
 | **The ET5 reboots on session close, wiping its display area *and* its calibration.** | Both must be re-applied on **every** connect, or the tracker reports no eyes at all. This shapes the whole device thread. |
 | **The IR illuminators are lit for as long as a USB session is open.** | The session is reference-counted (`Demand`) rather than held for the process lifetime. |
-| **One process at a time may claim the USB interface.** | The GUI must release the device when it is not using it, *and* on request, or `tobii headpose` cannot run for a game. Releasing on idle alone stopped being enough once the hub gained holds that never end by themselves (`keep_awake`, the virtual joystick), so the hub honours a **lease**: a client asks, the hub drops its session and waits, whatever its own demand says (`must_wait`, `crates/tobii-gtk/src/device.rs:229`). |
+| **One process at a time may claim the USB interface.** | The GUI must release the device when it is not using it, *and* on request, or `tobii headpose` cannot run for a game. Releasing on idle alone stopped being enough once the hub gained holds that never end by themselves (`keep_awake`, the virtual joystick), so the hub honours a **lease**: a client asks, the hub drops its session and waits, whatever its own demand says (`must_wait`, `crates/tobii-gtk/src/device.rs`). |
 | **The head-pose model's weights are non-commercial-only** (opentrack). | Not shipped. Fetched only after the user is shown the terms and agrees. |
 | **A dynamically linked binary needs a glibc at least as new as the one it was built against.** | Releases are built in a Debian 13 container, and the floor is enforced in CI. |
 | **GPL-3.0-only.** | Dependencies must be compatible. |
@@ -173,7 +173,7 @@ reader can check rather than take on trust.
 | `tobii-update` | Release checking, download integrity, installation with rollback. | All network access funnels through `net.rs`. No signature — see [[Quality-and-Risks]]. |
 | `tobii-diagnostics` | The `tobii debug` report, its redaction, and the log the report quotes. | Its own tests fail if a home path, hostname or raw monitor id reaches the output. |
 | `tobii-cli` | The `tobii` binary: user commands *and* the protocol diagnostics used to do the reverse engineering. | Five modules since the Wine bridge and `tobii uninstall` landed (`main.rs`, `bridge.rs`, `userreg.rs`, `wineserver.rs`, `uninstall.rs`); hand-rolled argument matching throughout. |
-| `tobii-gtk` | The hub, the guided flows, the game-setup window, the overlay, and the one device thread. | 32% of the workspace. |
+| `tobii-gtk` | The hub and its two tabs, the guided flows, the overlay, and the one device thread. | 32% of the workspace. |
 | `tobii-recap` | Decodes a usbmon pcap into a TTP op catalog. | Offline tool; how the protocol was mapped in the first place. |
 | `tobii-ipc` | The socket the hub serves tracking data on: its path, the framed codec, the server and the client. | No workspace dependencies at all, so both ends of the socket share one codec. |
 | `tobii-output` | Game output: the `games.toml` settings, the compose pipeline (Extended View, neutral, recentre), the opentrack port watch, and the sinks — UDP, virtual joystick, TrackIR/FreeTrack bridge. | Cross-compiles to `x86_64-pc-windows-gnu` for the Wine bridge, which is why the `/proc` watch is behind `cfg(target_os = "linux")`. |
@@ -220,7 +220,7 @@ session and replays it; see [[Development]].
 
 Four threads carry the device path, and the boundaries are deliberate. (The
 IPC server adds an accept thread and a reader/writer pair per client —
-`crates/tobii-ipc/src/server.rs:117`, `:128` — and the updater two more, §6.5.)
+`crates/tobii-ipc/src/server.rs`, `:128` — and the updater two more, §6.5.)
 The device thread owns the
 connection and never blocks the UI. The head-pose worker runs the neural model
 off the device thread on a **one-slot channel that drops rather than queues** —
@@ -231,9 +231,11 @@ thread at all when another hub already holds the socket, which is degradation
 rather than failure. §5 below is what it serves.
 
 `Demand` is the reference count on the USB session. Consumers take a
-`DemandGuard`: the hub while its window has focus, the gaze overlay while
+`DemandGuard`: the hub while its window has focus **and the Tracker tab is
+showing** (`hub_wants_tracker`), the gaze overlay while
 shown, a calibration or setup flow while it runs, the `--accuracy` diagnostic
-for the life of its process (`crates/tobii-gtk/src/lib.rs:818`), and a
+for the life of its process (`crates/tobii-gtk/src/lib.rs`, the
+`"the accuracy diagnostic"` hold), and a
 **socket client** for
 as long as it stays subscribed to pose, gaze or camera
 (`outputs::Holds::hello`) — which is all `tobii game` is. One more consumer

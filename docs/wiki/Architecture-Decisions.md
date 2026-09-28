@@ -109,7 +109,7 @@ without closing the hub — a complete route that needs neither the hub nor a
 wrapper. Since v0.4.1 the hub can also want it permanently (`wake_for_joystick`,
 default on, and `keep_awake`), so the reference count alone is no longer enough:
 the lease is an **override** on the device thread's wait, not another weight in
-it (`must_wait`, `crates/tobii-gtk/src/device.rs:229`). A socket client
+it (`must_wait`, `crates/tobii-gtk/src/device.rs`). A socket client
 subscribed to pose is itself one of the references, and
 that is the whole of `tobii game`: it transports nothing, it only tells the hub
 that something wants data for as long as the game runs. Commit `39c1547`.

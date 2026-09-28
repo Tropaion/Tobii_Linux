@@ -26,7 +26,7 @@ device itself (`UsbTransport::open`, then `Connection::connect`), builds a
 `games.toml` asks for them — and streams until it is stopped. The tracker is lit
 for exactly as long as the command runs, because that process holds the USB
 session. Where a hub is running it asks that hub to stand down first
-(`lease_the_tracker`, `crates/tobii-cli/src/main.rs:2115`) rather than failing
+(`lease_the_tracker`, `crates/tobii-cli/src/main.rs`) rather than failing
 under it, and gives the device back when it ends; with no hub it opens the
 device directly and waits for nothing. For the **opentrack UDP** route this is
 the whole story: opentrack's
@@ -41,7 +41,8 @@ settings.
 
 What the hub cannot work out by itself is *when*. The USB session is
 reference-counted (`Demand`, see [[Runtime-View]] §6.2), and the things that
-take a count are the hub window while it has focus, the gaze overlay, a
+take a count are the hub window while it has focus **and its Tracker tab is
+showing**, the gaze overlay, a
 calibration or setup flow, and **a socket client**
 (`crates/tobii-gtk/src/outputs.rs`: `Holds::hello` takes a `DemandGuard` for a
 client subscribed to pose, gaze or camera). A game cannot take a count itself:
@@ -54,7 +55,7 @@ connects to the hub's socket, subscribes to pose for the lifetime of the child
 process, and drops the connection when the child exits — the wrapper is a
 `DemandGuard` with a launcher's sense of timing. Any program that holds that
 subscription wakes the tracker the same way — but only `tobii game` also puts
-`TOBII_BRIDGE_PORT` into the child's environment (`main.rs:201-203`), which is
+`TOBII_BRIDGE_PORT` into the child's environment (`main.rs`), which is
 the only way the Wine-side DLL learns a non-default `bridge_port`.
 
 Which left, through v0.4.0, exactly one route that worked unattended — the
@@ -412,7 +413,7 @@ answer at all: turned off, or an opentrack address on another machine, where
 wrapper is `keep_awake`. The standalone `tobii headpose` route
 needs neither, because it holds the USB session itself — taking it from the hub
 where there is one, by asking for the lease first (`lease_the_tracker`,
-`crates/tobii-cli/src/main.rs:2115`).
+`crates/tobii-cli/src/main.rs`).
 
 This matters because the virtual joystick genuinely *cannot* reach X-Plane:
 Laminar's own developer documentation is explicit that a joystick axis cannot be
@@ -471,7 +472,7 @@ lines of `system.reg`). Both now decide from `user.reg` whenever the wineserver
 lock says nothing is serving the prefix, which is the case where the file *is*
 the registry; wine is started only once the run has decided it is going to write
 — something it was going to do anyway (`settled_keys`,
-`crates/tobii-cli/src/bridge.rs:1091-1107`). Measured on the merged tree, with a
+`crates/tobii-cli/src/bridge.rs`). Measured on the merged tree, with a
 `wine` that wrecks the prefix if it runs at all: a refused install and a no-op
 uninstall leave the prefix byte-for-byte as it was and never spawn it
 (`a_refused_install_runs_no_wine_and_leaves_the_prefix_as_it_was`,
@@ -502,21 +503,21 @@ time, not inferred from the format:
   missing, BOM'd, indented, lower-cased or renumbered, wine loads **no `HKCU`
   at all** and answers every query in that prefix with "key not found" — so a
   parser that skipped to the sections read a registration no process in that
-  prefix could see (`userreg.rs:100-110`, checked in `lookup` at
-  `userreg.rs:126-143`).
+  prefix could see (`userreg.rs`, checked in `lookup` at
+  `userreg.rs`).
 * Wine's loader applies the file top to bottom, so a key or a value spelled
   twice leaves the **last** one in memory. Measured four ways — section
   repeated, section re-cased, value repeated, value re-cased — all four answer
-  the second value (`userreg.rs:146-153`).
+  the second value (`userreg.rs`).
 * A section header written with one trailing `\` names the same key; a leading
   one, a doubled one or two trailing ones kill the wineserver outright, so
-  nothing at all can be read out of such a prefix (`userreg.rs:264-284`).
+  nothing at all can be read out of such a prefix (`userreg.rs`).
 * Wine reads indented headers and values, and tolerates whitespace on either
   side of the `=`, though its own writer produces neither
-  (`userreg.rs:157-169`, `userreg.rs:296-310`).
+  (`userreg.rs`).
 * Names and values are unescaped the way wine writes them, including the rule
   that makes the escapes decodable at all: a `\x` escape is padded to four hex
-  digits when the next character is itself a hex digit (`userreg.rs:54-61`).
+  digits when the next character is itself a hex digit (`userreg.rs`).
 
 One thing this reads that `wine reg query` could not: a path with characters
 outside ASCII. `reg.exe` prints in the console's OEM codepage, so those bytes
@@ -529,7 +530,7 @@ the character is decoded exactly and shown.
 into `$WINEPREFIX` or `~/.wine`, writing both discovery keys. Each subcommand
 now names the flags it reads, and anything else stops the command before a
 prefix is resolved, a directory created or a key written (`reject_unknown_flags`
-and `SUBS`, `crates/tobii-cli/src/bridge.rs:2969-2998` and `:3013-3031`).
+and `SUBS`, `crates/tobii-cli/src/bridge.rs` and `:3013-3031`).
 Refused, checked on the built binary: an unknown `--flag`; `-h` and every other
 single-dash token; `--prefix=PATH`, which would pass a name check and then be
 ignored because every reader compares whole tokens; a flag with nothing after it; and **a bare
@@ -628,7 +629,7 @@ was made by a Proton build by construction and the host's wine is by
 construction not that build: where which build made it cannot be read out of
 it, `install` stops before anything is copied or any key is written and says
 what would have happened (`refuse_unverified_wine_for_steam`,
-`crates/tobii-cli/src/bridge.rs:1562`, called from `install` at `:1606`). Three
+`crates/tobii-cli/src/bridge.rs`, called from `install` at `:1606`). Three
 things get past it and nothing else does — `--wine <Proton>/files/bin/wine`, a
 prefix whose own runner resolves, or `--force`. `run` and `uninstall` print the
 same warning and go on: stopping an uninstall would strand somebody taking our
@@ -638,13 +639,13 @@ files back out, and `run` is a user asking in so many words to start wine there.
 
 `HKCU\Software\NaturalPoint\NATURALPOINT\NPClient Location` and
 `HKCU\Software\Freetrack\FreeTrackClient` (`NP_KEY`/`FT_KEY`,
-`crates/tobii-cli/src/bridge.rs:86,89`) are how *any* head-tracking client in a
+`crates/tobii-cli/src/bridge.rs,89`) are how *any* head-tracking client in a
 prefix is found, ours included. So the installer treats them as shared state
 rather than as its own:
 
 * **`install` reads before it writes**, and **refuses** when a key holds
-  something it cannot account for — `bridge.rs:1644-1663`, message built by
-  `refusal` at `bridge.rs:1465`. The error names each key, what it holds and
+  something it cannot account for — `bridge.rs`, message built by
+  `refusal` at `bridge.rs`. The error names each key, what it holds and
   whose it looks like, and prints the exact
   `WINEPREFIX=… wine reg delete … /v Path /f` to clear it if it is stale. The
   refusal happens before anything is copied and before any key is touched, so a
@@ -653,18 +654,18 @@ rather than as its own:
   whose Linux opentrack has since been removed.
 * **What it will not refuse over** is a key that already holds, byte for byte,
   the value this run would write with nothing on record either way
-  (`stops_install`, `bridge.rs:1168-1188`). That is precisely what v0.4.0 left behind on a
+  (`stops_install`, `bridge.rs`). That is precisely what v0.4.0 left behind on a
   machine with opentrack installed, and refusing there would refuse the upgrade
   path over a write that changes nothing, in a sentence blaming another program
   for a value this program wrote. The cost is stated in `is_ours`'
-  **[LIMITATION]** (`bridge.rs:1138`, doc comment from 1109): such a key is then recorded as ours and
+  **[LIMITATION]** (`bridge.rs`, doc comment from 1109): such a key is then recorded as ours and
   comes out on the way out.
 * **`--force` goes through and promises nothing.** The installer writes down
   only the values it wrote itself (`RECORD_FILE`, `registered.txt`), so there
   is no previous value to put back — the refusal text says so in those words.
   It prints what it replaced.
-* **`uninstall` is the same rule from the other side** (`undo_keys`, `bridge.rs:2172`, deciding
-  with `undo_for` at `bridge.rs:2093`): a key
+* **`uninstall` is the same rule from the other side** (`undo_keys`, `bridge.rs`, deciding
+  with `undo_for` at `bridge.rs`): a key
   is deleted only while it still points at our own install directory or holds
   exactly what the record says we wrote; anything else is left in place and
   named. A blind `reg delete` here would take opentrack's own registration with
@@ -673,7 +674,7 @@ rather than as its own:
 
 Every file `install` puts in the prefix — both DLLs, the exe and the record —
 is written to a staging name beside the target and renamed into place
-(`staging_name`, `bridge.rs:1275`, used at `1289` and `1688`). The name carries
+(`staging_name`, `bridge.rs`, used at `1289` and `1688`). The name carries
 the writing process's pid, `.<artifact>.<pid>.new`, so two installs into one
 prefix cannot stage over each other, and a half-written record is never read
 back as a record with a line missing.
@@ -759,7 +760,7 @@ Two things enforce the rule rather than only documenting it
   `/var/tmp` report `st_dev` 31, 53 and 57 while `/proc/locks` says `00:1d` for
   a lock on any of them. The device is therefore taken from
   `/proc/self/mountinfo` for the mount the lock file is on
-  (`crates/tobii-cli/src/wineserver.rs:315-370`); comparing `st_dev` against
+  (`crates/tobii-cli/src/wineserver.rs`); comparing `st_dev` against
   that text missed every waiter on such a filesystem, silently, and the
   stand-down never fired.
 

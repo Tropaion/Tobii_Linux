@@ -12,7 +12,7 @@ read them back and report on them.
 > whole job is to fail if one appears.
 
 **Zero profiles ship.** `profiles::BUILTIN` is empty on purpose, so on every
-fresh install the hub's game-setup window has nothing to check and says so.
+fresh install the hub's Games tab has nothing to check and says so.
 Everything below is how you write the first one.
 
 ## Where they live
@@ -309,9 +309,9 @@ deliberately **does not open the file.** If the game has never run, it says
 there is no prefix yet and that every path below is a path with nothing to join
 it onto.
 
-To see what the check actually *answers*, open the hub, press **Set up a
-game…** on the *Head tracking for games* card, and pick the game. The third
-block runs every check in its profile and prints one row each: the value it
+To see what the check actually *answers*, open the hub, go to the **Games**
+tab (Ctrl+Page Down, or the strip under the title), and pick the game. The
+third block runs every check in its profile and prints one row each: the value it
 found, or an honest refusal saying which. That is the only place a check is
 run — there is no CLI verb that prints a check's answer, and `check where`
 will not open a file to get one.

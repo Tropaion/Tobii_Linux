@@ -391,7 +391,7 @@ nothing else could be holding the device) against a config with game output on:
 a socket binding `127.0.0.1:4242`, and **0** again after it closed and the three
 second linger elapsed. The watch rides the socket thread, so it runs only in a
 hub that owns the tracking socket: `outputs::spawn` returns before creating that
-thread if `Server::bind` fails (`crates/tobii-gtk/src/outputs.rs:697`). Which
+thread if `Server::bind` fails (`crates/tobii-gtk/src/outputs.rs`). Which
 hub held the device in the run above was therefore not established.
 
 ## Smaller candidates

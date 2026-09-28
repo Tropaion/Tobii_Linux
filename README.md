@@ -44,8 +44,10 @@ device properly, or to put head tracking into a game.
 - **The hub** — a live instrument panel with the trackbox, your eyes, the head
   turning as you turn, and the infrared sensor view, over the settings cards.
 - **A gaze overlay** — a translucent, click-through dot that follows your eyes.
-  It uses Wayland's `layer-shell`, which has no X11 equivalent and no fallback:
-  on an X11 session the overlay is untested.
+  It uses Wayland's `layer-shell`, which has no X11 equivalent and no fallback.
+  Where the session does not offer it — an X11 session never does, and not every
+  Wayland compositor does — the hub greys the switch out and says so on the card
+  rather than presenting a window the compositor has no layer for.
 - **A status-area icon** when you close the window — on desktops that provide
   one. It has only ever been seen on KDE Plasma; elsewhere the window minimises
   instead and Alt-Tab is the way back.
@@ -179,17 +181,28 @@ tobii-gtk --background   # resident, no window, tracker off — with a status-ar
 tobii-gtk --version
 ```
 
-Across the top: the trackbox with a graticule and the tolerance region drawn,
-your eyes as dots, the head drawn around them turning as you turn, a readout of
-position, distance, yaw, pitch and roll, and the infrared sensor view. Beneath
-it, six setting cards in three columns: *Improve my calibration*, *Change
-screen*, *Select eyes to detect*, *Head tracking*, *Preview my gaze*, and *Head
-tracking for games*.
+The hub has **two tabs**, on a strip under the title: **Tracker** and **Games**.
+Ctrl+Page Down goes to Games and Ctrl+Page Up comes back, and the strip is
+reachable with Tab.
+
+**Tracker** is the tracker itself. Across the top: the trackbox with a graticule
+and the tolerance region drawn, your eyes as dots, the head drawn around them
+turning as you turn, a readout of position, distance, yaw, pitch and roll, and
+the infrared sensor view. Beneath it, six setting cards in three columns:
+*Improve my calibration*, *Change screen*, *Select eyes to detect*, *Head
+tracking*, *Preview my gaze*, and *Head tracking for games*.
+
+**Games** is one game at a time — see [Setting a game up](#setting-a-game-up).
 
 The layout has three column counts and drops to two, then one, as the window
 narrows — though on a floating desktop the window's own minimum width is the
 three-column width, so reaching the narrower ones takes a tiling compositor or a
 screen smaller than the hub.
+
+The tab you are on decides whether the tracker is running: the hub asks for it
+while it has focus **and** the Tracker tab is showing, so reading about a game
+does not light the illuminators. See [When the tracker is
+on](#when-the-tracker-is-on).
 
 The **cogwheel** beside the connection status holds what is about the program
 rather than the tracker: keeping the tracker awake, start at login, check for
@@ -199,29 +212,35 @@ diagnostics report, *Help*, and *Quit*.
 **Help is a window, opened with F1**, with the **?** beside the cogwheel, or
 from the cogwheel itself. It explains every card and every control, including
 the ones that only explain themselves when you hover — the strength presets,
-the virtual joystick, what *Set up a game…* opens, and why *Recentre view* is
-greyed out. That is not a nicety: GTK4 shows a tooltip on pointer hover and on
+the virtual joystick, what the Games tab's buttons run, and why *Recentre view*
+is greyed out. That is not a nicety: GTK4 shows a tooltip on pointer hover and on
 nothing else, so anything that lives only in a tooltip is unreachable by
 keyboard and by touch, and the help window is where those sentences are
 reachable. Esc, F1 again or the Close button put it away; the topics are
 selectable text, so Tab walks them and they can be copied into a bug report.
 
-It is nine topics in a list, with a **search box** the window opens focused, so
+It is ten topics in a list, with a **search box** the window opens focused, so
 you can type the question rather than find it: the search reads every heading
 and the whole of every topic, and a word off the control in front of you —
 "joystick", "recentre", "standby", "tray" — is usually enough. Not every
 caption is in that text, though: if a word off a control finds nothing, type
-what the control does rather than what it is called — the three strength
-presets are the known case. Every word you type has to
+what the control does rather than what it is called. Two known cases: the three
+strength presets, and *games* — which is the name of half the program and opens
+*Head tracking for games* rather than the *Games* topic. Every word you type has to
 appear in the same topic, so a second word narrows rather than widens, and a
 query nothing answers says so rather than going blank. **Down** moves from the
 box into the list and the arrow keys walk it, with the topic beside it changing
-as you go; **Ctrl+F** comes back to the box from anywhere in the window. Narrow
+as you go; **Ctrl+F** comes back to the box from anywhere in the window. (Those
+keys are the help window's. The hub's own are **Ctrl+Page Up** and **Ctrl+Page
+Down**, which walk the two tabs, and **F1**, which opens this window.) Narrow
 the window and the list folds away behind a **Topics** button, so the topic you
 are reading gets the whole width.
 
 **Select eyes to detect** — both, left only, or right only — is a real device
-setting and lives on its own card.
+setting and lives on its own card. Choosing one eye adds a line saying what it
+cannot promise: the tracker stores the selection and, measured on this hardware,
+goes on reporting both eyes in its gaze stream anyway. The help window carries
+the measurement and its date.
 
 **An accuracy diagnostic** is a separate mode: `tobii-gtk --accuracy` runs a
 39-target sweep (13 columns × 3 rows) and reports error per target, per angle
@@ -349,19 +368,44 @@ already presents one.
 
 ### Setting a game up
 
-**Set up a game…**, on the hub's *Head tracking for games* card, opens a window
-listing everything Steam says is installed on this machine. Pick a title and it
-shows the three things that have to be configured for it, numbered:
+The hub's **Games** tab — Ctrl+Page Down, or the strip under the title — lists
+what Steam says is installed on this machine, in four sections:
 
-1. **These settings** — this program's own game output. The window reads them
-   and can change them.
-2. **The Wine bridge**, inside that game's Proton prefix. The window reports
-   which of the bridge's files are already there and can install them, provided
-   the command-line `tobii` is on this machine — the hub shells out to it. When
-   it is not, the block says what to type instead rather than offering a button
-   that cannot work.
+- **Set up** — every game there is a profile for, with what the Wine bridge is
+  doing under each: *bridge installed*, *bridge not installed*, or *never
+  launched*.
+- **Not set up** — the rest of the catalogue.
+- **Set up, not installed here** — a profile whose game Steam does not list on
+  this machine: an uninstalled title, or one on a drive that is not plugged in.
+  Nowhere else in this program says those files are there.
+- **Added by hand** — a game Steam has never heard of. Press **Add a game by
+  folder…** under the list, pick the Wine prefix it runs in (the folder holding
+  `drive_c`), and the bridge installs into it exactly as for a Steam title. The
+  list of them is `~/.config/tobii-linux/custom-games.tsv`, and
+  `tobii uninstall --purge` removes it.
+
+Pick a game and the page beside it shows the three things that have to be
+configured for it, numbered:
+
+1. **These settings** — this program's own game output. The page **reports them
+   and changes nothing**: every control for them is global and lives on the
+   *Head tracking for games* card on the Tracker tab, so a second editor here
+   would be one setting with two of them.
+2. **The Wine bridge**, inside that game's Proton prefix. The page reports which
+   of the bridge's files are already there; the buttons under it install them,
+   reinstall them, take them back out, or run `tobii bridge status` and print
+   what it says. They need the command-line `tobii` on this machine — the hub
+   shells out to it — and when there is nothing to press, the bar says why
+   rather than going blank.
 3. **The game's own settings** — and this one is **read-only in every state.**
    The program reports what those files say and never writes them.
+
+Which of the three a game gets depends on which section it came from. A game
+Steam does not list here loses the first two — there is no prefix on this
+machine and nothing to send tracking to from here — and keeps the third. A game
+added by hand keeps the first two and loses the third, because reading a game's
+own options needs a profile and a profile is a file named after a Steam app id.
+Each absence is a sentence on the page rather than a gap.
 
 Block 3 needs a **profile** to know what to look at: which setting, in which
 file, and what it should say. **No profiles ship with this program**, so on a
@@ -377,7 +421,7 @@ So a prefix holding one of the three is a working bridge, not a broken install,
 even though `tobii bridge status` describes the other two as
 `missing (optional)`.
 
-Everything the window can report, the command line can too:
+Everything the tab can report, the command line can too:
 
 ```sh
 tobii games profile show               # every profile, and where they live
@@ -389,7 +433,7 @@ tobii games profile check              # what a check is: the full schema
 
 The format, a worked example, and how to author the first profile for a game
 are in **[Game-Profiles](docs/wiki/Game-Profiles.md)**. In the hub, the same
-material is under *Head tracking for games* in the F1 help window.
+material is under *Games* in the F1 help window.
 
 ### Five degrees of freedom, or six
 
@@ -710,7 +754,7 @@ this program keeps one open only while something actually wants data:
 
 | Holds the tracker on | For how long |
 |---|---|
-| The hub window | while it has **focus** |
+| The hub window | while it has **focus** *and* the **Tracker** tab is showing. Focus alone was enough until the hub had two tabs; reading about a game does not light the illuminators |
 | Preview my gaze | while the overlay is shown |
 | Calibration, display setup, the accuracy diagnostic | while the flow is running |
 | Any program connected to the hub's socket asking for pose, gaze or camera — a game started with `tobii game` is one | while it stays connected |
@@ -1438,7 +1482,7 @@ not a missing test: the checksums are an integrity check, not a signature.
   was measured on a throwaway prefix — and "the freeze is fixed" must not be
   read as "the game gets tracking".
 - **No per-game profile has ever been verified against a running game.** The
-  hub's *Set up a game…* window can report what a game's own configuration
+  hub's **Games** tab can report what a game's own configuration
   files say, but only where a profile names a setting to look at — and **zero
   profiles ship**, so that section is empty for every user of this build. The
   two readers behind it were read off 30 real Elite Dangerous preset documents;
@@ -1448,10 +1492,12 @@ not a missing test: the checksums are an integrity check, not a signature.
   example path the program prints is a shape, not a location. Writing the first
   verified profile is the next step, not a finished one — see
   [Game-Profiles](docs/wiki/Game-Profiles.md).
-- **The bridge install offered inside that window has never been followed by a
-  real game launch.** It reports the prefix correctly and can copy the files
-  in; whether the game then loads them is the open question above about
-  `NPClient64.dll`, unchanged.
+- **The bridge install offered on that tab has never been followed by a real
+  game launch.** It reports the prefix correctly and can copy the files in;
+  whether the game then loads them is the open question above about
+  `NPClient64.dll`, unchanged. The same is true of the uninstall beside it and
+  of *Install another client…*, which is offered for the one Steam title
+  measured to refuse ours at the signature check.
 - **A pitch calibration and a `tobii headpose` started during it do not
   cooperate.** The measurement holds the hub's device thread for about 13
   seconds without declaring itself exclusive, so the hub grants the lease,
@@ -1463,8 +1509,8 @@ The full list, per release, is in
 [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1,
 §11.3f and §11.3g for v0.4.1, §11.3h–§11.3j for the help window, the
 wineserver lock and the prefix reads that no longer run wine, §11.3k for
-the per-game setup window and the profile format, and §11.3l for the launcher
-whose ordering answers the lock.
+per-game setup and the profile format, §11.3l for the launcher
+whose ordering answers the lock, and §11.3m for the two-tab hub.
 
 **Reporting a problem:** `tobii debug` prints the report an issue asks for, and
 the hub's cogwheel can copy or save it. Since v0.4.1 it carries a **game

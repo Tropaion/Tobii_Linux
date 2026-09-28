@@ -49,16 +49,27 @@ while must_wait(demand.active(), pending.is_empty(), lease_blocks) { /* … 120 
 `DeviceState::status` is `Idle`, which the hub renders as **"Tracker off"** —
 deliberately not "Disconnected", because the resting state is not a fault.
 
-**When the session actually opens.** The hub's claim is synced from
-`window.is_active()` on the 33 ms tick:
+**When the session actually opens.** The hub's claim is synced on the 33 ms tick
+from focus **and the visible tab**:
 
 ```rust
-match (window.is_active(), hold.is_some()) {
+let tab = tick_stack.upgrade().and_then(|s| s.visible_child_name());
+let active = hub_wants_tracker(tick_window.is_active(), tab.as_deref());
+match (active, hold.is_some()) {
     (true, false) => *hold = Some(demand.hold("the hub window")),
     (false, true) => *hold = None,
     _ => {}
 }
 ```
+
+`hub_wants_tracker` is `active && visible_tab == Some(TAB_TRACKER)`, and it is
+its own function rather than the two-term `&&` it looks like, because it is the
+one half of this promise a headless test can assert: a window that never gets
+focus reports `is_active() == false` whatever tab it shows, so a display test
+watching `Demand::reasons` on the Games tab passes with the tab condition
+deleted. Focus alone was enough until the hub had two tabs — the window that
+used to hold the game-setup page was modal, so opening it moved the focus off
+the hub and dropped the claim as a side effect. A tab moves no focus.
 
 Polled rather than signal-driven, and that is a correction, not laziness: it was
 an unconditional claim at build time plus a `notify::is-active` handler to
@@ -174,7 +185,7 @@ holds it for exactly as long as the child process lives (§6.2, and [[Game-Outpu
 3. Load the ONNX model if installed and apply the saved pitch zero. Without a
    model this prints a 5-DOF notice and continues — pitch reads zero.
 4. **Ask the hub for the tracker** (`lease_the_tracker`,
-   `crates/tobii-cli/src/main.rs:2115`) — deliberately *after* the model load,
+   `crates/tobii-cli/src/main.rs`) — deliberately *after* the model load,
    because a granted lease puts the hub's tracker out and loading weights can
    take seconds. Three answers: the socket will not connect (no hub — the
    ordinary case, open directly); a `LeaseReply { ok: true }` (the hub has
