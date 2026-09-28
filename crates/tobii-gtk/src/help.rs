@@ -340,14 +340,14 @@ pub fn topics() -> Vec<Topic> {
                  a machine that has not got the game. The profile is not lost, \
                  and it applies again the moment Steam lists the title.\n\n\
                  {custom} is the one section Steam has nothing to do with: press \
-                 \u{201c}Add a game by folder\u{2026}\u{201d} under the list and pick the Wine \
+                 \u{201c}{add_btn}\u{201d} under the list and pick the Wine \
                  prefix a game runs in — the folder holding `drive_c` — and the \
                  bridge can be installed into it exactly as it is for a Steam \
                  game. That is how a game Steam does not sell reaches this page \
                  at all. Those rows have no app id, so they get the first two \
                  sections of the page and not the third: reading a game's own \
                  options needs a profile, and a profile is a file named after an \
-                 app id. \u{201c}Remove from this list\u{201d} takes the row out and \
+                 app id. \u{201c}{forget}\u{201d} takes the row out and \
                  touches nothing on disk.\n\n\
                  Under the list, the count of what Steam has installed, and — on \
                  the rare machine that has any — a line for anything in the \
@@ -369,7 +369,7 @@ pub fn topics() -> Vec<Topic> {
                  Details runs `tobii bridge status` and prints what it says \
                  without starting anything. When there is nothing to press, the \
                  bar says why instead of going blank.\n\n\
-                 \u{201c}Install another client\u{2026}\u{201d} appears for a game this \
+                 \u{201c}{other}\u{201d} appears for a game this \
                  project has watched refuse ours at the signature check, and for \
                  no other. It puts somebody else's client DLL into the prefix \
                  instead — pick the folder holding its NPClient64.dll; opentrack \
@@ -434,6 +434,9 @@ pub fn topics() -> Vec<Topic> {
                 not_set_up = crate::game_setup::Group::NotSetUp.heading(),
                 elsewhere = crate::game_setup::Group::Elsewhere.heading(),
                 custom = crate::game_setup::Group::Custom.heading(),
+                add_btn = crate::game_setup::ADD_GAME_CAPTION,
+                forget = crate::game_setup::FORGET_CAPTION,
+                other = crate::game_setup::OTHER_CLIENT_CAPTION,
             ),
         ),
         topic(
@@ -644,7 +647,11 @@ pub fn open(app: &Application, parent: &impl IsA<gtk::Window>) -> gtk::Window {
     // The way back to the topic list when the sidebar has folded away. Hidden
     // at any width where the sidebar is on screen, so it costs nothing in the
     // layout most people will ever see.
-    let toggle = gtk::ToggleButton::with_label("Topics");
+    // `widget::toggle_button`, not `ToggleButton::with_label`: the built-in
+    // label is the path `widget.rs` records the glyph-clipping fault on, and
+    // this is the only ToggleButton in the program — so it was the only control
+    // left out of the workaround written for it.
+    let toggle = crate::widget::toggle_button("Topics");
     toggle.set_widget_name(TOGGLE_NAME);
     toggle.add_css_class("quiet");
     toggle.set_tooltip_text(Some("Show the list of topics"));
@@ -1342,10 +1349,13 @@ mod tests {
                     "something has to be filling it",
                 ],
             ),
-            (crate::game_setup::ADD_GAME_TIP, &["Add a game by folder"]),
+            (
+                crate::game_setup::ADD_GAME_TIP,
+                &[crate::game_setup::ADD_GAME_CAPTION],
+            ),
             (
                 crate::game_setup::FORGET_TIP,
-                &["Remove from this list", "touches nothing on disk"],
+                &[crate::game_setup::FORGET_CAPTION, "touches nothing on disk"],
             ),
         ] {
             for fact in facts {

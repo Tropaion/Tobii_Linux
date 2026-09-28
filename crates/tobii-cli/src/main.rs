@@ -4149,6 +4149,15 @@ fn setup() -> CmdResult {
 
     let path = tobii_config::config_path();
     tobii_config::save(&s)?;
+    // BOTH files, as the GUI's own setup flow writes both. The hub's screen
+    // card names the monitor from this id, so a CLI setup that wrote only the
+    // geometry left the card saying it could not name the monitor — on a
+    // machine whose monitor is perfectly nameable, for every session after.
+    // A monitor with no usable EDID id saves `None`, which is the same thing
+    // the flow saves and which the card has its own sentence for.
+    let _ = tobii_config::save_setup_monitor_id(
+        tobii_config::pick_monitor(&monitors).and_then(|m| m.id.as_deref()),
+    );
     println!("saved config to {}", path.display());
 
     match UsbTransport::open() {

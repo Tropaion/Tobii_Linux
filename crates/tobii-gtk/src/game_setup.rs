@@ -176,6 +176,18 @@ pub struct Scan {
     /// another — the disagreement this type's own doc says taking them from
     /// one value prevents.
     pub steam: Rc<tobii_steam::Steam>,
+    /// What [`tobii_steam::Steam::prefix`] answered for an app id, kept.
+    ///
+    /// `prefix` is NOT an in-memory lookup: it stats an `appmanifest_<id>.acf`
+    /// in each present library and then walks the candidates again looking for
+    /// a `drive_c`, so a title never launched under Proton pays every one and
+    /// finds nothing. `Catalog::new` asks it of every installed title, and
+    /// `read_catalog` runs on every `map` of the tab — so the answer was
+    /// re-derived for 29 titles every time somebody clicked Games. The comment
+    /// on `Catalog` already claimed this machine's prefixes were "a walk each
+    /// and deliberately paid once"; this is what makes that true. A prefix
+    /// appears when a game is first launched, which this program never does.
+    prefix_cache: RefCell<std::collections::HashMap<String, Option<PathBuf>>>,
     /// Where the hand-added games are kept.
     ///
     /// A path and not the list, because the list is re-read every time the tab
@@ -196,11 +208,50 @@ pub struct Scan {
 /// one value is what stops them naming different libraries.
 pub fn scan(home: &Path, profiles_dir: &Path) -> Scan {
     let steam = Rc::new(tobii_steam::Steam::at(home));
-    Scan {
-        profiles_dir: profiles_dir.to_path_buf(),
-        apps: steam.apps(),
+    let apps = steam.apps();
+    Scan::of(
+        profiles_dir.to_path_buf(),
+        apps,
         steam,
-        custom_games: tobii_config::custom_games::path(),
+        tobii_config::custom_games::path(),
+    )
+}
+
+impl Scan {
+    /// A scan assembled from parts.
+    ///
+    /// The one way to build one, because [`Scan::prefix_cache`] is an
+    /// implementation detail that has to start empty and a struct literal
+    /// would make it somebody else's to get right — which is also why the
+    /// field is private. `scan` uses this, and so does the display test that
+    /// builds a synthetic machine.
+    pub fn of(
+        profiles_dir: PathBuf,
+        apps: Vec<App>,
+        steam: Rc<tobii_steam::Steam>,
+        custom_games: PathBuf,
+    ) -> Self {
+        Self {
+            profiles_dir,
+            apps,
+            steam,
+            custom_games,
+            prefix_cache: RefCell::default(),
+        }
+    }
+
+    /// The Proton prefix for an app id, asked of the disk once.
+    ///
+    /// See [`Scan::prefix_cache`].
+    pub fn prefix(&self, appid: &str) -> Option<PathBuf> {
+        if let Some(hit) = self.prefix_cache.borrow().get(appid) {
+            return hit.clone();
+        }
+        let answer = self.steam.prefix(appid);
+        self.prefix_cache
+            .borrow_mut()
+            .insert(appid.to_string(), answer.clone());
+        answer
     }
 }
 
@@ -362,6 +413,21 @@ pub(crate) const OTHER_CLIENT_TIP: &str =
 pub(crate) const ADD_GAME_TIP: &str =
     "For a game Steam does not list — pick the Wine prefix it runs in, and this page can \
      install the bridge into it like any other. Nothing is written to the game.";
+/// The three captions the help topic names in prose.
+///
+/// Shared for the reason the ten strings beside them are: the same `format!`
+/// in `help.rs` already pulls `PROFILE_SAVE`, `TRACKER_TAB_POINTER` and the
+/// four `Group` headings across this boundary rather than copying them. These
+/// were the class left out — and the test that checks the topic mentions them
+/// was checking it against a third copy of the same literal, so a rename would
+/// have left the prose naming a button that no longer exists with every test
+/// still green.
+pub(crate) const ADD_GAME_CAPTION: &str = "Add a game by folder\u{2026}";
+/// See [`ADD_GAME_CAPTION`].
+pub(crate) const FORGET_CAPTION: &str = "Remove from this list";
+/// See [`ADD_GAME_CAPTION`].
+pub(crate) const OTHER_CLIENT_CAPTION: &str = "Install another client\u{2026}";
+
 /// See [`DETAILS_TIP`].
 pub(crate) const FORGET_TIP: &str =
     "Take this game out of the hub's list. It does not touch the prefix, the game, or a bridge \
@@ -672,6 +738,16 @@ pub(crate) struct Catalog {
 }
 
 impl Catalog {
+    /// A catalogue of nothing, for the moment before the tab has been looked
+    /// at. See where it is used for why that moment exists.
+    pub(crate) fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            installed: 0,
+            notes: Vec::new(),
+        }
+    }
+
     /// Every row, in three groups.
     ///
     /// `profiles` is [`tobii_config::profiles::Listing::profiles`] — the app ids
@@ -1299,7 +1375,7 @@ impl Action {
 }
 
 /// Stat the prefix. The only filesystem call in block 2.
-fn bridge_state(prefix: Option<&Path>, _appid: &str) -> BridgeState {
+fn bridge_state(prefix: Option<&Path>) -> BridgeState {
     match prefix.map(Path::to_path_buf) {
         None => BridgeState::NoPrefix,
         Some(prefix) => {
@@ -1612,12 +1688,7 @@ pub(crate) fn bridge_block(
 ///
 /// The first element is the program; the rest are its arguments.
 pub(crate) fn install_argv(tobii: &Path, target: &Target, with: &InstallWith) -> Vec<OsString> {
-    let mut v: Vec<OsString> = vec![
-        tobii.as_os_str().to_os_string(),
-        "bridge".into(),
-        "install".into(),
-    ];
-    target.push_flag(&mut v);
+    let mut v = bridge_argv(tobii, "install", target);
     if let Some(w) = &with.wine {
         v.push("--wine".into());
         v.push(w.as_os_str().to_os_string());
@@ -1649,13 +1720,7 @@ pub(crate) struct InstallWith {
 /// The argv for `tobii bridge status`, which starts nothing and only reads —
 /// which is why this window is allowed to run it behind a plain button.
 pub(crate) fn status_argv(tobii: &Path, target: &Target) -> Vec<OsString> {
-    let mut v: Vec<OsString> = vec![
-        tobii.as_os_str().to_os_string(),
-        "bridge".into(),
-        "status".into(),
-    ];
-    target.push_flag(&mut v);
-    v
+    bridge_argv(tobii, "status", target)
 }
 
 /// What the action bar can do for the game on screen, and what to say when it
@@ -1683,6 +1748,14 @@ pub(crate) struct Actions {
     pub details: bool,
     /// The Proton-build picker, which [`JobView`] decides is earned.
     pub wine: bool,
+    /// Whether to offer taking this row out of the hub's own list.
+    ///
+    /// In the value and not decided at the call site, which is where it was:
+    /// the whole reason `Actions` exists is that the bar is decided somewhere
+    /// testable "rather than by the absence of widgets", and Forget is on that
+    /// bar. Left outside, it also falsified the invariant below — a hand-added
+    /// game whose folder is gone returns a `blocked` reason AND shows a button.
+    pub forget: bool,
     /// Whether to offer installing somebody else's client DLL instead of ours.
     ///
     /// Only for a title this project has MEASURED stopping at the signature
@@ -1726,13 +1799,19 @@ pub(crate) fn actions(
     job: &JobView,
     reach: Reach,
     measured: bool,
+    group: Group,
 ) -> Actions {
+    // Forget is not gated on anything the refusals below test: the row is in
+    // this program's own list whether or not the folder it names is on the
+    // machine, and taking it out is the answer to a folder that has gone.
+    let forget = group == Group::Custom;
     let none = |why: &'static str| Actions {
         primary: None,
         uninstall: false,
         details: false,
         wine: false,
         other_client: false,
+        forget,
         blocked: Some(why),
     };
     match reach {
@@ -1770,6 +1849,7 @@ pub(crate) fn actions(
         details: true,
         wine: job.offer_wine,
         other_client: measured,
+        forget,
         blocked: None,
     }
 }
@@ -1797,10 +1877,21 @@ pub(crate) fn bridge_action(state: &BridgeState) -> Option<Action> {
 /// between them would be one character away from removing what somebody meant
 /// to install.
 pub(crate) fn uninstall_argv(tobii: &Path, target: &Target) -> Vec<OsString> {
+    bridge_argv(tobii, "uninstall", target)
+}
+
+/// `tobii bridge <verb>` pointed at a target — the half the three verbs share.
+///
+/// The three stay three FUNCTIONS: `uninstall_argv`'s own doc says why, and a
+/// boolean choosing between install and uninstall would be one character away
+/// from removing what somebody meant to install. What is shared here is only
+/// the preamble, which had drifted into three copies that all had to agree the
+/// subcommand is `bridge`.
+fn bridge_argv(tobii: &Path, verb: &str, target: &Target) -> Vec<OsString> {
     let mut v: Vec<OsString> = vec![
         tobii.as_os_str().to_os_string(),
         "bridge".into(),
-        "uninstall".into(),
+        verb.into(),
     ];
     target.push_flag(&mut v);
     v
@@ -3062,8 +3153,8 @@ fn read_catalog(scan: &Scan) -> Catalog {
         &scan.apps,
         &listing,
         &custom,
-        &|id| scan.steam.prefix(id).is_some(),
-        &|id| RowBridge::of(&bridge_state(scan.steam.prefix(id).as_deref(), id)),
+        &|id| scan.prefix(id).is_some(),
+        &|id| RowBridge::of(&bridge_state(scan.prefix(id).as_deref())),
     )
 }
 
@@ -3128,7 +3219,14 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // about a game the user had just set up, on the page whose whole subject is
     // what is set up. It is re-read when the tab comes into view, which is the
     // first moment anybody could be looking at the answer.
-    let catalog = Rc::new(RefCell::new(read_catalog(&scan)));
+    // EMPTY at build time, and filled when the tab is first shown. The hub adds
+    // the Tracker page to the stack first, so this page is not mapped at
+    // startup and `content.connect_map` re-reads the catalogue and rebuilds
+    // every row before anybody can see one — so a catalogue read here was a
+    // directory walk and a per-title prefix stat whose result was thrown away
+    // on every launch of the program, including the launches that never open
+    // this tab.
+    let catalog = Rc::new(RefCell::new(Catalog::empty()));
 
     // Before the pick page, because the lead above the list says what this
     // window will do for a game and one of the two things it does needs this.
@@ -3185,7 +3283,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // searching can never find. `tobii bridge install --prefix PATH` has always
     // worked from a terminal; what was out of reach from the hub was the list
     // that remembers the path.
-    let add_btn = crate::widget::button("Add a game by folder…");
+    let add_btn = crate::widget::button(ADD_GAME_CAPTION);
     add_btn.add_css_class("quiet");
     add_btn.set_halign(Align::Start);
     add_btn.set_tooltip_text(Some(ADD_GAME_TIP));
@@ -3402,14 +3500,14 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // ambiguous caption beside *Uninstall* is one click from somebody expecting
     // the bridge to come out of their prefix and getting the entry deleted
     // instead.
-    let forget_btn = crate::widget::button("Remove from this list");
+    let forget_btn = crate::widget::button(FORGET_CAPTION);
     forget_btn.add_css_class("quiet");
     forget_btn.set_tooltip_text(Some(FORGET_TIP));
     // Offered only to a title this project has watched stop at the signature
     // check — see `Actions::other_client`. The caption says "another" rather
     // than naming opentrack: opentrack ships a client and so might something
     // else, and this page has not watched either of them deliver.
-    let other_btn = crate::widget::button("Install another client\u{2026}");
+    let other_btn = crate::widget::button(OTHER_CLIENT_CAPTION);
     other_btn.add_css_class("quiet");
     other_btn.set_tooltip_text(Some(OTHER_CLIENT_TIP));
     let uninstall_btn = crate::widget::button("Uninstall");
@@ -3621,7 +3719,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 }
                 None => (app.prefix().cloned(), Vec::new()),
             };
-            let state = bridge_state(chosen.as_deref(), &app.key());
+            let state = bridge_state(chosen.as_deref());
             let mut text = bridge_block(
                 &state,
                 scan.steam.missing_libraries(),
@@ -3657,10 +3755,22 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 _ => Reach::Reachable,
             };
             // Whether this project has watched this very title stop at the
-            // signature check. One Steam game today; see `Actions::other_client`
-            // for why the offer is not made to the rest.
-            let measured = app.appid().and_then(signature::measured_steam).is_some();
-            let acts = actions(&state, tobii.as_deref(), &job, reach, measured);
+            // signature check — see `Actions::other_client` for why the offer
+            // is not made to the rest.
+            //
+            // BOTH lookups, and the second is not a nicety: `MEASURED[0]` is
+            // Star Citizen, which has no app id because it is not sold on
+            // Steam, and it is the title the hand-added list exists for. Keyed
+            // on the app id alone, the one route past the check was withheld
+            // from the one measured game that can only be reached by folder —
+            // while the help topic promised it appears "for a game this project
+            // has watched refuse ours at the signature check, and for no
+            // other".
+            let measured = match &app.target {
+                Target::Steam(appid) => signature::measured_steam(appid).is_some(),
+                Target::Prefix(_) => signature::measured_named(&app.name).is_some(),
+            };
+            let acts = actions(&state, tobii.as_deref(), &job, reach, measured, app.group);
             if let Some(btn) = install_w.upgrade() {
                 match acts.primary {
                     Some(a) => {
@@ -3670,20 +3780,18 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                     None => btn.set_visible(false),
                 }
             }
-            if let Some(btn) = uninstall_w.upgrade() {
-                btn.set_visible(acts.uninstall);
-            }
-            if let Some(btn) = details_w.upgrade() {
-                btn.set_visible(acts.details);
-            }
-            if let Some(btn) = wine_w.upgrade() {
-                btn.set_visible(acts.wine);
-            }
-            if let Some(btn) = other_w.upgrade() {
-                btn.set_visible(acts.other_client);
-            }
-            if let Some(btn) = forget_w.upgrade() {
-                btn.set_visible(app.group == Group::Custom);
+            // The same array loop the blocks above use. `install_w` keeps a
+            // block of its own because it also sets its caption.
+            for (w, on) in [
+                (&uninstall_w, acts.uninstall),
+                (&details_w, acts.details),
+                (&wine_w, acts.wine),
+                (&other_w, acts.other_client),
+                (&forget_w, acts.forget),
+            ] {
+                if let Some(b) = w.upgrade() {
+                    b.set_visible(on);
+                }
             }
             if let Some(b) = action_bar_w.upgrade() {
                 b.set_sensitive(job.enabled);
@@ -4028,7 +4136,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             notes.set_visible(!p.notes.is_empty());
         })
     };
-    rebuild("");
+    // Not called here: the list is built on the first `map`, for the reason
+    // `catalog` is empty above. 116 widgets on this machine's 29 titles, built
+    // and destroyed before the window was drawn.
     {
         let rebuild = rebuild.clone();
         search.connect_search_changed(move |e| rebuild(&e.text()));
@@ -4513,7 +4623,12 @@ mod tests {
             ("a prefix with it", present(), Some(tobii), Reach::Reachable),
         ];
         for (what, state, t, reach) in cases {
-            let a = actions(&state, t, &quiet_job(), reach, false);
+            let a = actions(&state, t, &quiet_job(), reach, false, Group::NotSetUp);
+            // The BRIDGE buttons. `forget` is not one of them and is
+            // deliberately outside this rule: it takes the row out of this
+            // program's own list, which is the answer to a folder that has
+            // gone rather than something the folder's absence forbids — so a
+            // hand-added row can legitimately show it beside a reason.
             let has_button = a.primary.is_some() || a.uninstall || a.details || a.wine;
             assert_ne!(
                 has_button,
@@ -4544,6 +4659,7 @@ mod tests {
             &quiet_job(),
             Reach::Reachable,
             false,
+            Group::NotSetUp,
         );
         assert!(
             no_tobii_no_prefix
@@ -4557,6 +4673,7 @@ mod tests {
             &quiet_job(),
             Reach::NotListedHere,
             false,
+            Group::Elsewhere,
         );
         assert!(
             elsewhere
@@ -4582,7 +4699,8 @@ mod tests {
                 Some(tobii),
                 &quiet_job(),
                 Reach::Reachable,
-                false
+                false,
+                Group::NotSetUp,
             )
             .uninstall
         );
@@ -4592,7 +4710,8 @@ mod tests {
                 Some(tobii),
                 &quiet_job(),
                 Reach::Reachable,
-                false
+                false,
+                Group::NotSetUp,
             )
             .uninstall
         );
@@ -4603,9 +4722,24 @@ mod tests {
                 &quiet_job(),
                 Reach::Reachable,
                 false,
+                Group::NotSetUp,
             )
             .uninstall
         );
+        // Forget follows the group and nothing else — in particular it
+        // survives every refusal, because removing a row is the one thing that
+        // still works when the folder it names is gone.
+        let tobii = Path::new("/usr/bin/tobii");
+        for (reach, group, want) in [
+            (Reach::Reachable, Group::Custom, true),
+            (Reach::FolderGone, Group::Custom, true),
+            (Reach::Reachable, Group::NotSetUp, false),
+            (Reach::NotListedHere, Group::Elsewhere, false),
+        ] {
+            let a = actions(&present(), Some(tobii), &quiet_job(), reach, false, group);
+            assert_eq!(a.forget, want, "{group:?} / {reach:?}: {a:?}");
+        }
+
         // And it is a different verb from install, not a flag on it.
         let argv = uninstall_argv(tobii, &Target::Steam("359320".to_string()));
         assert_eq!(
@@ -4639,6 +4773,7 @@ mod tests {
                 &quiet_job(),
                 Reach::Reachable,
                 measured,
+                Group::NotSetUp,
             )
         };
         assert!(
@@ -4673,14 +4808,21 @@ mod tests {
             ]
         );
 
-        // The appid the offer keys on is the one in the measurements, not one
-        // typed here — so the day a third title is measured, the button
-        // follows it.
+        // Through the function the offer actually calls, not by walking the
+        // list beside it: change how `measured_steam` matches and a hand-rolled
+        // scan here would go on asserting the raw data and stay green while the
+        // button's behaviour moved.
         assert!(
-            signature::MEASURED
-                .iter()
-                .any(|m| m.appid == Some("2537590")),
-            "the offer keys on this list, so it has to be in it"
+            signature::measured_steam("2537590").is_some(),
+            "the offer keys on this lookup, so it has to answer for MSFS"
+        );
+        // And the half that has no app id. Star Citizen is measured, is not on
+        // Steam, and is the title the hand-added list exists for — so the row
+        // that can only be reached by folder is the one this button must not
+        // be withheld from.
+        assert!(
+            signature::measured_named("Star Citizen").is_some(),
+            "the measured title with no app id is reachable by the name a user typed"
         );
     }
 
@@ -4801,6 +4943,7 @@ mod tests {
             &quiet_job(),
             Reach::FolderGone,
             false,
+            Group::Custom,
         );
         assert_eq!(a.primary, None);
         assert!(
@@ -6929,9 +7072,16 @@ mod tests {
         // now: `bridge_block` writes the paragraph and says nothing about
         // buttons. Asserted here because this test is about the two agreeing.
         assert!(
-            actions(&present(), None, &quiet_job(), Reach::Reachable, false)
-                .primary
-                .is_none(),
+            actions(
+                &present(),
+                None,
+                &quiet_job(),
+                Reach::Reachable,
+                false,
+                Group::NotSetUp
+            )
+            .primary
+            .is_none(),
             "nothing to run: {without}"
         );
         assert!(
@@ -7122,9 +7272,16 @@ mod tests {
             &Target::Steam("359320".to_string()),
         );
         assert!(
-            actions(&present(), None, &quiet_job(), Reach::Reachable, false)
-                .primary
-                .is_none(),
+            actions(
+                &present(),
+                None,
+                &quiet_job(),
+                Reach::Reachable,
+                false,
+                Group::NotSetUp
+            )
+            .primary
+            .is_none(),
             "nothing to run: {files}"
         );
         assert!(
@@ -7175,7 +7332,8 @@ mod tests {
             None,
             &quiet_job(),
             Reach::Reachable,
-            false
+            false,
+            Group::NotSetUp,
         )
         .primary
         .is_none());
@@ -7920,7 +8078,14 @@ mod tests {
         );
         // The button half is `actions`, which is the one decider: with no
         // `tobii` there is nothing to run, whatever the prefix holds.
-        let bar = actions(&state, None, &quiet_job(), Reach::Reachable, false);
+        let bar = actions(
+            &state,
+            None,
+            &quiet_job(),
+            Reach::Reachable,
+            false,
+            Group::NotSetUp,
+        );
         assert_eq!(bar.primary, None, "nothing to run it with: {text}");
         assert!(
             bar.blocked
@@ -7946,6 +8111,7 @@ mod tests {
             &quiet_job(),
             Reach::Reachable,
             false,
+            Group::NotSetUp,
         );
         assert_eq!(bar.primary, Some(Action::Install));
         assert_eq!(bar.blocked, None, "{bar:?}");

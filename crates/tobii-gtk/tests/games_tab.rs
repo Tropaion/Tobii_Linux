@@ -265,13 +265,7 @@ fn run(app_id: &str, hold: bool) -> Seen {
 
             // ---- on the Tracker tab: the measurements, and the census.
             {
-                let (s, d, h, p, k) = (
-                    seen.clone(),
-                    demand.clone(),
-                    hub.clone(),
-                    pending.clone(),
-                    keep.clone(),
-                );
+                let (s, d, h) = (seen.clone(), demand.clone(), hub.clone());
                 at(900, move || {
                     let mut s = s.borrow_mut();
                     s.claims_on_tracker = d.reasons();
@@ -296,10 +290,6 @@ fn run(app_id: &str, hold: bool) -> Seen {
                     s.tracker_height = tracker.measure(gtk::Orientation::Vertical, w).1;
                     s.games_height = games.measure(gtk::Orientation::Vertical, w).1;
                     s.games_min_width = games.measure(gtk::Orientation::Horizontal, -1).0;
-                    *p.borrow_mut() = Some(census(&games));
-                    if hold {
-                        k.borrow_mut().push(games);
-                    }
 
                     // Where the switcher sits, and what it says. The captions
                     // are the only words on the hub that name the two halves of
@@ -382,6 +372,29 @@ fn run(app_id: &str, hold: bool) -> Seen {
                         hub_stack(h.upcast_ref())
                             .and_then(|t| t.visible_child_name().map(Into::into)),
                     ));
+                });
+            }
+
+            // ---- the census, AFTER the tab has been shown once.
+            //
+            //      Not at 900 with the measurements above, and the difference
+            //      is the whole value of it: the list is built when the page is
+            //      first mapped, not when it is constructed, so a census taken
+            //      before any of that weak-references a tree with no rows in it
+            //      — 74 widgets where the tab in use has 190. The rows are most
+            //      of what this file is watching for cycles.
+            {
+                let (h, p, k) = (hub.clone(), pending.clone(), keep.clone());
+                at(1300, move || {
+                    let Some(games) = hub_stack(h.upcast_ref())
+                        .and_then(|st| st.child_by_name(tobii_gtk::TAB_GAMES))
+                    else {
+                        return;
+                    };
+                    *p.borrow_mut() = Some(census(&games));
+                    if hold {
+                        k.borrow_mut().push(games);
+                    }
                 });
             }
 

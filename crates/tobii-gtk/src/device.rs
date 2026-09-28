@@ -607,16 +607,13 @@ fn apply_command<T: Transport>(
             // just spent one of those; a second full window on the read turned
             // one radio click into a 20-second freeze. A device that answered
             // neither in that time is not going to answer this one.
-            let now = match applied {
-                Some(e) => Some(e),
-                None => {
-                    let was = conn.request_timeout();
-                    conn.set_request_timeout(REFUSED_READBACK);
-                    let got = conn.get_enabled_eye().ok().flatten();
-                    conn.set_request_timeout(was);
-                    got
-                }
-            };
+            let now = applied.or_else(|| {
+                let was = conn.request_timeout();
+                conn.set_request_timeout(REFUSED_READBACK);
+                let got = conn.get_enabled_eye().ok().flatten();
+                conn.set_request_timeout(was);
+                got
+            });
             {
                 let mut s = state.lock().unwrap();
                 if let Some(e) = now {

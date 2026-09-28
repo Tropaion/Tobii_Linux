@@ -1293,12 +1293,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // after quit, re-reading `/sys/class/drm` to update a label that is gone,
     // and a second `build_hub` — which the tray icon can ask for — would add
     // another. So the id is kept and dropped with the window.
-    let monitors_watch = Rc::new(RefCell::new(gtk::gdk::Display::default().map(|display| {
+    let monitors_watch = RefCell::new(gtk::gdk::Display::default().map(|display| {
         let monitors = display.monitors();
         let restate = restate_screen.clone();
         let id = monitors.connect_items_changed(move |_, _, _, _| restate());
         (monitors, id)
-    })));
+    }));
 
     let b_setup = crate::widget::button("Set up display");
     {
@@ -2035,18 +2035,18 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                     // the name is read rather than an index counted: the order
                     // the pages were added to the stack is the only thing that
                     // would keep an index honest, and it is not visible here.
-                    let on_tracker = stack.visible_child_name().as_deref() == Some(TAB_TRACKER);
-                    let want = if key == gtk::gdk::Key::Page_Down {
+                    //
+                    // Already there needs no guard, and it used to have one:
+                    // `set_visible_child_name` with the name already showing is
+                    // a no-op inside GTK, and the arm returns `Stop` either way
+                    // — which is the fact that matters. Ctrl+Page_Down on the
+                    // last tab must not fall through to a scroller and jump the
+                    // page, and it does not, because this arm never Proceeds.
+                    stack.set_visible_child_name(if key == gtk::gdk::Key::Page_Down {
                         TAB_GAMES
                     } else {
                         TAB_TRACKER
-                    };
-                    // Already there is still handled: Ctrl+Page_Down on the last
-                    // tab must not fall through to a scroller and jump the page.
-                    if on_tracker == (want == TAB_TRACKER) {
-                        return glib::Propagation::Stop;
-                    }
-                    stack.set_visible_child_name(want);
+                    });
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -2656,7 +2656,6 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // this window holding one of its own descendants, which is the cycle
         // that leaks a subtree. An `Rc<Cell<bool>>` holds nothing of GTK's.
         let games_alive = games_alive.clone();
-        let monitors_watch = monitors_watch.clone();
         window.connect_close_request(move |w| {
             // PRESSING X PUTS THE PROGRAM IN THE BACKGROUND; it does not exit.
             //

@@ -77,6 +77,29 @@ pub fn measured_steam(appid: &str) -> Option<&'static Measured> {
     MEASURED.iter().find(|m| m.appid == Some(appid))
 }
 
+/// The same question for a game nobody bought on Steam, by the name it is
+/// under.
+///
+/// **The other half of [`measured_steam`], and it has to exist.** The first
+/// entry in [`MEASURED`] is Star Citizen, which has no app id — it is not sold
+/// on Steam — and it is the title people ask about and the reason the hub has a
+/// list of games added by hand at all. Keying the offer on the app id alone
+/// withheld it from the one measured game that can only be reached by folder.
+///
+/// Matched on the name, case-folded and trimmed, and that is a weaker key than
+/// an app id on purpose: a name here is what the PERSON typed when they added
+/// the folder, not what a store spells, so the objection in `measured_steam`'s
+/// test — that a store spells a title differently in different places — does
+/// not carry over. What it costs is that somebody who types "star citizen" for
+/// an unrelated folder is offered a button they do not need, which is a button
+/// too many rather than an install they did not ask for.
+pub fn measured_named(name: &str) -> Option<&'static Measured> {
+    let want = name.trim().to_lowercase();
+    MEASURED
+        .iter()
+        .find(|m| m.title.trim().to_lowercase() == want)
+}
+
 impl Measured {
     /// The whole observation as one clause: the title, what identifies it,
     /// and what it did.
@@ -321,6 +344,28 @@ mod tests {
         // Star Citizen is measured and has no app id, so it cannot be found
         // here — asserted so that giving it one later is a deliberate act.
         assert!(MEASURED.iter().any(|m| m.appid.is_none()));
+    }
+
+    /// The measured title that has no app id is reachable, or the one route
+    /// past the check is withheld from the game it was measured on.
+    ///
+    /// Star Citizen is `MEASURED[0]`, has `appid: None`, and is the title the
+    /// hub's hand-added list exists for. A lookup that only knows app ids
+    /// cannot find it — which is exactly the hole this closes.
+    #[test]
+    fn the_measured_title_with_no_app_id_is_reachable_by_name() {
+        let sc = measured_named("Star Citizen").expect("measured, and not on Steam");
+        assert_eq!(sc.appid, None, "which is why the app-id lookup misses it");
+        // Case and surrounding space are the person's typing, not a key.
+        for typed in ["star citizen", "  STAR CITIZEN  "] {
+            assert!(measured_named(typed).is_some(), "{typed:?}");
+        }
+        assert_eq!(measured_named("Elden Ring"), None);
+        assert_eq!(
+            measured_named(""),
+            None,
+            "and an empty name matches nothing"
+        );
     }
 
     /// `named` carries whatever identifies a title and nothing it has not got,

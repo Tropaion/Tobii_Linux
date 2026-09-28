@@ -273,10 +273,6 @@ pub fn control(
                 .map(|s| s.head_model.clone())
                 .unwrap_or_else(|e| e.into_inner().head_model.clone());
             let st = model_store::status_quick(SRC);
-            let running = match &published {
-                HeadModel::Unasked => matches!(st, Status::Ready),
-                other => *other == HeadModel::Running,
-            };
             // Two questions, and conflating them took away the only way out of
             // a bad model. `running` decides what the line SAYS and whether a
             // pitch zero is worth offering; `installed` decides whether there
@@ -285,10 +281,15 @@ pub fn control(
             // was left with the bad file on disk, a line telling them it was
             // not being used, and re-downloading the same URL as the only
             // button.
-            let installed = match &published {
-                HeadModel::Unasked => !matches!(st, Status::Missing),
-                HeadModel::Missing => false,
-                _ => true,
+            //
+            // Exhaustive, and no catch-all arm: `HeadModel` is new, a fifth
+            // variant is a live possibility, and under two `_` arms one would
+            // have compiled silently into "not running, but there is a file".
+            let (running, installed) = match &published {
+                HeadModel::Unasked => (matches!(st, Status::Ready), !matches!(st, Status::Missing)),
+                HeadModel::Running => (true, true),
+                HeadModel::Missing => (false, false),
+                HeadModel::Refused(_) => (false, true),
             };
             status.set_text(&running_line(&published).unwrap_or_else(|| status_line(&st)));
             pitch.set_text(&pitch_line(model_store::pitch_offset()));
@@ -324,13 +325,7 @@ pub fn control(
             let parent = btn.root().and_downcast::<gtk::Window>();
             let reload = reload.clone();
             terms_dialog(parent.as_ref(), move || {
-                {
-                    // `Rc<dyn Fn()>` is not itself `Fn`, and the two callers
-                    // below take a `Fn + Clone` — one clone per call, wrapped
-                    // where it is passed rather than changing their bounds.
-                    let refresh = refresh.clone();
-                    start_download(&btn, &status, move || refresh(), reload.clone())
-                }
+                start_download(&btn, &status, refresh.clone(), reload.clone())
             });
         });
     }
@@ -345,10 +340,7 @@ pub fn control(
                 state.clone(),
                 cmd_tx.clone(),
                 pitch_label.clone(),
-                {
-                    let refresh = refresh.clone();
-                    move || refresh()
-                },
+                refresh.clone(),
             );
         });
     }
@@ -456,12 +448,12 @@ pub struct HeadCard {
 }
 
 /// The guided pitch-zero measurement: instructions, a live countdown, a result.
-fn pitch_dialog<F: Fn() + Clone + 'static>(
+fn pitch_dialog(
     parent: Option<&gtk::Window>,
     state: std::sync::Arc<std::sync::Mutex<crate::device::DeviceState>>,
     cmd_tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>,
     pitch_label: Label,
-    refresh: F,
+    refresh: Rc<dyn Fn()>,
 ) {
     const SECS: u64 = 10;
 
@@ -736,10 +728,10 @@ pub fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F
 }
 
 /// Fetch on a worker thread, reporting progress from the part-file's size.
-fn start_download<F: Fn() + Clone + 'static, R: Fn() + Clone + 'static>(
+fn start_download<R: Fn() + Clone + 'static>(
     btn: &Button,
     status: &Label,
-    refresh: F,
+    refresh: Rc<dyn Fn()>,
     reload: R,
 ) {
     btn.set_sensitive(false);
