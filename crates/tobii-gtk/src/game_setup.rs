@@ -613,8 +613,16 @@ fn wrote_line(path: &Path) -> String {
 pub(crate) enum BridgeState {
     /// [`tobii_steam::prefix`] found nothing.
     NoPrefix,
-    /// A prefix, with no bridge artifact in it.
-    Absent { prefix: PathBuf },
+    /// A prefix with no [`BRIDGE_ARTIFACT`] in it. `present` is which of
+    /// [`BRIDGE_FILES`] a stat *did* find, and it is here for the same reason
+    /// it is on [`Self::Files`]: a directory holding two of the three is not a
+    /// directory holding none, and "the bridge's files are not in it" over one
+    /// is this window reporting a presence as an absence — the mirror of the
+    /// bug [`present_files`] was written against, and just as wrong.
+    Absent {
+        prefix: PathBuf,
+        present: Vec<&'static str>,
+    },
     /// A prefix with the bridge's required artifact in it. `present` is which
     /// of [`BRIDGE_FILES`] a stat actually found — never assumed to be all
     /// three, because the installer skips an optional one it was not built
@@ -657,7 +665,7 @@ fn bridge_state(home: &Path, appid: &str) -> BridgeState {
                     present,
                 }
             } else {
-                BridgeState::Absent { prefix }
+                BridgeState::Absent { prefix, present }
             }
         }
     }
@@ -715,6 +723,38 @@ fn present_sentence(dir: &Path, present: &[&'static str]) -> String {
         list = present.join(", "),
         gone = missing.join(" and "),
         isnt = plural(missing.len(), "is", "are"),
+        req = BRIDGE_ARTIFACT,
+    )
+}
+
+/// The sentence for a prefix with no [`BRIDGE_ARTIFACT`] in it.
+///
+/// Two sentences, not one, for the reason [`present_sentence`] has two: the
+/// installer marks one of the three required and skips either of the others
+/// when the build it ran did not have them, so a prefix can hold two files and
+/// still be unable to load anything. Over that prefix the flat plural "the
+/// bridge's files are not in it" names an absence that is not there, which is
+/// [`present_files`]' own bug shape read backwards.
+fn absent_sentence(dir: &Path, present: &[&'static str]) -> String {
+    if present.is_empty() {
+        return format!(
+            "The bridge's files are not in it: there is no {req} under {dir}, and none of \
+             the other {n} {is} there either.",
+            req = BRIDGE_ARTIFACT,
+            dir = dir.display(),
+            n = BRIDGE_FILES.len() - 1,
+            is = plural(BRIDGE_FILES.len() - 1, "is", "are"),
+        );
+    }
+    format!(
+        "{n} of the bridge's {total} files {is} already in it, at {dir} — {list}. {req}, \
+         the one a game has to load, is not, so as it stands a game looking for the bridge \
+         finds nothing it can load.",
+        n = present.len(),
+        total = BRIDGE_FILES.len(),
+        is = plural(present.len(), "is", "are"),
+        dir = dir.display(),
+        list = present.join(", "),
         req = BRIDGE_ARTIFACT,
     )
 }
@@ -823,17 +863,16 @@ pub(crate) fn bridge_block(
             // fails is worse than no button.
             (s, None)
         }
-        BridgeState::Absent { prefix } => (
+        BridgeState::Absent { prefix, present } => (
             format!(
-                "The prefix is at {}.\nThe bridge's files are not in it: there is no {req} \
-                 under {dir}.\n\n\
+                "The prefix is at {}.\n{found}\n\n\
                  The bridge is what lets a game see a TrackIR or FreeTrack device from inside \
                  Wine. Installing it copies up to {n} small {file} into the prefix — {list} — \
                  and sets two registry values. Only {req} is required, and a `tobii` built \
                  without one of the others copies what it has and says which it skipped. It \
                  does not touch the game or its saves.",
                 prefix.display(),
-                dir = prefix.join(BRIDGE_SUBDIR).display(),
+                found = absent_sentence(&prefix.join(BRIDGE_SUBDIR), present),
                 n = BRIDGE_FILES.len(),
                 file = plural(BRIDGE_FILES.len(), "file", "files"),
                 list = BRIDGE_FILES.join(", "),
@@ -841,17 +880,25 @@ pub(crate) fn bridge_block(
             ),
             Some(Action::Install),
         ),
-        BridgeState::Files { dir, present, .. } => (
-            format!(
+        BridgeState::Files { dir, present, .. } => {
+            let mut s = format!(
                 "{}\n\n\
                  Whether the game will actually find {them} is a question about two registry \
-                 values inside the prefix, which this window does not read. Details below is \
-                 `tobii bridge status`, which does.",
+                 values inside the prefix, which this window does not read.",
                 present_sentence(dir, present),
                 them = plural(present.len(), "it", "them"),
-            ),
-            Some(Action::Reinstall),
-        ),
+            );
+            // The same gate the button has. `refresh` hides Details when there
+            // is no `tobii`, and this sentence pointing at it was appended
+            // unconditionally — so on a machine with none the page said
+            // "Details below is `tobii bridge status`" and then, two
+            // paragraphs down in `no_binary_text`, "which is why that button
+            // is not on the page either". X4 fixed that for the other arm.
+            if tobii.is_some() {
+                s.push_str(" Details below is `tobii bridge status`, which does.");
+            }
+            (s, Some(Action::Reinstall))
+        }
     };
     // Both notes hang off every state, because both are reasons the sentence
     // above them may be about the wrong place on this machine.
@@ -1054,14 +1101,13 @@ pub(crate) fn outcome_text(o: &Outcome, after: &BridgeState) -> String {
                 }
                 s
             }
-            BridgeState::Absent { prefix } => format!(
-                "The installer reported no error, and the bridge's files are still not in \
-                 the prefix: there is no {BRIDGE_ARTIFACT} under {}. This window will not \
-                 call that an install.\n\n\
+            BridgeState::Absent { prefix, present } => format!(
+                "The installer reported no error, and a stat of the prefix afterwards says \
+                 otherwise. {found} This window will not call that an install.\n\n\
                  An exit code is all a program hands back, and one that understood nothing \
                  and exited zero looks exactly like one that did the work. Press Details to \
                  see what the prefix holds, and read what this run said below.",
-                prefix.join(BRIDGE_SUBDIR).display()
+                found = absent_sentence(&prefix.join(BRIDGE_SUBDIR), present),
             ),
             BridgeState::NoPrefix => "The installer reported no error, and there is no Proton \
                                       prefix here for it to have written into — so whatever \
@@ -1245,21 +1291,49 @@ pub(crate) fn tobii_binary(
 /// `Details` is hidden by the same missing binary, so the reinstall wording
 /// names `bridge status` as well: that is the one thing the page tells the
 /// user to press for an answer it will not give itself.
+///
+/// # Whose `$PATH` this is about
+///
+/// [`on_path`] reads `std::env::var_os("PATH")` — **this process's**. A hub
+/// started from its desktop entry gets the session's environment, not an
+/// interactive shell's, and `~/.local/bin` is added by a shell rc far more
+/// often than by the session: `scripts/release.sh`'s `install.sh` puts both
+/// binaries there by default, so the ordinary user whose terminal has `tobii`
+/// is exactly the user this window cannot find it for.
+///
+/// So this paragraph used to state "is not on your PATH" — settled fact about
+/// the user's terminal — out of evidence covering only the GUI's environment,
+/// and then, in the same breath, tell them to type `tobii` in that terminal.
+/// It says what it actually looked at instead, and it says what it means when
+/// the terminal cannot find it either: every install route this project has
+/// puts `tobii` and this program in one directory, so the answer there is not
+/// a `$PATH` line, it is a reinstall.
 pub(crate) fn no_binary_text(action: Action, appid: &str) -> String {
-    let head = "The command-line program `tobii` is not beside this one and is not on your \
-                PATH, so";
+    let head = "The command-line program `tobii` is not beside this one, and it is not on \
+                the PATH this window was started with — which is not necessarily the one \
+                your terminal has. This project's installer puts both programs in \
+                `~/.local/bin` by default, and that directory is usually added to the PATH \
+                by a shell rc, which a window started from the app menu never reads. So try \
+                the command below in a terminal: it may simply work.";
+    let tail = "If the terminal cannot find `tobii` either, it is not installed on this \
+                machine. It is not a separate download — every install route this project \
+                has puts it in the same directory as this program — so the fix is to \
+                install the release again.";
     match action {
         Action::Install => format!(
-            "{head} the bridge cannot be installed from here. Run this in a terminal \
-             instead:\n\n\
-             tobii bridge install --steam {appid}"
+            "{head}\n\n\
+             Until then the bridge cannot be installed from here:\n\n\
+             tobii bridge install --steam {appid}\n\n\
+             {tail}"
         ),
         Action::Reinstall => format!(
-            "{head} nothing here can be run against this prefix — neither a reinstall nor \
-             the registry read behind Details, which is why that button is not on the page \
-             either. Run these in a terminal instead:\n\n\
+            "{head}\n\n\
+             Until then nothing here can be run against this prefix — neither a reinstall \
+             nor the registry read behind Details, which is why that button is not on the \
+             page either:\n\n\
              tobii bridge status --steam {appid}\n\
-             tobii bridge install --steam {appid}"
+             tobii bridge install --steam {appid}\n\n\
+             {tail}"
         ),
     }
 }
@@ -1788,8 +1862,9 @@ fn lead(tobii: Option<&Path>) -> &'static str {
             "Everything Steam says is installed on this machine. Pick one and this window \
              will show the three things that have to be configured for it. It can set this \
              program's own settings; the Wine bridge needs the command-line program `tobii`, \
-             which is not beside this one and is not on your PATH, so for that one the \
-             window says what to type instead."
+             which is not beside this one and is not on the PATH this window was started \
+             with — a terminal's is often not the same — so for that one the window says \
+             what to type there instead."
         }
     }
 }
@@ -2274,7 +2349,7 @@ pub fn open_with(
             let state = bridge_state(&scan.home, &app.appid);
             let chosen = match &state {
                 BridgeState::NoPrefix => None,
-                BridgeState::Absent { prefix } | BridgeState::Files { prefix, .. } => {
+                BridgeState::Absent { prefix, .. } | BridgeState::Files { prefix, .. } => {
                     Some(prefix.as_path())
                 }
             };
@@ -2929,6 +3004,7 @@ mod tests {
         let (absent, _) = block2(
             &BridgeState::Absent {
                 prefix: prefix.clone(),
+                present: vec![],
             },
             &[],
             &[],
@@ -3041,8 +3117,19 @@ mod tests {
         PathBuf::from("/games/compatdata/359320/pfx")
     }
 
+    /// A prefix holding none of the three.
     fn absent() -> BridgeState {
-        BridgeState::Absent { prefix: prefix() }
+        absent_with(vec![])
+    }
+
+    /// A prefix holding exactly `present` of them and not `BRIDGE_ARTIFACT` —
+    /// the state `bridge_state` builds when the required file is missing,
+    /// whatever else is there.
+    fn absent_with(present: Vec<&'static str>) -> BridgeState {
+        BridgeState::Absent {
+            prefix: prefix(),
+            present,
+        }
     }
 
     /// A prefix holding all three files.
@@ -3831,6 +3918,7 @@ mod tests {
         let (alone, _) = block2(
             &BridgeState::Absent {
                 prefix: here.clone(),
+                present: vec![],
             },
             &[],
             &[],
@@ -3845,7 +3933,10 @@ mod tests {
         );
 
         let (two, action) = block2(
-            &BridgeState::Absent { prefix: here },
+            &BridgeState::Absent {
+                prefix: here,
+                present: vec![],
+            },
             &[],
             &[(there.clone(), false)],
         );
@@ -3862,6 +3953,7 @@ mod tests {
         let (installed_there, _) = block2(
             &BridgeState::Absent {
                 prefix: PathBuf::from("/home/u/.steam/steam/steamapps/compatdata/359320/pfx"),
+                present: vec![],
             },
             &[],
             &[(there.clone(), true)],
@@ -3877,6 +3969,7 @@ mod tests {
         let (text, _) = block2(
             &BridgeState::Absent {
                 prefix: PathBuf::from("/p/pfx"),
+                present: vec![],
             },
             &[],
             &[],
@@ -3915,8 +4008,17 @@ mod tests {
     /// and "The bridge is installed." directly above the installer's own
     /// account of what it had skipped — a plural over one file, and an absence
     /// reported as a presence.
+    ///
+    /// It is named for a **state**, not a prefix, because that is all it
+    /// touches: it hands `BridgeState::Files` a `present` vector, so it is the
+    /// wording it breaks, never the stat. Deleting `present_files` leaves this
+    /// green, and it is meant to —
+    /// `present_files_lists_what_is_there_and_nothing_else` is the one that
+    /// stats a real directory, and it is the one that goes red. The old name
+    /// said "a prefix holding one of the three", which promised the stat this
+    /// test does not do.
     #[test]
-    fn a_prefix_holding_one_of_the_three_is_not_reported_as_holding_all_three() {
+    fn a_state_holding_one_of_the_three_is_not_worded_as_holding_all_three() {
         let one = files_with(vec![BRIDGE_ARTIFACT]);
         let (text, action) = block2(&one, &[], &[]);
         assert_eq!(action, Some(Action::Reinstall));
@@ -3971,6 +4073,171 @@ mod tests {
         assert!(
             !whole.contains("of the bridge's"),
             "all three arrived; the plain sentence is the whole truth: {whole}"
+        );
+    }
+
+    /// The mirror, which was left unfixed. `present_files`' own doc comment
+    /// states the rule for `Files` — "the bridge's files are in this prefix"
+    /// over one file is an absence reported as a presence — and `Absent`
+    /// carried no `present` at all, so it said flatly "The bridge's files are
+    /// not in it" over a directory that may hold two of the three. A presence
+    /// reported as an absence, out of a stat that had already seen them.
+    #[test]
+    fn a_prefix_missing_only_the_required_file_is_not_told_it_holds_none() {
+        let some = absent_files(&[BRIDGE_ARTIFACT]);
+        assert_eq!(
+            some.len(),
+            BRIDGE_FILES.len() - 1,
+            "the fixture is the other two, whatever they are called"
+        );
+
+        let (text, action) = block2(&absent_with(some.clone()), &[], &[]);
+        assert_eq!(
+            action,
+            Some(Action::Install),
+            "the file a game loads is still missing, so the button stays: {text}"
+        );
+        assert!(
+            !text.contains("The bridge's files are not in it"),
+            "{n} of them are, and a stat had already seen them: {text}",
+            n = some.len()
+        );
+        for f in &some {
+            assert!(
+                text.contains(f),
+                "{f} is in the prefix and the page does not name it: {text}"
+            );
+        }
+        assert!(
+            text.contains(&format!(
+                "{} of the bridge's {} files",
+                some.len(),
+                BRIDGE_FILES.len()
+            )),
+            "{text}"
+        );
+        let decides = format!("{BRIDGE_ARTIFACT}, the one a game has to load, is not");
+        assert!(
+            text.contains(&decides),
+            "and which one of them decides that nothing loads: {text}"
+        );
+
+        // An empty prefix reads as it always did: the qualification is earned
+        // by what the stat found, not appended to every page.
+        let (none, _) = block2(&absent(), &[], &[]);
+        assert!(none.contains("The bridge's files are not in it"), "{none}");
+        assert!(
+            none.contains(&format!("there is no {BRIDGE_ARTIFACT} under")),
+            "{none}"
+        );
+        assert_ne!(none, text, "two stats, two sentences");
+
+        // And the paragraph printed over an install that reported success and
+        // produced nothing loadable agrees with the same stat — which is why
+        // `outcome_text` takes the state at all.
+        let said = outcome_text(
+            &install_outcome(Some(0), "copied 2 file(s)\n", ""),
+            &absent_with(some),
+        );
+        assert!(said.contains("will not call that an install"), "{said}");
+        assert!(
+            !said.contains("The bridge's files are not in it"),
+            "the same two files are on disk here too: {said}"
+        );
+    }
+
+    /// `no_binary_text`'s own doc comment names the shape and the other arm
+    /// was fixed for it: `refresh` hides Details when there is no `tobii`, so
+    /// a page with no `tobii` must not point at it. The `Files` arm appended
+    /// "Details below is `tobii bridge status`, which does." unconditionally,
+    /// and `no_binary_text(Reinstall, …)` — appended in that same state — says
+    /// "which is why that button is not on the page either". Both paragraphs,
+    /// rendered, one after the other.
+    #[test]
+    fn a_page_with_no_details_button_does_not_tell_the_reader_to_press_details() {
+        let (with, _) = bridge_block(
+            &present(),
+            &[],
+            &[],
+            Some(Path::new("/usr/bin/tobii")),
+            "359320",
+        );
+        assert!(
+            with.contains("Details below is"),
+            "the button is on the page, so the sentence pointing at it is too: {with}"
+        );
+
+        let (without, action) = bridge_block(&present(), &[], &[], None, "359320");
+        assert_eq!(action, None, "nothing to run: {without}");
+        assert!(
+            !without.contains("Details below is"),
+            "`refresh` hides Details on `tobii.is_none()`, and this very page says so a \
+             paragraph later: {without}"
+        );
+        assert!(
+            without.contains("not on the page either"),
+            "the paragraph it contradicted is still here, so the sentence is what had to \
+             move: {without}"
+        );
+        // The fact that sentence was carrying is not lost with it.
+        assert!(
+            without.contains("which this window does not read"),
+            "the window still says what it did not look at: {without}"
+        );
+    }
+
+    /// `on_path` reads `std::env::var_os("PATH")` — **this process's**. A hub
+    /// started from its desktop entry does not inherit an interactive shell's,
+    /// and `~/.local/bin`, where `scripts/release.sh`'s `install.sh` puts both
+    /// binaries, is added by a shell rc far more often than by the session. So
+    /// three surfaces stated "is not on your PATH" — settled fact about the
+    /// user's terminal — from evidence covering only the GUI's environment,
+    /// and then told the user to type `tobii` in that terminal. None of them
+    /// said how to get it if the terminal has not got it either.
+    #[test]
+    fn what_this_window_says_about_a_tobii_it_could_not_find_is_about_its_own_path() {
+        for text in [
+            no_binary_text(Action::Install, "359320"),
+            no_binary_text(Action::Reinstall, "359320"),
+            lead(None).to_string(),
+        ] {
+            assert!(
+                !text.contains("not on your PATH"),
+                "the only PATH this window read is its own: {text}"
+            );
+            assert!(
+                text.contains("PATH this window was started with"),
+                "and it has to say whose, because it goes on to send the user to a terminal \
+                 with a different one: {text}"
+            );
+        }
+
+        // The two that print a command say where it would be, and what it
+        // means when the terminal cannot find it either — which no arm said.
+        for action in [Action::Install, Action::Reinstall] {
+            let text = no_binary_text(action, "359320");
+            assert!(
+                text.contains("~/.local/bin"),
+                "where this project's installer puts it: {text}"
+            );
+            assert!(
+                text.contains("install the release again"),
+                "and the one remedy that is not a PATH line: {text}"
+            );
+            assert!(
+                text.contains(&format!("tobii bridge install --steam {}", "359320")),
+                "the command is still there: {text}"
+            );
+        }
+
+        // And block 3 is the page every user sees, since no profile ships: it
+        // sends them to the same terminal, so the two must not disagree about
+        // what is known about it.
+        let write = write_a_profile_commands("359320");
+        assert!(write.contains("in a terminal"), "{write}");
+        assert!(
+            !write.contains("not on your PATH"),
+            "block 3 does not get to claim it either: {write}"
         );
     }
 
@@ -4384,6 +4651,23 @@ mod tests {
     /// and this window owns both: the whole file is refused when a path could
     /// climb out, and what the parser does accept is opened under the prefix
     /// and nowhere else.
+    ///
+    /// # What half one leans on, and who owns it
+    ///
+    /// The refusals are `check_path`'s, in
+    /// `crates/tobii-config/src/profiles.rs` — not this crate's. This test
+    /// pins its three answers because this window's own sentence is built on
+    /// them, so if that guard's answer to any of these three changes, this
+    /// test is the surface that has to change with it. It is a deliberate
+    /// cross-crate pin, not an accident.
+    ///
+    /// The backslash case did not reach `check_path` at all until the literal
+    /// was written with the escape TOML needs: `"drive_c\\users"` in Rust
+    /// source is one `\` in the file, and one `\` before `u` is a `\u`
+    /// escape, so the *string parser* rejected it for "`\u` takes four hex
+    /// digits" several hundred lines earlier. Deleting `check_path`'s
+    /// backslash guard left this test green. Hence the assertion below that
+    /// the refusal is not that one.
     #[test]
     fn this_window_opens_nothing_outside_the_prefix_it_was_given() {
         let root = scratch("stays-inside");
@@ -4411,13 +4695,18 @@ mod tests {
             )
         };
 
-        // Half one: nothing that could climb out survives being parsed, and
-        // the whole file goes rather than the one check — which is this
-        // window's sentence to write, not the parser's.
-        for bad in ["../drive_c/here.xml", "/etc/passwd", "drive_c\\users"] {
+        // Half one: none of the three shapes `check_path` refuses survives
+        // being parsed, and the whole file goes rather than the one check —
+        // which is this window's sentence to write, not the parser's.
+        for bad in ["../drive_c/here.xml", "/etc/passwd", "drive_c\\\\users"] {
             let error = profiles::parse(&profile(bad)).expect_err(
-                "a path that can leave the prefix has to be refused when the file is read, \
-                 not joined onto a prefix and opened",
+                "a path `check_path` refuses has to be refused when the file is read, not \
+                 joined onto a prefix and opened",
+            );
+            assert!(
+                !error.to_string().contains("hex digits"),
+                "{bad} has to reach `check_path`; dying in the string-escape parser is this \
+                 test passing for the wrong reason: {error}"
             );
             let v = profile_verdict(Err(profiles::LoadError::Malformed {
                 origin: at("/cfg/profiles/359320.toml"),
@@ -4543,6 +4832,7 @@ mod tests {
     fn a_machine_with_no_tobii_gets_no_button_and_a_command_to_type() {
         let state = BridgeState::Absent {
             prefix: PathBuf::from("/p/pfx"),
+            present: vec![],
         };
         let (text, action) = bridge_block(&state, &[], &[], None, "359320");
         assert_eq!(action, None, "nothing to run it with: {text}");
