@@ -399,21 +399,26 @@ impl RowBridge {
 /// this is the check that stands in for it and it runs in CI.
 /// What the button that runs `tobii bridge status` is called.
 ///
-/// It was "Details", and that is the one word it must not be: beside Install
-/// and Uninstall, "Details" reads as *more of what is above* — and what is
-/// above explicitly does not read the registry. This button does, and those
-/// two values are what decide whether a game loads our DLL at all. On the
-/// machine this was written on it answers `Z:\usr\libexec\opentrack`, which
-/// is the whole diagnosis of "I installed it and nothing happened" and was
-/// sitting behind a caption that sounded optional.
-pub(crate) const DETAILS_CAPTION: &str = "Check what's registered";
+/// It was "Details", then briefly "Check what's registered" — and neither is
+/// right now that block 2 reads the registry itself. What this button adds is
+/// the REST of that command's report: the wine build the prefix records,
+/// whether a wineserver is holding it, whose the registration is judged to be
+/// against a record file inside the prefix, and the caveats. It is the thing
+/// to paste into an issue, and nothing on this page depends on pressing it.
+///
+/// The step it went through is worth leaving here: while block 2 said it could
+/// not read those two values, this button was the only way to learn the one
+/// fact that decides whether a game loads our client — and pressing it printed
+/// a terminal report whose first half repeated the paragraph above it, which
+/// is what somebody noticed and reported.
+pub(crate) const DETAILS_CAPTION: &str = "Full report\u{2026}";
 
 /// See [`ADD_GAME_CAPTION`].
 pub(crate) const DETAILS_TIP: &str =
-    "Run `tobii bridge status` for this game and show what it prints: which client DLL this \
-     prefix has registered for TrackIR and FreeTrack, and which files are in it. That \
-     registration is what decides whether a game loads ours, and the section above does not \
-     read it. It starts nothing.";
+    "Run `tobii bridge status` for this game and show everything it prints — the wine build \
+     this prefix records, whether anything is holding it, and whose the registration is \
+     judged to be. What is registered is already above; this is the whole report, for \
+     pasting into an issue. It starts nothing.";
 /// See [`DETAILS_TIP`].
 pub(crate) const UNINSTALL_TIP: &str =
     "Run `tobii bridge uninstall` for this game: take the bridge's files back out of the prefix \
@@ -1366,6 +1371,49 @@ pub(crate) fn measured_note(m: Option<&signature::Measured>, already: bool) -> O
     Some(s)
 }
 
+/// The two registry values that decide which client a game loads, read out of
+/// the prefix's own `user.reg`.
+///
+/// # Why this is here now and was not before
+///
+/// Block 2 used to say, in as many words, that this window does not read these
+/// — and the reason was never that reading them is hard. It is a plain-text
+/// file and `tobii_config::userreg` does it with no dependencies and no wine.
+/// The reader simply lived in `tobii-cli`, which is a `[[bin]]`, so the one
+/// fact that decides whether a game loads our client at all was reachable only
+/// by pressing a button that shelled out — and what came back was a terminal
+/// report whose first half repeated what block 2 had already said.
+///
+/// # What it does NOT say
+///
+/// Whose the registration is. `tobii bridge status` judges that against a
+/// record file it wrote inside the prefix, and a second opinion here — "the
+/// path looks like ours" — would be a looser rule reaching a confident verdict
+/// on the same question. So this reports the VALUE and names the button that
+/// judges it. A user reading `Z:\usr\libexec\opentrack` has what they came
+/// for either way.
+///
+/// `None` when there is no prefix, no `user.reg`, or it cannot be read — three
+/// different nothings that all mean "this cannot be reported from here", and a
+/// sentence claiming otherwise is what the block above is written against.
+pub(crate) fn registered_clients(prefix: Option<&Path>) -> Option<String> {
+    use tobii_config::userreg::{lookup, Lookup};
+    let text = std::fs::read(prefix?.join(tobii_config::userreg::FILE)).ok()?;
+    let say = |abi: &str, path: &str| match lookup(&text, path, tobii_config::userreg::PATH_VALUE) {
+        Lookup::Absent => format!("{abi} has nothing registered"),
+        Lookup::Text(v) => format!("{abi} is registered to {v}"),
+        Lookup::Rejected(why) => format!("{abi} holds something this program cannot read — {why}"),
+    };
+    Some(format!(
+        "Registered in this prefix, read from its own `{file}` with no wine run against it: \
+         {ft}; {np}. That is what a game will load. Whether either of them is this program's \
+         is a question about a record kept inside the prefix, which the button below answers.",
+        file = tobii_config::userreg::FILE,
+        ft = say("FreeTrack", tobii_config::userreg::FREETRACK_KEY),
+        np = say("TrackIR", tobii_config::userreg::NPCLIENT_KEY),
+    ))
+}
+
 // ------------------------------------------------------- block 2: the bridge
 
 /// What a stat of the prefix found. Three cases, and the names say exactly how
@@ -1669,23 +1717,19 @@ pub(crate) fn bridge_block(
             )
         }
         BridgeState::Files { dir, present, .. } => {
-            let mut s = format!(
+            // The question, and no pointer at a button for the answer: the
+            // answer is the line `registered_clients` adds under this one. It
+            // used to say "which this window does not read" and then name the
+            // button that did — a sentence that had to be made conditional on
+            // there being a `tobii` to run, and whose whole existence was an
+            // artefact of the reader living in a binary the hub cannot link.
+            format!(
                 "{}\n\n\
                  Whether the game will actually find {them} is a question about two registry \
-                 values inside the prefix, which this window does not read.",
+                 values inside the prefix.",
                 present_sentence(dir, present),
                 them = plural(present.len(), "it", "them"),
-            );
-            // The same gate the button has. `refresh` hides Details when there
-            // is no `tobii`, and this sentence pointing at it was appended
-            // unconditionally — so on a machine with none the page said
-            // the sentence pointing at the button and then, two
-            // paragraphs down in `no_binary_text`, "which is why that button
-            // is not on the page either". X4 fixed that for the other arm.
-            if tobii.is_some() {
-                s.push_str(" The button below does — it runs `tobii bridge status`.");
-            }
-            s
+            )
         }
     };
     // Both notes hang off every state, because both are reasons the sentence
@@ -3781,6 +3825,13 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 beside.as_deref(),
                 &app.target,
             );
+            // What is registered in the prefix, which block 2 used to say it
+            // could not report. Above the profile and measurement notes,
+            // because it is a fact about this machine and they are context.
+            if let Some(note) = registered_clients(chosen.as_deref()) {
+                text.push_str("\n\n");
+                text.push_str(&note);
+            }
             let profile_said = profile.and_then(|p| profile_bridge_note(p.bridge));
             let said_the_gate = profile_said
                 .as_deref()
@@ -7158,77 +7209,101 @@ mod tests {
         );
     }
 
-    /// `no_binary_text`'s own doc comment names the shape and the other arm
-    /// was fixed for it: `refresh` hides Details when there is no `tobii`, so
-    /// a page with no `tobii` must not point at it. The `Files` arm appended
-    /// the sentence pointing at the button unconditionally,
-    /// and `no_binary_text(Reinstall, …)` — appended in that same state — says
-    /// "which is why that button is not on the page either". Both paragraphs,
-    /// rendered, one after the other.
+    /// The registry line reports the VALUE and judges nothing.
+    ///
+    /// `tobii bridge status` decides whose a registration is against a record
+    /// file it wrote inside the prefix. A second, looser opinion here — "the
+    /// path looks like ours" — would be two surfaces reaching confident
+    /// verdicts on one question by different rules, which is the drift
+    /// `signature.rs` was created to stop. So this states what is there and
+    /// names the button that judges it.
     #[test]
-    fn a_page_with_no_details_button_does_not_tell_the_reader_to_press_details() {
-        let with = bridge_block(
-            &present(),
-            &[],
-            &[],
-            Some(Path::new("/usr/bin/tobii")),
-            Some(Path::new("/opt/x")),
-            &Target::Steam("359320".to_string()),
-        );
-        assert!(
-            with.contains("The button below does"),
-            "the button is on the page, so the sentence pointing at it is too: {with}"
-        );
+    fn the_registry_line_says_what_is_registered_and_not_whose_it_is() {
+        let dir = scratch("userreg");
+        std::fs::create_dir_all(&dir).expect("fixture");
+        // Raw strings, and the backslashes are DOUBLED because that is how
+        // wine writes them into the file — a fixture with single ones parses
+        // as no such section and the line reads "nothing is registered",
+        // which is the confident negative this whole page is written against.
+        std::fs::write(
+            dir.join(tobii_config::userreg::FILE),
+            concat!(
+                "WINE REGISTRY Version 2\n\n",
+                r"[Software\\Freetrack\\FreeTrackClient] 1790444400",
+                "\n",
+                r#""Path"="C:\\tobii-bridge""#,
+                "\n\n",
+                r"[Software\\NaturalPoint\\NATURALPOINT\\NPClient Location] 1790444400",
+                "\n",
+                r#""Path"="Z:\\usr\\libexec\\opentrack""#,
+                "\n",
+            ),
+        )
+        .expect("fixture");
 
-        let without = bridge_block(
-            &present(),
-            &[],
-            &[],
+        let note = registered_clients(Some(&dir)).expect("a prefix with a user.reg");
+        assert!(note.contains("FreeTrack is registered to"), "{note}");
+        assert!(note.contains("TrackIR is registered to"), "{note}");
+        assert!(
+            note.contains("opentrack"),
+            "the value is the whole point — this is the line that answers \"I installed it \
+             and nothing happened\": {note}"
+        );
+        for verdict in [
+            "registered by this installer",
+            "not this installer's",
+            "ours",
+        ] {
+            assert!(
+                !note.contains(verdict),
+                "{verdict:?} is `tobii bridge status`'s judgement, made against a record \
+                 file this does not read: {note}"
+            );
+        }
+
+        // Three different nothings, all of which mean "not from here".
+        assert_eq!(registered_clients(None), None, "no prefix");
+        assert_eq!(
+            registered_clients(Some(&dir.join("nope"))),
             None,
-            Some(Path::new("/opt/x")),
-            &Target::Steam("359320".to_string()),
-        );
-        // The no-button half moved to `actions`, which is the one decider
-        // now: `bridge_block` writes the paragraph and says nothing about
-        // buttons. Asserted here because this test is about the two agreeing.
-        assert!(
-            actions(
-                &present(),
-                None,
-                &quiet_job(),
-                Reach::Reachable,
-                false,
-                Group::NotSetUp
-            )
-            .primary
-            .is_none(),
-            "nothing to run: {without}"
-        );
-        assert!(
-            !without.contains("The button below does"),
-            "`refresh` hides Details on `tobii.is_none()`, and this very page says so a \
-             paragraph later: {without}"
-        );
-        assert!(
-            without.contains("not on the page either"),
-            "the paragraph it contradicted is still here, so the sentence is what had to \
-             move: {without}"
-        );
-        // The fact that sentence was carrying is not lost with it.
-        assert!(
-            without.contains("which this window does not read"),
-            "the window still says what it did not look at: {without}"
+            "a prefix with no user.reg in it"
         );
     }
 
-    /// `on_path` reads `std::env::var_os("PATH")` — **this process's**. A hub
-    /// started from its desktop entry does not inherit an interactive shell's,
-    /// and `~/.local/bin`, where `scripts/release.sh`'s `install.sh` puts both
-    /// binaries, is added by a shell rc far more often than by the session. So
-    /// three surfaces stated "is not on your PATH" — settled fact about the
-    /// user's terminal — from evidence covering only the GUI's environment,
-    /// and then told the user to type `tobii` in that terminal. None of them
-    /// said how to get it if the terminal has not got it either.
+    /// Block 2 no longer says it cannot read the registry, because it can.
+    ///
+    /// That sentence, and the one pointing at the button that could, were the
+    /// shape of the whole problem: the hub shelled out for a plain-text file
+    /// because the reader lived in a binary it cannot link. `userreg` moved to
+    /// `tobii-config` and `registered_clients` reads it here, so the paragraph
+    /// states the question and the answer lands under it — and neither half
+    /// depends any more on whether there is a `tobii` to run.
+    #[test]
+    fn block_two_names_the_registry_question_whether_or_not_a_tobii_can_answer_it() {
+        for (what, tobii) in [
+            ("with a tobii", Some(Path::new("/usr/bin/tobii"))),
+            ("without one", None),
+        ] {
+            let text = bridge_block(
+                &present(),
+                &[],
+                &[],
+                tobii,
+                Some(Path::new("/opt/x")),
+                &Target::Steam("359320".to_string()),
+            );
+            assert!(
+                text.contains("two registry values inside the prefix"),
+                "{what}: the question this block is about: {text}"
+            );
+            assert!(
+                !text.contains("this window does not read"),
+                "{what}: it reads them now, and a page saying otherwise sends the reader \
+                 looking for a button it does not need: {text}"
+            );
+        }
+    }
+
     #[test]
     fn what_this_window_says_about_a_tobii_it_could_not_find_is_about_its_own_path() {
         for text in [

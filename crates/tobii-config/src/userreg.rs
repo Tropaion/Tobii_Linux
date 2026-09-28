@@ -11,11 +11,11 @@
 //! `drive_c/windows` tree — and against a *complete* prefix whose
 //! `.update-timestamp` was stale, which is what a Proton prefix looks like to
 //! the host's wine, it rewrote 2744 lines of `system.reg` and stamped the
-//! prefix as its own. That is exactly the upgrade [`crate::bridge::WineOrigin`]
+//! prefix as its own. That is exactly the upgrade `tobii-cli`'s `bridge::WineOrigin`
 //! exists to warn about, and a command whose whole job is to report what is
 //! wrong must not be the thing that changes it.
 //!
-//! [`crate::bridge`]'s two discovery keys are both under `HKCU`, and a prefix
+//! `tobii-cli`'s two discovery keys are both under `HKCU`, and a prefix
 //! keeps `HKCU` in one plain-text file. Reading it needs no wine, so the answer
 //! does not depend on which build happens to be on `$PATH` either.
 //!
@@ -23,7 +23,7 @@
 //! the registry as it was last *written back*. A live wineserver holds changes
 //! in memory and flushes them when the last process on the prefix exits, so a
 //! value written by something still running is not in this file yet.
-//! [`crate::wineserver::probe`] is what says whether that is the case, and the
+//! `tobii-cli`'s `wineserver::probe` is what says whether that is the case, and the
 //! caller says so in the report. The old path was accurate and destructive;
 //! this one is safe and can lag.
 //!
@@ -96,6 +96,20 @@ pub enum Lookup {
 
 /// The name of the file this module reads, inside a prefix.
 pub const FILE: &str = "user.reg";
+
+/// Where a TrackIR client says it lives, as [`lookup`] wants the path: under
+/// `HKCU`, with the hive prefix already off.
+///
+/// Here rather than in either caller, because there are two now — `tobii-cli`'s
+/// report and the hub's Games tab — and a key path spelled twice is a key path
+/// that can be spelled differently. Getting one character wrong reads as
+/// "nothing is registered", which is a confident negative about the one fact
+/// that decides whether a game loads anything.
+pub const NPCLIENT_KEY: &str = r"Software\NaturalPoint\NATURALPOINT\NPClient Location";
+/// Where a FreeTrack client says it lives. See [`NPCLIENT_KEY`].
+pub const FREETRACK_KEY: &str = r"Software\Freetrack\FreeTrackClient";
+/// The value name both of them keep the path under.
+pub const PATH_VALUE: &str = "Path";
 
 /// The first line wine requires of a `user.reg`, exactly.
 ///
@@ -526,8 +540,10 @@ fn escape_digits(
 mod tests {
     use super::*;
 
-    const FT: &str = r"Software\Freetrack\FreeTrackClient";
-    const NP: &str = r"Software\NaturalPoint\NATURALPOINT\NPClient Location";
+    // The shipped constants, so a test cannot pass against a path the
+    // callers do not use.
+    const FT: &str = super::FREETRACK_KEY;
+    const NP: &str = super::NPCLIENT_KEY;
 
     /// Copied byte for byte out of a `user.reg` written by wine 11.18 on this
     /// machine, from a prefix booted with `wineboot -i` and then given each

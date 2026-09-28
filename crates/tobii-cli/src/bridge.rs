@@ -1064,7 +1064,7 @@ fn hkcu_path(key: &str) -> Option<&str> {
 /// *were* answered are still returned alongside it — nothing here is
 /// `Reading::Absent` that was not read as absent.
 fn read_keys_read_only(prefix: &Path) -> (Vec<(KeyEntry, Reading)>, Option<String>) {
-    let file = prefix.join(crate::userreg::FILE);
+    let file = prefix.join(tobii_config::userreg::FILE);
     let text = match std::fs::read(&file) {
         Ok(t) => t,
         Err(e) => {
@@ -1077,7 +1077,7 @@ fn read_keys_read_only(prefix: &Path) -> (Vec<(KeyEntry, Reading)>, Option<Strin
                      not the same as nothing being registered in them. A prefix that\n\
                      has never been started has no {} yet.",
                     file.display(),
-                    crate::userreg::FILE
+                    tobii_config::userreg::FILE
                 )),
             );
         }
@@ -1100,10 +1100,10 @@ fn read_keys_read_only(prefix: &Path) -> (Vec<(KeyEntry, Reading)>, Option<Strin
         };
         out.push((
             entry,
-            match crate::userreg::lookup(&text, path, "Path") {
-                crate::userreg::Lookup::Absent => Reading::Absent,
-                crate::userreg::Lookup::Text(v) => Reading::Plain(v),
-                crate::userreg::Lookup::Rejected(why) => Reading::Other(why),
+            match tobii_config::userreg::lookup(&text, path, "Path") {
+                tobii_config::userreg::Lookup::Absent => Reading::Absent,
+                tobii_config::userreg::Lookup::Text(v) => Reading::Plain(v),
+                tobii_config::userreg::Lookup::Rejected(why) => Reading::Other(why),
             },
         ));
     }
@@ -2998,7 +2998,7 @@ fn gather_status(args: &[String]) -> Result<Status, String> {
         wine_given: crate::flag_value(args, "--wine").is_some(),
         wine_warning,
         server,
-        registry_file: prefix.join(crate::userreg::FILE),
+        registry_file: prefix.join(tobii_config::userreg::FILE),
         dir_present: presence(&dir, std::fs::Metadata::is_dir, "a directory"),
         dir,
         artifacts,
@@ -4124,7 +4124,7 @@ exit 0
 
         /// Where the prefix keeps its `HKEY_CURRENT_USER` keys.
         fn user_reg(&self) -> PathBuf {
-            self.prefix().join(crate::userreg::FILE)
+            self.prefix().join(tobii_config::userreg::FILE)
         }
 
         /// Rebuild `user.reg` from whatever the two keys hold, the way wine
@@ -4972,7 +4972,7 @@ exit 0
         w.registered("np", "   ");
         // About `reg query`'s reader, which is reached from a prefix the file
         // cannot answer for. `user.reg` has its own wording for this shape and
-        // its own test, in `crate::userreg`.
+        // its own test, in `tobii_config::userreg`.
         w.without_user_reg();
         let err = install(&w.args("install", &[]))
             .expect_err("must refuse")
@@ -6963,7 +6963,7 @@ exit 0
         let prefix = PathBuf::from("/games/steamapps/compatdata/2537590/pfx");
         Status {
             dir: prefix.join(INSTALL_SUBDIR),
-            registry_file: prefix.join(crate::userreg::FILE),
+            registry_file: prefix.join(tobii_config::userreg::FILE),
             prefix,
             source: PrefixSource::Steam(wanted.to_string()),
             wine: PathBuf::from("/games/Proton/files/bin/wine"),

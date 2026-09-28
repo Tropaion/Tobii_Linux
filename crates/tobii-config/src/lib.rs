@@ -35,6 +35,17 @@ mod setup;
 pub mod sha256;
 pub mod signature;
 mod store;
+/// Reading a Wine prefix's `HKEY_CURRENT_USER` out of `user.reg`, without
+/// running wine.
+///
+/// Here rather than in `tobii-cli` for [`signature`]'s reason, word for word:
+/// `tobii-cli` is a `[[bin]]`, so the hub cannot link it, and two surfaces have
+/// to answer the same question. The hub's Games tab used to say outright that
+/// it could not read these two values — not because reading them is hard (this
+/// module has no dependencies and does no I/O) but because the reader was on
+/// the wrong side of a binary. So the one fact that decides whether a game
+/// loads our client was reachable only by shelling out.
+pub mod userreg;
 
 pub use calibration_state::{decide, CalAction, RecommendReason};
 pub use edid::{detect_monitors, pick_monitor, MonitorInfo};

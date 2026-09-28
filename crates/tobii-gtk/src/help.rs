@@ -366,8 +366,8 @@ pub fn topics() -> Vec<Topic> {
                  The buttons under the page act on the Wine bridge and on \
                  nothing else. Install puts it into the prefix, Reinstall does it \
                  again over what is there, Uninstall takes it back out, and \
-                 Details runs `tobii bridge status` and prints what it says \
-                 without starting anything. When there is nothing to press, the \
+                 and the last runs `tobii bridge status` and prints its whole \
+                 report without starting anything. When there is nothing to press, the \
                  bar says why instead of going blank.\n\n\
                  \u{201c}{other}\u{201d} appears for a game this \
                  project has watched refuse ours at the signature check, and for \
