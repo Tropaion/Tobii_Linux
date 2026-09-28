@@ -23,6 +23,9 @@ use tobii_headpose::model_store::{self, ModelSource, Status};
 /// detector's guess and cost nothing.
 const SRC: &ModelSource = &model_store::HEAD_POSE;
 
+use crate::device::HeadModel;
+use std::rc::Rc;
+
 /// Status line for the section. Never invites the user to believe a wrong file
 /// will be used, and never implies head tracking is unavailable without it.
 pub fn status_line(st: &Status) -> String {
@@ -37,6 +40,45 @@ pub fn status_line(st: &Status) -> String {
             &found[..12.min(found.len())]
         ),
     }
+}
+
+/// The same line, from what the device thread found out rather than from a
+/// `stat`.
+///
+/// [`status_line`] answers "what is on disk"; this answers "what is this
+/// program running", and the two are not the same question. A file of the right
+/// length that ONNX will not load is `Status::Ready` and no up-and-down angle,
+/// which is the card saying *"Working, with the up-and-down angle."* over a
+/// model that was refused — the digest is enforced where the model is RUN and
+/// was reported nowhere.
+///
+/// [`HeadModel::Unasked`] falls back to the disk, and that is not a shortcut:
+/// the device thread only loads the model when it connects, so a hub opened
+/// with no tracker plugged in has nothing to report from — and "no model" over
+/// one that is sitting there would be worse than the stat it replaced.
+pub fn running_line(st: &HeadModel) -> Option<String> {
+    match st {
+        HeadModel::Unasked => None,
+        HeadModel::Running => Some(status_line(&Status::Ready)),
+        HeadModel::Missing => Some(status_line(&Status::Missing)),
+        // Not `status_line(Corrupt)`, which names a digest, because this is the
+        // wider case: the digest matched and ONNX refused it, the file is
+        // truncated, the runtime is missing. What the reader needs is that it
+        // is not being used and that fetching it again is the thing to try.
+        HeadModel::Refused(why) => Some(format!(
+            "Working. The model on disk is not being used — {}. Fetch it again.",
+            first_clause(why)
+        )),
+    }
+}
+
+/// The first line of a runtime's error, which is where it says what happened.
+///
+/// ONNX errors run to several lines with a stack of paths in them, and this
+/// label is one column wide. The whole thing is in the log, which is where a
+/// report comes from.
+fn first_clause(why: &str) -> &str {
+    why.lines().next().unwrap_or(why).trim()
 }
 
 /// Progress line while the fetcher runs. `total` is the pinned size, so this
@@ -137,7 +179,7 @@ pub fn download_summary(src: &ModelSource) -> String {
 pub fn control(
     state: std::sync::Arc<std::sync::Mutex<crate::device::DeviceState>>,
     cmd_tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>,
-) -> gtk::Box {
+) -> HeadCard {
     // Installing or removing the model changes what the device thread can do,
     // and it resolves that once when it connects. Every path that changes the
     // file tells it to look again, so a fetch takes effect immediately instead
@@ -180,28 +222,54 @@ pub fn control(
     actions.append(&updates);
     actions.append(&remove);
 
-    let refresh = {
+    let refresh: Rc<dyn Fn()> = {
         let (status, pitch) = (status.clone(), pitch.clone());
+        // **Weak, all four**, and it is the four buttons that make it
+        // necessary: each of them carries a handler that holds this closure, so
+        // a strong handle here is a cycle between two parts of one card — the
+        // shape `tests/games_tab.rs` measured at 23 widgets and 45 event
+        // controllers on the other tab. It matters more now than it did: this
+        // closure used to be reachable only from those handlers and now lives
+        // as long as the hub's tick.
         let (get, set_pitch, updates, remove) = (
-            get.clone(),
-            set_pitch.clone(),
-            updates.clone(),
-            remove.clone(),
+            get.downgrade(),
+            set_pitch.downgrade(),
+            updates.downgrade(),
+            remove.downgrade(),
         );
-        move || {
-            // The cheap check: `status` reads and digests 13 MB, and this runs
-            // during hub construction and after every change. The digest is
-            // still enforced where it decides whether to RUN the model.
+        let state = state.clone();
+        Rc::new(move || {
+            // What the device thread actually loaded, when it has tried. It
+            // answers the question this line asks — "is the up-and-down angle
+            // working" — where the file on disk only answers "is there a file
+            // of the right length", and a model ONNX refuses is both.
+            //
+            // The disk is still the fallback, for the hub opened with no
+            // tracker plugged in: the worker is spawned on connect, so until
+            // then nothing has tried. `status_quick` is the cheap form —
+            // `status` reads and digests 13 MB — and its digest is only paid
+            // when the length is already wrong.
+            let published = state
+                .lock()
+                .map(|s| s.head_model.clone())
+                .unwrap_or_else(|e| e.into_inner().head_model.clone());
             let st = model_store::status_quick(SRC);
-            let ready = matches!(st, Status::Ready);
-            status.set_text(&status_line(&st));
+            let ready = match &published {
+                HeadModel::Unasked => matches!(st, Status::Ready),
+                other => *other == HeadModel::Running,
+            };
+            status.set_text(&running_line(&published).unwrap_or_else(|| status_line(&st)));
             pitch.set_text(&pitch_line(model_store::pitch_offset()));
             pitch.set_visible(ready);
-            get.set_visible(!ready);
-            for only_when_installed in [&set_pitch, &updates, &remove] {
-                only_when_installed.set_visible(ready);
+            if let Some(b) = get.upgrade() {
+                b.set_visible(!ready);
             }
-        }
+            for only_when_installed in [&set_pitch, &updates, &remove] {
+                if let Some(b) = only_when_installed.upgrade() {
+                    b.set_visible(ready);
+                }
+            }
+        })
     };
     refresh();
     b.append(&status);
@@ -218,7 +286,13 @@ pub fn control(
             let parent = btn.root().and_downcast::<gtk::Window>();
             let reload = reload.clone();
             terms_dialog(parent.as_ref(), move || {
-                start_download(&btn, &status, refresh.clone(), reload.clone())
+                {
+                    // `Rc<dyn Fn()>` is not itself `Fn`, and the two callers
+                    // below take a `Fn + Clone` — one clone per call, wrapped
+                    // where it is passed rather than changing their bounds.
+                    let refresh = refresh.clone();
+                    start_download(&btn, &status, move || refresh(), reload.clone())
+                }
             });
         });
     }
@@ -233,7 +307,10 @@ pub fn control(
                 state.clone(),
                 cmd_tx.clone(),
                 pitch_label.clone(),
-                refresh.clone(),
+                {
+                    let refresh = refresh.clone();
+                    move || refresh()
+                },
             );
         });
     }
@@ -315,7 +392,26 @@ pub fn control(
         });
     }
 
-    b
+    HeadCard { root: b, refresh }
+}
+
+/// The head-model card, and the one thing the hub has to be able to do to it.
+///
+/// Two fields taken apart on the spot by the caller, for [`crate::GamesTab`]'s
+/// reason: `root` goes into the rack, which owns it, and `refresh` holds no
+/// widget strongly, so the hub's tick can keep a handle on it without holding
+/// a subtree of its own window.
+pub struct HeadCard {
+    /// The widget the rack gets.
+    pub root: gtk::Box,
+    /// Re-read what the device thread found out about the model.
+    ///
+    /// Held by the hub's tick and called when the answer changes. This card
+    /// had no refresh path at all: it was drawn once when the hub was built
+    /// and again after each of its own buttons, so what the device thread
+    /// learned on connect — which is the only place the model is really loaded
+    /// — reached the screen at the next restart of the program.
+    pub refresh: Rc<dyn Fn()>,
 }
 
 /// The guided pitch-zero measurement: instructions, a live countdown, a result.
@@ -656,6 +752,57 @@ mod tests {
         let s = status_line(&Status::Missing);
         assert!(s.starts_with("Working"), "{s}");
         assert!(s.contains("angle"), "{s}");
+    }
+
+    /// The card reports what the program is RUNNING, and falls back to the
+    /// disk only when nothing has tried yet.
+    ///
+    /// The bug this closes: a model file of the right length that ONNX refuses
+    /// is `Status::Ready` to a `stat`, so the card said "Working, with the
+    /// up-and-down angle." over a model that was not being used. The digest
+    /// was enforced where the model is run and reported nowhere, and the two
+    /// answers were never compared because only one of them was on screen.
+    ///
+    /// `Unasked` is `None` on purpose rather than a fourth sentence: the
+    /// device thread loads the model when it connects, so a hub opened with no
+    /// tracker plugged in has nothing to report from, and "no model" over one
+    /// that is sitting on the disk would be worse than the `stat` it replaced.
+    #[test]
+    fn the_card_reports_the_model_the_program_loaded_not_the_file_on_disk() {
+        assert_eq!(running_line(&HeadModel::Unasked), None, "fall back to disk");
+        assert_eq!(
+            running_line(&HeadModel::Running).as_deref(),
+            Some("Working, with the up-and-down angle."),
+            "the same sentence a ready file gets, because it is the same claim"
+        );
+        assert_eq!(
+            running_line(&HeadModel::Missing),
+            Some(status_line(&Status::Missing)),
+            "and the same for no model at all"
+        );
+        let refused = running_line(&HeadModel::Refused(
+            "Load model failed: /home/me/.local/share/x.onnx\n  invalid protobuf".to_string(),
+        ))
+        .expect("a refusal has something to say");
+        assert!(
+            refused.starts_with("Working."),
+            "head tracking still works without the model — this line has never been \
+             allowed to read as a broken feature: {refused}"
+        );
+        assert!(
+            refused.contains("not being used"),
+            "which is the whole of what a `stat` could not say: {refused}"
+        );
+        assert!(
+            refused.contains("Load model failed") && !refused.contains("invalid protobuf"),
+            "the first line of the runtime's error and not the stack of paths \
+             under it — this label is one column wide, and the whole thing is in \
+             the log: {refused}"
+        );
+        assert!(
+            !refused.contains('\n'),
+            "one line, wrapped by the widget: {refused}"
+        );
     }
 
     /// These sit under a heading in a narrow column. Long is unread.

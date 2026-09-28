@@ -408,6 +408,9 @@ pub struct DeviceState {
     pub cal_session_open: bool,
     /// Progress and result of a head-pose pitch-zero measurement.
     pub pitch_cal: PitchCal,
+    /// What became of the head-pose model the last time this program tried to
+    /// load it. See [`HeadModel`].
+    pub head_model: HeadModel,
     /// Most recent head pose, as the opentrack stream would see it: position
     /// from the eye origins, rotation from the model. `None` until a model is
     /// installed AND a frame it was confident about has arrived.
@@ -808,6 +811,36 @@ pub fn device_tick<T: Transport>(
     }
 }
 
+/// What became of the head-pose model the last time it was loaded.
+///
+/// Written by [`HeadWorker::spawn`], which is the one place that finds out: it
+/// reads the file, hashes it and hands it to ONNX, and what it learns decides
+/// whether this program reports an up-and-down angle at all.
+///
+/// The card that reports this used to `stat` the file instead — the size, and
+/// the digest only when the size was wrong. That is a cheap check and it was
+/// the right one while it ran during hub construction and nowhere else, but it
+/// answers a different question: a file of the right length that ONNX will not
+/// load reads as *"Working, with the up-and-down angle."* and there is no
+/// angle. The digest was enforced where the model is RUN and reported where it
+/// is not, so the two could disagree and only one of them was on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HeadModel {
+    /// Nothing has tried yet. The device thread loads the model when it
+    /// connects, so this is what a hub with no tracker plugged in reports —
+    /// and it is why the card falls back to reading the file itself rather
+    /// than saying "no model" over one that is sitting there.
+    #[default]
+    Unasked,
+    /// Loaded, and the worker is estimating from it.
+    Running,
+    /// No model file. The ordinary case: this program ships without one.
+    Missing,
+    /// There is a file and it would not load. Carries what went wrong, which
+    /// is a digest mismatch or whatever ONNX said about it.
+    Refused(String),
+}
+
 /// Runs the head-pose model off the device thread.
 ///
 /// Inference is ~12 ms a frame against a 33 ms frame interval. That fits, but
@@ -830,10 +863,21 @@ impl HeadWorker {
     fn spawn(state: Arc<Mutex<DeviceState>>) -> Option<HeadWorker> {
         use tobii_headpose::onnx::{fuse, OnnxPose, RotationSource};
         let mut model = match OnnxPose::from_store() {
-            Ok(m) => m,
-            Err(tobii_headpose::onnx::OnnxError::ModelMissing(_)) => return None,
+            Ok(m) => {
+                state.lock().unwrap().head_model = HeadModel::Running;
+                m
+            }
+            Err(tobii_headpose::onnx::OnnxError::ModelMissing(_)) => {
+                state.lock().unwrap().head_model = HeadModel::Missing;
+                return None;
+            }
+            // Published as well as logged, and that is the whole point of the
+            // field: this branch is a model file that is there and will not
+            // run, and the card reporting on it was reading the file's length.
             Err(e) => {
-                tobii_diagnostics::log::warn(&format!("head pose: {e}"));
+                let why = e.to_string();
+                tobii_diagnostics::log::warn(&format!("head pose: {why}"));
+                state.lock().unwrap().head_model = HeadModel::Refused(why);
                 return None;
             }
         };

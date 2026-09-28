@@ -1627,6 +1627,13 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         "",
         &eyes_box,
     ));
+    // Taken apart on the spot, the way the Games tab is and for the same
+    // reason: the tick holds `refresh`, which holds no widget strongly, and
+    // never the card, which is one of this window's own descendants.
+    let head_model::HeadCard {
+        root: head_root,
+        refresh: head_refresh,
+    } = head_model::control(state.clone(), cmd_tx.clone());
     col_display.append(&section(
         "Head tracking",
         // Kept, because it is the only thing on this card that says what head
@@ -1637,7 +1644,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // and "to games and apps" and "over opentrack", the searchable keyword,
         // both stay.
         "Sends position and angle to games and apps, over opentrack.",
-        &head_model::control(state.clone(), cmd_tx.clone()),
+        &head_root,
     ));
 
     // Where the result goes: onto the screen, and out to a game.
@@ -2187,6 +2194,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // or stopping — or `tobii games` run in a terminal — is reflected without
     // reopening the window, which is how somebody setting this up works.
     let tick_games = Rc::new(games_row);
+    // What the head-model card was last told, so the tick only redraws it when
+    // the device thread's answer has actually changed.
+    let last_head_model: Rc<RefCell<Option<device::HeadModel>>> = Rc::default();
     // The hub's claim on the tracker, synced from `window.is_active()` on every
     // tick. Declared here because the tick below owns it.
     let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
@@ -2378,6 +2388,20 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                 }
             }
             tick_games.refresh(conn);
+
+            // The head-model card, when and only when the answer changed.
+            //
+            // It is the device thread that finds out whether the model loads,
+            // and it finds out on connect — so until this the card was drawn
+            // once at build time from a `stat` and never again, and a model
+            // that ONNX refused reached the screen at the next restart of the
+            // program. Compared before calling because this runs every 33 ms
+            // and the refresh reads the profile directory's neighbour on disk;
+            // the value changes at most a handful of times in a session.
+            if last_head_model.borrow().as_ref() != Some(&snap.head_model) {
+                *last_head_model.borrow_mut() = Some(snap.head_model.clone());
+                head_refresh();
+            }
 
             // Only the guidance *text* is driven from this tick — the dots redraw
             // themselves on the frame clock (see `area.add_tick_callback` above).

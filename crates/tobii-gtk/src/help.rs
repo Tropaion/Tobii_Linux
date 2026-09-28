@@ -264,6 +264,11 @@ pub fn topics() -> Vec<Topic> {
              Angles need a head model, which is downloaded once — \"Get the model…\" \
              asks first and shows what it is about to fetch. Without it the hub still \
              reports yaw and roll from the eyes alone, and pitch reads \"no model\".\n\n\
+             The line at the top of the card says what this program is actually \
+             running, not what is on the disk: a model file that is there and will \
+             not load reads as not being used, rather than as working. It is the \
+             tracker connecting that finds that out, so on a hub opened with the \
+             sensor unplugged the line reports the file until one does.\n\n\
              \"Set pitch zero…\" measures how your head sits when you look at the \
              middle of the screen: the model reports tilt in its own frame, which is \
              offset by how the sensor is mounted, and this measures that offset once \
