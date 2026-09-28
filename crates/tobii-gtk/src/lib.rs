@@ -1177,11 +1177,38 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     live.append(&cam_side);
 
     // --- Right column: settings sections (original wording) ---
+
+    // Which monitor the display setup was done for, which is the antecedent of
+    // the sentence this card used to carry and never stated. Its own label, so
+    // it can be rewritten: the answer changes when a setup finishes and when a
+    // monitor is plugged in or out.
+    //
+    // `detect_monitors` reads `/sys/class/drm` — a directory and a small file
+    // per connector — so it is asked at the moments the answer can have
+    // changed, and never on the 33 ms tick.
+    let screen_desc = description(&screen_now());
+    let restate_screen: Rc<dyn Fn()> = {
+        let w = screen_desc.downgrade();
+        Rc::new(move || {
+            if let Some(l) = w.upgrade() {
+                l.set_text(&screen_now());
+            }
+        })
+    };
+    // A monitor arriving or leaving, from GDK rather than from a poll.
+    if let Some(display) = gtk::gdk::Display::default() {
+        let restate = restate_screen.clone();
+        display
+            .monitors()
+            .connect_items_changed(move |_, _, _, _| restate());
+    }
+
     let b_setup = crate::widget::button("Set up display");
     {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let demand = demand.clone();
+        let restate_screen = restate_screen.clone();
         b_setup.connect_clicked(move |btn| {
             // One flow at a time, the same guard `b_cal` has. A GtkButton emits
             // `clicked` per release and presenting a fullscreen Wayland surface
@@ -1193,8 +1220,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             let win = setup_flow::launch(&app, cmd_tx.clone());
             hold_while_open(&demand, &win, "display setup");
             let btn = btn.clone();
+            let restate_screen = restate_screen.clone();
             win.connect_close_request(move |_| {
                 btn.set_sensitive(true);
+                // The flow is where the saved monitor is written, so this is
+                // the moment this card's own sentence can have gone stale.
+                restate_screen();
                 glib::Propagation::Proceed
             });
         });
@@ -1451,13 +1482,16 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         "Helps if the light changed or precision dropped.",
         &b_cal,
     ));
-    col_calib.append(&section(
+    col_calib.append(&section_with(
         "Change screen",
-        // Same shape: the trigger is the content, and nothing in the hub says
-        // which monitor is configured. "you'll need to set up the new display"
-        // is already carried by the button directly beneath, which reads "Set
-        // up display". 46 characters.
-        "Needed if the sensor moves to another monitor.",
+        // It said "Needed if the sensor moves to another monitor." — the
+        // trigger, with the state left out, so the one question that sentence
+        // provokes was the one thing the card could not answer: nothing
+        // anywhere in the hub said which monitor the display setup had been
+        // done for. The sentence is in the help topic, beside the consequence
+        // there was never room for here; what the card says now is which
+        // monitor it is set up for. See `screen_pick::setup_line`.
+        Some(&screen_desc),
         &b_setup,
     ));
 
@@ -3392,6 +3426,45 @@ fn update_check_switch() -> Switch {
 /// operation) and "Preview my gaze" (whose sentence was wrong). Anything that
 /// moves out this way MUST be in the help window — see [`help`] for why.
 fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Box {
+    let d = (!desc.is_empty()).then(|| description(desc));
+    section_with(title, d.as_ref(), control)
+}
+
+/// The "Change screen" card's sentence, read off the disk it is stored on.
+///
+/// Two reads — the saved monitor id and `/sys/class/drm` — and they are here
+/// rather than at each of the places that ask, because they are one question
+/// and were a line of `.ok().flatten().as_deref()` at each.
+fn screen_now() -> String {
+    crate::screen_pick::setup_line(
+        tobii_config::load_setup_monitor_id()
+            .ok()
+            .flatten()
+            .as_deref(),
+        &tobii_config::detect_monitors(),
+    )
+}
+
+/// A card's description label, built the one way.
+///
+/// Its own function because one card's description is not a constant —
+/// "Change screen" says which monitor it is set up for — and that card has to
+/// build the same label to change it later. The 44-character cap is the part
+/// that must not be re-typed: a wrapping label reports its UNWRAPPED width as
+/// natural, so without it the longest sentence in the column sets the column's
+/// width, and the control rack grew until it crowded the instrument beside it.
+fn description(text: &str) -> Label {
+    let d = Label::new(Some(text));
+    d.add_css_class("section-desc");
+    d.set_halign(Align::Start);
+    d.set_xalign(0.0);
+    d.set_wrap(true);
+    d.set_max_width_chars(44);
+    d
+}
+
+/// [`section`] over a description the caller keeps a handle to.
+fn section_with<W: IsA<gtk::Widget>>(title: &str, desc: Option<&Label>, control: &W) -> gtk::Box {
     let b = gtk::Box::new(Orientation::Vertical, 6);
     b.add_css_class("surface");
     b.add_css_class("panel-pad");
@@ -3401,17 +3474,8 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
     t.set_xalign(0.0);
     t.set_wrap(true);
     b.append(&t);
-    if !desc.is_empty() {
-        let d = Label::new(Some(desc));
-        d.add_css_class("section-desc");
-        d.set_halign(Align::Start);
-        d.set_xalign(0.0);
-        d.set_wrap(true);
-        // A wrapping label reports its UNWRAPPED width as natural, so without a
-        // cap the longest sentence in the column sets the column's width — and
-        // the control rack grew until it crowded the instrument beside it.
-        d.set_max_width_chars(44);
-        b.append(&d);
+    if let Some(d) = desc {
+        b.append(d);
     }
     control.set_halign(Align::Start);
     control.set_margin_top(6);

@@ -46,6 +46,39 @@ pub fn monitor_label(m: &MonitorInfo) -> String {
     "Unknown display".to_string()
 }
 
+/// What the "Change screen" card says it is set up for.
+///
+/// The card's description was *"Needed if the sensor moves to another
+/// monitor."* — a conditional whose antecedent the hub never stated. Nothing
+/// anywhere in it said which monitor the display setup had been done for, so
+/// the one question that sentence provokes ("well, which one is it set up for
+/// now?") was the one thing the card could not answer. The sentence itself is
+/// not lost: it is in the help topic, with the consequence there was no room
+/// for on a card.
+///
+/// Four answers and not three, and the fourth is the reason this is not two
+/// lines of `if`. A saved id that matches nothing is *"not connected"* only
+/// when there were monitors to compare it against; with none read at all —
+/// no `/sys/class/drm`, a container, a permission — "that monitor is not
+/// connected" is a confident negative about hardware this program could not
+/// look at, which is the one shape of claim the rest of this tree is written
+/// against.
+///
+/// Matched on the saved EDID id, which is what is stored, and never on the
+/// model string: two identical monitors share a model and differ by serial.
+pub fn setup_line(saved: Option<&str>, monitors: &[MonitorInfo]) -> String {
+    let Some(id) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "No display set up yet.".to_string();
+    };
+    if let Some(m) = monitors.iter().find(|m| m.id.as_deref() == Some(id)) {
+        return format!("Set up for \u{201c}{}\u{201d}.", monitor_label(m));
+    }
+    if monitors.is_empty() {
+        return "Set up, but no monitor could be read here.".to_string();
+    }
+    "Set up for a monitor that is not connected.".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +92,71 @@ mod tests {
             id: id.map(|s| s.to_string()),
             connector: connector.map(|s| s.to_string()),
         }
+    }
+
+    /// The card answers the question its old sentence provoked, in all four
+    /// states — and the fourth is the one worth having a test for.
+    ///
+    /// "Set up for a monitor that is not connected" is a confident negative:
+    /// it says this program looked at what is plugged in and did not find that
+    /// screen. With no monitors read at all — no `/sys/class/drm`, a container,
+    /// a permission — nothing was looked at, and saying it anyway is the shape
+    /// of claim the rest of this tree is written against.
+    #[test]
+    fn the_card_says_which_monitor_it_is_set_up_for_or_why_it_cannot() {
+        let here = mon("Odyssey G9", Some("card1-DP-1"), Some("SAM0001"));
+        let other = mon("Dell", Some("card1-HDMI-1"), Some("DEL1234"));
+
+        assert_eq!(
+            setup_line(None, std::slice::from_ref(&here)),
+            "No display set up yet."
+        );
+        // And a saved id that is there but empty, which is what a truncated
+        // write leaves: the same answer as none, not a lookup for "".
+        assert_eq!(
+            setup_line(Some("  "), std::slice::from_ref(&here)),
+            "No display set up yet."
+        );
+
+        assert_eq!(
+            setup_line(Some("SAM0001"), &[other.clone(), here.clone()]),
+            "Set up for \u{201c}Odyssey G9\u{201d}.",
+            "the monitor by name, picked out of the ones that are plugged in"
+        );
+        assert_eq!(
+            setup_line(Some("SAM0001"), std::slice::from_ref(&other)),
+            "Set up for a monitor that is not connected.",
+            "monitors were read and this one is not among them"
+        );
+        assert_eq!(
+            setup_line(Some("SAM0001"), &[]),
+            "Set up, but no monitor could be read here.",
+            "nothing was read, so nothing may be concluded about what is plugged in"
+        );
+    }
+
+    /// Matched on the EDID id and never on the model, which is what makes two
+    /// identical screens two different answers.
+    ///
+    /// The id is what the setup flow saves, and it carries the serial; the
+    /// model string is the same on both panels of a matched pair. A lookup by
+    /// model would name whichever one came first out of `/sys/class/drm`, which
+    /// is a directory order, and be right half the time.
+    #[test]
+    fn two_identical_monitors_are_told_apart() {
+        let left = mon("Odyssey G9", Some("card1-DP-1"), Some("SAM0001"));
+        let right = mon("Odyssey G9", Some("card1-DP-2"), Some("SAM0002"));
+        // Both answers name the same words, so the test that means something is
+        // that the id decides which row was found — asserted by removing it.
+        assert_eq!(
+            setup_line(Some("SAM0002"), &[left.clone(), right.clone()]),
+            "Set up for \u{201c}Odyssey G9\u{201d}."
+        );
+        assert_eq!(
+            setup_line(Some("SAM0002"), std::slice::from_ref(&left)),
+            "Set up for a monitor that is not connected.",
+            "the other panel of a matched pair is not this one"
+        );
     }
 
     #[test]

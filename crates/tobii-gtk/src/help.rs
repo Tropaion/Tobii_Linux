@@ -221,10 +221,16 @@ pub fn topics() -> Vec<Topic> {
             "Change screen",
             "If you move the sensor to a different monitor, you'll need to set up the \
              new display.\n\n\
+             The card says which monitor it is set up for, matched on what the \
+             monitor itself reports — so two identical screens are told apart, and \
+             one that has been unplugged reads as not connected rather than as \
+             nothing having been set up. \u{201c}No display set up yet\u{201d} means \
+             the tracker has never been told where the sensor sits, and it cannot \
+             report eyes at all until it has.\n\n\
              Set up display asks which monitor the sensor is under and where on it \
-             the sensor sits. The tracker cannot report eyes at all until it has \
-             that, and a calibration made for one screen is not valid on another — \
-             the hub offers to recalibrate when it notices."
+             the sensor sits. Running it again replaces that answer, and a \
+             calibration made for one screen is not valid on another — the hub \
+             offers to recalibrate when it notices."
                 .to_string(),
         ),
         topic(
