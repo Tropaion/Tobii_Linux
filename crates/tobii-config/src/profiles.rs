@@ -118,17 +118,33 @@
 //! So [`save_to`] does not write [`Profile::to_toml`] over a file that is
 //! already there. It reads that file first and writes
 //! [`Profile::to_toml_over`], which puts every `#` line back beside the
-//! thing it was beside — above the key, table or check it sat above, or at
-//! the end of the same line. Nothing here reorders a profile, so a comment's
-//! place is a position and stays one.
+//! thing it was beside — above the key, table or check it sat above, at the
+//! end of that same line, or below it, which is where the comments at the
+//! end of a file are.
 //!
-//! A comment whose anchor is *gone* — above a check the new profile does not
-//! have, beside a setting that has been removed — stops the write, as
-//! [`CommentLoss`], and nothing is written at all. There is no honest place
-//! for such a comment: dropping it is the thing this exists to stop, and
-//! putting it anywhere else attaches somebody's sentence to a fact they did
-//! not write it about. The caller is told which line and what it sat beside,
-//! and the person decides.
+//! What a comment is beside is that *thing*, and not the slot it sat in. A
+//! check is found again by what it names — its `format`, `path` and
+//! `setting`, the same three fields `tobii games profile check add` already
+//! treats as one check being the same as another. That is what a removal
+//! turns on. Anchored by position, every note below a check that went would
+//! come back one check higher: still in the file, still reading as somebody's
+//! provenance, now above a check they never looked at, and never reported,
+//! because a slot that is still occupied looks like a comment that found its
+//! home. Anchored by what it names, each note either finds its own check or
+//! finds nothing.
+//!
+//! Finding nothing is the honest case, and it does not stop the write.
+//! Removing a check is what `tobii games profile check remove` is for, and
+//! the checks worth removing are exactly the ones somebody wrote a comment
+//! above. Such a comment comes back out of [`save_to`] as an [`Orphan`] — its
+//! line, its text, and what it sat beside — and the caller shows it: the file
+//! does not hold that sentence any more, so the report is the only place it
+//! now exists. What is never done is putting it somewhere else in the file.
+//!
+//! A file this build cannot *read* is the one case that still stops the write
+//! whole, as [`Unreadable`]. Nothing in it can be located, so nothing in it
+//! can be put back — and this build cannot say what any of it was about
+//! either, so it cannot even hand it over honestly.
 //!
 //! Blank lines are the one thing that is not kept. A comment comes back
 //! attached to its anchor, not to the spacing around it.
@@ -194,6 +210,26 @@ pub const BUILTIN: &[(&str, &str)] = &[];
 /// would go on being printed.
 pub const fn ships_profiles() -> bool {
     !BUILTIN.is_empty()
+}
+
+/// What this build ships, as the object of the sentence "this build ships …".
+///
+/// The one phrase, so that the several screens which say it say the same
+/// thing and change together. Each asks for it rather than typing "no profile
+/// for any game", because the day [`BUILTIN`] grows an entry every typed copy
+/// is wrong at once, and a typed copy goes on being printed.
+pub fn shipped_profiles() -> String {
+    shipped_phrase(BUILTIN.len())
+}
+
+/// [`shipped_profiles`] over a count, so that the wording for the counts this
+/// build cannot yet have is still something a test can reach.
+fn shipped_phrase(n: usize) -> String {
+    match n {
+        0 => "no profile for any game".to_string(),
+        1 => "a profile for one game".to_string(),
+        n => format!("profiles for {n} games"),
+    }
 }
 
 // ------------------------------------------------------------------- the type
@@ -394,42 +430,61 @@ impl Profile {
     /// `OutputConfig::apply_key`, and a writer that sometimes quoted and
     /// sometimes did not would have to decide which, on a value it is not
     /// entitled to have an opinion about.
+    ///
+    /// So the two spellings are not two formats and there is nothing to choose
+    /// between them: `enabled = true` is what a hand-written file may say,
+    /// `enabled = "true"` is what this writes, and both read back as the text
+    /// `true`. An example of a profile *as this program writes one* quotes
+    /// every value; an example of one somebody typed need not.
     pub fn to_toml(&self) -> String {
-        self.render(&Comments::default())
-            .expect("nothing was read, so there is no comment that could fail to be placed")
+        self.render(&Comments::default()).0
     }
 
     /// This profile as a profile file, keeping the comments of `existing` —
     /// the text of the file it is about to replace.
     ///
     /// Every `#` line of `existing` comes out again beside the thing it was
-    /// beside: above the key, table or `[[check]]` it sat above, or at the end
-    /// of that same line. Nothing here reorders a profile, so a comment's
-    /// place is a position and stays one — a check keeps its place in the file
-    /// because it keeps its index in [`Self::checks`].
+    /// beside: above the key, table or `[[check]]` it sat above, at the end of
+    /// that same line, or below it. Nothing here reorders a profile, and a
+    /// `[[check]]` is matched by what it names rather than by where it sat, so
+    /// a check that keeps its `format`, `path` and `setting` keeps its
+    /// comments however the checks around it change.
     ///
     /// Blank lines are not kept: a comment comes back attached to its anchor,
     /// not to the spacing around it.
     ///
-    /// [`Err`] when a comment has nowhere to go — see [`CommentLoss`]. The
-    /// caller is then holding a file it must not write, which is the point:
-    /// the alternatives are losing somebody's sentence or moving it onto
-    /// something they did not write it about.
-    pub fn to_toml_over(&self, existing: &str) -> Result<String, CommentLoss> {
-        if parse(existing).is_err() {
+    /// A comment whose anchor this profile does not have is **not** in the
+    /// text, and this call does not say which one it was: it is the text and
+    /// nothing else. To write a profile, go through [`save_to`], which hands
+    /// back every comment it could not put back — the only copy of them
+    /// left. [`Err`] is the one case where there is nothing honest to hand
+    /// back at all: see [`Unreadable`].
+    pub fn to_toml_over(&self, existing: &str) -> Result<String, Unreadable> {
+        Ok(self.rewrite_over(existing)?.0)
+    }
+
+    /// [`Self::to_toml_over`] with the comments it had nowhere to put.
+    ///
+    /// The one place a profile is written over another, and so the one place
+    /// that can say what writing it costs.
+    fn rewrite_over(&self, existing: &str) -> Result<(String, Vec<Orphan>), Unreadable> {
+        let Ok(was) = parse(existing) else {
             // Nothing in a file this build cannot read can be located, so no
             // comment in it can be put back. Refuse if there is one to lose.
             for (i, raw) in existing.lines().enumerate() {
                 if let (_, Some(c)) = split_comment(raw) {
-                    return Err(CommentLoss::Unplaceable {
+                    return Err(Unreadable {
                         line: i + 1,
                         comment: c.trim_end().to_string(),
                     });
                 }
             }
-            return Ok(self.to_toml());
-        }
-        self.render(&comments_of(existing))
+            return Ok((self.to_toml(), Vec::new()));
+        };
+        // `was` is `existing`'s own parse, which is what lets a comment above
+        // the n-th `[[check]]` be recorded as being about the check that is
+        // there rather than about the n-th slot.
+        Ok(self.render(&comments_of(existing, &was.checks)))
     }
 
     /// Every line this profile is, each with the thing a comment could be
@@ -454,8 +509,9 @@ impl Profile {
                 v.push((Anchor::Setting(k.clone()), format!("{k} = {}", quote(val))));
             }
         }
-        for (i, c) in self.checks.iter().enumerate() {
-            v.push((Anchor::Check(i), "[[check]]".into()));
+        for c in &self.checks {
+            let id = CheckId::of(c);
+            v.push((Anchor::Check(id.clone()), "[[check]]".into()));
             for (k, val) in [
                 ("format", c.format.as_str()),
                 ("path", c.path.as_str()),
@@ -464,7 +520,7 @@ impl Profile {
                 ("tell", c.tell.as_str()),
             ] {
                 v.push((
-                    Anchor::CheckKey(i, k.into()),
+                    Anchor::CheckKey(id.clone(), k.into()),
                     format!("{k} = {}", quote(val)),
                 ));
             }
@@ -472,8 +528,9 @@ impl Profile {
         v
     }
 
-    /// This profile written out with `kept` put back where it came from.
-    fn render(&self, kept: &Comments) -> Result<String, CommentLoss> {
+    /// This profile written out with `kept` put back where it came from, and
+    /// whatever `kept` held that this profile has nowhere to put.
+    fn render(&self, kept: &Comments) -> (String, Vec<Orphan>) {
         let mut used = vec![false; kept.at.len()];
         let mut s = String::from(HEADER);
         s.push('\n');
@@ -483,8 +540,17 @@ impl Profile {
             if matches!(anchor, Anchor::Settings | Anchor::Check(_)) {
                 s.push('\n');
             }
-            let mut trailing = None;
-            if let Some(i) = kept.at.iter().position(|a| a.anchor == anchor) {
+            // The first match not already spoken for. Nothing in the grammar
+            // stops a hand-written file naming one thing in two `[[check]]`
+            // blocks — only `check add` does — and then the second one's
+            // comments are its own, not a second copy of the first one's.
+            let hit = kept
+                .at
+                .iter()
+                .enumerate()
+                .find(|(i, a)| !used[*i] && a.anchor == anchor)
+                .map(|(i, _)| i);
+            if let Some(i) = hit {
                 used[i] = true;
                 for (_, c) in &kept.at[i].leading {
                     // The header is written above, so a file this program
@@ -494,35 +560,47 @@ impl Profile {
                         s.push('\n');
                     }
                 }
-                trailing = kept.at[i].trailing.as_deref();
             }
             s.push_str(&line);
-            if let Some(t) = trailing {
+            if let Some(t) = hit.and_then(|i| kept.at[i].trailing.as_deref()) {
                 s.push(' ');
                 s.push_str(t);
             }
             s.push('\n');
+            if let Some(i) = hit {
+                for (_, c) in &kept.at[i].following {
+                    s.push_str(c);
+                    s.push('\n');
+                }
+            }
         }
-        // In file order, so the line named is the first one that would go.
+        // In file order: `at` is in file order, and within one anchor what was
+        // above it comes before what was on its line, which comes before what
+        // was below it.
+        let mut orphans = Vec::new();
         for (i, a) in kept.at.iter().enumerate() {
             if used[i] {
                 continue;
             }
-            let (line, comment) = match a.leading.first() {
-                Some((l, c)) => (*l, c.clone()),
-                None => (a.line, a.trailing.clone().unwrap_or_default()),
+            let about = a.anchor.describe();
+            let mut lost = |line: usize, comment: &str| {
+                orphans.push(Orphan {
+                    line,
+                    comment: comment.to_string(),
+                    about: about.clone(),
+                });
             };
-            return Err(CommentLoss::Orphaned {
-                line,
-                comment,
-                about: a.anchor.describe(),
-            });
+            for (line, c) in &a.leading {
+                lost(*line, c);
+            }
+            if let Some(c) = &a.trailing {
+                lost(a.line, c);
+            }
+            for (line, c) in &a.following {
+                lost(*line, c);
+            }
         }
-        for (_, c) in &kept.end {
-            s.push_str(c);
-            s.push('\n');
-        }
-        Ok(s)
+        (s, orphans)
     }
 }
 
@@ -869,8 +947,10 @@ const HEADER: &str = "# tobii-linux game profile";
 
 /// What a comment in a profile file sits beside.
 ///
-/// A position, not an identity: these files are written in one fixed order
-/// and nothing reorders them, so a check's index is its place in the file.
+/// An identity, not a position. Nothing here reorders a profile, so for the
+/// keys a name is enough; for a `[[check]]` it is not, because a removal
+/// renumbers every check below it and a note anchored to a number would come
+/// back above whichever check inherited the number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Anchor {
     /// A key before any table: `version`, `name`, `bridge`.
@@ -879,10 +959,10 @@ enum Anchor {
     Settings,
     /// A key under `[settings]`.
     Setting(String),
-    /// The n-th `[[check]]` header, counting from zero.
-    Check(usize),
-    /// A key of the n-th `[[check]]`.
-    CheckKey(usize, String),
+    /// A `[[check]]` header.
+    Check(CheckId),
+    /// A key of a `[[check]]`.
+    CheckKey(CheckId, String),
 }
 
 impl Anchor {
@@ -893,9 +973,44 @@ impl Anchor {
             Anchor::Top(k) => format!("`{k}`"),
             Anchor::Settings => "`[settings]`".to_string(),
             Anchor::Setting(k) => format!("the setting `{k}`"),
-            Anchor::Check(i) => format!("the check in position {}", i + 1),
-            Anchor::CheckKey(i, k) => format!("`{k}` of the check in position {}", i + 1),
+            Anchor::Check(id) => id.describe(),
+            Anchor::CheckKey(id, k) => format!("`{k}` of {}", id.describe()),
         }
+    }
+}
+
+/// Which `[[check]]` a comment is about: the three fields that say what a
+/// check reads, and so which check it is.
+///
+/// Not `wants` and not `tell`. Correcting the value a game should have, or
+/// the sentence shown to whoever has to set it, leaves it the same check, and
+/// a note above it is still a note about it. Changing what it reads makes it
+/// a different claim, and a note above it stops being about the check that is
+/// there now — which is a comment to hand back, not one to keep silently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CheckId {
+    format: String,
+    path: String,
+    setting: String,
+}
+
+impl CheckId {
+    fn of(c: &Check) -> CheckId {
+        CheckId {
+            format: c.format.as_str().to_string(),
+            path: c.path.clone(),
+            setting: c.setting.clone(),
+        }
+    }
+
+    /// What to call this check in the sentence a person reads. What it reads,
+    /// not where it sat: a comment is handed back because a check went, and
+    /// after that neither file's numbering is the one they are looking at.
+    fn describe(&self) -> String {
+        format!(
+            "the check that reads `{}` out of `{}`",
+            self.setting, self.path
+        )
     }
 }
 
@@ -913,17 +1028,17 @@ struct Attached {
     leading: Vec<(usize, String)>,
     /// The comment at the end of the anchor's own line.
     trailing: Option<String>,
+    /// Whole-line comments below it with nothing but the end of the file
+    /// after them, with their lines. Only the last anchor in a file can have
+    /// any: a comment with another line under it is that line's `leading`.
+    following: Vec<(usize, String)>,
 }
 
 /// Every comment in one profile file, by what it sits beside.
 #[derive(Debug, Default)]
 struct Comments {
-    /// In file order, which is why the first orphan reported is the first one
-    /// in the file.
+    /// In file order, which is why orphans come back in file order too.
     at: Vec<Attached>,
-    /// Comments after the last line that anchors anything. These can never be
-    /// orphaned: every profile has an end.
-    end: Vec<(usize, String)>,
 }
 
 /// One line split into what it says and the comment on the end of it.
@@ -956,15 +1071,18 @@ fn split_comment(raw: &str) -> (&str, Option<&str>) {
 
 /// Every comment in `text`, attached to what it is about.
 ///
-/// `text` must be something [`parse`] accepted: this walks the same shapes
-/// and takes each line to be a table header or a `key = value`, which is what
-/// having parsed guarantees.
-fn comments_of(text: &str) -> Comments {
+/// `text` must be something [`parse`] accepted and `checks` must be what it
+/// parsed to: this walks the same shapes and takes each line to be a table
+/// header or a `key = value`, which is what having parsed guarantees, and it
+/// names the n-th `[[check]]` by what the n-th check holds.
+fn comments_of(text: &str, checks: &[Check]) -> Comments {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut out = Comments::default();
     let mut pending: Vec<(usize, String)> = Vec::new();
     let mut table = Table::Top;
-    let mut checks = 0usize;
+    let mut seen = 0usize;
+    let mut id = CheckId::default();
+    let mut last: Option<(Anchor, usize)> = None;
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let (content, comment) = split_comment(raw);
@@ -978,8 +1096,14 @@ fn comments_of(text: &str) -> Comments {
         }
         let anchor = if t.starts_with("[[") {
             table = Table::Check;
-            checks += 1;
-            Anchor::Check(checks - 1)
+            // `checks` is this text's own parse, so there is one entry per
+            // header. The default is reachable only by breaking that, and it
+            // is an id no profile can write out — every check has a `format`
+            // — so its comments would come back as orphans rather than land
+            // on some other check.
+            id = checks.get(seen).map(CheckId::of).unwrap_or_default();
+            seen += 1;
+            Anchor::Check(id.clone())
         } else if t.starts_with('[') {
             table = Table::Settings;
             Anchor::Settings
@@ -988,70 +1112,123 @@ fn comments_of(text: &str) -> Comments {
             match table {
                 Table::Top => Anchor::Top(key),
                 Table::Settings => Anchor::Setting(key),
-                // `checks` is at least one: a parsed file cannot be inside a
-                // `[[check]]` without having had its header.
-                Table::Check => Anchor::CheckKey(checks.saturating_sub(1), key),
+                // `id` is set: a parsed file cannot be inside a `[[check]]`
+                // without having had its header.
+                Table::Check => Anchor::CheckKey(id.clone(), key),
             }
         };
         let leading = std::mem::take(&mut pending);
         if !leading.is_empty() || comment.is_some() {
             out.at.push(Attached {
-                anchor,
+                anchor: anchor.clone(),
                 line,
                 leading,
                 trailing: comment,
+                following: Vec::new(),
             });
         }
+        last = Some((anchor, line));
     }
-    out.end = pending;
+    // What is left is the comments at the end of the file, and they are about
+    // the last line of it — the thing they sit under. Kept as a list of their
+    // own they came back at the end of whatever the *new* file turned out to
+    // be, so a note under the last check moved to under a check added after
+    // it: silently, and never as an orphan, because a file always has an end.
+    //
+    // `text` has parsed, so it has a `version` line and `last` is set.
+    if let (false, Some((anchor, line))) = (pending.is_empty(), last) {
+        match out.at.last_mut() {
+            Some(a) if a.line == line => a.following = pending,
+            _ => out.at.push(Attached {
+                anchor,
+                line,
+                leading: Vec::new(),
+                trailing: None,
+                following: pending,
+            }),
+        }
+    }
     out
 }
 
-/// A comment in the file being replaced that the new profile has no place
-/// for, and so a write that did not happen.
+/// A comment in the file being replaced that the new profile has nowhere to
+/// put, because the thing it sat beside is not in it.
 ///
-/// Two ways that comes about, and they need different sentences: the file
-/// cannot be read at all, or it can and the thing the comment is about is
-/// being removed.
+/// Not a refusal: the write happens, and this is the comment itself, handed
+/// back for the caller to show. See the module docs for why that is the
+/// answer and putting it elsewhere in the file is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommentLoss {
-    /// The file being replaced is not one this build can read, so nothing in
-    /// it can be located and nothing in it can be put back.
-    Unplaceable { line: usize, comment: String },
-    /// The comment sits beside something the profile being written does not
-    /// have.
-    Orphaned {
-        line: usize,
-        comment: String,
-        /// What it sat beside, as [`Anchor::describe`] spells it.
-        about: String,
-    },
+pub struct Orphan {
+    /// The 1-based line it was on, in the file being replaced.
+    pub line: usize,
+    /// The comment as it was written, `#` and all, without trailing space.
+    pub comment: String,
+    /// What it sat beside, as a fragment to put after "a comment about": *the
+    /// setting `x`*, *the check that reads `X` out of `y`*.
+    pub about: String,
 }
 
-impl fmt::Display for CommentLoss {
+impl fmt::Display for Orphan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CommentLoss::Unplaceable { line, comment } => write!(
-                f,
-                "line {line} is a comment — {comment} — in a file this build cannot read as a \
-                 profile, so there is nowhere to put it back. Nothing was written: fix the file, \
-                 or move it aside."
-            ),
-            CommentLoss::Orphaned {
-                line,
-                comment,
-                about,
-            } => write!(
-                f,
-                "line {line} — {comment} — is a comment about {about}, which the profile being \
-                 written does not have. Nothing was written: take the comment out, or keep what \
-                 it is about."
-            ),
-        }
+        let Orphan {
+            line,
+            comment,
+            about,
+        } = self;
+        write!(
+            f,
+            "line {line} — {comment} — was a comment about {about}, which this profile does not \
+             have"
+        )
     }
 }
 
-impl std::error::Error for CommentLoss {}
+/// The comments a write could not put back.
+///
+/// Nothing else holds these now: a caller that writes the profile and drops
+/// this has lost somebody's sentence with nobody told, which is the one
+/// outcome the whole comment mechanism exists to prevent. So a caller of
+/// [`save_to`] reports them — every one of them, in full, since a count of
+/// comments is not a comment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Orphans(Vec<Orphan>);
+
+impl std::ops::Deref for Orphans {
+    type Target = [Orphan];
+
+    fn deref(&self) -> &[Orphan] {
+        &self.0
+    }
+}
+
+/// A file that is there and is not one this build can read as a profile, so
+/// the write over it did not happen at all.
+///
+/// The one loss that is still a refusal. Nothing in such a file can be
+/// located, so nothing in it can be put back — and nothing in it can be
+/// handed back honestly either, because this build cannot say what any of it
+/// was about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    /// The 1-based line of the first comment that would be lost.
+    pub line: usize,
+    /// That comment, `#` and all.
+    pub comment: String,
+}
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Unreadable { line, comment } = self;
+        write!(
+            f,
+            "line {line} is a comment — {comment} — in a file this build cannot read as a \
+             profile, so there is nowhere to put it back. Nothing was written: fix the file, or \
+             move it aside."
+        )
+    }
+}
+
+impl std::error::Error for Unreadable {}
 
 // ------------------------------------------------------------------- writing
 
@@ -1062,12 +1239,13 @@ impl std::error::Error for CommentLoss {}
 /// file is malformed by a program that malformed it.
 ///
 /// Over a file that is already there this is a read-modify-write, so that the
-/// comments in it survive — see [`Profile::to_toml_over`]. A comment that
-/// cannot be put back stops the write whole, as an
-/// [`io::ErrorKind::InvalidInput`] carrying [`CommentLoss`]'s sentence; so
-/// does a file that is there and cannot be read, rather than that file being
-/// overwritten by a program that could not say what was in it.
-pub fn save_to(dir: &Path, appid: &str, profile: &Profile) -> io::Result<()> {
+/// comments in it survive — see [`Profile::to_toml_over`]. The ones it had
+/// nowhere to put come back as [`Orphans`], which the caller must show: they
+/// are in no file now. A file that is there and cannot be read is the one
+/// case that stops the write, as an [`io::ErrorKind::InvalidInput`] carrying
+/// [`Unreadable`]'s sentence, rather than that file being overwritten by a
+/// program that could not say what was in it.
+pub fn save_to(dir: &Path, appid: &str, profile: &Profile) -> io::Result<Orphans> {
     if !is_appid(appid) {
         // Before the path is built, not after: `path_in` would happily make a
         // name out of `../../anything`.
@@ -1082,20 +1260,24 @@ pub fn save_to(dir: &Path, appid: &str, profile: &Profile) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
-    let body = match &text {
-        Some(t) => profile.to_toml_over(t).map_err(|loss| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{}: {loss}", path.display()),
-            )
-        })?,
-        None => profile.to_toml(),
+    let (body, orphans) = match &text {
+        Some(t) => {
+            let (text, orphans) = profile.rewrite_over(t).map_err(|loss| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{}: {loss}", path.display()),
+                )
+            })?;
+            (text, Orphans(orphans))
+        }
+        None => (profile.to_toml(), Orphans::default()),
     };
-    crate::write_atomic(&path, body.as_bytes())
+    crate::write_atomic(&path, body.as_bytes())?;
+    Ok(orphans)
 }
 
 /// Write a profile into this user's config.
-pub fn save(appid: &str, profile: &Profile) -> io::Result<()> {
+pub fn save(appid: &str, profile: &Profile) -> io::Result<Orphans> {
     save_to(&profiles_dir(), appid, profile)
 }
 
@@ -2065,6 +2247,7 @@ mod tests {
             !ships_profiles(),
             "the answer every sentence about this asks for"
         );
+        assert_eq!(shipped_profiles(), "no profile for any game");
 
         let dir = scratch("builtin");
         let bad: &[(&str, &str)] = &[(FAKE, "version = 1\nnot_a_key = 1\n")];
@@ -2082,6 +2265,23 @@ mod tests {
         }
         assert_eq!(list_from(&dir, bad).problems.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The phrase the screens that say what this build ships ask for, at the
+    /// counts this build cannot have yet. It is one sentence fragment in one
+    /// place so that the day `BUILTIN` grows an entry, every screen carrying
+    /// it changes with it instead of going on saying "none".
+    #[test]
+    fn what_this_build_ships_reads_as_a_sentence_at_every_count() {
+        assert_eq!(shipped_phrase(0), "no profile for any game");
+        assert_eq!(shipped_phrase(1), "a profile for one game");
+        assert_eq!(shipped_phrase(4), "profiles for 4 games");
+        for n in 0..3 {
+            assert!(
+                format!("this build ships {}.", shipped_phrase(n)).starts_with("this build ships "),
+                "it is the object of that sentence and nothing else"
+            );
+        }
     }
 
     /// A `<appid>.toml.tmp` is what an interrupted write of ours leaves. It
@@ -2116,7 +2316,10 @@ mod tests {
     #[test]
     fn what_is_written_is_read_back() {
         let dir = scratch("save");
-        save_to(&dir, FAKE, &full()).expect("save");
+        assert!(
+            save_to(&dir, FAKE, &full()).expect("save").is_empty(),
+            "there was no file, so there was nothing in one to lose"
+        );
         let got = load_from(&dir, &[], FAKE).expect("ok").expect("found");
         assert_eq!(got.profile, full());
         assert_eq!(got.origin, Origin::File(path_in(&dir, FAKE)));
@@ -2178,14 +2381,14 @@ tell = \"Set head look to toggle.\"
         let mut p = parse(before).expect("parses");
         p.settings.push(("rate_hz".into(), "60".into()));
 
-        save_to(&dir, FAKE, &p).expect("save");
+        assert!(save_to(&dir, FAKE, &p).expect("save").is_empty());
         let back = std::fs::read_to_string(path_in(&dir, FAKE)).expect("read");
         assert_eq!(back, after);
 
         // And a save that changes nothing changes nothing — the header a
         // profile of ours starts with is not a comment to preserve on top of
         // the one being written.
-        save_to(&dir, FAKE, &p).expect("save again");
+        assert!(save_to(&dir, FAKE, &p).expect("save again").is_empty());
         assert_eq!(
             std::fs::read_to_string(path_in(&dir, FAKE)).expect("read"),
             after
@@ -2194,32 +2397,153 @@ tell = \"Set head look to toggle.\"
     }
 
     /// The other half of the promise. A comment about a check that is being
-    /// removed has no honest place, so the file is left alone and the person
-    /// is told which line and what it was about.
+    /// removed has no place in the file, so it comes back out to the caller —
+    /// and the write happens, because `tobii games profile check remove` is
+    /// impossible otherwise and a commented check is the only kind this
+    /// feature exists to produce.
     #[test]
-    fn a_comment_about_what_is_going_stops_the_save() {
+    fn a_comment_about_a_removed_check_comes_back_and_the_write_happens() {
         let dir = scratch("save-orphan");
         let before = "version = 1\n\n[[check]]\n# measured on Odyssey 4.0\n                      format = \"binds-dir\"\npath = \"a\"\nsetting = \"X\"\n                      wants = \"1\"\ntell = \"t\"\n";
         std::fs::write(path_in(&dir, FAKE), before).expect("write");
         let mut p = parse(before).expect("parses");
         p.checks.clear();
 
-        let e = save_to(&dir, FAKE, &p).expect_err("refused");
-        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-        let shown = e.to_string();
+        let lost = save_to(&dir, FAKE, &p).expect("the removal goes through");
+        assert_eq!(lost.len(), 1, "{lost:?}");
+        assert_eq!(lost[0].line, 4);
+        assert_eq!(lost[0].comment, "# measured on Odyssey 4.0");
+        assert_eq!(
+            lost[0].about,
+            "`format` of the check that reads `X` out of `a`"
+        );
+        let shown = lost[0].to_string();
         assert!(shown.contains("# measured on Odyssey 4.0"), "{shown}");
         assert!(shown.contains("line 4"), "{shown}");
-        assert!(shown.contains("check in position 1"), "{shown}");
-        assert_eq!(
-            std::fs::read_to_string(path_in(&dir, FAKE)).expect("read"),
-            before,
-            "nothing was written"
-        );
 
-        // Keep the check and the same save goes through.
-        let p = parse(before).expect("parses");
-        save_to(&dir, FAKE, &p).expect("save");
+        let back = std::fs::read_to_string(path_in(&dir, FAKE)).expect("read");
+        assert_eq!(back, format!("{HEADER}\nversion = 1\n"), "{back}");
+        assert!(
+            !back.contains("Odyssey"),
+            "and the sentence it handed back is not also still in the file"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The comment at the end of a file is about the last thing in the file,
+    /// so it comes back under that thing — not under whatever ends the file
+    /// after a check is added. Anything else moves somebody's *measured on
+    /// Odyssey 4.0* onto a check they never looked at, without a word.
+    #[test]
+    fn a_note_at_the_end_of_a_file_stays_under_what_it_was_under() {
+        let before = "\
+version = 1
+
+[[check]]
+format = \"binds-dir\"
+path = \"a\"
+setting = \"X\"
+wants = \"1\"
+tell = \"t\"
+# measured on Odyssey 4.0
+";
+        let mut p = parse(before).expect("parses");
+        p.checks.push(Check {
+            format: Format::AttributesXml,
+            path: "b".into(),
+            setting: "Y".into(),
+            wants: "2".into(),
+            tell: "u".into(),
+        });
+        let (text, orphans) = p.rewrite_over(before).expect("readable");
+        assert!(orphans.is_empty(), "{orphans:?}");
+
+        let lines: Vec<&str> = text.lines().collect();
+        let note = lines
+            .iter()
+            .position(|l| *l == "# measured on Odyssey 4.0")
+            .expect("the note is still there");
+        assert_eq!(
+            lines[note - 1],
+            "tell = \"t\"",
+            "under the check it was written under: {text}"
+        );
+        assert_ne!(
+            lines.last(),
+            Some(&"# measured on Odyssey 4.0"),
+            "and not at the end of a file that now ends with another check: {text}"
+        );
+    }
+
+    /// A check is found again by what it reads, not by its number. Take the
+    /// first of two out and the second one's numbering changes; a note above
+    /// the one that went must not come back above the one that stayed, which
+    /// is the same untruth as re-emitting it at the end of the file and is
+    /// harder to see, because nothing about the result looks wrong.
+    #[test]
+    fn a_note_above_a_removed_check_does_not_slide_onto_the_next_one() {
+        let before = "\
+version = 1
+
+# X is what the HUD calls head look
+[[check]]
+format = \"binds-dir\"
+path = \"a\"
+setting = \"X\"
+wants = \"1\"
+tell = \"t\"
+
+[[check]]
+format = \"attributes-xml\"
+path = \"b\"
+setting = \"Y\"
+wants = \"2\"
+tell = \"u\"
+";
+        let mut p = parse(before).expect("parses");
+        p.checks.remove(0);
+        let (text, orphans) = p.rewrite_over(before).expect("readable");
+
+        assert!(
+            !text.contains("HUD"),
+            "the note is about a check that is gone: {text}"
+        );
+        assert_eq!(orphans.len(), 1, "{orphans:?}");
+        assert_eq!(orphans[0].line, 3);
+        assert_eq!(
+            orphans[0].about, "the check that reads `X` out of `a`",
+            "named by what it read, since after a removal neither numbering is theirs"
+        );
+        assert_eq!(parse(&text).expect("reads back").checks.len(), 1);
+    }
+
+    /// The other side of that: a check whose value or sentence is corrected
+    /// is the same check, and keeps its comment. `check add` already treats
+    /// format, path and setting as what makes two checks the same one.
+    #[test]
+    fn correcting_what_a_check_wants_keeps_the_note_above_it() {
+        let before = "\
+version = 1
+
+# measured on Odyssey 4.0
+[[check]]
+format = \"binds-dir\"
+path = \"a\"
+setting = \"X\"
+wants = \"1\"
+tell = \"t\"
+";
+        let mut p = parse(before).expect("parses");
+        p.checks[0].wants = "2".into();
+        p.checks[0].tell = "set it to 2".into();
+        let (text, orphans) = p.rewrite_over(before).expect("readable");
+        assert!(orphans.is_empty(), "{orphans:?}");
+        let lines: Vec<&str> = text.lines().collect();
+        let note = lines
+            .iter()
+            .position(|l| *l == "# measured on Odyssey 4.0")
+            .expect("kept");
+        assert_eq!(lines[note + 1], "[[check]]", "{text}");
     }
 
     /// A `#` inside a value is part of the value, not a comment to move.
