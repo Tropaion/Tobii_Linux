@@ -97,6 +97,13 @@ window { background-color: #0d1013; color: #e8ecef; }
     border-bottom: none; color: #e8ecef; }
 .tab-page { background-color: #11151a; border: 1px solid #232a32;
             border-radius: 0 12px 12px 12px; padding: 16px; }
+
+/* The Games tab's action bar: the only controls on that tab that change
+   anything, pinned under the detail pane instead of three paragraphs down
+   inside it. A rule above it rather than a filled strip — the pane it belongs
+   to has no fill either, and a second filled surface inside the tab page would
+   be a third level of background in one view. */
+.action-bar { border-top: 1px solid #232a32; padding-top: 12px; }
 /* The same rule stood on end, for the help window's sidebar divider. A
    separate class because `.hairline` states a MINIMUM HEIGHT, and a box that
    is one pixel tall is not a box that is one pixel wide. */

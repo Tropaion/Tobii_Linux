@@ -1221,8 +1221,13 @@ pub(crate) fn bridge_block(
     tobii: Option<&Path>,
     beside: Option<&Path>,
     appid: &str,
-) -> (String, Option<Action>) {
-    let (mut text, action) = match state {
+) -> String {
+    // The caption is `bridge_action`'s, not this match's. The bar at the foot
+    // of the pane asks the same question, and a paragraph and a button that
+    // decided it separately is how a page ends up offering *Install* under a
+    // sentence saying it is already installed.
+    let action = bridge_action(state);
+    let mut text = match state {
         BridgeState::NoPrefix => {
             let s = "No Proton prefix was found for this game. Steam makes one the first \
                      time a title runs under Proton, so if this is a Windows game, run it \
@@ -1233,9 +1238,9 @@ pub(crate) fn bridge_block(
             .to_string();
             // No button. There is nothing to install into, and a button that
             // fails is worse than no button.
-            (s, None)
+            s
         }
-        BridgeState::Absent { prefix, present } => (
+        BridgeState::Absent { prefix, present } => {
             format!(
                 "The prefix is at {}.\n{found}\n\n\
                  The bridge is what lets a game see a TrackIR or FreeTrack device from inside \
@@ -1249,9 +1254,8 @@ pub(crate) fn bridge_block(
                 file = plural(BRIDGE_FILES.len(), "file", "files"),
                 list = BRIDGE_FILES.join(", "),
                 req = BRIDGE_ARTIFACT,
-            ),
-            Some(Action::Install),
-        ),
+            )
+        }
         BridgeState::Files { dir, present, .. } => {
             let mut s = format!(
                 "{}\n\n\
@@ -1269,7 +1273,7 @@ pub(crate) fn bridge_block(
             if tobii.is_some() {
                 s.push_str(" Details below is `tobii bridge status`, which does.");
             }
-            (s, Some(Action::Reinstall))
+            s
         }
     };
     // Both notes hang off every state, because both are reasons the sentence
@@ -1289,11 +1293,10 @@ pub(crate) fn bridge_block(
         (None, Some(a)) => {
             text.push_str("\n\n");
             text.push_str(&no_binary_text(*a, beside, appid));
-            return (text, None);
         }
         (None, None) => {}
     }
-    (text, action)
+    text
 }
 
 // ------------------------------------------------------- running the installer
@@ -1332,6 +1335,116 @@ pub(crate) fn status_argv(tobii: &Path, appid: &str) -> Vec<OsString> {
         tobii.as_os_str().to_os_string(),
         "bridge".into(),
         "status".into(),
+        "--steam".into(),
+        appid.into(),
+    ]
+}
+
+/// What the action bar can do for the game on screen, and what to say when it
+/// can do nothing.
+///
+/// # Why this is a value
+///
+/// The three buttons used to be inside block 2, three paragraphs down a
+/// scroller, and their visibility was four `if let` blocks in the middle of
+/// `refresh` reading four different things. Two consequences, and both were
+/// real: the one thing this tab can actually DO was below the fold on a short
+/// window, and when it could do nothing the page said so only in prose that had
+/// to be read to the end. A bar that is always on screen has to be able to say
+/// "nothing, and here is why" in one line, and that is a sentence — so it is
+/// decided here, where it can be tested, rather than by the absence of widgets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Actions {
+    /// Install or Reinstall — one button, whose caption is the promise.
+    pub primary: Option<Action>,
+    /// Whether taking it back out is offered. Only ever over a prefix that
+    /// holds the artifact: there is nothing to remove otherwise, and a button
+    /// that fails is worse than no button.
+    pub uninstall: bool,
+    /// `tobii bridge status`, which reads and starts nothing.
+    pub details: bool,
+    /// The Proton-build picker, which [`JobView`] decides is earned.
+    pub wine: bool,
+    /// Why there is nothing to press, when there is nothing. [`None`] when the
+    /// bar has a button.
+    pub blocked: Option<&'static str>,
+}
+
+/// Decide the bar from what block 2 has just worked out.
+///
+/// `installed_here` is false for a row of [`Group::Elsewhere`] — a profile for
+/// a game Steam does not list on this machine. Nothing on the bar can act on
+/// one, and the reason is not the same as having no prefix: a prefix appears
+/// when a game is launched, and this game cannot be launched from here at all.
+///
+/// The order of the three refusals is the order they have to be answered in.
+/// A game that is not here has no prefix either, and a machine with no `tobii`
+/// on its PATH would still have nothing to install into — reporting the second
+/// or third over the first tells somebody to fix the wrong thing.
+pub(crate) fn actions(
+    state: &BridgeState,
+    tobii: Option<&Path>,
+    job: &JobView,
+    installed_here: bool,
+) -> Actions {
+    let none = |why: &'static str| Actions {
+        primary: None,
+        uninstall: false,
+        details: false,
+        wine: false,
+        blocked: Some(why),
+    };
+    if !installed_here {
+        return none(
+            "Steam does not list this game on this machine, so there is no prefix here to              install into.",
+        );
+    }
+    if matches!(state, BridgeState::NoPrefix) {
+        return none(
+            "No Proton prefix yet. Run the game once under Proton and come back — a native              Linux game never gets one, and the virtual joystick is how it receives head              tracking.",
+        );
+    }
+    if tobii.is_none() {
+        return none(
+            "The command-line program `tobii` is not on the PATH this window was started              with, so this page cannot run the installer. Block 2 prints what to type              instead.",
+        );
+    }
+    Actions {
+        primary: bridge_action(state),
+        uninstall: matches!(state, BridgeState::Files { .. }),
+        details: true,
+        wine: job.offer_wine,
+        blocked: None,
+    }
+}
+
+/// What the primary button promises, from the prefix alone.
+///
+/// Split out of [`bridge_block`], which used to be the only thing that decided
+/// it — the bar needs the same answer and must not reach a different one, and
+/// the paragraph and the button captioning themselves separately is exactly how
+/// a page ends up offering *Install* under a paragraph that says it is already
+/// installed.
+pub(crate) fn bridge_action(state: &BridgeState) -> Option<Action> {
+    match state {
+        BridgeState::NoPrefix => None,
+        BridgeState::Absent { .. } => Some(Action::Install),
+        BridgeState::Files { .. } => Some(Action::Reinstall),
+    }
+}
+
+/// The argv for `tobii bridge uninstall`.
+///
+/// Takes the artifacts back out of the prefix and unregisters them. Its own
+/// function beside [`install_argv`] rather than a flag on it, because the two
+/// are different verbs with different consequences and a boolean that chose
+/// between them would be one character away from removing what somebody meant
+/// to install.
+pub(crate) fn uninstall_argv(tobii: &Path, appid: &str) -> Vec<OsString> {
+    vec![
+        tobii.as_os_str().to_os_string(),
+        "bridge".into(),
+        "uninstall".into(),
         "--steam".into(),
         appid.into(),
     ]
@@ -2794,9 +2907,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     game.append(&d1);
 
     let (b2, br_body) = block(2, "The Wine bridge");
-    let b_actions = gtk::Box::new(Orientation::Horizontal, 10);
-    b_actions.set_halign(Align::Start);
-    b2.append(&b_actions);
+    // No actions box in the block any more. The buttons are on a bar at the
+    // foot of the pane — see `action_bar` below for why.
     let b_report = small("");
     b2.append(&b_report);
     let d2 = divider();
@@ -2828,6 +2940,41 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     detail_scroll.set_size_request(DETAIL_WIDTH, -1);
     detail_scroll.set_child(Some(&detail));
 
+    // ---- the action bar, pinned under the detail pane
+    //
+    // Outside the scroller, and that is the whole point of it. These are the
+    // only controls on this tab that change anything, and they were three
+    // paragraphs down inside block 2: on a short window the one thing this page
+    // can DO was below the fold, and a user who had not scrolled had no way of
+    // knowing there was anything to press. Pinned, they are on screen for every
+    // game and at every window height.
+    //
+    // It also has to be able to say NOTHING, out loud. Hiding every button for
+    // a game with no prefix left a blank strip and a reason buried at the end of
+    // a paragraph; `actions` returns that sentence and this shows it where the
+    // buttons would have been.
+    let action_bar = gtk::Box::new(Orientation::Horizontal, 10);
+    action_bar.set_halign(Align::End);
+    action_bar.set_valign(Align::Center);
+    // NOT `wrapped`, which is selectable: this label sits in a row of buttons,
+    // and a selectable label selects all of its text the moment focus reaches
+    // it — which here is every time Tab passes through on the way to Install.
+    // `help.rs` records the measurement; the three bodies in the pane above
+    // pay for it because their text is worth copying, and a refusal is not.
+    let blocked = Label::new(None);
+    blocked.add_css_class("control-note");
+    blocked.set_halign(Align::Start);
+    blocked.set_xalign(0.0);
+    blocked.set_wrap(true);
+    blocked.set_hexpand(true);
+    blocked.set_max_width_chars(64);
+    blocked.set_visible(false);
+    let bar = gtk::Box::new(Orientation::Horizontal, 12);
+    bar.add_css_class("action-bar");
+    bar.append(&blocked);
+    bar.append(&action_bar);
+    bar.set_visible(false);
+
     // ---- the two panes, side by side
 
     // `vexpand`, unlike the control rack this sits beside in the hub's stack,
@@ -2854,7 +3001,13 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     let content = gtk::Box::new(Orientation::Horizontal, 16);
     content.set_vexpand(true);
     content.append(&pick);
-    content.append(&detail_scroll);
+    // The detail side is the scroller with the bar under it, so the bar stays
+    // put while the page behind it scrolls.
+    let right = gtk::Box::new(Orientation::Vertical, 10);
+    right.set_hexpand(true);
+    right.append(&detail_scroll);
+    right.append(&bar);
+    content.append(&right);
 
     // ---- the buttons, built once
     //
@@ -2870,9 +3023,19 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
          prefix and starts nothing.",
     ));
     let wine_btn = crate::widget::button("Choose the Proton build…");
-    b_actions.append(&install_btn);
-    b_actions.append(&details_btn);
-    b_actions.append(&wine_btn);
+    let uninstall_btn = crate::widget::button("Uninstall");
+    uninstall_btn.add_css_class("quiet");
+    uninstall_btn.set_tooltip_text(Some(
+        "Run `tobii bridge uninstall` for this game: take the bridge's files back out of the \
+         prefix and unregister them. It does not touch the game or its saves.",
+    ));
+    // The one that commits, first and accented; the rest quiet, in the order
+    // somebody reaches for them.
+    install_btn.add_css_class("primary");
+    action_bar.append(&install_btn);
+    action_bar.append(&uninstall_btn);
+    action_bar.append(&details_btn);
+    action_bar.append(&wine_btn);
 
     // ---- the state the page draws itself from
 
@@ -2946,9 +3109,11 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             b2.downgrade(),
             d2.downgrade(),
         );
-        let b_actions = b_actions.downgrade();
-        let (install_w, details_w, wine_w) = (
+        let action_bar_w = action_bar.downgrade();
+        let (bar_w, blocked_w) = (bar.downgrade(), blocked.downgrade());
+        let (install_w, uninstall_w, details_w, wine_w) = (
             install_btn.downgrade(),
+            uninstall_btn.downgrade(),
             details_btn.downgrade(),
             wine_btn.downgrade(),
         );
@@ -3027,7 +3192,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             let chosen = (!all.is_empty()).then(|| all.remove(0));
             let state = bridge_state(chosen.as_deref(), &app.appid);
             let others = other_prefixes(all);
-            let (mut text, action) = bridge_block(
+            let mut text = bridge_block(
                 &state,
                 scan.steam.missing_libraries(),
                 &others,
@@ -3048,8 +3213,12 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             );
             text.push_str(&job.text);
             br_body.set_text(&text);
+            // The bar, from one value. `action` above is what block 2's
+            // paragraph was worded from, and `acts.primary` is the same
+            // function — see `bridge_action`.
+            let acts = actions(&state, tobii.as_deref(), &job, app.installed);
             if let Some(btn) = install_w.upgrade() {
-                match action {
+                match acts.primary {
                     Some(a) => {
                         crate::widget::set_button_text(&btn, a.caption());
                         btn.set_visible(true);
@@ -3057,14 +3226,28 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                     None => btn.set_visible(false),
                 }
             }
+            if let Some(btn) = uninstall_w.upgrade() {
+                btn.set_visible(acts.uninstall);
+            }
             if let Some(btn) = details_w.upgrade() {
-                btn.set_visible(tobii.is_some() && !matches!(state, BridgeState::NoPrefix));
+                btn.set_visible(acts.details);
             }
             if let Some(btn) = wine_w.upgrade() {
-                btn.set_visible(tobii.is_some() && job.offer_wine);
+                btn.set_visible(acts.wine);
             }
-            if let Some(b) = b_actions.upgrade() {
+            if let Some(b) = action_bar_w.upgrade() {
                 b.set_sensitive(job.enabled);
+            }
+            if let (Some(bar), Some(blocked)) = (bar_w.upgrade(), blocked_w.upgrade()) {
+                match acts.blocked {
+                    Some(why) => {
+                        blocked.set_text(why);
+                        blocked.set_visible(true);
+                    }
+                    None => blocked.set_visible(false),
+                }
+                // The bar itself appears the moment a game is picked and stays.
+                bar.set_visible(true);
             }
             match &job.report {
                 Some(r) => {
@@ -3130,6 +3313,34 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             };
             *outcome.borrow_mut() = None;
             let argv = install_argv(t, &app.appid, None);
+            let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.appid.clone());
+            start_job(argv, &app.appid, &alive, &running, move |o| {
+                *outcome2.borrow_mut() = Some((id.clone(), o));
+                refresh2();
+            });
+            refresh();
+        });
+    }
+
+    {
+        let (refresh, sel, tobii, running, outcome, alive) = (
+            refresh.clone(),
+            sel.clone(),
+            tobii.clone(),
+            running.clone(),
+            outcome.clone(),
+            alive.clone(),
+        );
+        uninstall_btn.connect_clicked(move |_| {
+            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
+                return;
+            };
+            // The same slot the install writes into, on purpose: one job at a
+            // time, and whichever ran last is what the page reports. `Outcome`
+            // is already keyed by app id, so an uninstall finishing after the
+            // user has moved on lands on the right game or nowhere.
+            *outcome.borrow_mut() = None;
+            let argv = uninstall_argv(t, &app.appid);
             let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.appid.clone());
             start_job(argv, &app.appid, &alive, &running, move |o| {
                 *outcome2.borrow_mut() = Some((id.clone(), o));
@@ -3479,11 +3690,7 @@ mod tests {
 
     /// Block 2 on a machine that has a `tobii` to run. The two arguments the
     /// tests that are not about the binary would otherwise repeat.
-    fn block2(
-        state: &BridgeState,
-        missing: &[PathBuf],
-        others: &[(PathBuf, bool)],
-    ) -> (String, Option<Action>) {
+    fn block2(state: &BridgeState, missing: &[PathBuf], others: &[(PathBuf, bool)]) -> String {
         bridge_block(
             state,
             missing,
@@ -3492,6 +3699,12 @@ mod tests {
             Some(Path::new("/opt/x")),
             "359320",
         )
+    }
+
+    /// A [`JobView`] with nothing running, for the tests that ask [`actions`]
+    /// what the bar offers rather than what a job is doing to it.
+    fn quiet_job() -> JobView {
+        job_view("359320", None, None, None, &BridgeState::NoPrefix)
     }
 
     /// Block 1 for a game no profile has anything to say about, with a
@@ -3623,6 +3836,90 @@ mod tests {
             !got.get(),
             "the poll reported into a hub that has quit, which is a closure holding \
              widgets of a window that is being torn down"
+        );
+    }
+
+    // ------------------------------------------------------- the action bar
+
+    /// The bar answers with a BUTTON or with a SENTENCE, and never with
+    /// nothing.
+    ///
+    /// The buttons lived in block 2 and were simply hidden when there was
+    /// nothing to press, so a game with no prefix — or a machine with no
+    /// `tobii` — got a blank strip and a reason buried at the end of a
+    /// paragraph. Pinned under the pane, the bar is the first thing a user
+    /// looks at to find out whether this page can do anything, so an empty one
+    /// has to say why it is empty.
+    #[test]
+    fn the_bar_always_answers_either_with_a_button_or_with_a_reason() {
+        let tobii = Path::new("/usr/bin/tobii");
+        let cases = [
+            ("not installed here", present(), Some(tobii), false),
+            ("no prefix", BridgeState::NoPrefix, Some(tobii), true),
+            ("no tobii", present(), None, true),
+            ("a prefix without it", absent(), Some(tobii), true),
+            ("a prefix with it", present(), Some(tobii), true),
+        ];
+        for (what, state, t, here) in cases {
+            let a = actions(&state, t, &quiet_job(), here);
+            let has_button = a.primary.is_some() || a.uninstall || a.details || a.wine;
+            assert_ne!(
+                has_button,
+                a.blocked.is_some(),
+                "{what}: the bar has {} button(s) and {} a reason — it must have exactly \
+                 one of the two: {a:?}",
+                if has_button { "some" } else { "no" },
+                if a.blocked.is_some() {
+                    "has"
+                } else {
+                    "has not"
+                },
+            );
+        }
+    }
+
+    /// The three refusals, in the order they have to be answered.
+    ///
+    /// A game Steam does not list here has no prefix either, and a machine
+    /// with no `tobii` would still have nothing to install into — so answering
+    /// the second or third over the first sends somebody to fix the wrong
+    /// thing. Each case below is true of every refusal after it.
+    #[test]
+    fn the_bar_names_the_first_reason_and_not_a_later_one() {
+        let no_tobii_no_prefix = actions(&BridgeState::NoPrefix, None, &quiet_job(), true);
+        assert!(
+            no_tobii_no_prefix
+                .blocked
+                .is_some_and(|w| w.contains("No Proton prefix")),
+            "a missing prefix outranks a missing program: {no_tobii_no_prefix:?}"
+        );
+        let elsewhere = actions(&BridgeState::NoPrefix, None, &quiet_job(), false);
+        assert!(
+            elsewhere
+                .blocked
+                .is_some_and(|w| w.contains("does not list this game")),
+            "and a game that is not on this machine outranks both: {elsewhere:?}"
+        );
+    }
+
+    /// Uninstall is offered over a prefix that holds the artifact and nowhere
+    /// else.
+    ///
+    /// There is nothing to take out of a prefix that has not got it, and a
+    /// button that can only fail is the thing block 2 has always refused to
+    /// show. The mirror matters as much: a prefix that HAS it must offer the
+    /// way back out, or the only way to undo an install is a terminal.
+    #[test]
+    fn taking_the_bridge_back_out_is_offered_exactly_where_there_is_something_to_remove() {
+        let tobii = Path::new("/usr/bin/tobii");
+        assert!(actions(&present(), Some(tobii), &quiet_job(), true).uninstall);
+        assert!(!actions(&absent(), Some(tobii), &quiet_job(), true).uninstall);
+        assert!(!actions(&BridgeState::NoPrefix, Some(tobii), &quiet_job(), true).uninstall);
+        // And it is a different verb from install, not a flag on it.
+        let argv = uninstall_argv(tobii, "359320");
+        assert_eq!(
+            argv.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
+            vec!["/usr/bin/tobii", "bridge", "uninstall", "--steam", "359320"],
         );
     }
 
@@ -4190,17 +4487,21 @@ mod tests {
     #[test]
     fn a_missing_prefix_with_an_absent_library_does_not_read_as_never_launched() {
         let missing = [PathBuf::from("/mnt/games2")];
-        let (text, action) = block2(&BridgeState::NoPrefix, &missing, &[]);
+        let text = block2(&BridgeState::NoPrefix, &missing, &[]);
         assert!(text.contains("/mnt/games2"), "{text}");
         assert!(text.contains("cannot rule out"), "{text}");
-        assert_eq!(action, None, "there is nothing to install into");
+        assert_eq!(
+            bridge_action(&BridgeState::NoPrefix),
+            None,
+            "there is nothing to install into"
+        );
     }
 
     /// The other half. Without it the test above is satisfied by appending the
     /// sentence always, which would name a library on every machine.
     #[test]
     fn a_missing_prefix_with_every_library_present_invents_no_library() {
-        let (text, _) = block2(&BridgeState::NoPrefix, &[], &[]);
+        let text = block2(&BridgeState::NoPrefix, &[], &[]);
         assert!(!text.contains("cannot rule out"), "{text}");
         assert!(!text.contains("not on this machine"), "{text}");
         assert!(
@@ -4212,7 +4513,7 @@ mod tests {
     #[test]
     fn a_prefix_that_already_has_the_files_is_not_offered_an_install() {
         let prefix = PathBuf::from("/games/compatdata/1/pfx");
-        let (text, action) = block2(
+        let text = block2(
             &BridgeState::Files {
                 dir: prefix.join(BRIDGE_SUBDIR),
                 prefix,
@@ -4221,8 +4522,8 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(action, Some(Action::Reinstall));
-        assert_ne!(action, Some(Action::Install));
+        assert_eq!(bridge_action(&present()), Some(Action::Reinstall));
+        assert_ne!(bridge_action(&present()), Some(Action::Install));
         // It stats two paths, so it claims two paths — never that the bridge
         // "is installed", which two registry values decide.
         assert!(!text.contains("is installed"), "{text}");
@@ -4238,8 +4539,8 @@ mod tests {
     #[test]
     fn the_three_bridge_states_read_as_three_sentences() {
         let prefix = PathBuf::from("/games/compatdata/1/pfx");
-        let (no_prefix, _) = block2(&BridgeState::NoPrefix, &[], &[]);
-        let (absent, _) = block2(
+        let no_prefix = block2(&BridgeState::NoPrefix, &[], &[]);
+        let absent = block2(
             &BridgeState::Absent {
                 prefix: prefix.clone(),
                 present: vec![],
@@ -4247,7 +4548,7 @@ mod tests {
             &[],
             &[],
         );
-        let (files, _) = block2(
+        let files = block2(
             &BridgeState::Files {
                 dir: prefix.join(BRIDGE_SUBDIR),
                 prefix: prefix.clone(),
@@ -4569,7 +4870,7 @@ mod tests {
         // `binary_line` and asserting on its return value tests that function
         // and nothing else: it stayed green with the line never appended to
         // any block.
-        let (here, _) = bridge_block(
+        let here = bridge_block(
             &absent(),
             &[],
             &[],
@@ -4579,7 +4880,7 @@ mod tests {
         );
         assert!(here.contains("/home/x/.local/bin/tobii"), "{here}");
 
-        let (there, _) = bridge_block(
+        let there = bridge_block(
             &absent(),
             &[],
             &[],
@@ -4595,8 +4896,8 @@ mod tests {
 
         // And on every state that has a button, not only the one.
         for state in [absent(), present()] {
-            let (text, action) = block2(&state, &[], &[]);
-            assert!(action.is_some(), "{state:?}");
+            let text = block2(&state, &[], &[]);
+            assert!(bridge_action(&state).is_some(), "{state:?}");
             assert!(
                 text.contains("/usr/bin/tobii"),
                 "{state:?} carries a button and does not say what runs it: {text}"
@@ -5346,7 +5647,7 @@ mod tests {
         let here = PathBuf::from("/home/u/.steam/steam/steamapps/compatdata/359320/pfx");
         let there = PathBuf::from("/mnt/games2/steamapps/compatdata/359320/pfx");
 
-        let (alone, _) = block2(
+        let alone = block2(
             &BridgeState::Absent {
                 prefix: here.clone(),
                 present: vec![],
@@ -5363,7 +5664,7 @@ mod tests {
             "and says nothing about others: {alone}"
         );
 
-        let (two, action) = block2(
+        let two = block2(
             &BridgeState::Absent {
                 prefix: here,
                 present: vec![],
@@ -5374,14 +5675,14 @@ mod tests {
         assert!(two.contains(&there.display().to_string()), "{two}");
         assert!(two.contains("Move Install Folder"), "{two}");
         assert_eq!(
-            action,
+            bridge_action(&absent()),
             Some(Action::Install),
             "the button stays — the named prefix is still the one an install writes"
         );
 
         // And when the OTHER one already holds the bridge, that is the fact
         // most worth knowing before pressing anything.
-        let (installed_there, _) = block2(
+        let installed_there = block2(
             &BridgeState::Absent {
                 prefix: PathBuf::from("/home/u/.steam/steam/steamapps/compatdata/359320/pfx"),
                 present: vec![],
@@ -5397,7 +5698,7 @@ mod tests {
     /// fact, so the sentence takes it from the list.
     #[test]
     fn the_install_paragraph_counts_the_files_it_will_copy() {
-        let (text, _) = block2(
+        let text = block2(
             &BridgeState::Absent {
                 prefix: PathBuf::from("/p/pfx"),
                 present: vec![],
@@ -5451,8 +5752,8 @@ mod tests {
     #[test]
     fn a_state_holding_one_of_the_three_is_not_worded_as_holding_all_three() {
         let one = files_with(vec![BRIDGE_ARTIFACT]);
-        let (text, action) = block2(&one, &[], &[]);
-        assert_eq!(action, Some(Action::Reinstall));
+        let text = block2(&one, &[], &[]);
+        assert_eq!(bridge_action(&one), Some(Action::Reinstall));
         assert!(
             !text.contains("The bridge's files are in this prefix"),
             "one file is not \"the bridge's files\": {text}"
@@ -5476,7 +5777,7 @@ mod tests {
 
         // The full set reads as it always did — the qualification is earned by
         // a gap, not appended to every page.
-        let (all, _) = block2(&present(), &[], &[]);
+        let all = block2(&present(), &[], &[]);
         assert!(
             all.contains(&format!("All {} of the bridge's files", BRIDGE_FILES.len())),
             "{all}"
@@ -5522,9 +5823,9 @@ mod tests {
             "the fixture is the other two, whatever they are called"
         );
 
-        let (text, action) = block2(&absent_with(some.clone()), &[], &[]);
+        let text = block2(&absent_with(some.clone()), &[], &[]);
         assert_eq!(
-            action,
+            bridge_action(&absent_with(some.clone())),
             Some(Action::Install),
             "the file a game loads is still missing, so the button stays: {text}"
         );
@@ -5555,7 +5856,7 @@ mod tests {
 
         // An empty prefix reads as it always did: the qualification is earned
         // by what the stat found, not appended to every page.
-        let (none, _) = block2(&absent(), &[], &[]);
+        let none = block2(&absent(), &[], &[]);
         assert!(none.contains("The bridge's files are not in it"), "{none}");
         assert!(
             none.contains(&format!("there is no {BRIDGE_ARTIFACT} under")),
@@ -5586,7 +5887,7 @@ mod tests {
     /// rendered, one after the other.
     #[test]
     fn a_page_with_no_details_button_does_not_tell_the_reader_to_press_details() {
-        let (with, _) = bridge_block(
+        let with = bridge_block(
             &present(),
             &[],
             &[],
@@ -5599,7 +5900,7 @@ mod tests {
             "the button is on the page, so the sentence pointing at it is too: {with}"
         );
 
-        let (without, action) = bridge_block(
+        let without = bridge_block(
             &present(),
             &[],
             &[],
@@ -5607,7 +5908,15 @@ mod tests {
             Some(Path::new("/opt/x")),
             "359320",
         );
-        assert_eq!(action, None, "nothing to run: {without}");
+        // The no-button half moved to `actions`, which is the one decider
+        // now: `bridge_block` writes the paragraph and says nothing about
+        // buttons. Asserted here because this test is about the two agreeing.
+        assert!(
+            actions(&present(), None, &quiet_job(), true)
+                .primary
+                .is_none(),
+            "nothing to run: {without}"
+        );
         assert!(
             !without.contains("Details below is"),
             "`refresh` hides Details on `tobii.is_none()`, and this very page says so a \
@@ -5775,7 +6084,7 @@ mod tests {
     /// it replaced was *Reinstall*.
     #[test]
     fn the_sentence_replacing_the_button_names_what_the_button_did() {
-        let (files, action) = bridge_block(
+        let files = bridge_block(
             &present(),
             &[],
             &[],
@@ -5783,7 +6092,12 @@ mod tests {
             Some(Path::new("/opt/x")),
             "359320",
         );
-        assert_eq!(action, None, "nothing to run: {files}");
+        assert!(
+            actions(&present(), None, &quiet_job(), true)
+                .primary
+                .is_none(),
+            "nothing to run: {files}"
+        );
         assert!(
             !files.contains("cannot be installed from here"),
             "the files are in the prefix and the button said Reinstall: {files}"
@@ -5794,7 +6108,7 @@ mod tests {
             "Details is gone for the same reason, so the page says what it ran: {files}"
         );
 
-        let (absent, _) = bridge_block(
+        let absent = bridge_block(
             &absent(),
             &[],
             &[],
@@ -5811,7 +6125,7 @@ mod tests {
 
         // No button at all, and so no sentence about one: a prefix that does
         // not exist is not a machine missing a program.
-        let (none, action) = bridge_block(
+        let none = bridge_block(
             &BridgeState::NoPrefix,
             &[],
             &[],
@@ -5819,7 +6133,9 @@ mod tests {
             Some(Path::new("/opt/x")),
             "359320",
         );
-        assert_eq!(action, None);
+        assert!(actions(&BridgeState::NoPrefix, None, &quiet_job(), true)
+            .primary
+            .is_none());
         // Asserted on a phrase both arms of `no_binary_text`'s head share.
         // The old assertion was `!none.contains("not beside this one")`,
         // which stopped being a substring of either arm the moment the head
@@ -6551,15 +6867,22 @@ mod tests {
             prefix: PathBuf::from("/p/pfx"),
             present: vec![],
         };
-        let (text, action) =
-            bridge_block(&state, &[], &[], None, Some(Path::new("/opt/x")), "359320");
-        assert_eq!(action, None, "nothing to run it with: {text}");
+        let text = bridge_block(&state, &[], &[], None, Some(Path::new("/opt/x")), "359320");
+        // The button half is `actions`, which is the one decider: with no
+        // `tobii` there is nothing to run, whatever the prefix holds.
+        let bar = actions(&state, None, &quiet_job(), true);
+        assert_eq!(bar.primary, None, "nothing to run it with: {text}");
+        assert!(
+            bar.blocked
+                .is_some_and(|w| w.contains("`tobii` is not on the PATH")),
+            "and the bar says so where the buttons would be: {bar:?}"
+        );
         assert!(
             text.contains("tobii bridge install --steam 359320"),
             "{text}"
         );
 
-        let (with, action) = bridge_block(
+        let with = bridge_block(
             &state,
             &[],
             &[],
@@ -6567,7 +6890,14 @@ mod tests {
             Some(Path::new("/opt/x")),
             "359320",
         );
-        assert_eq!(action, Some(Action::Install));
+        let bar = actions(
+            &state,
+            Some(Path::new("/home/x/.local/bin/tobii")),
+            &quiet_job(),
+            true,
+        );
+        assert_eq!(bar.primary, Some(Action::Install));
+        assert_eq!(bar.blocked, None, "{bar:?}");
         assert!(
             with.contains("/home/x/.local/bin/tobii"),
             "which program these buttons run is the premise of the rest: {with}"
