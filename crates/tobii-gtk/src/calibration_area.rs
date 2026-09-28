@@ -27,7 +27,7 @@ pub const MAX_DIAGONAL_MM: f64 = 700.0;
 /// a 10mm tolerance = 360mm).
 pub const MAX_HEIGHT_MM: f64 = 360.0;
 
-/// A normalized [0,1]x[0,1] sub-rectangle `(x0, y0, width, height)` that
+/// A normalized `[0,1]x[0,1]` sub-rectangle `(x0, y0, width, height)` that
 /// calibration points should be confined to, or `None` if the physical
 /// screen is small enough that the full screen can be used directly
 /// (matches the decompiled original's own "already small enough, use
@@ -84,7 +84,7 @@ pub const OUTERMOST_POINT_FRACTION: f64 = 0.4;
 /// op and *no* calibration had any effect at all, so nothing could have shown
 /// one.
 ///
-/// **[CONFIRMED]** live 2026-08-26, measured against the 600 mm cap on the same
+/// **\[CONFIRMED\]** live 2026-08-26, measured against the 600 mm cap on the same
 /// 13-column sweep, paired by target position:
 ///
 /// ```text
@@ -128,7 +128,7 @@ pub fn capped_area_at(
     Some(((1.0 - cap_w) / 2.0, y0, cap_w, h))
 }
 
-/// Remap a point from the "conceptual full-screen" [0,1]x[0,1] space (where
+/// Remap a point from the "conceptual full-screen" `[0,1]x[0,1]` space (where
 /// the calibration flow's raw point-set values live) into the capped,
 /// centered sub-rectangle — or return it unchanged if `area` is `None`.
 pub fn remap_point(point: (f64, f64), area: Option<(f64, f64, f64, f64)>) -> (f64, f64) {

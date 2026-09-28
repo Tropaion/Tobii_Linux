@@ -419,7 +419,7 @@ pub fn control(
 
 /// The head-model card, and the one thing the hub has to be able to do to it.
 ///
-/// Two fields taken apart on the spot by the caller, for [`crate::GamesTab`]'s
+/// Two fields taken apart on the spot by the caller, for [`crate::game_setup::GamesTab`]'s
 /// reason: `root` goes into the rack, which owns it, and `refresh` holds no
 /// widget strongly, so the hub's tick can keep a handle on it without holding
 /// a subtree of its own window.

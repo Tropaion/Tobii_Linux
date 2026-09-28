@@ -619,7 +619,7 @@ impl GameOutput {
     /// # Why this is not just a rebuild
     ///
     /// Rebuilding `GameOutput` is what the device thread used to do on any
-    /// settings change, and it constructs a fresh [`FramePipeline`] — which
+    /// settings change, and it constructs a fresh `FramePipeline` — which
     /// throws away the **neutral**, the head position that reads as zero
     /// displacement. Re-taking it mid-game means re-taking it from wherever the
     /// user's head happens to be at that instant. Change the Extended View

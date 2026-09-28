@@ -18,7 +18,7 @@
 //!    `align`), so absent or wrong EDID can be corrected by eye. They are
 //!    *rendered* from the current width/offset, so seeding the width places
 //!    them correctly for free. A "Show advanced" toggle reveals the editable
-//!    numeric form (compact −[value]+ spinners, two-way synced with the
+//!    numeric form (compact −`[value]`+ spinners, two-way synced with the
 //!    drag), each row carrying a "?" button whose tooltip explains + diagrams
 //!    the field. Its "Done" button only advances to Posture — no writes yet.
 //! 3. **Posture** — a static reminder to sit up straight. Its "Done" button

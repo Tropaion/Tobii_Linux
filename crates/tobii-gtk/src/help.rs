@@ -1304,6 +1304,68 @@ mod tests {
         );
     }
 
+    /// Every fact the Games tab states only in a tooltip is in here too.
+    ///
+    /// The same rule the rack keeps, applied to the one surface
+    /// `tests/help_window.rs` cannot reach: that test walks `CARDS`, which is
+    /// the Tracker tab's six, and always was — so the tab's five tooltips were
+    /// covered by nothing at all. GTK4 shows a tooltip on pointer hover and on
+    /// nothing else, so a fact that lives only in one is unreachable by
+    /// keyboard and by touch.
+    ///
+    /// Asserted over the constants rather than over retyped copies, and
+    /// **fact by fact rather than string by string**: a tooltip is written for
+    /// a pointer resting on a button and a help topic is written to be read, so
+    /// requiring the sentences to match would force one of them to be written
+    /// badly. What each pair shares is the claim.
+    #[test]
+    fn every_fact_the_games_tab_puts_only_in_a_tooltip_is_in_this_window() {
+        let games = super::topics()
+            .into_iter()
+            .find(|t| t.title == "Games")
+            .expect("the Games topic");
+        let text = games.text();
+        for (tip, facts) in [
+            (
+                crate::game_setup::DETAILS_TIP,
+                &["tobii bridge status", "without starting anything"][..],
+            ),
+            (
+                crate::game_setup::UNINSTALL_TIP,
+                &["Uninstall takes it back out"],
+            ),
+            (
+                crate::game_setup::OTHER_CLIENT_TIP,
+                &[
+                    "NPClient64.dll",
+                    "signature check",
+                    "something has to be filling it",
+                ],
+            ),
+            (crate::game_setup::ADD_GAME_TIP, &["Add a game by folder"]),
+            (
+                crate::game_setup::FORGET_TIP,
+                &["Remove from this list", "touches nothing on disk"],
+            ),
+        ] {
+            for fact in facts {
+                assert!(
+                    text.contains(fact),
+                    "the tooltip {tip:?} states {fact:?} and this window does not, so a \
+                     keyboard or touch user cannot reach it:\n{text}"
+                );
+            }
+        }
+        // And the list is the whole list, so a sixth tooltip cannot be added
+        // to that tab without this test being made to look at it.
+        assert_eq!(
+            crate::game_setup::TIPS.len(),
+            5,
+            "a tooltip was added or removed on the Games tab; the pairs above are what \
+             says whether the help window still carries its facts"
+        );
+    }
+
     /// A switch this program greys out has to say why, where a keyboard and a
     /// touch user can read it.
     ///

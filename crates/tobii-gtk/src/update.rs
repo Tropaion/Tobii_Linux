@@ -388,8 +388,17 @@ pub fn banner() -> gtk::Box {
     row.append(&dismiss);
 
     {
-        let row = row.clone();
-        dismiss.connect_clicked(move |_| row.set_visible(false));
+        // Weak. `row` holds `dismiss` as a child and this handler held `row`
+        // back — a cycle between two parts of one banner, which GTK never
+        // breaks, on a widget that goes onto the hub's root and therefore
+        // outlives every window the suite censuses. `tests/hub_lifetime.rs`
+        // is what found it.
+        let row = row.downgrade();
+        dismiss.connect_clicked(move |_| {
+            if let Some(row) = row.upgrade() {
+                row.set_visible(false);
+            }
+        });
     }
 
     // Nothing is asked of the network when the user has said not to.

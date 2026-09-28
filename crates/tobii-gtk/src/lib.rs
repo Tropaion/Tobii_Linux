@@ -1635,15 +1635,23 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     banner.append(&banner_recal);
     banner.append(&banner_dismiss);
     {
-        let banner = banner.clone();
-        banner_dismiss.connect_clicked(move |_| banner.set_visible(false));
+        // Weak, for `update::banner`'s reason: `banner` holds this button as a
+        // child, so a strong handle here closes a cycle between two parts of
+        // one row and the whole banner outlives the program.
+        let banner = banner.downgrade();
+        banner_dismiss.connect_clicked(move |_| {
+            if let Some(b) = banner.upgrade() {
+                b.set_visible(false);
+            }
+        });
     }
     {
         let app = app.clone();
         let state = state.clone();
         let cmd_tx = cmd_tx.clone();
         let sw_preview = sw_preview.clone();
-        let banner = banner.clone();
+        // Weak, same reason: `banner` is this button's parent.
+        let banner = banner.downgrade();
         let demand = demand.clone();
         banner_recal.connect_clicked(move |btn| {
             // Same reasoning as `b_cal`: the gaze-preview overlay would poison
@@ -1651,7 +1659,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             sw_preview.set_active(false);
             // A recalibration is now in flight; the recommendation no longer
             // applies (and would otherwise reappear stale once this closes).
-            banner.set_visible(false);
+            if let Some(b) = banner.upgrade() {
+                b.set_visible(false);
+            }
             btn.set_sensitive(false);
             // The banner fires when the existing calibration is no longer
             // trusted, so seeding from it would be self-defeating.

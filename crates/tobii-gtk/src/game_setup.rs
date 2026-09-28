@@ -24,7 +24,7 @@
 //! hub and dropped the hub's own claim as a side effect, where a tab does not.
 //! So the hub holds `"the hub window"` only while the **Tracker** tab is
 //! showing — see `crate::build_hub`'s tick — and nothing in here calls
-//! [`crate::hold_while_open`] or takes a `DemandGuard`. The argument is
+//! `crate::hold_while_open` or takes a `DemandGuard`. The argument is
 //! [`crate::help`]'s, word for word: lighting the illuminators to show
 //! somebody a paragraph is precisely the behaviour the whole demand mechanism
 //! exists to prevent. `tests/games_tab.rs` asserts it against the device
@@ -131,10 +131,16 @@ const BRIDGE_ARTIFACT: &str = "freetrackclient64.dll";
 /// says what the tab is for to somebody who has just landed on it.
 const HEADING: &str = "Set up a game";
 
-/// The search box, so the display test can find it without matching on text.
-pub const SEARCH_NAME: &str = "gamesetup-search";
+/// The search box, so a test can find it without matching on text.
+///
+/// `pub(crate)` and not `pub`: these were exported for a display test that
+/// went with the modal, and nothing outside this crate has referred to either
+/// since. A name in a crate's public API on the strength of a caller that does
+/// not exist is a promise nothing is holding — `tests/games_tab.rs` finds the
+/// tab stack through [`crate::HUB_STACK_NAME`], which IS `pub` and IS used.
+pub(crate) const SEARCH_NAME: &str = "gamesetup-search";
 /// The list of games, likewise.
-pub const LIST_NAME: &str = "gamesetup-games";
+pub(crate) const LIST_NAME: &str = "gamesetup-games";
 
 /// How wide the list of games asks to be, and how wide the detail pane does.
 ///
@@ -151,7 +157,7 @@ const DETAIL_WIDTH: i32 = 380;
 
 /// Everything this window reads off the machine before it draws anything.
 ///
-/// Injected rather than read inside [`open_with`] so the whole window can be
+/// Injected rather than read inside [`build_with`] so the whole tab can be
 /// opened in a test against a synthetic library: CI runs as root with no real
 /// `$HOME` and no Steam install, and a window that read `$HOME` itself could
 /// only ever be tested on somebody's laptop.
@@ -321,6 +327,52 @@ impl RowBridge {
         }
     }
 }
+
+/// What the action bar's buttons say when a pointer rests on them.
+///
+/// Consts, and `pub(crate)`, for [`crate::PREVIEW_HELP`]'s reason: GTK4 shows a
+/// tooltip on pointer hover and on nothing else, so a fact that lives only in
+/// one is unreachable by keyboard and by touch. The help window has to carry
+/// the same facts, and `help::tests` asserts it over these very strings rather
+/// than over a retyped copy — this tab is outside `tests/help_window.rs`'s
+/// rack walk, which is scoped to the Tracker tab's cards and always was, so
+/// this is the check that stands in for it and it runs in CI.
+pub(crate) const DETAILS_TIP: &str =
+    "Run `tobii bridge status` for this game and show what it prints. It reads the prefix and \
+     starts nothing.";
+/// See [`DETAILS_TIP`].
+pub(crate) const UNINSTALL_TIP: &str =
+    "Run `tobii bridge uninstall` for this game: take the bridge's files back out of the prefix \
+     and unregister them. It does not touch the game or its saves.";
+/// See [`DETAILS_TIP`].
+pub(crate) const OTHER_CLIENT_TIP: &str =
+    "Install a client DLL that is not ours into this prefix — pick the folder holding its \
+     NPClient64.dll. For a game that refuses ours at the signature check. Something still has \
+     to be filling the shared mapping; the paragraph above says what.";
+/// See [`DETAILS_TIP`].
+pub(crate) const ADD_GAME_TIP: &str =
+    "For a game Steam does not list — pick the Wine prefix it runs in, and this page can \
+     install the bridge into it like any other. Nothing is written to the game.";
+/// See [`DETAILS_TIP`].
+pub(crate) const FORGET_TIP: &str =
+    "Take this game out of the hub's list. It does not touch the prefix, the game, or a bridge \
+     already installed in it.";
+
+/// Every tooltip on this tab, for the one test that asks whether the help
+/// window carries the same facts.
+///
+/// `cfg(test)` because nothing in the program reads it: the buttons each take
+/// their own const. What it is for is the LENGTH — `help::tests` asserts it, so
+/// a sixth tooltip on this tab cannot be added without that test being made to
+/// look at the new one.
+#[cfg(test)]
+pub(crate) const TIPS: [&str; 5] = [
+    DETAILS_TIP,
+    UNINSTALL_TIP,
+    OTHER_CLIENT_TIP,
+    ADD_GAME_TIP,
+    FORGET_TIP,
+];
 
 /// One row of the game list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,7 +850,11 @@ pub(crate) fn picker(catalog: &Catalog, missing: &[PathBuf], query: &str) -> Pic
         let mut s = format!(
             "Nothing installed here is called “{}”, and no app id contains it. This list is \
              what Steam's manifests on this machine say, matched on the title and on the app \
-             id.",
+             id.\n\n\
+             A game that is not Steam's is not in those manifests and never will be, and this \
+             is where somebody with one keeps typing. Add it by hand instead: the button under \
+             this list takes the Wine prefix the game runs in, and the bridge installs into \
+             that exactly as it does for a Steam title.",
             query.trim()
         );
         if let Some(note) = missing_note(missing) {
@@ -2270,8 +2326,8 @@ pub(crate) fn write_a_profile_commands(appid: &str) -> String {
     )
 }
 
-/// The `tobii games profile` commands this window tells somebody to type, and
-/// the help window's "Set up a game…" topic types the same ones.
+/// The `tobii games profile` commands this tab tells somebody to type, and the
+/// help window's "Games" topic types the same ones.
 ///
 /// One spelling each, in one place, for the reason [`BRIDGE_FILES`] is one
 /// list: two surfaces that both name a command and are edited apart end up
@@ -2790,7 +2846,7 @@ fn lead(tobii: Option<&Path>) -> &'static str {
 /// hard way.
 ///
 /// The actions, where a block has any, are appended by the caller into a box
-/// of their own — and block 3 has none, on purpose. See [`open_with`].
+/// of their own — and block 3 has none, on purpose. See [`build_with`].
 fn block(n: u32, title: &str) -> (gtk::Box, Label) {
     let b = gtk::Box::new(Orientation::Vertical, 8);
     let t = Label::new(Some(&format!("{n}. {title}")));
@@ -2997,14 +3053,14 @@ fn read_catalog(scan: &Scan) -> Catalog {
 ///
 /// The scan is a measured ~400 µs and 81 filesystem calls, and it is now paid
 /// once when the hub is built rather than on the first press of a button. That
-/// is the trade the tab makes: it used to be paid on every press of a door that
-/// had already opened its window, which was worse, and it is why [`open`]'s
-/// registry check came before the disk read.
+/// is the trade the tab makes: it used to be paid on every press of a door
+/// that had already opened its window, which was worse — the modal checked the
+/// registry before it read the disk for exactly that reason, and there is no
+/// door to be on the wrong side of any more.
 ///
 /// `joystick` is the device thread's own answer, the one the games card reports
 /// from — see [`destinations`] for why the checkbox is not enough.
 ///
-/// [`open`]: GamesTab
 pub fn build(joystick: Arc<Mutex<JoystickStatus>>) -> GamesTab {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -3111,10 +3167,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     let add_btn = crate::widget::button("Add a game by folder…");
     add_btn.add_css_class("quiet");
     add_btn.set_halign(Align::Start);
-    add_btn.set_tooltip_text(Some(
-        "For a game Steam does not list — pick the Wine prefix it runs in, and this page can \
-         install the bridge into it like any other. Nothing is written to the game.",
-    ));
+    add_btn.set_tooltip_text(Some(ADD_GAME_TIP));
     pick.append(&search);
     pick.append(&list_scroll);
     pick.append(&census);
@@ -3321,10 +3374,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     let install_btn = crate::widget::button(Action::Install.caption());
     let details_btn = crate::widget::button("Details");
     details_btn.add_css_class("quiet");
-    details_btn.set_tooltip_text(Some(
-        "Run `tobii bridge status` for this game and show what it prints. It reads the \
-         prefix and starts nothing.",
-    ));
+    details_btn.set_tooltip_text(Some(DETAILS_TIP));
     let wine_btn = crate::widget::button("Choose the Proton build…");
     // Only ever on a row of `Group::Custom`, and it removes the ROW rather than
     // anything on disk. Named for what it does to this program's own list: an
@@ -3333,27 +3383,17 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // instead.
     let forget_btn = crate::widget::button("Remove from this list");
     forget_btn.add_css_class("quiet");
-    forget_btn.set_tooltip_text(Some(
-        "Take this game out of the hub's list. It does not touch the prefix, the game, or a \
-         bridge already installed in it.",
-    ));
+    forget_btn.set_tooltip_text(Some(FORGET_TIP));
     // Offered only to a title this project has watched stop at the signature
     // check — see `Actions::other_client`. The caption says "another" rather
     // than naming opentrack: opentrack ships a client and so might something
     // else, and this page has not watched either of them deliver.
     let other_btn = crate::widget::button("Install another client\u{2026}");
     other_btn.add_css_class("quiet");
-    other_btn.set_tooltip_text(Some(
-        "Install a client DLL that is not ours into this prefix — pick the folder holding its \
-         NPClient64.dll. For a game that refuses ours at the signature check. Something still \
-         has to be filling the shared mapping; the paragraph above says what.",
-    ));
+    other_btn.set_tooltip_text(Some(OTHER_CLIENT_TIP));
     let uninstall_btn = crate::widget::button("Uninstall");
     uninstall_btn.add_css_class("quiet");
-    uninstall_btn.set_tooltip_text(Some(
-        "Run `tobii bridge uninstall` for this game: take the bridge's files back out of the \
-         prefix and unregister them. It does not touch the game or its saves.",
-    ));
+    uninstall_btn.set_tooltip_text(Some(UNINSTALL_TIP));
     // The one that commits, first and accented; the rest quiet, in the order
     // somebody reaches for them.
     install_btn.add_css_class("primary");
@@ -4918,6 +4958,42 @@ mod tests {
         );
     }
 
+    /// The one-word answer on a row is read off the same value block 2's
+    /// paragraph is written from.
+    ///
+    /// The row's own doc says "a row and the page it opens cannot disagree
+    /// about a prefix they both stat'd", and nothing was holding it: every
+    /// other test in this module injects a `RowBridge` variant straight into
+    /// `Catalog::new`, so `RowBridge::of` could have been rewritten to return
+    /// the wrong variant for every arm with the whole suite still green.
+    ///
+    /// All three arms, because the mapping is the claim. `Files` is
+    /// "bridge installed" even when only the required artifact is there, and
+    /// that is deliberate rather than a rounding: `present_sentence` says the
+    /// same of the same state, and the other two files are ones a `tobii` built
+    /// without them skips and says so.
+    #[test]
+    fn a_rows_one_word_answer_is_read_off_the_state_the_page_is_worded_from() {
+        for (state, want) in [
+            (BridgeState::NoPrefix, RowBridge::NeverLaunched),
+            (absent(), RowBridge::NotInstalled),
+            (present(), RowBridge::Installed),
+            (files_with(vec![BRIDGE_ARTIFACT]), RowBridge::Installed),
+        ] {
+            assert_eq!(RowBridge::of(&state), want, "{state:?}");
+        }
+        // And the three clauses, which are what a reader sees.
+        assert_eq!(
+            [
+                RowBridge::NeverLaunched,
+                RowBridge::Installed,
+                RowBridge::NotInstalled
+            ]
+            .map(RowBridge::clause),
+            ["never launched", "bridge installed", "bridge not installed"],
+        );
+    }
+
     /// The expensive question is asked of the rows that need it and of nothing
     /// else.
     ///
@@ -5341,6 +5417,30 @@ mod tests {
             bridge_action(&BridgeState::NoPrefix),
             None,
             "there is nothing to install into"
+        );
+    }
+
+    /// The moment somebody with a non-Steam game keeps typing is the moment
+    /// to tell them the list cannot have it.
+    ///
+    /// The text explained the MATCH — title and app id, from Steam's manifests
+    /// — and not the BOUNDARY, so a user with Star Citizen read an accurate
+    /// sentence about how the search works and tried a different spelling. The
+    /// way in exists and is one button below the list; this is where it is
+    /// worth naming.
+    #[test]
+    fn a_search_that_finds_nothing_says_a_non_steam_game_never_will_be_found() {
+        let apps = [app("1", "Something Else")];
+        let text = picker(&catalog(&apps, &none), &[], "Star Citizen")
+            .no_match
+            .expect("nothing matched");
+        assert!(
+            text.contains("not in those manifests and never will be"),
+            "the boundary, not just the match rule: {text}"
+        );
+        assert!(
+            text.contains("Add it by hand"),
+            "and the way in, which is a button on this very page: {text}"
         );
     }
 
@@ -5824,7 +5924,7 @@ mod tests {
     /// sentence printed when it finds nothing has to answer for that.**
     ///
     /// `std::env::current_exe` reads `/proc/self/exe` on Linux and can fail;
-    /// `open_with` hands its `.ok()` straight through, so `exe` arrives as
+    /// `build_with` hands its `.ok()` straight through, so `exe` arrives as
     /// `None`. `tobii_binary` then has no directory to join `tobii` onto and
     /// goes straight to `$PATH` — while `no_binary_text`'s head opened "is
     /// not beside this one" whatever had happened, reporting a stat that was

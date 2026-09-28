@@ -111,7 +111,7 @@ const KEEP_AWAKE_REASON: &str = "standby turned off in the settings";
 /// Whether any current reason forbids handing the device over.
 ///
 /// Reads the reasons rather than a separate flag, so a new exclusive flow
-/// cannot forget to set one: it only has to name itself in [`EXCLUSIVE`].
+/// cannot forget to set one: it only has to name itself in `EXCLUSIVE`.
 pub fn wants_exclusive(reasons: &[&'static str]) -> bool {
     reasons.iter().any(|r| EXCLUSIVE.contains(r))
 }
@@ -376,7 +376,7 @@ impl CalPhase {
 pub struct DeviceState {
     pub status: ConnStatus,
     pub latest_gaze: Option<GazeSample>,
-    /// Most recent decoded eye-camera frame ([`CAMERA_STREAM`]), for the hub
+    /// Most recent decoded eye-camera frame (`CAMERA_STREAM`), for the hub
     /// preview. `None` until the camera stream is subscribed and a frame arrives.
     ///
     /// An `Arc` because the head-pose worker is handed the same frame, and a
@@ -606,10 +606,6 @@ fn apply_command<T: Transport>(
                 // its radios on this edge — see `crate::build_hub`'s tick.
                 s.enabled_eye_applied = s.enabled_eye_applied.wrapping_add(1);
             }
-            // NOT saved here. The UI writes the preference where the user
-            // chooses it, so it survives the tracker being unreachable; writing
-            // it again on the way to the device would mean two places that can
-            // disagree about what the user picked.
         }
         DeviceCommand::CalBegin { improve, token } => {
             state.lock().unwrap().calibration = CalPhase::begin(token);
@@ -847,7 +843,7 @@ pub fn device_tick<T: Transport>(
 
 /// What became of the head-pose model the last time it was loaded.
 ///
-/// Written by [`HeadWorker::spawn`], which is the one place that finds out: it
+/// Written by `HeadWorker::spawn`, which is the one place that finds out: it
 /// reads the file, hashes it and hands it to ONNX, and what it learns decides
 /// whether this program reports an up-and-down angle at all.
 ///

@@ -16,7 +16,7 @@
 //! `calibrate_flow.rs`, e.g. `FULL_7`) — simpler, and needs no pixel
 //! dimensions — but a raw Euclidean distance in normalized space IS
 //! distorted on a non-square screen (a 0.1 x-distance covers more physical
-//! screen than a 0.1 y-distance on a 16:9 display). [`aspect_corrected_dist`]
+//! screen than a 0.1 y-distance on a 16:9 display). `aspect_corrected_dist`
 //! corrects for this by scaling the x-component by `aspect` (screen
 //! width/height) before computing the Euclidean distance, and both
 //! [`zone_radius`] and [`closest_focused_point`] use it consistently so the
