@@ -31,6 +31,7 @@ mod setup;
 /// than duplicated, or reached for across a crate that has nothing to do with
 /// either.
 pub mod sha256;
+pub mod signature;
 mod store;
 
 pub use calibration_state::{decide, CalAction, RecommendReason};
