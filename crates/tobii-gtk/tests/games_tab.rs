@@ -188,6 +188,12 @@ struct Seen {
     /// The window's default size, before and after a tab switch.
     size_on_tracker: (i32, i32),
     size_on_games: (i32, i32),
+    /// And after coming back to Tracker, where a re-fit that was asked for on
+    /// the other tab has to land.
+    size_after_return: (i32, i32),
+    /// What that re-fit would have produced if it had been asked for again,
+    /// on the Tracker tab, where nothing skips it.
+    size_forced: (i32, i32),
     /// Whether the stack measures its visible child rather than the largest.
     homogeneous: (bool, bool),
     /// What the stack and each of its two children measure.
@@ -358,8 +364,22 @@ fn run(app_id: &str, hold: bool) -> Seen {
             // did not move proves only that nobody asked it to. `apply_text_scale`
             // is the shortest way in — it is the cogwheel's own path into the
             // `REFIT` closure, and the same closure a banner appearing calls,
-            // which is the case the guard was written for. At the same scale
-            // it is a no-op everywhere except in the re-fit it triggers.
+            // which is the case the guard was written for.
+            //
+            // At a DIFFERENT scale, and that is the second half of this file's
+            // geometry. At 1.0 the re-fit is a no-op in everything but its own
+            // arithmetic, so it can prove the guard skipped the Games page and
+            // nothing at all about what becomes of the fit it skipped. A window
+            // that has to change size makes both observable: the guard still
+            // has to leave it alone here, and the fit still has to land when
+            // the Tracker tab comes back.
+            //
+            // SMALLER and not larger, which is not taste. The re-fit sets the
+            // height and keeps the width (`effective_width`), so larger text
+            // leaves the rack's minimum width past the window's and GTK spends
+            // the rest of the run warning about it — a real thing about the
+            // cogwheel's own text control, and not this test's to demonstrate.
+            // Shrinking exercises the same code and says nothing it should not.
             //
             // Without the guard this measures the Games page (182px of content)
             // and shrinks the window to about a third of its height under a
@@ -367,7 +387,7 @@ fn run(app_id: &str, hold: bool) -> Seen {
             {
                 let (s, d, h) = (seen.clone(), demand.clone(), hub.clone());
                 at(1500, move || {
-                    tobii_gtk::apply_text_scale(1.0);
+                    tobii_gtk::apply_text_scale(0.9);
                     let mut s = s.borrow_mut();
                     s.claims_on_games = d.reasons();
                     s.size_on_games = (h.default_width(), h.default_height());
@@ -393,12 +413,43 @@ fn run(app_id: &str, hold: bool) -> Seen {
                 });
             }
 
+            // ---- back on Tracker: where the skipped re-fit has to have landed.
+            //
+            //      Not in the Ctrl+Page_Up callback above: the switch and the
+            //      handler that answers it run in the same turn, and a size
+            //      read on that turn would be racing GTK's own bookkeeping
+            //      rather than reading a settled window.
+            {
+                let (s, h) = (seen.clone(), hub.clone());
+                at(1900, move || {
+                    let mut s = s.borrow_mut();
+                    s.size_after_return = (h.default_width(), h.default_height());
+                });
+            }
+
+            // ---- and what that re-fit is supposed to have produced.
+            //
+            //      The same call again, on the tab where nothing skips it. It
+            //      is the reference the line above is compared against, and it
+            //      is taken from the program rather than typed here, because a
+            //      height typed into a test is this machine's fonts and not a
+            //      promise. If the two differ, the fit asked for on the Games
+            //      tab was dropped rather than deferred.
+            {
+                let (s, h) = (seen.clone(), hub.clone());
+                at(2100, move || {
+                    tobii_gtk::apply_text_scale(0.9);
+                    let mut s = s.borrow_mut();
+                    s.size_forced = (h.default_width(), h.default_height());
+                });
+            }
+
             // ---- and a plain Page_Down, which must NOT move the tab: the
             //      controller is in the Capture phase, so a key it claimed too
             //      eagerly would be taken from every scroller in the window.
             {
                 let (s, h) = (seen.clone(), hub.clone());
-                at(2000, move || {
+                at(2300, move || {
                     let handled = press(
                         h.upcast_ref(),
                         gtk::gdk::Key::Page_Down,
@@ -416,7 +467,7 @@ fn run(app_id: &str, hold: bool) -> Seen {
 
             {
                 let a = app.clone();
-                at(2300, move || a.activate_action("quit", None));
+                at(2600, move || a.activate_action("quit", None));
             }
             // If the quit action does nothing the run must still end, and fail.
             {
@@ -530,14 +581,41 @@ fn check(seen: &Seen) {
         seen.hub_natural_width
     );
 
-    // 4. A tab switch does not resize the window. The re-fit returns early
-    //    unless the Tracker tab is showing, precisely so that a banner arriving
-    //    while somebody is reading about a game cannot re-measure the window at
-    //    that page's height.
+    // 4. A re-fit asked for on the Games tab is skipped there and taken on the
+    //    way back — not taken there, and not thrown away.
+    //
+    //    Both halves, because each without the other is a bug this has had.
+    //    Taking it there re-measures the window at the Games page's height and
+    //    shrinks it to a third under somebody who is reading it. Throwing it
+    //    away is what the guard did at first: the re-fit exists because a
+    //    banner arriving pushes the last card out of view, a banner that
+    //    arrives while Games is showing does exactly that, and nothing ever
+    //    measured again — so the last card stayed below the fold for the rest
+    //    of the session.
     assert_eq!(
         seen.size_on_tracker, seen.size_on_games,
         "switching tabs resized the window, which is worse than a scrollbar: \
          {seen:#?}"
+    );
+    //    The premise first: larger text has to want a taller window, or the
+    //    comparison under it is two equal numbers that were never going to
+    //    differ. If this fails, the re-fit stopped resizing at all and what is
+    //    below it proves nothing.
+    assert!(
+        seen.size_forced.1 < seen.size_on_tracker.1,
+        "text at 0.9 did not change the height the window wants ({} -> {}), so \
+         the re-fit is not resizing anything and the check below cannot fail: \
+         {seen:#?}",
+        seen.size_on_tracker.1,
+        seen.size_forced.1,
+    );
+    assert_eq!(
+        seen.size_after_return, seen.size_forced,
+        "the re-fit asked for while the Games tab was showing was dropped rather \
+         than deferred: coming back to Tracker left the window at {:?} and asking \
+         again there produced {:?}, which is the height it should already have \
+         had: {seen:#?}",
+        seen.size_after_return, seen.size_forced,
     );
 
     // 5. The switcher is reachable without a pointer. The tabs are the only way

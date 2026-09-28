@@ -301,11 +301,16 @@ pub fn topics() -> Vec<Topic> {
                  program's own settings, the Wine bridge inside that game's \
                  Proton prefix, and the game's own options. It reads a game's own \
                  files and never changes them.\n\n\
-                 The first section reports and never writes. {pointer} The tracker \
-                 goes dark while this tab is showing, for the same reason it does \
-                 when you look at another window: nothing here needs the sensor, \
-                 and lighting the illuminators to show somebody a paragraph is \
-                 what this program is written not to do. Ctrl+Page Up comes back.\n\n\
+                 The first section reports and never writes. {pointer} Showing \
+                 this tab also stops the hub asking for the tracker, for the same \
+                 reason looking at another window does: nothing here needs the \
+                 sensor, and lighting the illuminators to show somebody a \
+                 paragraph is what this program is written not to do. Whether it \
+                 then goes dark depends on what else is holding it — a game \
+                 receiving through the joystick or the opentrack port, a \
+                 calibration, or Keep the tracker awake, which is what an ALWAYS \
+                 ON badge in the header means. With none of those it is dark \
+                 three seconds later. Ctrl+Page Up comes back.\n\n\
                  The third section, the game's own options, is read-only: this \
                  program reports what those files say and never writes them. It \
                  checks them only where a profile says what to look at, and this \
@@ -1226,6 +1231,48 @@ mod tests {
         assert!(
             text.contains(&tobii_config::signature::provider_note()),
             "and nothing says the answering client needs the provider behind it:\n{text}"
+        );
+    }
+
+    /// The Games topic may not promise the tracker goes dark on that tab.
+    ///
+    /// It did, in a sentence four inches from an ALWAYS ON badge that means the
+    /// opposite, and both are on screen at once. Showing the Games tab stops
+    /// the **hub** asking for the tracker — `hub_wants_tracker` is the whole of
+    /// it — and the hub's is one claim of eight. The other seven are standby
+    /// turned off, the virtual joystick, a program on the opentrack port, a
+    /// calibration, display setup, the gaze preview and the accuracy
+    /// diagnostic, and any one of them on its own keeps the illuminators lit
+    /// while this tab is showing, which made the sentence simply untrue.
+    ///
+    /// Asserted over the words rather than over the mechanism, because the
+    /// mechanism is a GTK tab and the defect was a promise. What is pinned is
+    /// that the topic names the condition and names the badge, so a reader
+    /// holding one of those seven is not told their tracker is off.
+    #[test]
+    fn the_games_topic_does_not_promise_a_tracker_it_does_not_control() {
+        let games = super::topics()
+            .into_iter()
+            .find(|t| t.title == "Games")
+            .expect("the Games topic");
+        let text = games.text();
+        assert!(
+            !text.contains("The tracker goes dark while this tab is showing"),
+            "the hub is one of several holders and this says it is the only one:\n{text}"
+        );
+        assert!(
+            text.contains("stops the hub asking for the tracker"),
+            "it has to say whose claim this is, or the next rewrite widens it back \
+             into a promise about the device:\n{text}"
+        );
+        assert!(
+            text.contains("what else is holding it"),
+            "and that something else can be:\n{text}"
+        );
+        assert!(
+            text.contains("ALWAYS ON"),
+            "and name the badge that is on screen at the same time saying so — the \
+             contradiction a reader actually sees:\n{text}"
         );
     }
 

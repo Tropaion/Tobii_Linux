@@ -493,7 +493,9 @@ fn joystick_paragraph(bridge: profiles::Bridge) -> String {
 /// `pub(crate)` so the help topic and the tests quote it rather than retyping
 /// it.
 pub(crate) const TRACKER_TAB_POINTER: &str =
-    "These are the Tracker tab's own settings; this page only reports them.";
+    "This page only reports these. The switch, the strength and the virtual joystick are on \
+     the Tracker tab; an opentrack address or a bridge port is not — those come from \
+     games.toml and `tobii games set` changes them.";
 
 /// Block 1: this program's own settings, reported.
 ///
@@ -2073,8 +2075,9 @@ fn lead(tobii: Option<&Path>) -> &'static str {
         }
         None => {
             "Everything Steam says is installed on this machine. Pick one and this page will \
-             show the three things that have to be configured for it. The one it can do is \
-             install the Wine bridge, and that needs the command-line program `tobii`, which \
+             show the three things that have to be configured for it, and do none of them: \
+             installing the Wine bridge is the one it could do, and that needs the \
+             command-line program `tobii`, which \
              this window could not find — it is not on the PATH this window was started with, \
              and a terminal's is often not the same — so for that one the page says what to \
              type there instead."
@@ -2174,7 +2177,7 @@ fn pretty(argv: &[OsString]) -> String {
 /// result. Now the poll keeps running while the hub is hidden and the outcome
 /// lands in its slot, where [`JobView`] finds it — keyed by appid, which it
 /// already was — the next time the page is drawn. Only the quit path sets this
-/// false. See [`GamesTab::shutdown`].
+/// false. See [`GamesTab::alive`].
 ///
 /// `appid` is stored beside the command line and is what the page keys its
 /// "Running now:" line to. One job at a time on this tab, whichever game it
@@ -2249,25 +2252,25 @@ fn start_job(
 pub struct GamesTab {
     /// The widget the hub adds to its `Stack`.
     pub root: gtk::Box,
-    /// See [`GamesTab::shutdown`].
-    pub alive: Rc<Cell<bool>>,
-}
-
-impl GamesTab {
-    /// Stop watching whatever subprocess is running, because the program is
-    /// ending.
+    /// Clear this and the tab stops watching whatever subprocess it started,
+    /// because the program is ending.
     ///
-    /// **From the quit path and not from `unmap`.** The modal this tab replaces
-    /// was closed by the hub's unmap handler — that is, by hiding to the tray —
-    /// and closing it set this flag, so hiding the hub in the middle of a
-    /// `tobii bridge install` threw the result away while the installer carried
-    /// on. A tab is not closed by hiding, so the poll keeps running, the
-    /// outcome lands in its per-appid slot, and the page shows it when the hub
-    /// comes back. That is strictly better and it is why this is not wired to
-    /// `unmap`.
-    pub fn shutdown(&self) {
-        self.alive.set(false);
-    }
+    /// **Set false from the quit path and not from `unmap`.** The modal this
+    /// tab replaces was closed by the hub's unmap handler — that is, by hiding
+    /// to the tray — and closing it cleared this flag, so hiding the hub in the
+    /// middle of a `tobii bridge install` threw the result away while the
+    /// installer carried on. A tab is not closed by hiding, so the poll keeps
+    /// running, the outcome lands in its per-appid slot, and the page shows it
+    /// when the hub comes back. That is strictly better and it is why this is
+    /// not wired to `unmap`.
+    ///
+    /// A bare flag and not a `shutdown(&self)` method, which is what this was:
+    /// the caller cannot hold a `GamesTab` to call one on. [`crate::build_hub`]
+    /// takes this struct apart the moment it has it precisely so that the
+    /// close handler captures an `Rc<Cell<bool>>` and not `root`, which is one
+    /// of the window's own descendants — so a method here had no reachable
+    /// caller and the inline `set(false)` was never going to become one.
+    pub alive: Rc<Cell<bool>>,
 }
 
 /// Build the Games tab.
@@ -2721,7 +2724,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
 
     // The **hub's** lifetime, as one flag. Every poll reads it on its first
     // line and stops when it is false; only the quit path sets it. See
-    // [`GamesTab::shutdown`] for why not `unmap`.
+    // [`GamesTab::alive`] for why not `unmap`.
     let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
 
     {
@@ -2944,6 +2947,22 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // the focus away does not clear it; this does. The bug `help.rs` records.
     for body in [&s_body, &br_body, &p_body, &b_report, &g_sub, &nothing_body] {
         body.select_region(0, 0);
+    }
+
+    // Re-read when the tab comes into view. Block 1 reports settings the other
+    // tab owns, and the sentence it added — "turning it on, on the Tracker tab"
+    // — is an instruction to go and change one of them. Without this, a user
+    // does exactly what it says, comes back, and reads the same sentence,
+    // now false, with nothing on screen looking wrong. The modal could not have
+    // this bug: it blocked the card, which was the whole of its modality
+    // argument. `refresh` re-reads `load_output_config` on every call, so only
+    // the trigger was missing.
+    //
+    // Safe for the lifetime: `refresh` reaches every handler-carrying widget
+    // through `downgrade()`, so nothing under `content` holds `content` back.
+    {
+        let refresh = refresh.clone();
+        content.connect_map(move |_| refresh());
     }
 
     GamesTab {
@@ -5087,6 +5106,64 @@ mod tests {
         assert!(
             without.contains("`tobii`"),
             "and says which program is missing: {without}"
+        );
+        // And the tense, which is the half a count cannot carry. With no
+        // `tobii` the page does nothing at all, and the sentence still read
+        // "The one it can do is install the Wine bridge" — an offer, in the
+        // present tense, above a block whose button is not built. A reader
+        // looking for it found three paragraphs and no control.
+        assert!(
+            without.contains("do none of them"),
+            "with no `tobii` the page does none of the three, and has to say so \
+             before naming the one it would otherwise do: {without}"
+        );
+        assert!(
+            !without.contains("The one it can do is"),
+            "that is the offer, in the present tense, and there is no button under \
+             it: {without}"
+        );
+    }
+
+    /// Block 1 reports five settings, and only three of them have a control on
+    /// the other tab.
+    ///
+    /// The sentence sent all five there — "These are the Tracker tab's own
+    /// settings" — and two of them are not on it and never were: an opentrack
+    /// address and a bridge port live in `games.toml` and are written by
+    /// `tobii games set`. A reader who went looking for the address on the
+    /// Tracker tab would find nothing, and the page that sent them is the one
+    /// whose whole argument is that it does not tell small untruths.
+    ///
+    /// The lists are hand-written here, and that is the limit of what this
+    /// catches: it notices the sentence being reworded back into a blanket
+    /// claim, and it would not notice a sixth setting appearing in block 1
+    /// with no route at all. What it pins is the split.
+    #[test]
+    fn the_pointer_sends_each_setting_to_the_place_that_can_change_it() {
+        for on_the_tab in ["The switch", "the strength", "the virtual joystick"] {
+            assert!(
+                TRACKER_TAB_POINTER.contains(on_the_tab),
+                "{on_the_tab} has a control on the Tracker tab and the pointer does \
+                 not send anyone to it: {TRACKER_TAB_POINTER}"
+            );
+        }
+        for elsewhere in ["opentrack", "bridge port"] {
+            assert!(
+                TRACKER_TAB_POINTER.contains(elsewhere),
+                "{elsewhere} is reported by block 1 and the pointer says nothing \
+                 about where it is changed: {TRACKER_TAB_POINTER}"
+            );
+        }
+        assert!(
+            TRACKER_TAB_POINTER.contains("games.toml")
+                && TRACKER_TAB_POINTER.contains("tobii games set"),
+            "and where those two really are, which is the half the Tracker tab \
+             cannot answer: {TRACKER_TAB_POINTER}"
+        );
+        assert!(
+            !TRACKER_TAB_POINTER.contains("the Tracker tab's own settings"),
+            "that is the blanket claim: it puts all five on a tab that has three: \
+             {TRACKER_TAB_POINTER}"
         );
     }
 

@@ -1796,7 +1796,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // was silently grown back to its content the next time anything
         // re-fitted.
         let fit_tabs = stack.downgrade();
+        // Set when a re-fit was asked for while the Games tab was showing, and
+        // consumed when the Tracker tab comes back. See the guard below.
+        let fit_missed = Rc::new(Cell::new(false));
         let fit: Rc<dyn Fn()> = {
+            let fit_missed = Rc::clone(&fit_missed);
             let ours = Cell::new((0i32, 0i32));
             Rc::new(move || {
                 let (Some(fit_window), Some(root)) = (fit_window.upgrade(), root.upgrade()) else {
@@ -1817,6 +1821,16 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                     .as_deref()
                     != Some(TAB_TRACKER)
                 {
+                    // Skipped, not dropped. The re-fit exists because "a banner
+                    // pushed the last card out of view", and a banner that
+                    // arrives while Games is showing is exactly that case — the
+                    // rack grows by the banner's height and nothing ever
+                    // measures it again, so returning to Tracker leaves the
+                    // last card below the fold for the rest of the session.
+                    // Noting it here and consuming it on the way back keeps the
+                    // rule above (no resize *caused by* clicking a tab) without
+                    // losing the banner's.
+                    fit_missed.set(true);
                     return;
                 }
                 // Maximised or fullscreen, the height is not ours to choose.
@@ -1839,6 +1853,22 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             })
         };
         REFIT.with(|c| *c.borrow_mut() = Some(fit.clone()));
+
+        // Consume a skipped re-fit on the way back to Tracker. Deliberately
+        // not a re-fit on every switch: this fires only when something asked
+        // while the other tab was up, so clicking between tabs still never
+        // moves the window.
+        {
+            let fit = fit.clone();
+            let fit_missed = Rc::clone(&fit_missed);
+            stack.connect_visible_child_name_notify(move |s| {
+                if s.visible_child_name().as_deref() == Some(TAB_TRACKER)
+                    && fit_missed.replace(false)
+                {
+                    fit();
+                }
+            });
+        }
 
         // Once, and latched — because `map` is not a first-appearance signal.
         // It fires on every show, so closing to the tray and coming back used to
@@ -2255,7 +2285,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             // away. The Games tab is not a window and is not closed by hiding:
             // the poll carries on, the outcome lands in its per-appid slot, and
             // the page shows it when the hub comes back. Only the quit path
-            // stops it — see `GamesTab::shutdown`.
+            // stops it — see `GamesTab::alive`.
         });
     }
 
