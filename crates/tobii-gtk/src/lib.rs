@@ -81,6 +81,14 @@ window { background-color: #0d1013; color: #e8ecef; }
            color: #79838d; }
 .section-title { font-size: 14px; font-weight: bold; }
 .section-desc { font-size: 12px; color: #8a949d; }
+/* The same muted line, under a CONTROL rather than under a title. Identical to
+   `.section-desc` on purpose and a separate name on purpose: a card's
+   description is the sentence between its title and its controls, and
+   `tests/help_window.rs` finds it by that class to assert which cards have one
+   and that none of them wraps at the width the window opens at. A note under a
+   control is neither, and wearing the description's class made it answer to a
+   question it is not part of. */
+.control-note { font-size: 12px; color: #8a949d; }
 .section-warn { color: #f2b134; font-weight: bold; }
 .status { font-size: 12px; color: #8a949d; }
 /* The header badge for a setting that is costing the user something right now.
@@ -646,6 +654,33 @@ pub(crate) const PREVIEW_HELP: &str = "Show a dot on screen where you're looking
 /// in the help window, and the two must be the same sentence.
 pub(crate) const EYES_HELP: &str = "If you typically squint or have poor sight in one eye, you \
                                     can make the eye tracker detect one eye only.";
+
+/// What choosing one eye does not promise.
+///
+/// The card used to say nothing, and a control that says nothing reads as a
+/// control that worked. What was measured on this hardware on 2026-07-20 is
+/// that the tracker **stores** the selection — it persists across a reboot, and
+/// reads back — and goes on reporting both eyes in the gaze stream regardless.
+/// The original applies the choice by rebuilding the tracking model, and this
+/// program has not watched a standalone set change what the tracker detects.
+///
+/// So the radios are honest about the half they can promise, and this is the
+/// half they cannot. `help` carries the whole measurement; this is the line
+/// that has to fit on a card.
+///
+/// **Under about 48 characters**, which is what fits on one line at the width
+/// this column is narrowest at — see `games::set_up_clause` for the 19px this
+/// rule was written from, and `tests/help_window.rs` for what measures it.
+pub(crate) const EYES_CAVEAT: &str = "The tracker may go on detecting both.";
+
+/// The caveat, for a selection that has one.
+///
+/// A function rather than a `!= Both` at each of the places that set it,
+/// because there are two — the radio being clicked and the radio being re-seeded
+/// from the device on the tick — and the second was added after the first.
+pub(crate) fn eye_caveat(eye: EnabledEye) -> Option<&'static str> {
+    (eye != EnabledEye::Both).then_some(EYES_CAVEAT)
+}
 
 /// The hub's tab stack, so a display test can find it without matching on text.
 pub const HUB_STACK_NAME: &str = "hub-tabs";
@@ -1239,6 +1274,28 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // it; see [`help`].
     eyes_ctl.set_tooltip_text(Some(EYES_HELP));
 
+    // What one eye cannot promise, under the radios and only when one of them
+    // is chosen. Hidden the rest of the time, which is almost always: it takes
+    // no card height for the users who never touch this control.
+    let eyes_caveat = Label::new(None);
+    eyes_caveat.set_halign(Align::Start);
+    eyes_caveat.set_xalign(0.0);
+    eyes_caveat.set_wrap(true);
+    eyes_caveat.add_css_class("control-note");
+    eyes_caveat.set_visible(false);
+    let eyes_box = gtk::Box::new(Orientation::Vertical, 6);
+    eyes_box.append(&eyes_ctl);
+    eyes_box.append(&eyes_caveat);
+    // The seeding above ran before this label existed, so the first draw is
+    // set here rather than left to the first toggle — which for a user who
+    // saved "left eye only" last session never comes.
+    if let Some(saved) = saved_eye {
+        if let Some(text) = eye_caveat(saved) {
+            eyes_caveat.set_text(text);
+            eyes_caveat.set_visible(true);
+        }
+    }
+
     // Selecting a radio pushes the choice to the device (unless we're seeding).
     for (cb, eye) in [
         (&r_both, EnabledEye::Both),
@@ -1247,7 +1304,27 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     ] {
         let cmd_tx = cmd_tx.clone();
         let seeding = eye_seeding.clone();
+        // Weak: this label is a sibling of the box these radios are in, and the
+        // rule this file keeps is that a handler never holds a widget of its own
+        // tree strongly.
+        let caveat = eyes_caveat.downgrade();
         cb.connect_toggled(move |c| {
+            // Before the seeding guard, and that is the point of it being here
+            // rather than beside the `cmd_tx.send` below: the tick re-seeds
+            // these radios from what the device reports, and a caveat that only
+            // followed a click would be missing on exactly the selection the
+            // device came back with.
+            if c.is_active() {
+                if let Some(l) = caveat.upgrade() {
+                    match eye_caveat(eye) {
+                        Some(text) => {
+                            l.set_text(text);
+                            l.set_visible(true);
+                        }
+                        None => l.set_visible(false),
+                    }
+                }
+            }
             if c.is_active() && !seeding.get() {
                 // Saved HERE, at the point of choice, not in the device thread
                 // where the command is applied. A preference belongs to the
@@ -1446,7 +1523,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // single saving in the rack: 141 → 96px, which is what takes this
         // column from the tallest to the middle one.
         "",
-        &eyes_ctl,
+        &eyes_box,
     ));
     col_display.append(&section(
         "Head tracking",
@@ -3344,6 +3421,38 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
 
 #[cfg(test)]
 mod tests {
+    /// The eye card says what it cannot promise, for the two selections that
+    /// have something to say and not for the one that has not.
+    ///
+    /// Both directions, because a caveat that appeared under *Both eyes* would
+    /// be this card warning somebody about a setting they have not changed —
+    /// and a card that never shows it is the card as it was, which said
+    /// nothing at all and therefore read as a control that worked.
+    ///
+    /// The length is a measurement rather than a preference. The line wraps at
+    /// the width its column is narrowest at and again with room to spare, and
+    /// a sentence long enough to wrap differently between the two costs a line
+    /// of card in the only layout most people will ever see —
+    /// `tests/help_window.rs` measures exactly that and `games::set_up_clause`
+    /// records the 19px it cost when it was found. That test needs a display
+    /// and cannot run in CI; this bound can, and it is what keeps the line
+    /// short enough for the rule to hold.
+    #[test]
+    fn the_eye_card_says_what_one_eye_cannot_promise() {
+        use tobii_protocol::EnabledEye;
+        assert_eq!(super::eye_caveat(EnabledEye::Both), None);
+        for eye in [EnabledEye::Left, EnabledEye::Right] {
+            assert_eq!(super::eye_caveat(eye), Some(super::EYES_CAVEAT), "{eye:?}");
+        }
+        let n = super::EYES_CAVEAT.chars().count();
+        assert!(
+            n <= 48,
+            "{:?} is {n} characters, which wraps at the width the window opens at \
+             and not at the width it is measured at",
+            super::EYES_CAVEAT
+        );
+    }
+
     /// The hub lights the illuminators for the Tracker tab and for nothing
     /// else.
     ///

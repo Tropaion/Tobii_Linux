@@ -232,11 +232,24 @@ pub fn topics() -> Vec<Topic> {
             // The card's own sentence, which is a tooltip now. This is where a
             // keyboard or touch user reads it.
             format!(
-                "{}\n\n\
+                "{help}\n\n\
                  The choice is saved as soon as you make it and sent to the tracker \
                  again every time it connects, so it survives unplugging the sensor \
-                 — and choosing it with the sensor unplugged is not lost.",
-                crate::EYES_HELP
+                 — and choosing it with the sensor unplugged is not lost.\n\n\
+                 {caveat} That is a measurement and not a caution. Put to this \
+                 hardware on 2026-07-20, the tracker stored the selection — it \
+                 reads back, and it survives a reboot — and went on reporting both \
+                 eyes in its gaze stream regardless. Tobii's own software applies \
+                 the choice by rebuilding the tracking model rather than by \
+                 setting it on its own, and nobody here has watched a standalone \
+                 set change what this tracker detects. So the card says what was \
+                 saved, and does not say what is being detected.\n\n\
+                 If the tracker does not answer at all, the radio goes back to \
+                 what the tracker last said it was doing rather than sitting on a \
+                 selection that did not take. The reason is in the log — \
+                 `tobii debug` collects it.",
+                help = crate::EYES_HELP,
+                caveat = crate::EYES_CAVEAT,
             ),
         ),
         topic(
@@ -1248,6 +1261,42 @@ mod tests {
         assert!(
             text.contains(&tobii_config::signature::provider_note()),
             "and nothing says the answering client needs the provider behind it:\n{text}"
+        );
+    }
+
+    /// The eye-selection topic says what was measured, and the card says the
+    /// half of it that fits on a card.
+    ///
+    /// The topic read as a guarantee: it said the choice is saved and re-sent
+    /// on every connect, which is true, and said nothing about whether the
+    /// tracker then detects one eye — which is the only thing a reader wants
+    /// from that control. What was measured is that it does not, on its own,
+    /// and this project's standing rule is that a measurement gets stated
+    /// rather than softened into a caution.
+    #[test]
+    fn the_eye_topic_says_what_choosing_one_eye_does_not_do() {
+        let eyes = super::topics()
+            .into_iter()
+            .find(|t| t.title == "Select eyes to detect")
+            .expect("the eye topic");
+        let text = eyes.text();
+        // The card's line is in here word for word, because a tooltip and a
+        // card are invisible to a keyboard and a touch user and this window is
+        // where they read it.
+        assert!(text.contains(crate::EYES_CAVEAT), "{text}");
+        assert!(
+            text.contains("2026-07-20"),
+            "the date it was measured, so a later measurement replaces it rather \
+             than arguing with it: {text}"
+        );
+        assert!(
+            text.contains("went on reporting both") && text.contains("stored the selection"),
+            "both halves: what the tracker kept, and what it did anyway: {text}"
+        );
+        assert!(
+            text.contains("nobody here has watched"),
+            "and the limit of what is known, which is the sentence that stops \
+             this becoming a promise in the other direction: {text}"
         );
     }
 

@@ -547,8 +547,20 @@ fn apply_command<T: Transport>(
             // saying why — and the radios re-seed from the device on the next
             // connection, so a silent failure quietly moves the selection back
             // and that looks like the setting not sticking.
+            // **Recorded only when the tracker said yes.** This is what the
+            // radios are re-seeded from on every tick, so writing the requested
+            // value here regardless made the hub report a selection the device
+            // had refused — and then the next connect re-reads the device and
+            // the radio moves back on its own, which is exactly what "the
+            // setting does not stick" looks like from the outside. Leaving it
+            // alone leaves the last thing the device actually said, which is
+            // the true answer to what it is detecting.
+            //
+            // The user's PREFERENCE is not lost by this: it is saved where the
+            // radio is clicked, before the command is sent, and re-applied on
+            // every connect. What is not recorded is the claim that it took.
             match conn.set_enabled_eye(e) {
-                Ok(true) => {}
+                Ok(true) => state.lock().unwrap().enabled_eye = Some(e),
                 Ok(false) => tobii_diagnostics::log::warn(&format!(
                     "the tracker did not acknowledge the eye selection ({e:?}); it may still \
                      be detecting both"
@@ -561,7 +573,6 @@ fn apply_command<T: Transport>(
             // chooses it, so it survives the tracker being unreachable; writing
             // it again on the way to the device would mean two places that can
             // disagree about what the user picked.
-            state.lock().unwrap().enabled_eye = Some(e);
         }
         DeviceCommand::CalBegin { improve, token } => {
             state.lock().unwrap().calibration = CalPhase::begin(token);
@@ -2313,6 +2324,48 @@ mod tests {
             to_recv,
         })
         .expect("connect")
+    }
+
+    /// The hub reports the eye selection the tracker acknowledged, and not the
+    /// one it was asked for.
+    ///
+    /// `DeviceState::enabled_eye` is what the radios are re-seeded from on
+    /// every tick, so recording the request regardless made the card claim a
+    /// selection the device had refused — and then the next connect re-reads
+    /// the device and the radio moves back on its own, with nothing on screen
+    /// saying why. That is exactly what "the setting does not stick" looks
+    /// like, and it is a claim this card has no business making: whether the
+    /// tracker is detecting one eye is the tracker's answer.
+    ///
+    /// Both halves, because either alone passes with the fix half-applied. The
+    /// acknowledged one must be recorded — a `match` that wrote nothing at all
+    /// would leave the card unable to report a selection that worked.
+    #[test]
+    fn a_refused_eye_selection_is_not_reported_as_the_one_in_effect() {
+        // Op `0xc58` is SET_ENABLED_EYE; sequence 5 is the next one after the
+        // three the handshake in `connected` spends, and the response has to
+        // carry it or `request` treats the frame as somebody else's and waits
+        // out its window.
+        let ack = inbound(TTP_MAGIC_RSP, 5, 0xc58, &[]);
+        for (what, post, want) in [
+            ("acknowledged", vec![ack.clone()], Some(EnabledEye::Left)),
+            ("no answer at all", vec![], None),
+        ] {
+            let mut conn = connected(post);
+            // Or the refusal case spins for the default three-second window.
+            conn.set_request_timeout(Duration::from_millis(20));
+            let state = Mutex::new(DeviceState::default());
+            apply_command(
+                &mut conn,
+                &state,
+                DeviceCommand::SetEnabledEye(EnabledEye::Left),
+            );
+            assert_eq!(
+                state.lock().unwrap().enabled_eye,
+                want,
+                "{what}: the card reads this and says what the tracker is doing"
+            );
+        }
     }
 
     #[test]
