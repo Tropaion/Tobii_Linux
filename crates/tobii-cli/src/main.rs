@@ -2557,158 +2557,25 @@ fn refusing_to_overwrite(e: tobii_config::profiles::LoadError) -> String {
     }
 }
 
-/// The whole-line comments in `path` that writing `p` over it will not put
-/// back, as a paragraph to print — empty when there are none.
+/// Write `p` as the profile for `appid`, and hand back what the writer could
+/// not carry across, as a paragraph to print.
 ///
-/// Every command here that writes a profile rebuilds the file from the
-/// `Profile` it parsed, and a comment is not part of a `Profile`. The writer
-/// puts them back by position, which covers a hand-written
-/// `# measured 2026-10-01 by playing the game with the bridge running` — the
-/// only place in the format a verification date can live, and the thing a
-/// first verified profile is *for*.
-///
-/// What it cannot place, it refuses to write at all, so the cases left for
-/// this paragraph are the ones a write really does drop. They are printed back
-/// in full at the person whose work they are, so a copy survives on the
-/// terminal.
-///
-/// Read off the file rather than remembered from the parse, so that what it
-/// reports is what is actually about to be overwritten. A file that cannot be
-/// read yields nothing: the caller has already refused to write over one of
-/// those.
-fn comments_this_write_loses(
-    path: &std::path::Path,
-    p: &tobii_config::profiles::Profile,
-) -> String {
-    let Ok(before) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-    // Asked of the writer that is actually about to run, not of a second guess
-    // at what it does — [`body_over`] is the same call [`save_profile_to`]
-    // makes, on the same text, so the report and the file cannot differ.
-    // Deriving the loss independently is how this paragraph came to list, in
-    // full, six comments that were still in the file.
-    let after = body_over(p, &before).unwrap_or_else(|_| p.to_toml());
-    let kept: Vec<&str> = comment_lines(&after);
-    let lost: Vec<&str> = comment_lines(&before)
-        .into_iter()
-        .filter(|c| !kept.contains(c))
-        .collect();
-    if lost.is_empty() {
-        return String::new();
-    }
-    let mut s = format!(
-        "\nNOT kept: {} comment line{} that {} in the file before this write. A\n  \
-         profile is rebuilt from what was parsed out of it, and a comment is not\n  \
-         part of that. Here {} in full — put back what you still want:\n",
-        lost.len(),
-        if lost.len() == 1 { "" } else { "s" },
-        if lost.len() == 1 { "was" } else { "were" },
-        if lost.len() == 1 { "it is" } else { "they are" },
-    );
-    for c in &lost {
-        s.push_str(&format!("    {c}\n"));
-    }
-    s.push_str(
-        "  A comment written after a value on its own line goes the same way, and\n  \
-         is not listed here.\n",
-    );
-    s
-}
-
-/// The whole-line comments of a profile file, trimmed, in order.
-///
-/// Whole-line only. A `#` inside a quoted `tell` is an ordinary character, and
-/// telling those apart is the parser's job, not a substring search's.
-fn comment_lines(text: &str) -> Vec<&str> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with('#'))
-        .collect()
-}
-
-/// The file `p` written over `before` produces, with the whole-line comments
-/// that write deliberately orphans taken out of the way first.
-///
-/// [`tobii_config::profiles::Profile::to_toml_over`] refuses a write that
-/// would leave somebody's sentence attached to nothing. That is right for
-/// `save`, which
-/// removes nothing, and it made `check remove` impossible on the only kind of
-/// check this feature is meant to produce: `check add` asks for a `#` line
-/// saying how you know, and a removal then refused over the note written about
-/// the very thing being removed. The one way out was to hand-edit the file —
-/// which is what the authoring commands exist to avoid.
-///
-/// So that comment goes, and the caller prints it back in full; see
-/// [`comments_this_write_loses`], which renders through here for exactly that
-/// reason. Only a whole comment line goes: a `#` written after a value cannot
-/// be lifted off without rewriting the value's line, and rewriting a line of
-/// somebody's file is not this function's business. That case still refuses,
-/// in the writer's own words.
-///
-/// Both decisions here are the writer's — which comment has nowhere to go, and
-/// what the file then looks like. This asks it, drops the line it names, and
-/// asks again. It works neither out for itself, because a second copy of
-/// either rule in this crate is a second answer waiting to disagree.
-fn body_over(
-    p: &tobii_config::profiles::Profile,
-    before: &str,
-) -> Result<String, tobii_config::profiles::CommentLoss> {
-    use tobii_config::profiles::CommentLoss;
-    let mut text = before.to_string();
-    // Bounded by the comment lines there are: every turn drops one, and
-    // nothing here writes one. The call after the loop is the writer's answer
-    // on the text that is left, whatever it is.
-    for _ in 0..comment_lines(before).len() {
-        let e = match p.to_toml_over(&text) {
-            Ok(body) => return Ok(body),
-            Err(e) => e,
-        };
-        // An unreadable file has nothing to locate, so nothing to drop either.
-        let line = match &e {
-            CommentLoss::Orphaned { line, .. } => *line,
-            CommentLoss::Unplaceable { .. } => return Err(e),
-        };
-        let i = line.wrapping_sub(1);
-        let whole_line = line > 0
-            && text
-                .lines()
-                .nth(i)
-                .is_some_and(|l| l.trim_start().starts_with('#'));
-        if !whole_line {
-            return Err(e);
-        }
-        let kept: Vec<&str> = text
-            .lines()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, l)| l)
-            .collect();
-        let mut next = kept.join("\n");
-        next.push('\n');
-        text = next;
-    }
-    p.to_toml_over(&text)
-}
-
-/// Write `p` as the profile for `appid`, naming the file once.
-///
-/// [`tobii_config::profiles::save_to`] is the writer this stands in for, and
-/// it stays the authority on what the file says: the body comes from
-/// [`tobii_config::profiles::Profile::to_toml_over`] by way of [`body_over`],
-/// and the bytes go down through the same [`tobii_config::write_atomic`]. What
-/// it does not do is refuse a removal over the note written about the thing
-/// removed.
+/// [`tobii_config::profiles::save_to`] is the writer and the authority on both
+/// halves: what the file ends up saying, and which comments it had nowhere to
+/// put. Nothing here works either out for itself. A second copy of the
+/// writer's rule in this crate is a second answer waiting to disagree with it,
+/// which is exactly how this command once listed six comments as destroyed, in
+/// full, while leaving every one of them in the file.
 ///
 /// Its refusals also read as what they are. `save_to` puts the path in front
-/// of the writer's sentence, and every caller here then prefixed "could not
-/// write <path>" — which printed the path twice and called a deliberate
-/// refusal that wrote nothing an I/O failure.
+/// of the writer's own sentence, so a caller that adds "could not write
+/// <path>" prints the path twice and calls a deliberate refusal that wrote
+/// nothing an I/O failure. Only a real I/O error gets that wrapper.
 fn save_profile_to(
     dir: &std::path::Path,
     appid: &str,
     p: &tobii_config::profiles::Profile,
-) -> Result<(), String> {
+) -> Result<String, String> {
     use tobii_config::profiles;
     // Asked before a path is built, as `save_to` asks it: `path_in` would
     // happily make a name out of `../../anything`.
@@ -2718,16 +2585,45 @@ fn save_profile_to(
             profiles::LoadError::NotAnAppId(appid.to_string())
         ));
     }
-    let path = profiles::path_in(dir, appid);
-    let body = match std::fs::read_to_string(&path) {
-        Ok(before) => {
-            body_over(p, &before).map_err(|loss| format!("{}: {loss}", path.display()))?
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => p.to_toml(),
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
-    };
-    tobii_config::write_atomic(&path, body.as_bytes())
-        .map_err(|e| format!("could not write {}: {e}", path.display()))
+    let orphans = profiles::save_to(dir, appid, p).map_err(|e| match e.kind() {
+        // The writer's refusal, already carrying the file it is about.
+        std::io::ErrorKind::InvalidInput => e.to_string(),
+        _ => format!(
+            "could not write {}: {e}",
+            profiles::path_in(dir, appid).display()
+        ),
+    })?;
+    Ok(orphan_report(&orphans))
+}
+
+/// The comments a write could not put back, printed back at the person whose
+/// work they are — empty when there are none.
+///
+/// In full, never counted: a count of somebody's sentences is not their
+/// sentences, and the terminal is the only copy left once the file is written.
+/// Each one says where it was and what it was about, because "a comment was
+/// lost" is not enough to put it back with.
+fn orphan_report(orphans: &[tobii_config::profiles::Orphan]) -> String {
+    if orphans.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(
+        "\nNOT kept: {} comment line{} the profile being written has nowhere to\n  \
+         put. A profile is rebuilt from what was parsed out of it, and a comment\n  \
+         belongs to what it sat beside. Here {} in full — put back what you\n  \
+         still want:\n",
+        orphans.len(),
+        if orphans.len() == 1 { "" } else { "s" },
+        if orphans.len() == 1 {
+            "it is"
+        } else {
+            "they are"
+        },
+    );
+    for o in orphans {
+        s.push_str(&format!("    {o}\n"));
+    }
+    s
 }
 
 /// `tobii games profile save <game>`: capture what is honestly capturable.
@@ -2766,8 +2662,7 @@ fn profile_save(
         p.name = game.name.clone();
     }
     let path = profiles::path_in(dir, &game.appid);
-    let lost = comments_this_write_loses(&path, &p);
-    save_profile_to(dir, &game.appid, &p)?;
+    let lost = save_profile_to(dir, &game.appid, &p)?;
     out.push_str(&format!("wrote {}\n", path.display()));
     out.push_str(&format!(
         "\ncaptured: {} settings — every setting this program has, as it stands\n  \
@@ -3138,8 +3033,7 @@ fn profile_check_add(
         ));
     }
 
-    let lost = comments_this_write_loses(&path, &p);
-    save_profile_to(dir, &game.appid, &p)?;
+    let lost = save_profile_to(dir, &game.appid, &p)?;
     let n = p.checks.len();
     out.push_str(&format!("wrote {}\n", path.display()));
     if existing.is_none() {
@@ -3225,8 +3119,7 @@ fn profile_check_remove(
         });
     }
     let gone = p.checks.remove(n - 1);
-    let lost = comments_this_write_loses(&path, &p);
-    save_profile_to(dir, &game.appid, &p)?;
+    let lost = save_profile_to(dir, &game.appid, &p)?;
     out.push_str(&format!("wrote {}\n", path.display()));
     out.push_str(&format!(
         "\nremoved check {n}. It said:\n  \
@@ -5888,13 +5781,18 @@ mod tests {
         assert!(out.contains("# about the second"), "it comes back:\n{out}");
     }
 
-    /// The refusal that is left — a `#` written after a value on the removed
-    /// check's own line, which cannot be lifted off without rewriting that
-    /// line — is still a refusal, and has to read as one: it wrote nothing,
-    /// and it is not an I/O failure. Both its callers used to put "could not
-    /// write <path>" in front of a sentence that already began with the path.
+    /// A `#` written after a value on the removed check's own line cannot be
+    /// lifted off without rewriting that line, so the write cannot carry it.
+    /// It is handed back instead of refused: refusing made `check remove`
+    /// impossible on the only kind of check this feature produces, since
+    /// `check add` asks for a `#` line saying how you know.
+    ///
+    /// Handed back, not dropped. The terminal is the only copy left once the
+    /// file is written, so the sentence, its line and what it was about all
+    /// have to come back — "a comment was lost" is not enough to put one back
+    /// with.
     #[test]
-    fn a_write_this_still_refuses_names_the_file_once_and_is_not_called_an_io_failure() {
+    fn a_comment_the_write_cannot_carry_comes_back_rather_than_stopping_it() {
         let dir = scratch("check-remove-trailing");
         write_profile(
             &dir,
@@ -5903,23 +5801,20 @@ mod tests {
              \n[[check]]\nformat = \"binds-dir\" # a note about the format\n\
              path = \"drive_c/A\"\nsetting = \"One\"\nwants = \"1\"\ntell = \"Do it.\"\n",
         );
-        let before = std::fs::read_to_string(dir.join("359320.toml")).expect("before");
         let mut out = String::new();
-        let e = profile_check_remove(&mut out, &dir, &[], &game("359320", None), Some("1"))
-            .expect_err("a comment on the value's own line still stops it");
-        let path = dir.join("359320.toml").display().to_string();
-        assert_eq!(e.matches(&path).count(), 1, "the path, once:\n{e}");
+        profile_check_remove(&mut out, &dir, &[], &game("359320", None), Some("1"))
+            .expect("the removal goes through");
         assert!(
-            !e.contains("could not write"),
-            "it wrote nothing on purpose:\n{e}"
+            out.contains("# a note about the format"),
+            "the comment itself comes back:\n{out}"
         );
-        // What "wrote nothing" means, asked of the file rather than of the
-        // sentence: the wording is `tobii-config`'s and this must not be the
-        // test that pins it.
-        assert_eq!(
-            std::fs::read_to_string(dir.join("359320.toml")).expect("after"),
-            before,
-            "and the file is untouched"
+        assert!(out.contains("line 4"), "where it was:\n{out}");
+        assert!(out.contains("`format`"), "what it was about:\n{out}");
+        let after = std::fs::read_to_string(dir.join("359320.toml")).expect("after");
+        assert!(
+            !after.contains("a note about the format"),
+            "and it really is gone from the file, which is why it had to be \
+             printed:\n{after}"
         );
     }
 
