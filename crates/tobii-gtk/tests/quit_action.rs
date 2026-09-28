@@ -129,7 +129,15 @@ fn quit_ends_a_hub_hidden_to_the_tray_and_releases_its_claims() {
             // teardown (a bare `app.quit()`) would pass the check at shutdown.
             let (h, a, fc) = (hub.clone(), app.clone(), flow_closed.clone());
             gtk::glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                by_tooltip::<gtk::Switch>(&h, "Show a dot on screen where you're looking")
+                // By name. It was found by its tooltip, and the tooltip moved to
+                // the row the switch sits in — GTK skips an insensitive widget
+                // when it picks a hover target, and this switch is insensitive
+                // on a desktop with no `wlr-layer-shell`.
+                all_widgets(&h)
+                    .into_iter()
+                    .find(|w| w.widget_name() == tobii_gtk::PREVIEW_SWITCH_NAME)
+                    .and_then(|w| w.downcast::<gtk::Switch>().ok())
+                    .expect("the gaze-preview switch")
                     .set_active(true);
                 let flow = a
                     .windows()

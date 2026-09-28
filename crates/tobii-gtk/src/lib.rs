@@ -642,6 +642,36 @@ const CARD_GAP: i32 = 16;
 /// and that code have to change together.
 pub(crate) const PREVIEW_HELP: &str = "Show a dot on screen where you're looking";
 
+/// The card line for a desktop that cannot draw the dot at all.
+///
+/// Short, because it is a line of card — see [`EYES_CAVEAT`] for the bound and
+/// what it was measured from. The whole reason is [`PREVIEW_UNSUPPORTED`], on
+/// the row as a tooltip and in [`help`], because it does not fit here and
+/// because a switch that is simply dead with no words beside it reads as a bug
+/// in this program.
+pub(crate) const PREVIEW_UNAVAILABLE: &str = "Not available on this desktop.";
+
+/// Why, at the length a tooltip and a help topic have room for.
+///
+/// **On the row and not on the switch.** GTK skips an insensitive widget when
+/// it picks a hover target, so a tooltip on the switch itself is unreachable in
+/// exactly the state it exists to explain — which is the measurement
+/// [`crate::games::RECENTRE_TOOLTIP`] records, made the same way, about the
+/// same kind of control.
+///
+/// It names the protocol, and that is deliberate: "not supported" sends
+/// somebody looking for a setting in this program, and there is none to find.
+/// It does not name a compositor. Which ones implement `wlr-layer-shell` is a
+/// list that changes, and a wrong name here would be this program telling a
+/// user something about their desktop that it has not checked — what it has
+/// checked is the one bit `gtk4_layer_shell::is_supported()` returns for the
+/// session it is running in.
+pub(crate) const PREVIEW_UNSUPPORTED: &str =
+    "The dot is drawn on a layer above every other window, which needs the \
+     wlr-layer-shell Wayland protocol. This session's compositor does not offer it: an \
+     X11 session never does, and not every Wayland compositor does either. Nothing else \
+     in this program uses it, so everything else here works normally.";
+
 /// Who the per-eye setting is for.
 ///
 /// The card's own sentence, moved into a tooltip: the title plus three radios
@@ -684,6 +714,16 @@ pub(crate) fn eye_caveat(eye: EnabledEye) -> Option<&'static str> {
 
 /// The hub's tab stack, so a display test can find it without matching on text.
 pub const HUB_STACK_NAME: &str = "hub-tabs";
+
+/// The gaze-preview switch, so a display test can find it.
+///
+/// By name and not by tooltip, which is how `tests/quit_action.rs` used to find
+/// it: the tooltip moved to the row the switch sits in, because GTK skips an
+/// insensitive widget when it picks a hover target and this switch is now
+/// insensitive on a desktop with no `wlr-layer-shell`. A test matching on a
+/// tooltip is a test that breaks when a tooltip is moved for a reason that has
+/// nothing to do with it.
+pub const PREVIEW_SWITCH_NAME: &str = "preview-switch";
 
 /// The tracker tab: calibration, the screen, the eyes, the head model, the gaze
 /// preview, and the card that says where the output goes.
@@ -1232,8 +1272,36 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     }
 
     let sw_preview = Switch::new();
+    sw_preview.set_widget_name(PREVIEW_SWITCH_NAME);
     sw_preview.set_valign(Align::Center);
-    sw_preview.set_tooltip_text(Some(PREVIEW_HELP));
+    // In a row, and the tooltip is on the row rather than on the switch. GTK
+    // skips an insensitive widget when it picks a hover target, so a tooltip on
+    // a switch this program has just turned off is unreachable in exactly the
+    // state it exists to explain — `games::RECENTRE_TOOLTIP` records the same
+    // measurement about the same kind of control.
+    let preview_row = gtk::Box::new(Orientation::Horizontal, 10);
+    preview_row.append(&sw_preview);
+    let preview_note = Label::new(None);
+    preview_note.set_halign(Align::Start);
+    preview_note.set_xalign(0.0);
+    preview_note.set_wrap(true);
+    preview_note.add_css_class("control-note");
+    preview_note.set_valign(Align::Center);
+    preview_note.set_visible(false);
+    preview_row.append(&preview_note);
+    // A desktop with no `wlr-layer-shell` cannot draw the overlay at all, and
+    // the switch used to be live there: turning it on presented a window the
+    // compositor had no layer for, so nothing appeared and nothing said why.
+    // Asked once, here — the protocol a session offers does not change while
+    // the session is running.
+    if gtk4_layer_shell::is_supported() {
+        preview_row.set_tooltip_text(Some(PREVIEW_HELP));
+    } else {
+        sw_preview.set_sensitive(false);
+        preview_note.set_text(PREVIEW_UNAVAILABLE);
+        preview_note.set_visible(true);
+        preview_row.set_tooltip_text(Some(PREVIEW_UNSUPPORTED));
+    }
     {
         let app = app.clone();
         let state = state.clone();
@@ -1584,7 +1652,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // adds the fact neither has room for — that starting a calibration
         // switches this off.
         "",
-        &sw_preview,
+        &preview_row,
     ));
     // How many games have a profile, for the games card's last sentence.
     //
@@ -3485,6 +3553,36 @@ fn section_with<W: IsA<gtk::Widget>>(title: &str, desc: Option<&Label>, control:
 
 #[cfg(test)]
 mod tests {
+    /// The card line for an unavailable gaze preview fits on one line.
+    ///
+    /// Same bound and same reason as the eye caveat: a wrapping label is
+    /// allocated whatever width it is given, so a line long enough to wrap
+    /// differently between the width the window opens at and the width a card
+    /// is measured at costs a line of card in the layout most people see.
+    /// `games::set_up_clause` records the 19px that taught this.
+    ///
+    /// This one cannot be checked by the display tests at all, unlike the
+    /// others: they run in a nested `kwin_wayland`, which supports
+    /// `wlr-layer-shell`, so the line never appears there. A bound that can be
+    /// asserted without a display is the whole of what is available.
+    #[test]
+    fn the_unavailable_preview_says_so_in_one_line() {
+        let n = super::PREVIEW_UNAVAILABLE.chars().count();
+        assert!(
+            n <= 48,
+            "{:?} is {n} characters, which wraps at the width the window opens at \
+             and not at the width it is measured at",
+            super::PREVIEW_UNAVAILABLE
+        );
+        // And the short line does not try to be the reason. Two strings for one
+        // fact is only worth it while they say different amounts.
+        assert!(
+            !super::PREVIEW_UNAVAILABLE.contains("layer-shell"),
+            "the protocol belongs in the tooltip and the help window, which have \
+             room for what it means"
+        );
+    }
+
     /// The eye card says what it cannot promise, for the two selections that
     /// have something to say and not for the one that has not.
     ///

@@ -273,13 +273,17 @@ pub fn topics() -> Vec<Topic> {
         topic(
             "Preview my gaze",
             format!(
-                "{}. It is a preview, not a feature games use: one dot at the point \
-                 you are looking at, drawn over everything.\n\n\
+                "{help}. It is a preview, not a feature games use: one dot at the \
+                 point you are looking at, drawn over everything.\n\n\
                  Starting a calibration switches it off. The dot is drawn above a \
                  full-screen flow, so you would end up following your own gaze dot \
                  instead of the one you are being asked to look at — which spoils \
-                 every sample while still reporting success.",
-                crate::PREVIEW_HELP
+                 every sample while still reporting success.\n\n\
+                 If the switch is greyed out and the card reads \u{201c}{short}\u{201d}: \
+                 {why}",
+                help = crate::PREVIEW_HELP,
+                short = crate::PREVIEW_UNAVAILABLE,
+                why = crate::PREVIEW_UNSUPPORTED,
             ),
         ),
         topic(
@@ -1267,6 +1271,43 @@ mod tests {
         assert!(
             text.contains(&tobii_config::signature::provider_note()),
             "and nothing says the answering client needs the provider behind it:\n{text}"
+        );
+    }
+
+    /// A switch this program greys out has to say why, where a keyboard and a
+    /// touch user can read it.
+    ///
+    /// The gaze preview needs `wlr-layer-shell`, and on a desktop without it
+    /// the switch used to be live: turning it on presented a window the
+    /// compositor had no layer for, so nothing appeared and nothing said
+    /// anything. It is insensitive there now — and an insensitive switch with
+    /// no words beside it is a bug in this program as far as anyone can tell,
+    /// so both the card's short line and the whole reason are here.
+    ///
+    /// The reason is a tooltip on the row, which is the only place it can be:
+    /// GTK skips an insensitive widget when it picks a hover target. A tooltip
+    /// is invisible to a keyboard and to a touch user either way, so this
+    /// window is where it has to be repeated.
+    #[test]
+    fn the_preview_topic_says_why_the_switch_can_be_greyed_out() {
+        let preview = super::topics()
+            .into_iter()
+            .find(|t| t.title == "Preview my gaze")
+            .expect("the preview topic");
+        let text = preview.text();
+        assert!(
+            text.contains(crate::PREVIEW_UNAVAILABLE),
+            "the words on the card, so somebody can match what they are looking \
+             at against what they are reading:\n{text}"
+        );
+        assert!(
+            text.contains(crate::PREVIEW_UNSUPPORTED),
+            "and the whole reason, which only a pointer can reach on the rack:\n{text}"
+        );
+        assert!(
+            text.contains("wlr-layer-shell"),
+            "naming the protocol is what stops somebody hunting for a setting in \
+             this program that does not exist:\n{text}"
         );
     }
 
