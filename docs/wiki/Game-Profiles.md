@@ -125,23 +125,45 @@ nothing will: `check add` says so when you write it, `check where` takes back
 its own promise for exactly those checks by name, and a newer build may know
 the format.
 
-### `path` cannot escape the prefix — and what that costs
+### `path` stays relative — which is not the same as staying inside
 
 `parse` refuses a leading `/`, a `..` component and a backslash, at the line
-that held it (`check_path`, `crates/tobii-config/src/profiles.rs`). A profile
-is a hand-edited file whose path is joined onto a prefix and then opened, so
-`..` would let one point the reader anywhere on the machine. A backslash is
-refused because it is an ordinary character in a Linux path: a Windows-style
-path would not fail, it would silently name nothing.
+that held it (`check_path`, `crates/tobii-config/src/profiles.rs`). What those
+three buy is that the path stays **relative**: a profile written on one machine
+names the same thing on another, whose prefix lives somewhere else entirely,
+and `path_under` can join it onto a prefix without producing nonsense. A
+backslash is refused because it is an ordinary character in a Linux path: a
+Windows-style path would not fail, it would silently name nothing.
 
-**The prefix is the only root a check has.** That puts a game's *shipped* files
-permanently out of reach, and the consequence is concrete rather than
-theoretical:
+**They are not a security boundary.** Until 2026-09-28 this page said "the
+prefix is the only root a check has" and drew a containment conclusion from it.
+The root part is true; the conclusion was not, and the reason is what a Proton
+prefix *is*:
+
+```
+steamapps/compatdata/359320/pfx/dosdevices/
+  c: -> ../drive_c
+  s: -> /home/you/Daten_2/games/steam      ← the Steam library root (Steam adds this)
+  z: -> /                                  ← every wine prefix has this one
+```
+
+Those are ordinary directory entries under the prefix. `dosdevices/z:/etc/hostname`
+has no `..`, no leading `/` and no backslash, so `check_path` accepts it and the
+reader opens `/etc/hostname`. **A check reaches whatever the prefix reaches, and
+a wine prefix reaches the machine.** Measured on this project's own Elite prefix;
+pinned by `a_check_path_reaches_what_the_prefix_reaches` in `profiles.rs`.
+
+### That is a capability, and it is how you reach shipped files
+
+It would be easy to close by refusing `dosdevices`, and that would be the wrong
+trade, because the files on the other side of it are ones a profile author
+actually wants:
 
 - Elite Dangerous ships **30** `.binds` preset documents under
   `steamapps/common/Elite Dangerous/Products/elite-dangerous-odyssey-64/ControlSchemes/`.
-  That is the **Steam library**, not the prefix, so **no check can ever name
-  one of them.**
+  That is the **Steam library**, not the prefix — and a check names it as
+  `dosdevices/s:/steamapps/common/Elite Dangerous/Products/elite-dangerous-odyssey-64/ControlSchemes`,
+  which parses, and which this project has read the whole census through.
 - All 30 of those presets say `Bindings_HeadlookModeAccumulate` — counted, not
   sampled, and re-measured on 2026-09-28 with:
 
@@ -150,11 +172,38 @@ theoretical:
   ```
 
   So the setting a head tracker cares about is one every user starts on the
-  wrong side of, and a check still cannot read the file that says so.
+  wrong side of, and a check *can* read the file that says so.
 
-What a check *can* reach is whatever the game writes into its own prefix once
-you have changed a setting and it has saved. That is the whole reason the
-authoring walkthrough below begins with **play the game once**.
+Two cautions that come with using it. `s:` is a Steam convention, not a wine
+one, and it points at **one** library root — a game in a second library is not
+under it. And a path through a drive letter is only as portable as the drive
+letter: `z:` is universal, `s:` is present because Steam made it, and neither is
+something the profile can verify before the reader tries.
+
+### What a profile from a stranger can actually do
+
+A profile is somebody's file. Shared in a forum, it is content you are trusting,
+so here is the whole of what it can ask this program to do:
+
+> **Read a file you can already read, and tell you what one named setting in it
+> says.**
+
+That is the real bound, and unlike the path rule it holds. `[[check]]` has no
+grammar for writing — the two readers, `binds` and `attrs`, only ever read. It
+has no grammar for listing a directory it did not name, and none for returning a
+file's contents: a check names one `setting` and gets back one value, or a
+refusal. It runs as you, so it reads nothing you could not `cat` yourself, and
+it reports to you and nowhere else.
+
+What it *can* do is point that one-value read at somewhere personal. A `path`
+beginning `dosdevices/z:` or `dosdevices/s:` is reaching outside the prefix on
+purpose — usually at `steamapps/common`, legitimately — so read those lines
+before running a profile you did not write, the same way you would read any
+hand-edited file from a stranger.
+
+Everything else a check can reach is whatever the game writes into its own
+prefix once you have changed a setting and it has saved. That is the whole
+reason the authoring walkthrough below begins with **play the game once**.
 
 ## Authoring a profile
 
