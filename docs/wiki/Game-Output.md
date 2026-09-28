@@ -842,10 +842,28 @@ the two titles we have measured stopping dead at the signature check. It is not
 a recommendation, it is not a supported route, and no part of this program will
 set it up, fetch anything, or write anything into Steam.
 
+**Measured here since, and it changes what to take from this section.** The
+batch substitution above is the part that does *not* transfer. Proton's own
+`steam.exe` helper runs an `.exe` target through `CreateProcessW` and waits for
+it, and a `.bat` target through `ShellExecuteW`, which does not — measured on
+four Proton builds, each against an `.exe` control that waited correctly. So
+`start /wait` keeps `cmd.exe` alive for as long as the game, but **Proton does
+not stay to watch**: it reports success about a second in, while everything is
+still starting. This project built the same shape, measured that, and ships
+nothing; see [Quality-and-Risks](Quality-and-Risks.md) §11.3l. Anyone reading
+this section for a design to copy should read that one first.
+
+The *ordering* argument still stands, and is still the strongest corroboration
+of §11.3i: one `waitforexitandrun`, one `wineserver -w`, both processes born
+after it. What does not stand is a batch file as the thing Proton is pointed
+at.
+
 **Still unmeasured, here, as of 2026-09-28:**
 
 * That the reported configuration works — at all, or for the reason given. We
-  have one user's account and no run of our own.
+  have one user's account and no run of our own. Note that on our measurement
+  the same substitution would have Steam record the game as exited a second in,
+  which a user would not necessarily notice if tracking worked anyway.
 * Whether our provider, started this way, is seen by a client DLL in the same
   launch. The mechanism says it should be the same wineserver; nothing here has
   watched `FT_SharedMem` cross that boundary.

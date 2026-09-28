@@ -285,8 +285,12 @@ fn ours_for_trackir(explicit: bool, installed: Option<&Path>) -> String {
 fn wrapped(text: &str, indent: &str, width: usize) -> String {
     let mut out = String::new();
     let mut line = String::new();
+    let columns = |s: &str| s.chars().count();
     for word in text.split_whitespace() {
-        if !line.is_empty() && indent.len() + line.len() + 1 + word.len() > width {
+        // Characters, not bytes: the text this folds carries em dashes, and
+        // measuring them as three columns each broke every line holding one
+        // two short of the width the caller asked for.
+        if !line.is_empty() && columns(indent) + columns(&line) + 1 + columns(word) > width {
             out.push_str(indent);
             out.push_str(&line);
             out.push('\n');
@@ -2515,15 +2519,26 @@ struct Status {
 /// "working" line would be a claim nobody has earned, and a user pasting this
 /// into an issue would be pasting our guess back at us as though it were a
 /// measurement.
-const STATUS_CAVEAT: &str = "\
-     This says what is installed and registered in this prefix. It does not say\n\
-     whether a game will use it. Two titles have been measured against\n\
-     NaturalPoint's signature check, with our own DLL registered for TrackIR, and\n\
-     both stop at it: Star Citizen (2026-08-15) rejects it and never asks for data\n\
-     again; Microsoft Flight Simulator 2024 (Steam appid 2537590, Proton\n\
-     Experimental, 2026-09-27) calls the check over and over and never gets past\n\
-     it. Two titles are not a rule about the rest, and nothing here knows what any\n\
-     other title does.\n";
+fn status_caveat() -> String {
+    let measured: Vec<String> = tobii_config::signature::MEASURED
+        .iter()
+        .map(|m| format!("{} {}", m.named(), m.behaviour))
+        .collect();
+    format!(
+        "{}\n",
+        wrapped(
+            &format!(
+                "This says what is installed and registered in this prefix. It does not say \
+                 whether a game will use it. Put to NaturalPoint's signature check with our \
+                 own DLL registered for TrackIR: {}. Nothing here knows what any other title \
+                 does.",
+                measured.join("; ")
+            ),
+            "",
+            78,
+        )
+    )
+}
 
 /// What the prefix's wineserver lock says, in one entry.
 ///
@@ -2727,7 +2742,7 @@ fn render_status(s: &Status) -> String {
         }
     }
 
-    o.push_str(&format!("\n{STATUS_CAVEAT}"));
+    o.push_str(&format!("\n{}", status_caveat()));
     // Which of the two commands this report hands back, and whether it may
     // promise the one it names will go through.
     //
@@ -3859,8 +3874,12 @@ mod tests {
     #[test]
     fn the_note_names_the_client_that_ours_was_chosen_over() {
         let note = ours_for_trackir(true, Some(Path::new("/usr/libexec/opentrack")));
-        assert!(note.contains("/usr/libexec/opentrack"), "{note}");
-        assert!(note.contains("--npclient auto"), "{note}");
+        // Folded to a terminal width before it is read, so a phrase with a
+        // space in it can straddle a line break. These assert what it says,
+        // not how it is laid out.
+        let flat = note.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("/usr/libexec/opentrack"), "{note}");
+        assert!(flat.contains("`--npclient auto`"), "{note}");
 
         // Auto reaches ours only because there is nothing else, so there is
         // nothing to have been chosen over, and naming one would invent it.

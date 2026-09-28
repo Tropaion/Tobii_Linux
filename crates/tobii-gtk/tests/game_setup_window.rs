@@ -188,9 +188,16 @@ fn focus_is_under(win: &gtk::Window, page: &gtk::Widget) -> bool {
 /// A scan that names nothing real: no library is found, no profile is found,
 /// and nothing under the user's home is opened.
 fn synthetic(apps: Vec<tobii_steam::App>) -> game_setup::Scan {
+    let home = PathBuf::from("/nonexistent/tobii-game-setup-test/home");
     game_setup::Scan {
-        home: PathBuf::from("/nonexistent/tobii-game-setup-test/home"),
+        // Built over the same nonexistent home, so it finds no library and
+        // every prefix question the window asks answers "no" — which is what
+        // this fixture is for. The window takes its walk from here rather than
+        // making one of its own, so a `Scan` that names nothing real is a
+        // window that touches nothing real.
+        steam: std::rc::Rc::new(tobii_steam::Steam::at(&home)),
         profiles_dir: PathBuf::from("/nonexistent/tobii-game-setup-test/profiles"),
+        home,
         apps,
         missing: Vec::new(),
     }

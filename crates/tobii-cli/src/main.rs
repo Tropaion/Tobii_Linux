@@ -4678,15 +4678,22 @@ mod tests {
         // below: libtest gives each test its own thread, so a per-thread list
         // is exactly the one that cannot see the collision.
         static TAKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        {
-            let mut taken = TAKEN.lock().expect("the tag list");
-            assert!(
-                !taken.iter().any(|t| t == tag),
-                "two tests share the scratch tag {tag:?}, and this one would \
-                 delete the other's fixture while it is running"
-            );
+        // The guard is dropped before the assert, and the lock is taken
+        // through `into_inner` on a poisoned mutex, for one reason: asserting
+        // while holding it poisons it, so the collision this is here to name
+        // would be followed by every later `scratch()` panicking with "the tag
+        // list" — the one useful message buried under a dozen unrelated ones.
+        let seen = {
+            let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = taken.iter().any(|t| t == tag);
             taken.push(tag.to_string());
-        }
+            seen
+        };
+        assert!(
+            !seen,
+            "two tests share the scratch tag {tag:?}, and this one would \
+             delete the other's fixture while it is running"
+        );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("scratch");
         SCRATCH.with_borrow_mut(|dirs| dirs.0.push(dir.clone()));

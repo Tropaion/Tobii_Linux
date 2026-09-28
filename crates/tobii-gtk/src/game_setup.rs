@@ -133,7 +133,7 @@ pub const PAGE_NOTHING: &str = "nothing";
 /// opened in a test against a synthetic library: CI runs as root with no real
 /// `$HOME` and no Steam install, and a window that read `$HOME` itself could
 /// only ever be tested on somebody's laptop.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Scan {
     /// The home the libraries were read from. Every later filesystem question
     /// about a game goes through this and never through `$HOME` a second time,
@@ -150,6 +150,15 @@ pub struct Scan {
     /// shape of every genuinely user-visible bug this project has found in
     /// itself: an unmounted drive reported as "the game never saved this".
     pub missing: Vec<PathBuf>,
+    /// The walk `apps` and `missing` were taken off, kept so that every later
+    /// prefix answer comes from the same one.
+    ///
+    /// Without it the window built a second `Steam` at open, so the two halves
+    /// of the census came from one walk and every `no Proton prefix yet`,
+    /// `bridge_state` and `other_prefixes` answer on the page came from
+    /// another — the disagreement this type's own doc says taking them from
+    /// one value prevents.
+    pub steam: Rc<tobii_steam::Steam>,
 }
 
 /// Read the machine.
@@ -161,12 +170,13 @@ pub struct Scan {
 /// could not be looked in are two halves of one census, and taking them from
 /// one value is what stops them naming different libraries.
 pub fn scan(home: &Path, profiles_dir: &Path) -> Scan {
-    let steam = tobii_steam::Steam::at(home);
+    let steam = Rc::new(tobii_steam::Steam::at(home));
     Scan {
         home: home.to_path_buf(),
         profiles_dir: profiles_dir.to_path_buf(),
         apps: steam.apps(),
         missing: steam.missing_libraries().to_vec(),
+        steam,
     }
 }
 
@@ -266,9 +276,6 @@ pub(crate) struct Picker {
 pub(crate) struct Catalog {
     /// The rows, ordered. Each carries the lowercased name beside it.
     rows: Vec<(PickRow, String)>,
-    /// How many titles were installed, which is not `rows.len()` once a query
-    /// has narrowed anything — the census counts the machine, not the search.
-    installed: usize,
 }
 
 impl Catalog {
@@ -301,7 +308,6 @@ impl Catalog {
                     (row, a.name.to_lowercase())
                 })
                 .collect(),
-            installed: apps.len(),
         }
     }
 }
@@ -328,7 +334,10 @@ pub(crate) fn picker(catalog: &Catalog, missing: &[PathBuf], query: &str) -> Pic
         .map(|(row, _)| row.clone())
         .collect();
 
-    let n = catalog.installed;
+    // `rows` is the machine's whole list; a query narrows the `Vec` that
+    // `picker` returns, never this one. A separate count would be the same
+    // number kept twice.
+    let n = catalog.rows.len();
     let mut census = format!(
         "{n} {thing} installed, from Steam's own manifests on this machine.",
         thing = plural(n, "title", "titles")
@@ -610,36 +619,6 @@ pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<Str
     ))
 }
 
-/// The opentrack route is not one that runs itself, and why it is not running
-/// after a launch.
-///
-/// Not part of [`tobii_config::signature::trackir_gate`], because that seam is
-/// about the check and this is about a command. It belongs beside the gate
-/// wherever the gate is shown: the client that answers the check is a pure
-/// consumer of the shared mapping, so something has to fill it, and that is
-/// `tobii bridge run`. `run` yields to a launching game on purpose — a wine
-/// process alive on the prefix makes Proton's own `wineserver -w` wait forever
-/// and the game never starts — and it does not come back by itself.
-///
-/// So "the launch stopped freezing" and "the game is getting data" are two
-/// different outcomes, and this project has already been found reading the
-/// first as the second. A page that offers an install button and names only
-/// the first would be making that mistake in front of a user.
-///
-/// A constant rather than a sentence in each place that needs it:
-/// [`profile_bridge_note`] shows it in the window and [`crate::help`] shows it
-/// in the F1 manual, and two hand-typed copies is how the two start
-/// disagreeing.
-/// What has to be running behind a client that answers the check.
-///
-/// [`tobii_config::signature::provider_note`] owns the words: the CLI says the
-/// same thing when it installs, and this window and the help topic both show
-/// it, so it lives where all three can ask rather than in whichever of them
-/// was edited last.
-pub(crate) fn provider_note() -> String {
-    tobii_config::signature::provider_note()
-}
-
 /// What a profile says about the bridge, for block 2.
 ///
 /// [`None`] for [`profiles::Bridge::Unstated`], and that is the whole point of
@@ -668,7 +647,7 @@ pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
              {gate}\n\n\
              {note}",
             gate = signature::trackir_gate(),
-            note = provider_note(),
+            note = signature::provider_note(),
         )),
         profiles::Bridge::NotNeeded => Some(
             "The profile for this game says it does not need the bridge. Head tracking for it \
@@ -2313,7 +2292,7 @@ pub fn open_with(
     // Derived from `scan.home` rather than carried in `Scan`, because a `Scan`
     // is plain data a test can write down; this is what that home turns out to
     // hold.
-    let steam = Rc::new(tobii_steam::Steam::at(&scan.home));
+    let steam = Rc::clone(&scan.steam);
 
     // The list, in the order the page shows it, with the prefix question
     // answered for each row. Neither depends on what gets typed.
@@ -3987,7 +3966,10 @@ mod tests {
             );
         }
         assert!(
-            note.contains("Two titles are not a rule"),
+            // The property, not the sentence: the count in it comes from
+            // `signature::MEASURED`, so a literal here is a literal that goes
+            // stale on the one edit the seam computes its way around.
+            note.contains("not a rule about the rest"),
             "and it must not read as a rule about the user's own game: {note}"
         );
         assert!(
@@ -5627,10 +5609,12 @@ mod tests {
         // A title with one prefix has no others, which is what keeps the note
         // from being appended to every page.
         std::fs::create_dir_all(two.join("steamapps/compatdata/220/pfx/drive_c")).expect("fixture");
-        // A fresh `Steam`: this one is looking at a prefix made after the
-        // one above was built, and a value that walked the disk once is a
-        // value that cannot see it.
-        let steam = tobii_steam::Steam::at(&home);
+        // The same `Steam` answers this: what it caches is the library
+        // layout, and `prefix` stats `drive_c` on every call — so a prefix
+        // made inside a library the walk already found is one it sees. A
+        // second value here would be dead work, and a comment saying it could
+        // not see the new prefix would teach the opposite of that type's
+        // contract.
         let only_one = steam.prefix("220").expect("one prefix");
         assert!(other_prefixes(&steam, "220", Some(&only_one)).is_empty());
 

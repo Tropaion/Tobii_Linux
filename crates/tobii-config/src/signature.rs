@@ -105,13 +105,15 @@ pub fn trackir_gate() -> String {
         "A TrackIR game loads whichever client DLL the registry names, and checks its \
          signature against NaturalPoint's. Ours cannot answer that, and the material that \
          would answer it is theirs: reproducing it is not this project's to do. \
-         {count} ever measured against that check stop at it. {} \
-         Two titles are not a rule about the rest, and nothing here knows what your game \
-         does. An installed opentrack provides a client that does answer the check, and it \
-         reads the same shared mapping, so our tracking can sit behind it. FreeTrack has no \
-         signature check at all, so a game that speaks FreeTrack works with ours today.",
+         {count} put to that check stopped at it. {} \
+         {tally} not a rule about the rest, and nothing here knows what your game \
+         does. A separately installed client — opentrack ships one — is what can answer the \
+         check; whether that then delivers tracking is not something this project has \
+         watched happen. FreeTrack has no signature check at all, so a game that speaks \
+         FreeTrack works with ours today.",
         measured.join(" "),
         count = count_word(MEASURED.len()),
+        tally = tally_word(MEASURED.len()),
     )
 }
 
@@ -126,8 +128,34 @@ fn count_word(n: usize) -> &'static str {
         1 => "The one title",
         2 => "Both titles",
         3 => "All three titles",
-        _ => "Every title",
+        n => leaked(format!("All {n} titles")),
     }
+}
+
+/// The same count again, in the shape the second sentence needs.
+///
+/// Two slots, two phrasings: "Both titles put to that check stopped at it"
+/// reads, and "Both titles are not a rule" does not. One helper serving both
+/// produced exactly that sentence, which is what comes of reusing a word
+/// because it holds the right number rather than because it fits.
+fn tally_word(n: usize) -> &'static str {
+    match n {
+        0 => "Nothing measured is",
+        1 => "One result is",
+        2 => "Two results are",
+        3 => "Three results are",
+        n => leaked(format!("{n} results are")),
+    }
+}
+
+/// A count word that outlives the call, for the arms a `match` cannot spell as
+/// a literal.
+///
+/// Leaking is defensible for exactly this: there is one [`MEASURED`] per
+/// process, so this runs at most once per distinct count, and the alternative
+/// is making every caller own a `String` for a phrase that never changes.
+fn leaked(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
 }
 
 /// What has to be running behind a third-party client, and the two ways to
@@ -140,6 +168,11 @@ fn count_word(n: usize) -> &'static str {
 /// the check and still deliver nothing, which looks from the outside exactly
 /// like the check having failed. Naming both routes is the difference between
 /// a user knowing what is missing and a user concluding the bridge is broken.
+///
+/// So "the launch stopped freezing" and "the game is getting data" are two
+/// different outcomes, and this project has been found reading the first as
+/// the second. A screen that offers an install and names only the first would
+/// be making that mistake in front of somebody.
 pub fn provider_note() -> String {
     [
         "A client that answers the check only reads the shared mapping —",
@@ -175,10 +208,18 @@ mod tests {
                 m.title
             );
         }
-        assert!(
-            text.contains(&format!("{} ever measured", count_word(MEASURED.len()))),
-            "the count and the list have to agree:\n{text}"
-        );
+        // Both sentences that carry a count, not just the first: the count
+        // word was computed and the sentence three clauses later was typed,
+        // so the paragraph said "All three titles … Two titles are not a
+        // rule" on the one edit the computation exists to survive — and the
+        // test pinned the typed half.
+        for phrase in [count_word(MEASURED.len()), tally_word(MEASURED.len())] {
+            assert!(
+                text.contains(phrase),
+                "every count in the paragraph comes from the list, and {phrase:?} \
+                 does not appear in:\n{text}"
+            );
+        }
     }
 
     /// What the paragraph must not become. It reports observations; a reader
@@ -189,10 +230,22 @@ mod tests {
     fn the_gate_does_not_predict_what_an_unmeasured_game_will_do() {
         let text = trackir_gate();
         assert!(
-            text.contains("Two titles are not a rule"),
+            text.contains("not a rule about the rest"),
             "it says so outright:\n{text}"
         );
-        for claim in ["will not work", "cannot work", "no game", "every game"] {
+        // Positive claims too, which is the half this missed. Saying a
+        // third-party client "does answer the check" is a measurement nobody
+        // here took, and the register records it as unmeasured — but it read
+        // as harmless because it was not a prediction *against* anything.
+        for claim in [
+            "does answer the check",
+            "will work",
+            "works with opentrack",
+            "will not work",
+            "cannot work",
+            "no game",
+            "every game",
+        ] {
             assert!(
                 !text.contains(claim),
                 "{claim:?} is a claim about games nobody ran:\n{text}"

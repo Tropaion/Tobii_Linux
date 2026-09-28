@@ -1464,12 +1464,13 @@ and none of what follows was run by anybody on this project.
   group is building this project's own sequencing in the same round as this
   entry; at the time of writing their result is not in front of me, so nothing
   here claims anything about it.
-- **It landed, and here is the line that entry asked for.**
-  `crates/tobii-cli/src/proton.rs`: `tobii game -- %command%` now recognises a
-  Proton launch by Proton's own argument pair — a program named `proton`
-  followed by the verb `waitforexitandrun` — and, **only** when
-  `tobii-bridge.exe` is already in that launch's
-  `$STEAM_COMPAT_DATA_PATH/pfx`, replaces Proton's target with a batch file of
+- **It was built, and here is the line that entry asked for. It does not
+  ship — read the two bullets below before this one.**
+  `crates/tobii-cli/src/proton.rs` *was written to* have
+  `tobii game -- %command%` recognise a Proton launch by Proton's own argument
+  pair — a program named `proton` followed by the verb `waitforexitandrun` —
+  and, **only** when `tobii-bridge.exe` was already in that launch's
+  `$STEAM_COMPAT_DATA_PATH/pfx`, replace Proton's target with a batch file of
   ours: `start /b` the provider, `start /wait` the game, `taskkill` the
   provider, return the game's saved exit code. Every other case runs the
   command exactly as Steam wrote it.
