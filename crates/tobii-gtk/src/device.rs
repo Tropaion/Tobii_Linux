@@ -299,6 +299,13 @@ fn stand_by(
 /// while the user is still looking at them.
 const LINGER: Duration = Duration::from_secs(3);
 
+/// How long to wait for the device to say what the eye selection IS, after it
+/// has just declined to change it.
+///
+/// Short on purpose — see the read in `apply_command`. It is a courtesy read
+/// after a failure, not a request anything depends on.
+const REFUSED_READBACK: Duration = Duration::from_millis(500);
+
 /// Hands out process-unique calibration session tokens. The UI mints one per
 /// `CalBegin` and only trusts a `CalPhase` that carries it back (see
 /// [`CalPhase::token`]); starting at 1 keeps `CalPhase::default()`'s 0 a token
@@ -592,9 +599,23 @@ fn apply_command<T: Transport>(
             // answer rather than silently keeping the last one. A read that
             // fails too leaves the field alone, which is the only honest
             // remaining answer.
+            //
+            // On a SHORT window, and that is not a detail. This runs inline on
+            // the device thread between `device_tick` calls, so everything it
+            // waits for — gaze, the camera stream, head pose — waits with it.
+            // The default is 10s, and a tracker that did not answer the SET has
+            // just spent one of those; a second full window on the read turned
+            // one radio click into a 20-second freeze. A device that answered
+            // neither in that time is not going to answer this one.
             let now = match applied {
                 Some(e) => Some(e),
-                None => conn.get_enabled_eye().ok().flatten(),
+                None => {
+                    let was = conn.request_timeout();
+                    conn.set_request_timeout(REFUSED_READBACK);
+                    let got = conn.get_enabled_eye().ok().flatten();
+                    conn.set_request_timeout(was);
+                    got
+                }
             };
             {
                 let mut s = state.lock().unwrap();

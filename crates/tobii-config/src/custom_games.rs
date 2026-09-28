@@ -121,10 +121,10 @@ pub fn list() -> Vec<CustomGame> {
 
 /// [`list`] over a given file.
 pub fn list_from(file: &Path) -> Vec<CustomGame> {
-    let Ok(text) = std::fs::read_to_string(file) else {
+    let Ok(bytes) = std::fs::read(file) else {
         return Vec::new();
     };
-    parse(&text)
+    parse(&bytes)
 }
 
 /// Every line of `text` that is a game, in order, without repeats.
@@ -135,30 +135,42 @@ pub fn list_from(file: &Path) -> Vec<CustomGame> {
 /// wrote and expects to be applied, and a junk line here is a list of
 /// nicknames with a typo in it. What a caller can act on is the games; what it
 /// cannot act on is a line with three tabs in it.
-pub fn parse(text: &str) -> Vec<CustomGame> {
+pub fn parse(bytes: &[u8]) -> Vec<CustomGame> {
+    use std::os::unix::ffi::OsStrExt;
     let mut out: Vec<CustomGame> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim_end_matches(['\r']);
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+    for raw in bytes.split(|b| *b == b'\n') {
+        let line = match raw.split_last() {
+            Some((b'\r', head)) => head,
+            _ => raw,
+        };
+        let text = String::from_utf8_lossy(line);
+        if text.trim().is_empty() || text.trim_start().starts_with('#') {
             continue;
         }
         // Split once. A second tab means a line this writer did not produce,
         // and guessing which of the three fields is the path is exactly the
         // guess that puts an install somewhere nobody asked for.
-        let mut parts = line.splitn(2, '\t');
+        let mut parts = line.splitn(2, |b| *b == b'\t');
         let (Some(name), Some(prefix)) = (parts.next(), parts.next()) else {
             continue;
         };
-        if prefix.contains('\t') {
+        if prefix.contains(&b'\t') {
             continue;
         }
-        let (name, prefix) = (name.trim(), prefix.trim());
+        // The name is a person's typing and must be text; the path is bytes and
+        // is kept as they are, trimmed of ASCII space only — a trailing space in
+        // a directory name is legal, and stripping it pointed the entry at a
+        // directory that does not exist.
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        let name = name.trim();
         if name.is_empty() || prefix.is_empty() {
             continue;
         }
         let game = CustomGame {
             name: name.to_string(),
-            prefix: PathBuf::from(prefix),
+            prefix: PathBuf::from(std::ffi::OsStr::from_bytes(prefix)),
         };
         // First spelling wins, and the identity is the prefix — see
         // [`CustomGame::prefix`].
@@ -170,15 +182,24 @@ pub fn parse(text: &str) -> Vec<CustomGame> {
 }
 
 /// Render the list as the file holds it.
-pub fn render(games: &[CustomGame]) -> String {
-    let mut s = String::from(HEADER);
+///
+/// Paths are written through [`std::os::unix::ffi::OsStrExt`] rather than
+/// `to_string_lossy`, which replaces every byte it cannot decode with U+FFFD
+/// — so a prefix on a path that is not valid UTF-8, which Linux allows, came
+/// back from the next read pointing at a directory that does not exist, no
+/// longer matched by `remove`, and no longer recognised as a duplicate by
+/// `add`. The file is bytes and a path is bytes; the only thing in between
+/// that has to be UTF-8 is the name, which a person typed.
+pub fn render(games: &[CustomGame]) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = Vec::from(HEADER.as_bytes());
     for g in games {
-        s.push_str(&g.name);
-        s.push('\t');
-        s.push_str(&g.prefix.to_string_lossy());
-        s.push('\n');
+        out.extend_from_slice(g.name.as_bytes());
+        out.push(b'\t');
+        out.extend_from_slice(g.prefix.as_os_str().as_bytes());
+        out.push(b'\n');
     }
-    s
+    out
 }
 
 /// What the file starts with, so a person who opens it knows what it is.
@@ -193,7 +214,7 @@ pub fn save(games: &[CustomGame]) -> std::io::Result<()> {
 
 /// [`save`] to a given file.
 pub fn save_to(file: &Path, games: &[CustomGame]) -> std::io::Result<()> {
-    crate::write_atomic(file, render(games).as_bytes())
+    crate::write_atomic(file, &render(games))
 }
 
 /// Add one game to `games`, or say why not.
@@ -262,8 +283,8 @@ mod tests {
     /// an entry called `# tobii-linux custom games`.
     #[test]
     fn the_header_is_not_read_back_as_a_game() {
-        assert!(parse(HEADER).is_empty());
-        assert!(render(&[]).starts_with('#'));
+        assert!(parse(HEADER.as_bytes()).is_empty());
+        assert!(render(&[]).starts_with(b"#"));
     }
 
     /// A line this writer did not produce is skipped, and the skip is silent.
@@ -283,7 +304,7 @@ mod tests {
                     no tab at all\n\
                     Also good\t/p/two\n";
         assert_eq!(
-            parse(text),
+            parse(text.as_bytes()),
             vec![game("Good", "/p/one"), game("Also good", "/p/two")]
         );
     }
@@ -297,9 +318,9 @@ mod tests {
     #[test]
     fn one_prefix_is_one_game_however_it_is_named() {
         let text = "First\t/p/one\nSecond\t/p/one\n";
-        assert_eq!(parse(text), vec![game("First", "/p/one")]);
+        assert_eq!(parse(text.as_bytes()), vec![game("First", "/p/one")]);
 
-        let mut games = parse(text);
+        let mut games = parse(text.as_bytes());
         let err = add(&mut games, "Third", Path::new("/p/one")).expect_err("already there");
         assert_eq!(err, AddError::Already("First".to_string()));
         assert!(
@@ -353,6 +374,51 @@ mod tests {
         assert!(remove(&mut games, Path::new("/p/one")));
         assert_eq!(games, vec![game("Two", "/p/two")]);
         assert!(!remove(&mut games, Path::new("/p/one")));
+    }
+
+    /// A path is bytes, and the round trip this module promises has to hold
+    /// for the ones that are not text.
+    ///
+    /// Linux allows any byte but NUL and `/` in a path. `to_string_lossy`
+    /// replaced every undecodable one with U+FFFD, so the entry came back
+    /// pointing at a directory that does not exist, `remove` by the original
+    /// path no longer matched it, and `add` of the same folder was no longer
+    /// caught as a duplicate — three failures from one lossy conversion, none
+    /// of them visible until somebody had such a path.
+    #[test]
+    fn a_path_that_is_not_utf8_survives_the_round_trip() {
+        use std::os::unix::ffi::OsStrExt;
+        let odd = PathBuf::from(std::ffi::OsStr::from_bytes(b"/games/\xff\xfe/pfx"));
+        let g = CustomGame {
+            name: "Bad Bytes".to_string(),
+            prefix: odd.clone(),
+        };
+        let back = parse(&render(std::slice::from_ref(&g)));
+        assert_eq!(back, vec![g], "the bytes came back as they went in");
+        let mut games = back;
+        assert_eq!(
+            add(&mut games, "Again", &odd),
+            Err(AddError::Already("Bad Bytes".to_string())),
+            "and it is still recognised as the same prefix"
+        );
+        assert!(remove(&mut games, &odd), "and still removable by it");
+    }
+
+    /// A trailing space in a folder name is part of the name.
+    ///
+    /// Trimming the path made the entry point one directory away from the one
+    /// the user picked. The NAME is trimmed — that is somebody's typing — and
+    /// the path is not.
+    #[test]
+    fn a_path_keeps_its_own_whitespace_and_the_name_does_not() {
+        let g = CustomGame {
+            name: "Spacey".to_string(),
+            prefix: PathBuf::from("/games/odd /pfx"),
+        };
+        assert_eq!(parse(&render(std::slice::from_ref(&g))), vec![g]);
+        let mut games = Vec::new();
+        assert_eq!(add(&mut games, "  Trimmed  ", Path::new("/p/one")), Ok(()));
+        assert_eq!(games[0].name, "Trimmed");
     }
 
     /// A prefix that is not there is kept, not pruned.

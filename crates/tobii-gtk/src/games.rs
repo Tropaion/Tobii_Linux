@@ -571,8 +571,8 @@ impl GamesRow {
         // 1189 x 725**, so the row was worth 51px of height in the column that
         // was the tallest of the three — and 0px of width, which is what it was
         // put on a row of its own to be. The full working is in
-        // `crate::build_hub`, beside the columns.
-
+        // `crate::build_hub`, beside the columns, which also carries what the
+        // tab page's own border and padding added afterwards.
         //
         // Re-take it by printing `hub.measure(Orientation::Horizontal, -1)` and
         // the window's `default_height` from a timeout inside

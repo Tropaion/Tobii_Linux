@@ -118,6 +118,11 @@ fn the_games_tab_re_reads_the_settings_when_it_comes_back_into_view() {
             buildid: None,
         }],
         steam: Rc::new(tobii_steam::Steam::at(&empty_home)),
+        // A file of this test's own. The tab can WRITE this one, and a test
+        // that let it reach `$XDG_CONFIG_HOME` would be a test that edits the
+        // list of whoever runs the suite — which `Scan` exists to prevent for
+        // every other input the tab has.
+        custom_games: dir.join("custom-games.tsv"),
     };
 
     let app = gtk::Application::builder()

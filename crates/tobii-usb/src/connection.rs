@@ -103,6 +103,16 @@ impl<T: Transport> Connection<T> {
     }
 
     /// Override how long [`Connection::request`] waits for a response.
+    /// The window a request waits for its answer in.
+    ///
+    /// Readable so a caller can narrow it for one call and put it back — see
+    /// the eye-selection read-back in `tobii-gtk`'s device thread, which runs
+    /// after a request has already failed and must not spend a second full
+    /// window on a courtesy.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     pub fn set_request_timeout(&mut self, t: Duration) {
         self.request_timeout = t;
     }

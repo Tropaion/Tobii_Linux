@@ -273,19 +273,38 @@ pub fn control(
                 .map(|s| s.head_model.clone())
                 .unwrap_or_else(|e| e.into_inner().head_model.clone());
             let st = model_store::status_quick(SRC);
-            let ready = match &published {
+            let running = match &published {
                 HeadModel::Unasked => matches!(st, Status::Ready),
                 other => *other == HeadModel::Running,
             };
+            // Two questions, and conflating them took away the only way out of
+            // a bad model. `running` decides what the line SAYS and whether a
+            // pitch zero is worth offering; `installed` decides whether there
+            // is a file to act on — and a model ONNX refuses is a file that is
+            // very much there. With one flag, `Refused` hid Remove, so the user
+            // was left with the bad file on disk, a line telling them it was
+            // not being used, and re-downloading the same URL as the only
+            // button.
+            let installed = match &published {
+                HeadModel::Unasked => !matches!(st, Status::Missing),
+                HeadModel::Missing => false,
+                _ => true,
+            };
             status.set_text(&running_line(&published).unwrap_or_else(|| status_line(&st)));
             pitch.set_text(&pitch_line(model_store::pitch_offset()));
-            pitch.set_visible(ready);
+            pitch.set_visible(running);
             if let Some(b) = get.upgrade() {
-                b.set_visible(!ready);
+                // Fetch is offered whenever the model is not running, refusals
+                // included: re-downloading is a real answer to a truncated file.
+                b.set_visible(!running);
             }
-            for only_when_installed in [&set_pitch, &updates, &remove] {
-                if let Some(b) = only_when_installed.upgrade() {
-                    b.set_visible(ready);
+            if let Some(b) = set_pitch.upgrade() {
+                // The one that needs the model to actually run.
+                b.set_visible(running);
+            }
+            for whenever_there_is_a_file in [&updates, &remove] {
+                if let Some(b) = whenever_there_is_a_file.upgrade() {
+                    b.set_visible(installed);
                 }
             }
         })

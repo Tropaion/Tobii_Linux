@@ -119,6 +119,21 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
             let hub = tobii_gtk::build_hub(app, session).expect("hub");
             hub.present();
 
+            // Both tabs FIRST, because half the tree is on the one that is not
+            // showing — and because the Games tab rebuilds its list when it is
+            // mapped. A census taken before that walk weak-references rows that
+            // are destroyed a moment later, which reads as a pass, and never
+            // sees the ones that exist at quit: a cycle in a row's own widgetry
+            // would sail through it.
+            {
+                let h = hub.clone();
+                at(600, move || press(&h, gtk::gdk::Key::Page_Down));
+            }
+            {
+                let h = hub.clone();
+                at(900, move || press(&h, gtk::gdk::Key::Page_Up));
+            }
+
             // The census is taken over the window's CHILD rather than the
             // window: a `GtkApplicationWindow` is itself a `GtkNative` and the
             // application holds it, so what is being asked about is everything
@@ -130,7 +145,7 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
                     pending.clone(),
                     pending_c.clone(),
                 );
-                at(900, move || {
+                at(1300, move || {
                     let Some(child) = h.child() else {
                         s.borrow_mut().troubles.push("the hub has no child".into());
                         return;
@@ -142,22 +157,6 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
                     s.controllers = cs.len();
                     *p.borrow_mut() = ws.iter().map(|w| w.downgrade()).collect();
                     *pc.borrow_mut() = cs.iter().map(|c| c.downgrade()).collect();
-                });
-            }
-
-            // Both tabs, because half the tree is on the one that is not
-            // showing and a census taken over an unrealised page is still a
-            // census of the widgets that page built.
-            {
-                let h = hub.clone();
-                at(1200, move || {
-                    press(&h, gtk::gdk::Key::Page_Down);
-                });
-            }
-            {
-                let h = hub.clone();
-                at(1500, move || {
-                    press(&h, gtk::gdk::Key::Page_Up);
                 });
             }
 

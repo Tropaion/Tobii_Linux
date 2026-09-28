@@ -176,6 +176,14 @@ pub struct Scan {
     /// another — the disagreement this type's own doc says taking them from
     /// one value prevents.
     pub steam: Rc<tobii_steam::Steam>,
+    /// Where the hand-added games are kept.
+    ///
+    /// A path and not the list, because the list is re-read every time the tab
+    /// comes into view and the tab can write it. Here for the reason
+    /// `profiles_dir` is: a tab that read `$XDG_CONFIG_HOME` itself could only
+    /// be tested on somebody's laptop, and this is the one file on this tab
+    /// that is written as well as read.
+    pub custom_games: PathBuf,
 }
 
 /// Read the machine.
@@ -192,6 +200,7 @@ pub fn scan(home: &Path, profiles_dir: &Path) -> Scan {
         profiles_dir: profiles_dir.to_path_buf(),
         apps: steam.apps(),
         steam,
+        custom_games: tobii_config::custom_games::path(),
     }
 }
 
@@ -1509,7 +1518,7 @@ pub(crate) fn bridge_block(
     others: &[(PathBuf, bool)],
     tobii: Option<&Path>,
     beside: Option<&Path>,
-    appid: &str,
+    target: &Target,
 ) -> String {
     // The caption is `bridge_action`'s, not this match's. The bar at the foot
     // of the pane asks the same question, and a paragraph and a button that
@@ -1581,7 +1590,7 @@ pub(crate) fn bridge_block(
         }
         (None, Some(a)) => {
             text.push_str("\n\n");
-            text.push_str(&no_binary_text(*a, beside, appid));
+            text.push_str(&no_binary_text(*a, beside, target));
         }
         (None, None) => {}
     }
@@ -1744,12 +1753,15 @@ pub(crate) fn actions(
     }
     if matches!(state, BridgeState::NoPrefix) {
         return none(
-            "No Proton prefix yet. Run the game once under Proton and come back — a native              Linux game never gets one, and the virtual joystick is how it receives head              tracking.",
+            "No Proton prefix yet. Run the game once under Proton and come back — a native \
+             Linux game never gets one, and the virtual joystick is how it receives head \
+             tracking.",
         );
     }
     if tobii.is_none() {
         return none(
-            "The command-line program `tobii` is not on the PATH this window was started              with, so this page cannot run the installer. Block 2 prints what to type              instead.",
+            "The command-line program `tobii` is not on the PATH this window was started with, \
+             so this page cannot run the installer. Block 2 prints what to type instead.",
         );
     }
     Actions {
@@ -2182,7 +2194,16 @@ pub(crate) struct Search {
 /// such a machine the first sentence the user read reported on a place that
 /// was never examined. It is the same shape as the `$PATH` sentence above it,
 /// one clause to the left.
-pub(crate) fn no_binary_text(action: Action, beside: Option<&Path>, appid: &str) -> String {
+pub(crate) fn no_binary_text(action: Action, beside: Option<&Path>, target: &Target) -> String {
+    // What the reader would have to type, from the SAME value the buttons are
+    // built from. It was an app id and a hardcoded `--steam`, and a game added
+    // by hand has a path — so the one machine that cannot run the installer was
+    // handed `tobii bridge install --steam /games/sc/pfx`, which is the exact
+    // pairing `Target::push_flag` exists to make impossible.
+    let flag = match target {
+        Target::Steam(id) => format!("--steam {id}"),
+        Target::Prefix(p) => format!("--prefix {}", p.display()),
+    };
     // The first clause is the one that used to be printed over a place
     // nothing had looked at. `tobii_binary` only stats the directory beside
     // this program when it knows which directory that is; when `current_exe`
@@ -2213,7 +2234,7 @@ pub(crate) fn no_binary_text(action: Action, beside: Option<&Path>, appid: &str)
         Action::Install => format!(
             "{head}\n\n\
              Until then the bridge cannot be installed from here:\n\n\
-             tobii bridge install --steam {appid}\n\n\
+             tobii bridge install {flag}\n\n\
              {tail}"
         ),
         Action::Reinstall => format!(
@@ -2221,8 +2242,8 @@ pub(crate) fn no_binary_text(action: Action, beside: Option<&Path>, appid: &str)
              Until then nothing here can be run against this prefix — neither a reinstall \
              nor the registry read behind Details, which is why that button is not on the \
              page either:\n\n\
-             tobii bridge status --steam {appid}\n\
-             tobii bridge install --steam {appid}\n\n\
+             tobii bridge status {flag}\n\
+             tobii bridge install {flag}\n\n\
              {tail}"
         ),
     }
@@ -3036,7 +3057,7 @@ pub struct GamesTab {
 /// saying *bridge installed* and the page it opens cannot disagree.
 fn read_catalog(scan: &Scan) -> Catalog {
     let listing = profiles::list_from(&scan.profiles_dir, profiles::BUILTIN);
-    let custom = tobii_config::custom_games::list();
+    let custom = tobii_config::custom_games::list_from(&scan.custom_games);
     Catalog::new(
         &scan.apps,
         &listing,
@@ -3502,11 +3523,16 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // is suppressed somewhere and each absence is a different
             // sentence — see `blocks`.
             let shown = blocks(app.group);
+            // `d1` sits under block 1 and `d2` under block 2, so each belongs
+            // to the block BELOW it: a divider is a line between two things,
+            // and one shown with nothing under it is a rule at the foot of the
+            // pane. `d2` was tied to `shown.bridge`, which left exactly that on
+            // every hand-added game — bridge shown, block 3 hidden.
             for (w, on) in [
                 (&b1, shown.settings),
-                (&d1, shown.settings),
+                (&d1, shown.settings && (shown.bridge || shown.game)),
                 (&b2, shown.bridge),
-                (&d2, shown.bridge),
+                (&d2, shown.bridge && shown.game),
                 (&b3w, shown.game),
             ] {
                 if let Some(w) = w.upgrade() {
@@ -3602,7 +3628,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 &others,
                 tobii.as_deref(),
                 beside.as_deref(),
-                &app.key(),
+                &app.target,
             );
             if let Some(note) = profile.and_then(|p| profile_bridge_note(p.bridge)) {
                 text.push_str("\n\n");
@@ -3994,7 +4020,11 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             } else {
                 census.remove_css_class("section-warn");
             }
-            notes.set_text(&p.notes.join(" "));
+            // Newlines, not spaces. `directory_notes` returns three separate
+            // claims — our bug, somebody else's file, our interrupted save —
+            // and joining them with a space glued three deliberately distinct
+            // accusations into one blur.
+            notes.set_text(&p.notes.join("\n"));
             notes.set_visible(!p.notes.is_empty());
         })
     };
@@ -4018,18 +4048,19 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             rebuild.clone(),
             refresh.clone(),
         );
-        let search_w = search.downgrade();
+        let (search_w, notes_top) = (search.downgrade(), notes.downgrade());
         add_btn.connect_clicked(move |b| {
             let parent = b.root().and_downcast::<gtk::Window>();
             let dialog = gtk::FileDialog::new();
             dialog.set_title("Pick the game's Wine prefix");
             dialog.set_modal(true);
-            let (catalog, scan, rebuild, refresh, search_w) = (
+            let (catalog, scan, rebuild, refresh, search_w, notes_w) = (
                 catalog.clone(),
                 scan.clone(),
                 rebuild.clone(),
                 refresh.clone(),
                 search_w.clone(),
+                notes_top.clone(),
             );
             // A FOLDER, and the prefix itself rather than the game's directory:
             // that is what `tobii bridge install --prefix` takes, and it is the
@@ -4042,14 +4073,27 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 let Some(dir) = res.ok().and_then(|f| f.path()) else {
                     return;
                 };
-                let mut games = tobii_config::custom_games::list();
+                let mut games = tobii_config::custom_games::list_from(&scan.custom_games);
                 let name = name_for_prefix(&dir);
-                if let Err(e) = tobii_config::custom_games::add(&mut games, &name, &dir) {
-                    tobii_diagnostics::log::warn(&format!("could not add {}: {e}", dir.display()));
-                    return;
-                }
-                if let Err(e) = tobii_config::custom_games::save(&games) {
-                    tobii_diagnostics::log::warn(&format!("could not save the game list: {e}"));
+                // Shown, not only logged. `AddError`'s whole `Display` impl
+                // exists to name the entry a duplicate is already under, and
+                // swallowing it left the dialog closing with no row added and
+                // nothing on screen — indistinguishable from a broken button.
+                let saved = tobii_config::custom_games::add(&mut games, &name, &dir)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| {
+                        tobii_config::custom_games::save_to(&scan.custom_games, &games)
+                            .map_err(|e| e.to_string())
+                    });
+                if let Err(why) = saved {
+                    tobii_diagnostics::log::warn(&format!(
+                        "could not add {}: {why}",
+                        dir.display()
+                    ));
+                    if let Some(l) = notes_w.upgrade() {
+                        l.set_text(&format!("Could not add that folder — {why}"));
+                        l.set_visible(true);
+                    }
                     return;
                 }
                 *catalog.borrow_mut() = read_catalog(&scan);
@@ -4072,11 +4116,11 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             let Some(prefix) = sel.borrow().as_ref().and_then(|p| p.prefix().cloned()) else {
                 return;
             };
-            let mut games = tobii_config::custom_games::list();
+            let mut games = tobii_config::custom_games::list_from(&scan.custom_games);
             if !tobii_config::custom_games::remove(&mut games, &prefix) {
                 return;
             }
-            if let Err(e) = tobii_config::custom_games::save(&games) {
+            if let Err(e) = tobii_config::custom_games::save_to(&scan.custom_games, &games) {
                 tobii_diagnostics::log::warn(&format!("could not save the game list: {e}"));
                 return;
             }
@@ -4284,7 +4328,7 @@ mod tests {
             others,
             Some(Path::new("/usr/bin/tobii")),
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         )
     }
 
@@ -5841,7 +5885,7 @@ mod tests {
             &[],
             Some(Path::new("/home/x/.local/bin/tobii")),
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         assert!(here.contains("/home/x/.local/bin/tobii"), "{here}");
 
@@ -5851,7 +5895,7 @@ mod tests {
             &[],
             Some(Path::new("/usr/bin/tobii")),
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         assert!(there.contains("/usr/bin/tobii"), "{there}");
         assert!(
@@ -5912,7 +5956,11 @@ mod tests {
 
         // And the sentence that replaces the button says what to type.
         for a in [Action::Install, Action::Reinstall] {
-            let text = no_binary_text(a, Some(Path::new("/opt/x")), "359320");
+            let text = no_binary_text(
+                a,
+                Some(Path::new("/opt/x")),
+                &Target::Steam("359320".to_string()),
+            );
             assert!(
                 text.contains("tobii bridge install --steam 359320"),
                 "{a:?}: {text}"
@@ -5954,7 +6002,7 @@ mod tests {
         // Half two: the sentence. It must not report on the place that was
         // not looked at, and it must say that it was not looked at.
         for a in [Action::Install, Action::Reinstall] {
-            let text = no_binary_text(a, None, "359320");
+            let text = no_binary_text(a, None, &Target::Steam("359320".to_string()));
             assert!(
                 !text.contains("beside this one"),
                 "{a:?} reported on a directory nothing stat'd: {text}"
@@ -5971,7 +6019,11 @@ mod tests {
 
         // And with one, it names the directory it stat'd — not "this one",
         // which the user cannot check.
-        let named = no_binary_text(Action::Install, Some(Path::new("/opt/x")), "359320");
+        let named = no_binary_text(
+            Action::Install,
+            Some(Path::new("/opt/x")),
+            &Target::Steam("359320".to_string()),
+        );
         assert!(named.contains("/opt/x"), "{named}");
         assert!(named.contains("beside this one"), "{named}");
         assert!(
@@ -6858,7 +6910,7 @@ mod tests {
             &[],
             Some(Path::new("/usr/bin/tobii")),
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         assert!(
             with.contains("Details below is"),
@@ -6871,7 +6923,7 @@ mod tests {
             &[],
             None,
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         // The no-button half moved to `actions`, which is the one decider
         // now: `bridge_block` writes the paragraph and says nothing about
@@ -6910,8 +6962,16 @@ mod tests {
     #[test]
     fn what_this_window_says_about_a_tobii_it_could_not_find_is_about_its_own_path() {
         for text in [
-            no_binary_text(Action::Install, Some(Path::new("/opt/x")), "359320"),
-            no_binary_text(Action::Reinstall, Some(Path::new("/opt/x")), "359320"),
+            no_binary_text(
+                Action::Install,
+                Some(Path::new("/opt/x")),
+                &Target::Steam("359320".to_string()),
+            ),
+            no_binary_text(
+                Action::Reinstall,
+                Some(Path::new("/opt/x")),
+                &Target::Steam("359320".to_string()),
+            ),
             lead(None).to_string(),
         ] {
             assert!(
@@ -6928,7 +6988,11 @@ mod tests {
         // The two that print a command say where it would be, and what it
         // means when the terminal cannot find it either — which no arm said.
         for action in [Action::Install, Action::Reinstall] {
-            let text = no_binary_text(action, Some(Path::new("/opt/x")), "359320");
+            let text = no_binary_text(
+                action,
+                Some(Path::new("/opt/x")),
+                &Target::Steam("359320".to_string()),
+            );
             assert!(
                 text.contains("~/.local/bin"),
                 "where this project's installer puts it: {text}"
@@ -7055,7 +7119,7 @@ mod tests {
             &[],
             None,
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         assert!(
             actions(&present(), None, &quiet_job(), Reach::Reachable, false)
@@ -7079,12 +7143,20 @@ mod tests {
             &[],
             None,
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         assert!(absent.contains("cannot be installed from here"), "{absent}");
         assert_ne!(
-            no_binary_text(Action::Install, Some(Path::new("/opt/x")), "359320"),
-            no_binary_text(Action::Reinstall, Some(Path::new("/opt/x")), "359320"),
+            no_binary_text(
+                Action::Install,
+                Some(Path::new("/opt/x")),
+                &Target::Steam("359320".to_string())
+            ),
+            no_binary_text(
+                Action::Reinstall,
+                Some(Path::new("/opt/x")),
+                &Target::Steam("359320".to_string())
+            ),
             "two jobs, two sentences"
         );
 
@@ -7096,7 +7168,7 @@ mod tests {
             &[],
             None,
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         assert!(actions(
             &BridgeState::NoPrefix,
@@ -7838,7 +7910,14 @@ mod tests {
             prefix: PathBuf::from("/p/pfx"),
             present: vec![],
         };
-        let text = bridge_block(&state, &[], &[], None, Some(Path::new("/opt/x")), "359320");
+        let text = bridge_block(
+            &state,
+            &[],
+            &[],
+            None,
+            Some(Path::new("/opt/x")),
+            &Target::Steam("359320".to_string()),
+        );
         // The button half is `actions`, which is the one decider: with no
         // `tobii` there is nothing to run, whatever the prefix holds.
         let bar = actions(&state, None, &quiet_job(), Reach::Reachable, false);
@@ -7859,7 +7938,7 @@ mod tests {
             &[],
             Some(Path::new("/home/x/.local/bin/tobii")),
             Some(Path::new("/opt/x")),
-            "359320",
+            &Target::Steam("359320".to_string()),
         );
         let bar = actions(
             &state,

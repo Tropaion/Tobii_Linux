@@ -66,9 +66,20 @@ pub fn monitor_label(m: &MonitorInfo) -> String {
 ///
 /// Matched on the saved EDID id, which is what is stored, and never on the
 /// model string: two identical monitors share a model and differ by serial.
-pub fn setup_line(saved: Option<&str>, monitors: &[MonitorInfo]) -> String {
-    let Some(id) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
+pub fn setup_line(set_up: bool, saved: Option<&str>, monitors: &[MonitorInfo]) -> String {
+    if !set_up {
         return "No display set up yet.".to_string();
+    }
+    let Some(id) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
+        // Set up, and the monitor it was set up for cannot be named. The setup
+        // flow saves the EDID id of the monitor it used, and that id is `None`
+        // whenever the panel's EDID has no usable serial or no monitor could be
+        // read at all — in a VM, in a container, on a panel with a blank
+        // descriptor. Keying "is a display set up" on the ID rather than on the
+        // SETUP reported "No display set up yet." over a completed setup, for
+        // every session after, and the help topic glosses that sentence as "the
+        // tracker has never been told where the sensor sits".
+        return "Set up, for a monitor this machine cannot name.".to_string();
     };
     if let Some(m) = monitors.iter().find(|m| m.id.as_deref() == Some(id)) {
         return format!("Set up for \u{201c}{}\u{201d}.", monitor_label(m));
@@ -108,28 +119,36 @@ mod tests {
         let other = mon("Dell", Some("card1-HDMI-1"), Some("DEL1234"));
 
         assert_eq!(
-            setup_line(None, std::slice::from_ref(&here)),
-            "No display set up yet."
+            setup_line(false, None, std::slice::from_ref(&here)),
+            "No display set up yet.",
+            "nothing saved at all"
         );
-        // And a saved id that is there but empty, which is what a truncated
-        // write leaves: the same answer as none, not a lookup for "".
-        assert_eq!(
-            setup_line(Some("  "), std::slice::from_ref(&here)),
-            "No display set up yet."
-        );
+        // Set up, and the monitor cannot be named — a panel whose EDID has no
+        // usable serial, a VM, a container. This is the case that read as
+        // "never set up", and it is the reason the first argument exists: the
+        // SETUP is what was done, and the id is only how the card names it. An
+        // empty id is the same answer, since that is what a truncated write
+        // leaves.
+        for id in [None, Some("  ")] {
+            assert_eq!(
+                setup_line(true, id, std::slice::from_ref(&here)),
+                "Set up, for a monitor this machine cannot name.",
+                "{id:?}"
+            );
+        }
 
         assert_eq!(
-            setup_line(Some("SAM0001"), &[other.clone(), here.clone()]),
+            setup_line(true, Some("SAM0001"), &[other.clone(), here.clone()]),
             "Set up for \u{201c}Odyssey G9\u{201d}.",
             "the monitor by name, picked out of the ones that are plugged in"
         );
         assert_eq!(
-            setup_line(Some("SAM0001"), std::slice::from_ref(&other)),
+            setup_line(true, Some("SAM0001"), std::slice::from_ref(&other)),
             "Set up for a monitor that is not connected.",
             "monitors were read and this one is not among them"
         );
         assert_eq!(
-            setup_line(Some("SAM0001"), &[]),
+            setup_line(true, Some("SAM0001"), &[]),
             "Set up, but no monitor could be read here.",
             "nothing was read, so nothing may be concluded about what is plugged in"
         );
@@ -149,11 +168,11 @@ mod tests {
         // Both answers name the same words, so the test that means something is
         // that the id decides which row was found — asserted by removing it.
         assert_eq!(
-            setup_line(Some("SAM0002"), &[left.clone(), right.clone()]),
+            setup_line(true, Some("SAM0002"), &[left.clone(), right.clone()]),
             "Set up for \u{201c}Odyssey G9\u{201d}."
         );
         assert_eq!(
-            setup_line(Some("SAM0002"), std::slice::from_ref(&left)),
+            setup_line(true, Some("SAM0002"), std::slice::from_ref(&left)),
             "Set up for a monitor that is not connected.",
             "the other panel of a matched pair is not this one"
         );

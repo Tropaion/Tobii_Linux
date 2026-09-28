@@ -1287,12 +1287,18 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         })
     };
     // A monitor arriving or leaving, from GDK rather than from a poll.
-    if let Some(display) = gtk::gdk::Display::default() {
+    //
+    // `gdk::Display::monitors()` is a process-global list this hub does not
+    // own, so a handler left on it outlives the window: it would go on firing
+    // after quit, re-reading `/sys/class/drm` to update a label that is gone,
+    // and a second `build_hub` — which the tray icon can ask for — would add
+    // another. So the id is kept and dropped with the window.
+    let monitors_watch = Rc::new(RefCell::new(gtk::gdk::Display::default().map(|display| {
+        let monitors = display.monitors();
         let restate = restate_screen.clone();
-        display
-            .monitors()
-            .connect_items_changed(move |_, _, _, _| restate());
-    }
+        let id = monitors.connect_items_changed(move |_, _, _, _| restate());
+        (monitors, id)
+    })));
 
     let b_setup = crate::widget::button("Set up display");
     {
@@ -2191,9 +2197,16 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // The breakpoints. Three layouts, chosen by width alone, each switching at
     // the width its own layout measured — see `arrange` above.
     let breakpoint: Rc<dyn Fn(i32)> = {
-        // Measured above, plus the page margins either side.
-        let three_below = three_col_min + PAGE_MARGIN * 2;
-        let two_below = two_col_min + PAGE_MARGIN * 2;
+        // Measured above, plus the page margins either side — and the tab
+        // page's own border and padding, which is the same `page_chrome` the
+        // opening width had to learn about. The rack does not sit under the
+        // margins any more; it sits inside the page, which is inside them. Left
+        // out, every threshold was 34px too low: in the band just above one,
+        // `apply` chose a layout wider than the width the rack was actually
+        // handed, and GTK under-allocated and warned — the same defect, in the
+        // same commit, one function further down.
+        let three_below = three_col_min + PAGE_MARGIN * 2 + page_chrome;
+        let two_below = two_col_min + PAGE_MARGIN * 2 + page_chrome;
 
         let arrange = arrange.clone();
         // Three, because that is how the children were attached above — so a
@@ -2643,6 +2656,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // this window holding one of its own descendants, which is the cycle
         // that leaks a subtree. An `Rc<Cell<bool>>` holds nothing of GTK's.
         let games_alive = games_alive.clone();
+        let monitors_watch = monitors_watch.clone();
         window.connect_close_request(move |w| {
             // PRESSING X PUTS THE PROGRAM IN THE BACKGROUND; it does not exit.
             //
@@ -2735,6 +2749,15 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             //     there when the user comes back. Quitting is the one moment
             //     nobody is coming back. The child itself is never killed.
             games_alive.set(false);
+
+            // 3c. The handler on GDK's monitor list. It is on a process-global
+            //     object this window does not own, so nothing else would ever
+            //     take it off — it would go on firing after quit, re-reading
+            //     `/sys/class/drm` for a label that is gone, and a second hub
+            //     would add another beside it.
+            if let Some((monitors, id)) = monitors_watch.borrow_mut().take() {
+                monitors.disconnect(id);
+            }
 
             // 4. The tray icon, and then the application.
             //
@@ -3620,7 +3643,13 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
 /// rather than at each of the places that ask, because they are one question
 /// and were a line of `.ok().flatten().as_deref()` at each.
 fn screen_now() -> String {
+    // THREE reads, and the first is the one that answers the question. A saved
+    // setup is what "a display is set up" means; the monitor id is only how the
+    // card names which one, and it is `None` whenever the panel's EDID has no
+    // usable serial. Asking the id alone said "No display set up yet." over a
+    // completed setup on any machine whose monitor could not be identified.
     crate::screen_pick::setup_line(
+        tobii_config::load().ok().flatten().is_some(),
         tobii_config::load_setup_monitor_id()
             .ok()
             .flatten()
