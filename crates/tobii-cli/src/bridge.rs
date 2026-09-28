@@ -488,20 +488,15 @@ pub fn wine_from_steam_config_info(prefix: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Reading Steam's own files — the libraries, what is installed in them, and
-/// where a title's Proton prefix is — is [`tobii_steam`]'s job, not this
-/// module's.
-///
-/// It lives there so the GTK hub can reach it: `tobii-cli` is a `[[bin]]` with
-/// no `[lib]`, so nothing declared in here is callable from anywhere else in
-/// the workspace. What stays here is the wording — which errors this command
-/// prints and how — because a picker in the hub and a line on a terminal want
-/// the same decision phrased two different ways.
-///
-/// Re-exported under the name it had for `uninstall::wine_prefixes`, the one
-/// caller outside this module that asks bridge where the libraries are. It can
-/// go the day that caller reaches the crate itself.
-pub use tobii_steam::libraries as steam_libraries;
+// Reading Steam's own files — the libraries, what is installed in them, and
+// where a title's Proton prefix is — is `tobii_steam`'s job, not this
+// module's, and every caller below goes there directly for it.
+//
+// It lives there so the GTK hub can reach it: `tobii-cli` is a `[[bin]]` with
+// no `[lib]`, so nothing declared in here is callable from anywhere else in
+// the workspace. What stays here is the wording — which errors this command
+// prints and how — because a picker in the hub and a line on a terminal want
+// the same decision phrased two different ways.
 
 /// Whether `--steam <wanted>` names an app id rather than a title.
 ///
@@ -547,7 +542,11 @@ fn used_verbatim_as_app_id(wanted: &str) -> bool {
 /// with the right capitalisation twice. An ambiguous fragment lists what it
 /// matched rather than picking one.
 fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
-    let apps = tobii_steam::apps(home);
+    // One walk, for the list, the absent-library sentence and the prefix
+    // alike. Each of the three used to read every root's `libraryfolders.vdf`
+    // for itself.
+    let steam = tobii_steam::Steam::at(home);
+    let apps = steam.apps();
     let appid = if used_verbatim_as_app_id(wanted) {
         wanted.to_string()
     } else {
@@ -564,7 +563,7 @@ fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
                 ));
             }
             tobii_steam::Match::None => {
-                let missing = crate::steam_libraries_missing(home);
+                let missing = crate::steam_libraries_missing(&steam);
                 // "No installed Steam game matches" is a claim about every
                 // game installed, and there is a library here that could not
                 // be looked in. So the sentence says what was looked at.
@@ -585,7 +584,7 @@ fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
             }
         }
     };
-    tobii_steam::prefix(home, &appid).ok_or_else(|| {
+    steam.prefix(&appid).ok_or_else(|| {
         let name = apps
             .iter()
             .find(|a| a.appid == appid)
@@ -2978,12 +2977,16 @@ fn list_steam_games() -> CmdResult {
 /// of the environment, so that both of its refusals can be put to a test:
 /// `$HOME` is process-global and these tests run in parallel.
 fn list_steam_games_in(home: &Path) -> CmdResult {
-    let libs = steam_libraries(home);
-    let missing = crate::steam_libraries_missing(home);
+    // The libraries, the ones that are not here, the applications and a prefix
+    // stat per row, off one walk. The two halves of the census came from two
+    // walks before, which is two chances to disagree about one library.
+    let steam = tobii_steam::Steam::at(home);
+    let libs = steam.libraries();
+    let missing = crate::steam_libraries_missing(&steam);
     if libs.is_empty() {
         return Err(crate::with_missing("no Steam libraries found".to_string(), &missing).into());
     }
-    for lib in &libs {
+    for lib in libs {
         println!("library: {}", lib.display());
     }
     // With the libraries, not at the end: this is part of the same census, and
@@ -2991,7 +2994,7 @@ fn list_steam_games_in(home: &Path) -> CmdResult {
     if !missing.is_empty() {
         println!("{missing}");
     }
-    let apps = tobii_steam::apps(home);
+    let apps = steam.apps();
     if apps.is_empty() {
         // Bare, unlike the refusal above it: that one returns before the block
         // is printed, this one after, and naming the absent library twice
@@ -3007,7 +3010,7 @@ fn list_steam_games_in(home: &Path) -> CmdResult {
         // `tobii_steam::looks_like_tool` could now filter out. Left alone: this
         // list is what it was before the move, and what it should be is the
         // maintainer's call, not a rewiring's.
-        let mark = if tobii_steam::prefix(home, &app.appid).is_some() {
+        let mark = if steam.prefix(&app.appid).is_some() {
             "proton"
         } else {
             "  --  "

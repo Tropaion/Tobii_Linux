@@ -224,42 +224,194 @@ fn scan(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (found, missing)
 }
 
-/// Every Steam library on this machine.
+/// This machine's Steam install: the libraries that are here, the ones
+/// `libraryfolders.vdf` names and are not, and everything that can be asked
+/// about either.
 ///
-/// Not every library Steam knows about. A path `libraryfolders.vdf` names
-/// that is not a library here — an external drive nobody has plugged in is
-/// the ordinary way — is left out, because there is nothing to read there.
-/// [`missing_libraries`] names those, and a caller whose answer would
-/// otherwise read as the whole picture of what is installed owes the user
-/// that list.
-pub fn libraries(home: &Path) -> Vec<PathBuf> {
-    scan(home).0
+/// One value, because [`scan`] is one walk. Every question below is answered
+/// out of the walk taken when this was built, so asking a second question
+/// costs no disk at all. The free functions further down each take that walk
+/// for themselves, which is right for a caller with exactly one question and
+/// wrong for every caller with two: the hub's game picker asked [`prefix`] of
+/// 29 installed titles, which came to 31 walks and 124 reads of a
+/// `libraryfolders.vdf` to open one window, and is 2 and 8 now. One of the
+/// maintainer's libraries is on a drive that is not plugged in, and 93 of
+/// those 124 walks stat'd that path; 6 do now.
+///
+/// # What it is a snapshot of
+///
+/// The library layout, and only that. [`Self::apps`] re-reads the manifests
+/// on each call, so a game installed while this value is alive appears in the
+/// next list rather than being hidden by a stale one. What is fixed is which
+/// libraries were looked in.
+///
+/// # The pairing
+///
+/// [`Self::apps`] is what could be read and [`Self::missing_libraries`] is
+/// what could not, and a caller that shows the first without the second has
+/// told the user a confident negative about a game installed on a drive
+/// nobody has plugged in. Taking both off one value is what makes them unable
+/// to name different libraries — a list that shows a library beside a
+/// sentence calling that library absent is worse than either answer alone.
+#[derive(Debug)]
+pub struct Steam {
+    libraries: Vec<PathBuf>,
+    missing: Vec<PathBuf>,
 }
 
-/// The libraries `libraryfolders.vdf` names that are not on this machine,
-/// spelled as that file spells them.
+impl Steam {
+    /// Walk `home`'s Steam roots. The only disk read in here that is not
+    /// repeatable on demand, and the reason this type exists.
+    ///
+    /// `home` is a parameter rather than `$HOME` because CI runs as root with
+    /// no Steam install, and because one window should be one machine's worth
+    /// of answers even when the environment changes under it.
+    pub fn at(home: &Path) -> Self {
+        let (libraries, missing) = scan(home);
+        Self { libraries, missing }
+    }
+
+    /// Every Steam library on this machine, in the order the library files
+    /// name them.
+    ///
+    /// Not every library Steam knows about. A path `libraryfolders.vdf` names
+    /// that is not a library here — an external drive nobody has plugged in is
+    /// the ordinary way — is left out, because there is nothing to read there.
+    /// [`Self::missing_libraries`] names those, and a caller whose answer would
+    /// otherwise read as the whole picture of what is installed owes the user
+    /// that list.
+    pub fn libraries(&self) -> &[PathBuf] {
+        &self.libraries
+    }
+
+    /// The libraries `libraryfolders.vdf` names that are not on this machine,
+    /// spelled as that file spells them.
+    ///
+    /// Steam records a library's path, not whether its drive is plugged in, so
+    /// a title installed on an external drive stays in that file after the
+    /// drive is gone. [`Self::apps`] cannot see it, [`resolve`] answers
+    /// [`Match::None`] for its name, and a caller that reports that as "no such
+    /// game is installed" has told the user a confident negative about a game
+    /// that is installed. This is what such a caller shows instead of guessing.
+    ///
+    /// **It is not every reason a title can be absent from [`Self::apps`].** A
+    /// library that IS here but whose `steamapps` directory cannot be read, and
+    /// a manifest that cannot be read or is not UTF-8, are each skipped by
+    /// [`Self::apps`] and neither appears here. This answers one question —
+    /// which of the paths in `libraryfolders.vdf` are not there — and a caller
+    /// should word it as that, rather than as a complete account of what was
+    /// missed.
+    pub fn missing_libraries(&self) -> &[PathBuf] {
+        &self.missing
+    }
+
+    /// Everything installed, across every library.
+    ///
+    /// The manifests are read here and not at [`Self::at`]: a caller that only
+    /// wants a prefix should not pay for a `read_dir` of every library, and a
+    /// caller that wants the list twice wants the second one to be current.
+    pub fn apps(&self) -> Vec<App> {
+        apps_in(&self.libraries)
+    }
+
+    /// The Proton prefix for `appid`, if the game has ever been run.
+    ///
+    /// Proton creates `steamapps/compatdata/<appid>/pfx` the first time a
+    /// title launches. Its absence is the commonest reason this fails and is
+    /// worth saying out loud rather than reporting as "not found".
+    ///
+    /// The library holding the manifest is asked first, not just whichever
+    /// library happens to come first. Steam's "Move Install Folder" does not
+    /// move `compatdata`, so a game moved between libraries leaves its old
+    /// prefix behind and gets a fresh one on the next run — and installing
+    /// into the abandoned one succeeds, prints the ordinary success text, and
+    /// does nothing at all for the game. [`Self::prefixes`] is how a caller
+    /// sees that there were others.
+    pub fn prefix(&self, appid: &str) -> Option<PathBuf> {
+        self.prefix_candidates(appid)
+            .find(|p| p.join("drive_c").is_dir())
+    }
+
+    /// Every Proton prefix this machine holds for `appid`, the one
+    /// [`Self::prefix`] picks first and the abandoned ones after it.
+    ///
+    /// Nothing else this crate answers hints that a second one exists:
+    /// [`Self::apps`] folds two copies of a title into one row, and
+    /// [`Self::prefix`] names one path with no sign that it chose. A caller
+    /// that offers to install into a prefix is the one caller that has to be
+    /// able to say there is more than one, and it used to have to rebuild the
+    /// `compatdata/<appid>/pfx` shape out of [`Self::libraries`] itself — a
+    /// second copy of this path, in another crate, that no test here could
+    /// hold to this one.
+    ///
+    /// Empty when the title has never been run, which is the same answer
+    /// [`Self::prefix`] gives as [`None`].
+    pub fn prefixes(&self, appid: &str) -> Vec<PathBuf> {
+        self.prefix_candidates(appid)
+            .filter(|p| p.join("drive_c").is_dir())
+            .collect()
+    }
+
+    /// Where a prefix for `appid` could be, in the order a caller should
+    /// prefer them: the library holding the manifest, then the rest in library
+    /// order. Nothing is stat'd here — the two callers above differ only in
+    /// how much of this they take.
+    fn prefix_candidates<'a>(&'a self, appid: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
+        let owner = self.libraries.iter().position(|lib| {
+            lib.join(format!("steamapps/appmanifest_{appid}.acf"))
+                .is_file()
+        });
+        owner
+            .into_iter()
+            .chain((0..self.libraries.len()).filter(move |i| Some(*i) != owner))
+            .map(move |i| {
+                self.libraries[i]
+                    .join("steamapps/compatdata")
+                    .join(appid)
+                    .join("pfx")
+            })
+    }
+}
+
+/// Every Steam library on this machine.
 ///
-/// Steam records a library's path, not whether its drive is plugged in, so a
-/// title installed on an external drive stays in that file after the drive is
-/// gone. [`apps`] cannot see it, [`resolve`] answers [`Match::None`] for its
-/// name, and a caller that reports that as "no such game is installed" has
-/// told the user a confident negative about a game that is installed. This is
-/// what such a caller shows instead of guessing.
+/// [`Steam::at`] plus one question. A caller that asks a second one should
+/// hold the [`Steam`] instead: this walks every root's `libraryfolders.vdf`
+/// again, and so does every other free function here.
+pub fn libraries(home: &Path) -> Vec<PathBuf> {
+    Steam::at(home).libraries
+}
+
+/// The libraries `libraryfolders.vdf` names that are not on this machine.
 ///
-/// **It is not every reason a title can be absent from [`apps`].** A library
-/// that IS here but whose `steamapps` directory cannot be read, and a
-/// manifest that cannot be read or is not UTF-8, are each skipped by [`apps`]
-/// and neither appears here. This answers one question — which of the paths
-/// in `libraryfolders.vdf` are not there — and a caller should word it as
-/// that, rather than as a complete account of what was missed.
+/// [`Steam::missing_libraries`], plus a walk of its own — and it is the half
+/// of an answer that must not drift from the other half, so a caller that
+/// also wants [`apps`] wants one [`Steam`] rather than these two.
 pub fn missing_libraries(home: &Path) -> Vec<PathBuf> {
-    scan(home).1
+    Steam::at(home).missing
 }
 
 /// Everything installed, across every library.
+///
+/// [`Steam::at`] plus [`Steam::apps`]. See [`missing_libraries`] for why a
+/// caller that prints this list usually wants the [`Steam`] rather than this.
 pub fn apps(home: &Path) -> Vec<App> {
+    Steam::at(home).apps()
+}
+
+/// The Proton prefix for `appid`, if the game has ever been run.
+///
+/// [`Steam::at`] plus [`Steam::prefix`]. Asking this of a list of titles is
+/// what made the [`Steam`] value necessary: it is one whole scan per title.
+pub fn prefix(home: &Path, appid: &str) -> Option<PathBuf> {
+    Steam::at(home).prefix(appid)
+}
+
+/// Everything installed in these libraries, collapsed the way [`App`]'s
+/// identity says it must be.
+fn apps_in(libraries: &[PathBuf]) -> Vec<App> {
     let mut out = Vec::new();
-    for lib in libraries(home) {
+    for lib in libraries {
         let Ok(dir) = std::fs::read_dir(lib.join("steamapps")) else {
             continue;
         };
@@ -325,33 +477,6 @@ pub fn apps(home: &Path) -> Vec<App> {
         true
     });
     out
-}
-
-/// The Proton prefix for `appid`, if the game has ever been run.
-///
-/// Proton creates `steamapps/compatdata/<appid>/pfx` the first time a title
-/// launches. Its absence is the commonest reason this fails and is worth
-/// saying out loud rather than reporting as "not found".
-pub fn prefix(home: &Path, appid: &str) -> Option<PathBuf> {
-    let libs = libraries(home);
-    // The library holding the manifest is asked first, not just whichever
-    // library happens to come first. Steam's "Move Install Folder" does not
-    // move `compatdata`, so a game moved between libraries leaves its old
-    // prefix behind and gets a fresh one on the next run — and installing into
-    // the abandoned one succeeds, prints the ordinary success text, and does
-    // nothing at all for the game.
-    let owner = libs
-        .iter()
-        .find(|lib| {
-            lib.join(format!("steamapps/appmanifest_{appid}.acf"))
-                .is_file()
-        })
-        .cloned();
-    owner
-        .into_iter()
-        .chain(libs)
-        .map(|lib| lib.join("steamapps/compatdata").join(appid).join("pfx"))
-        .find(|p| p.join("drive_c").is_dir())
 }
 
 /// Whether an installed application is Steam's own plumbing rather than
@@ -925,26 +1050,124 @@ mod tests {
     /// the abandoned one succeeds, says so, and does nothing for the game — so
     /// the library holding the manifest is asked FIRST, not whichever library
     /// happens to come first.
-    #[test]
-    fn the_library_that_owns_the_manifest_is_asked_before_the_others() {
-        let home = scratch("moved");
-        let root = home.join(".steam/steam");
-        let elsewhere = home.join("games/second");
-        library(&root, &[]);
-        library(&elsewhere, &[("42", "Moved Game", None)]);
+    /// Two libraries, each holding a prefix for the same title, with the
+    /// manifest in the one the scan reaches **last**.
+    ///
+    /// The order matters to the case and not only to the code: a fixture whose
+    /// owning library is also the first one scanned passes whether the
+    /// preference exists or not, and this fixture was that until it was
+    /// checked by removing the preference and watching it go on passing. A
+    /// root is pushed after everything its own `libraryfolders.vdf` names, so
+    /// putting the manifest in the root is what makes the two orders differ.
+    fn moved_game(what: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let home = scratch(what);
+        let owner = home.join(".steam/steam");
+        let abandoned = home.join("games/second");
+        library(&owner, &[("42", "Moved Game", None)]);
+        library(&abandoned, &[]);
         std::fs::write(
-            root.join("steamapps/libraryfolders.vdf"),
-            format!("\t\"path\"\t\t\"{}\"\n", elsewhere.display()),
+            owner.join("steamapps/libraryfolders.vdf"),
+            format!("\t\"path\"\t\t\"{}\"\n", abandoned.display()),
         )
         .expect("vdf");
-        // The abandoned prefix, in the library that does NOT hold the manifest.
-        for lib in [&root, &elsewhere] {
+        for lib in [&owner, &abandoned] {
             std::fs::create_dir_all(lib.join("steamapps/compatdata/42/pfx/drive_c")).expect("pfx");
         }
+        (home, owner, abandoned)
+    }
+
+    /// Steam's "Move Install Folder" does not move `compatdata`, so a moved
+    /// game leaves its old prefix behind and gets a fresh one. Installing into
+    /// the abandoned one succeeds, says so, and does nothing for the game — so
+    /// the library holding the manifest is asked FIRST, not whichever library
+    /// happens to come first.
+    #[test]
+    fn the_library_that_owns_the_manifest_is_asked_before_the_others() {
+        let (home, owner, abandoned) = moved_game("moved");
+        let libs = libraries(&home);
+        assert_eq!(
+            libs.first(),
+            Some(&abandoned.canonicalize().expect("real")),
+            "the fixture is only a test of the preference while the owning \
+             library is not the first one scanned: {libs:?}"
+        );
         let got = prefix(&home, "42").expect("a prefix");
         assert!(
-            got.starts_with(elsewhere.canonicalize().expect("real")),
+            got.starts_with(owner.canonicalize().expect("real")),
             "the manifest's own library wins; got {got:?}"
+        );
+    }
+
+    /// The point of [`Steam`]: the walk is taken once, at construction, and
+    /// nothing asked of the value afterwards goes back to `libraryfolders.vdf`.
+    ///
+    /// Checked by taking the file away and asking again. A library named only
+    /// by that file is the whole of what it can tell anyone, so a second walk
+    /// would lose it — which is exactly what the free functions do here, and
+    /// they are asserted alongside so the case fails if the two ever become
+    /// the same thing.
+    #[test]
+    fn the_walk_is_taken_once_and_every_later_answer_comes_out_of_it() {
+        let home = scratch("walkonce");
+        let root = home.join(".steam/steam");
+        let named_only_by_the_file = home.join("games/library-two");
+        library(&root, &[]);
+        library(
+            &named_only_by_the_file,
+            &[("42", "Second Library Game", None)],
+        );
+        std::fs::create_dir_all(named_only_by_the_file.join("steamapps/compatdata/42/pfx/drive_c"))
+            .expect("pfx");
+        let vdf = root.join("steamapps/libraryfolders.vdf");
+        std::fs::write(
+            &vdf,
+            format!("\t\"path\"\t\t\"{}\"\n", named_only_by_the_file.display()),
+        )
+        .expect("vdf");
+
+        let steam = Steam::at(&home);
+        std::fs::remove_file(&vdf).expect("take the file away");
+
+        assert_eq!(
+            rows(&steam.apps()),
+            vec![("42", "Second Library Game", None)],
+            "the library the file named is still this value's, after the file is gone"
+        );
+        assert!(
+            steam.prefix("42").is_some(),
+            "and so is the prefix in it: asking again is not walking again"
+        );
+        assert!(
+            apps(&home).is_empty() && prefix(&home, "42").is_none(),
+            "while a free function walks afresh and now finds nothing — which is \
+             what every one of these calls was doing on every question"
+        );
+    }
+
+    /// A title can have a prefix in every library it has ever been installed
+    /// in, and the hub is the one place that offers to install into one — so
+    /// it has to be able to name the others. It used to rebuild
+    /// `compatdata/<appid>/pfx` out of `libraries` itself to do it.
+    #[test]
+    fn every_prefix_a_title_has_is_listed_with_the_chosen_one_first() {
+        let (home, owner, abandoned) = moved_game("allprefixes");
+        let steam = Steam::at(&home);
+        let all = steam.prefixes("42");
+        assert_eq!(all.len(), 2, "both are on this machine: {all:?}");
+        assert_eq!(
+            all.first(),
+            steam.prefix("42").as_ref(),
+            "and the one an install writes into leads the list"
+        );
+        assert!(
+            all[0].starts_with(owner.canonicalize().expect("real"))
+                && all[1].starts_with(abandoned.canonicalize().expect("real")),
+            "which is the manifest's own library, although the scan reaches the \
+             abandoned one first: {all:?}"
+        );
+        assert!(
+            steam.prefixes("7").is_empty(),
+            "a title that has never been run has none, as `prefix` says with None"
         );
     }
 

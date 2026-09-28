@@ -1566,7 +1566,7 @@ fn root_hint(fs: &Fs) -> Option<String> {
 /// necessarily the one the bridge was installed with.
 fn wine_prefixes(fs: &Fs, home: &Path, wineprefix: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for lib in bridge::steam_libraries(&fs.at(home)) {
+    for lib in tobii_steam::Steam::at(&fs.at(home)).libraries() {
         let Ok(entries) = std::fs::read_dir(lib.join("steamapps/compatdata")) else {
             continue;
         };

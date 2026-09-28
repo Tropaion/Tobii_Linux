@@ -2057,8 +2057,12 @@ fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
 /// rather than keeping its own copy. The crate root is the one module both
 /// can see, and one sentence about somebody's unplugged drive is worth more
 /// than two that can drift.
-pub(crate) fn steam_libraries_missing(home: &std::path::Path) -> String {
-    let missing = tobii_steam::missing_libraries(home);
+///
+/// Takes the [`tobii_steam::Steam`] rather than a home, so this sentence and
+/// the list it is printed beside come out of one walk of the disk. Asked of a
+/// home, it took a walk of its own, and every caller here already had one.
+pub(crate) fn steam_libraries_missing(steam: &tobii_steam::Steam) -> String {
+    let missing = steam.missing_libraries();
     if missing.is_empty() {
         return String::new();
     }
@@ -2073,7 +2077,7 @@ pub(crate) fn steam_libraries_missing(home: &std::path::Path) -> String {
             missing.len()
         )
     };
-    for path in &missing {
+    for path in missing {
         block.push_str(&format!("\n  {}", path.display()));
     }
     block
@@ -2206,9 +2210,14 @@ fn steam_appid_for(home: &std::path::Path, wanted: &str) -> Result<GameRef, Stri
     if wanted.is_empty() {
         return Err("name a game: an app id, or part of its name".to_string());
     }
-    let apps = tobii_steam::apps(home);
-    let missing_libraries = steam_libraries_missing(home);
-    let has_prefix = |appid: &str| tobii_steam::prefix(home, appid).is_some();
+    // One walk of this machine's Steam install, for all three of the questions
+    // below. Each used to take its own: `apps`, the missing-library sentence
+    // and the prefix stat re-read every root's `libraryfolders.vdf`, so every
+    // `tobii games profile` command read the same four files three times over.
+    let steam = tobii_steam::Steam::at(home);
+    let apps = steam.apps();
+    let missing_libraries = steam_libraries_missing(&steam);
+    let has_prefix = |appid: &str| steam.prefix(appid).is_some();
     match tobii_steam::resolve(&apps, wanted) {
         tobii_steam::Match::One(app) => Ok(GameRef {
             has_prefix: has_prefix(&app.appid),
