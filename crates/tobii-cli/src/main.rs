@@ -2053,10 +2053,10 @@ fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
 /// is installed carries this, so "this game is not installed" is never printed
 /// over a drive nobody could look in.
 ///
-/// `pub(crate)` because `bridge.rs` words these same answers from its own
-/// private copy of this function. The crate root is the one module both can
-/// see; when that file is next opened, its copy should go and this should be
-/// what it calls.
+/// `pub(crate)` because `bridge.rs` words these same answers and calls this
+/// rather than keeping its own copy. The crate root is the one module both
+/// can see, and one sentence about somebody's unplugged drive is worth more
+/// than two that can drift.
 pub(crate) fn steam_libraries_missing(home: &std::path::Path) -> String {
     let missing = tobii_steam::missing_libraries(home);
     if missing.is_empty() {
@@ -2080,7 +2080,7 @@ pub(crate) fn steam_libraries_missing(home: &std::path::Path) -> String {
 }
 
 /// `head`, then the missing-library block under it if there is one.
-fn with_missing(head: String, missing: &str) -> String {
+pub(crate) fn with_missing(head: String, missing: &str) -> String {
     if missing.is_empty() {
         head
     } else {
@@ -4630,6 +4630,24 @@ mod tests {
     /// delete each other's fixtures.
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tobii-cliprof-{tag}-{}", std::process::id()));
+        // A tag is a name, not a hint: this clears the directory before
+        // handing it over, so two tests sharing one tag are two tests where
+        // whichever starts second deletes the other's fixture mid-run. That
+        // happened, and it read as an intermittent bug in `profile_list`.
+        //
+        // The check has to be process-wide, not thread-local like the cleanup
+        // below: libtest gives each test its own thread, so a per-thread list
+        // is exactly the one that cannot see the collision.
+        static TAKEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        {
+            let mut taken = TAKEN.lock().expect("the tag list");
+            assert!(
+                !taken.iter().any(|t| t == tag),
+                "two tests share the scratch tag {tag:?}, and this one would \
+                 delete the other's fixture while it is running"
+            );
+            taken.push(tag.to_string());
+        }
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("scratch");
         SCRATCH.with_borrow_mut(|dirs| dirs.0.push(dir.clone()));
@@ -6092,7 +6110,7 @@ mod tests {
     /// straight into it.
     #[test]
     fn a_value_wider_than_its_column_is_still_followed_by_a_space() {
-        let dir = scratch("listing-wide");
+        let dir = scratch("listing-wide-space");
         write_profile(
             &dir,
             "359320",

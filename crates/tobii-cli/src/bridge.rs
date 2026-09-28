@@ -539,51 +539,6 @@ fn used_verbatim_as_app_id(wanted: &str) -> bool {
     wanted.chars().all(|c| c.is_ascii_digit())
 }
 
-/// The libraries `libraryfolders.vdf` names that are not on this machine, as
-/// a block to print — empty when there are none.
-///
-/// Every answer below that would otherwise read as the whole picture of what
-/// is installed carries this. Steam records a library's path, not whether its
-/// drive is plugged in, so a title on an external drive that is unplugged is
-/// installed and in no list here: "no installed Steam game matches" is then a
-/// negative this command has no grounds for. The maintainer's own
-/// `libraryfolders.vdf` names a library under `/run/media` that is not there.
-///
-/// The paths are named and nothing is inferred from them. Whether a drive
-/// could be mounted, or whether the wanted title is the one on it, is not
-/// something this can know — so the user is handed the one fact that is
-/// checkable and recognises their own drive in it.
-fn steam_libraries_missing(home: &Path) -> String {
-    let missing = tobii_steam::missing_libraries(home);
-    if missing.is_empty() {
-        return String::new();
-    }
-    let mut block = if missing.len() == 1 {
-        "libraryfolders.vdf names a Steam library this machine does not have, \
-         so anything installed there is in no list here:"
-            .to_string()
-    } else {
-        format!(
-            "libraryfolders.vdf names {} Steam libraries this machine does not \
-             have, so anything installed there is in no list here:",
-            missing.len()
-        )
-    };
-    for path in &missing {
-        block.push_str(&format!("\n  {}", path.display()));
-    }
-    block
-}
-
-/// `head`, then the missing-library block under it if there is one.
-fn with_missing(head: String, missing: &str) -> String {
-    if missing.is_empty() {
-        head
-    } else {
-        format!("{head}\n{missing}")
-    }
-}
-
 /// Turn `--steam <appid|name fragment>` into a prefix path.
 ///
 /// What a name fragment picked out is [`tobii_steam::resolve`]'s decision; the
@@ -609,7 +564,7 @@ fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
                 ));
             }
             tobii_steam::Match::None => {
-                let missing = steam_libraries_missing(home);
+                let missing = crate::steam_libraries_missing(home);
                 // "No installed Steam game matches" is a claim about every
                 // game installed, and there is a library here that could not
                 // be looked in. So the sentence says what was looked at.
@@ -626,7 +581,7 @@ fn steam_prefix_for(home: &Path, wanted: &str) -> Result<PathBuf, String> {
                         msg.push_str(&format!("\n  {:<10} {}", a.appid, a.name));
                     }
                 }
-                return Err(with_missing(msg, &missing));
+                return Err(crate::with_missing(msg, &missing));
             }
         }
     };
@@ -3024,9 +2979,9 @@ fn list_steam_games() -> CmdResult {
 /// `$HOME` is process-global and these tests run in parallel.
 fn list_steam_games_in(home: &Path) -> CmdResult {
     let libs = steam_libraries(home);
-    let missing = steam_libraries_missing(home);
+    let missing = crate::steam_libraries_missing(home);
     if libs.is_empty() {
-        return Err(with_missing("no Steam libraries found".to_string(), &missing).into());
+        return Err(crate::with_missing("no Steam libraries found".to_string(), &missing).into());
     }
     for lib in &libs {
         println!("library: {}", lib.display());

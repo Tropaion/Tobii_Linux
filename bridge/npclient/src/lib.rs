@@ -106,18 +106,20 @@ macro_rules! trace {
 /// `data` must be null or point to a writable [`TrackIrData`].
 #[no_mangle]
 pub unsafe extern "system" fn NP_GetData(data: *mut TrackIrData) -> i32 {
-    if data.is_null() {
-        trace!("NP_GetData(data={data:p}) -> {NP_ERR_INVALID_ARG}");
-        return NP_ERR_INVALID_ARG;
-    }
-    #[cfg(not(feature = "spike-log"))]
-    {
-        let _ = trackir::fill(&mut *data);
-    }
-    // Logged with its code, because a reader working out why a game stopped
-    // asking should not have to know which build wrote the line.
-    trace!("NP_GetData(data={data:p}) -> {NP_OK}");
-    NP_OK
+    let rc = if data.is_null() {
+        NP_ERR_INVALID_ARG
+    } else {
+        #[cfg(not(feature = "spike-log"))]
+        {
+            trackir::fill(&mut *data);
+        }
+        NP_OK
+    };
+    // One line per call, carrying what was answered: a reader working out why
+    // a game stopped asking should not have to know which build wrote it, or
+    // which branch.
+    trace!("NP_GetData(data={data:p}) -> {rc}");
+    rc
 }
 
 /// NaturalPoint's anti-clone check, which this client cannot answer.
@@ -185,18 +187,20 @@ pub unsafe extern "system" fn NP_GetSignature(sig: *mut c_void) -> i32 {
 /// `version` must be null or point to a writable `u16`.
 #[no_mangle]
 pub unsafe extern "system" fn NP_QueryVersion(version: *mut u16) -> i32 {
-    if version.is_null() {
-        trace!("NP_QueryVersion(version={version:p}) -> {NP_ERR_INVALID_ARG}");
-        return NP_ERR_INVALID_ARG;
-    }
-    trace!("NP_QueryVersion(version={version:p}) -> {NP_OK}");
-    // 4.00. The established open client reports 5.00, but TIR5 also requires a
-    // checksum computed over the head-pose data and relayed to the game, which
-    // this does not compute — claiming the newer version without it may be
-    // worse than claiming the older one. Untested either way, so it is left
-    // where it was rather than changed on a hunch.
-    *version = 0x0400;
-    NP_OK
+    let rc = if version.is_null() {
+        NP_ERR_INVALID_ARG
+    } else {
+        // 4.00. The established open client reports 5.00, but TIR5 also
+        // requires a checksum computed over the head-pose data and relayed to
+        // the game, which this does not compute — claiming the newer version
+        // without it may be worse than claiming the older one. Untested
+        // either way, so it is left where it was rather than changed on a
+        // hunch.
+        *version = 0x0400;
+        NP_OK
+    };
+    trace!("NP_QueryVersion(version={version:p}) -> {rc}");
+    rc
 }
 
 /// # Safety
@@ -318,6 +322,10 @@ mod tests {
 
     /// Not the default port: the first data call starts the feeder, which binds
     /// it, and 4243 may belong to a hub running on this machine for real.
+    /// Gated with the test that uses it: the spike build serves no data, so
+    /// the one test that publishes a frame is not built there and this port
+    /// would be a constant nobody reads.
+    #[cfg(not(feature = "spike-log"))]
     const TEST_PORT: u16 = 47431;
 
     /// The caller allocates this buffer and does not initialise it — MSFS

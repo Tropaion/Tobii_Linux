@@ -562,10 +562,10 @@ pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<Str
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
-        "The profile for this game also asks for {n} of this program's own {s}: {pairs}. This \
-         window has not applied {them} — `tobii games set <key> <value>` in a terminal does.",
+        "The profile for this game also asks for {n} of this program's own settings: {pairs}. \
+         This window has not applied {them} — `tobii games set <key> <value>` in a terminal \
+         does.",
         n = settings.len(),
-        s = plural(settings.len(), "settings", "settings"),
         them = plural(settings.len(), "it", "them"),
     ))
 }
@@ -1924,14 +1924,17 @@ fn run_check(check: &profiles::Check, prefix: Option<&Path>) -> (Vec<Row>, Optio
             Source::Rejected(why) => (vec![row(None, Answer::Unreadable(why))], None),
             Source::Read(b) => {
                 let note = binds_note(&b);
+                // A guard, not a case: `binds::read` answers `Unwritten`
+                // before it builds a `Bindings` with nothing in it, on both of
+                // its paths. Kept so a change there cannot turn into a row-less
+                // block here, and worded once — the two path-dependent
+                // sentences this used to carry could drift with nothing
+                // reaching them to notice.
                 if b.presets.is_empty() {
                     return (
                         vec![row(
                             None,
-                            Answer::Unwritten(match &b.start {
-                                Some(start) => format!("{} names no preset", start.display()),
-                                None => format!("{} holds no preset", path.display()),
-                            }),
+                            Answer::Unwritten(format!("{} holds no preset", path.display())),
                         )],
                         note,
                     );

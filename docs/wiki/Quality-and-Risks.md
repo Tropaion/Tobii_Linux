@@ -1336,10 +1336,12 @@ what is tested and what is known.
   count the same files (only `freetrackclient64.dll` is required; the other two
   are optional and the installer says `skipping`). But no game has been started
   from this window afterwards to see whether it loads anything. §11.3j's
-  conclusion stands unchanged and applies here: **the only title ever measured
-  against NaturalPoint's signature check rejected our `NPClient64.dll`**, and
-  nothing in this window may be read as evidence that any game accepts it. The
-  verified route remains FreeTrack.
+  conclusion stands unchanged and applies here: **both titles ever measured
+  against NaturalPoint's signature check stop at it** — Star Citizen rejects
+  our `NPClient64.dll` and never asks for data again, and Microsoft Flight
+  Simulator 2024 retries the check for as long as it runs — and nothing in
+  this window may be read as evidence that any game accepts it. The verified
+  route remains FreeTrack.
 - **The window is display-tested for lifecycle, not for the correctness of what
   it says.** `tests/game_setup_window.rs` opens it, closes it, and asserts it
   frees itself and takes no claim on the tracker — run under a nested
