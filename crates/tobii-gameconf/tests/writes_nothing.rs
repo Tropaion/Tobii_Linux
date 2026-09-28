@@ -25,10 +25,10 @@
 //! # Running the code is not the same as reaching it
 //!
 //! A snapshot that comes back identical says nothing about a branch that
-//! never ran. `binds::read` answers at its first lookup for a directory with
-//! no `StartPreset` file in it, and a fixture made only of those would leave
-//! most of the function — and any write planted in it — untouched while every
-//! path in the tree stayed byte-identical.
+//! never ran. `binds::read` answers at its first lookup for a directory that
+//! is not there at all, and a fixture made only of those would leave most of
+//! the function — and any write planted in it — untouched while every path in
+//! the tree stayed byte-identical.
 //!
 //! So the fixture holds one directory per shape the reader distinguishes, and
 //! [`Seen`] counts the cases each entry point answered with: the three
@@ -365,11 +365,18 @@ fn preset(name: &str, setting_value: &str) -> Vec<u8> {
 /// The last four are not preset directories: a directory sealed against this
 /// process, a directory named like an attributes file, an attributes file
 /// where a directory was expected, and a path that is not there.
-const DIRECTORIES: [&str; 14] = [
+///
+/// Two of them are the two shapes with no start file, and they are two
+/// entries and not one because they are two answers: `shipped-presets` holds
+/// documents a game ships and is read, `unwritten-presets` holds none and is
+/// the absence. A fixture with only the first would never reach the absence;
+/// one with only the second would never reach the reading.
+const DIRECTORIES: [&str; 15] = [
     "presets",
     "trap-presets",
     "read-presets",
     "broken-presets",
+    "shipped-presets",
     "unwritten-presets",
     "nameless-presets",
     "unnamed-preset-presets",
@@ -444,9 +451,22 @@ fn fixture(root: &Path) {
     );
     write(broken.join("NotText.binds"), &[0xff, 0xfe, 0x00, 0x01]);
 
-    // A directory a game ships and has never run in: presets, no start file.
+    // A directory a game ships and has never run in: presets, no start
+    // file. Every one of them is reported, and none is in use — the shape
+    // Elite Dangerous' `ControlSchemes` has, and the one `binds::read`
+    // answered as an absence until 2026-09-28.
+    let shipped = dir(root.join("shipped-presets"));
+    write(shipped.join("Custom.binds"), &preset("Custom", "1"));
+    write(shipped.join("Spare.binds"), &preset("Spare", "0"));
+    write(shipped.join("Help.txt"), b"not a preset");
+
+    // A directory holding no control scheme at all, saved or shipped, which
+    // is the only shape with a real directory in front of it that is an
+    // absence. It is the `Source::Unwritten` branch reached over something
+    // this reader could list, where `never-written` below is the branch
+    // reached over a path that is not there.
     let unwritten = dir(root.join("unwritten-presets"));
-    write(unwritten.join("Custom.binds"), &preset("Custom", "1"));
+    write(unwritten.join("DeviceMappings.xml"), b"<Root/>");
 
     // A start file naming nothing a reader can use.
     let nameless = dir(root.join("nameless-presets"));
@@ -529,11 +549,19 @@ fn fixture(root: &Path) {
 /// satisfied by a reader that got as far as opening a directory: `Source`
 /// says whether the directory was read at all, `Found` says what became of
 /// each preset the start file named, and `Lookup` says what one document held.
+///
+/// `selected` and `unselected` split the outermost level's `read` once more.
+/// A preset directory is read down two different paths depending on whether
+/// anything in it chooses a preset, and a fixture that stopped holding one of
+/// the two shapes would leave that path — and any write planted in it —
+/// unrun while this count still said the reader had read something.
 #[derive(Default)]
 struct Seen {
     unwritten: usize,
     rejected: usize,
     read: usize,
+    selected: usize,
+    unselected: usize,
     absent: usize,
     text: usize,
     refused: usize,
@@ -579,6 +607,11 @@ fn run_everything(root: &Path) -> Seen {
             let found = binds::read(&root.join(dir), setting);
             seen.source(&found);
             if let Source::Read(bindings) = &found {
+                if bindings.start.is_some() {
+                    seen.selected += 1;
+                } else {
+                    seen.unselected += 1;
+                }
                 for active in &bindings.presets {
                     seen.found(&active.found);
                     if let binds::Found::Read { preset, .. } = &active.found {
@@ -654,6 +687,12 @@ fn every_entry_point_leaves_the_tree_byte_identical() {
         seen.unwritten > 0 && seen.rejected > 0 && seen.read > 0,
         "the readers did not reach all three answers, so this tree did not \
          exercise what it is here to exercise"
+    );
+    assert!(
+        seen.selected > 0 && seen.unselected > 0,
+        "the directory reader did not reach both shapes of preset directory — \
+         one a game has run in and one holding only the presets it ships — so \
+         one of the two paths through it went unrun"
     );
     assert!(
         seen.missing_preset > 0 && seen.unusable_preset > 0 && seen.read_preset > 0,

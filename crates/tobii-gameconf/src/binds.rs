@@ -1,5 +1,13 @@
 //! Elite Dangerous-style control presets: a directory of `.binds` documents
-//! and the `StartPreset` file that says which of them is live.
+//! and, when a game has run there, the `StartPreset` file that says which of
+//! them is live.
+//!
+//! **When** it has run there. A directory of presets a game merely *ships* has
+//! no start file, and it is not an empty directory — it is thirty control
+//! schemes with nothing chosen among them. [`read`] answers both shapes and
+//! says which it was; see its docs, which are also where the sentence this
+//! module used to print about the first shape is written out, because it was
+//! the exact failure the crate exists to prevent.
 //!
 //! # The format, as the game's own files have it
 //!
@@ -67,13 +75,22 @@
 //! cargo run -p tobii-gameconf --example read -- presets <ControlSchemes> HeadlookMode
 //! ```
 //!
-//! Its `presets` mode reads every `.binds` document in a directory, without a
-//! `StartPreset` file, and prints each of those counts beside the per-file
-//! numbers it is made of — the 2 and the 28 included, tallied off what the
-//! reader made of each `<Root>`. A number in this census that the example does
-//! not print is a number nobody can check; that is a rule for whoever edits the
-//! census, and not something a test can hold, because the files it would have
-//! to count are on one maintainer's disk.
+//! Its `presets` mode reads every `.binds` document in a directory and prints
+//! each of those counts beside the per-file numbers it is made of — the 2 and
+//! the 28 included, tallied off what the reader made of each `<Root>`. A
+//! number in this census that the example does not print is a number nobody
+//! can check; that is a rule for whoever edits the census, and not something a
+//! test can hold, because the files it would have to count are on one
+//! maintainer's disk.
+//!
+//! What that mode is *not* is a second reader. It counts writing habits —
+//! byte-order marks, line endings, the spacing of the declaration — that
+//! nothing in a report needs, and it is the only thing it has that [`read`]
+//! does not. Taking the census with it and then saying a *check* had read the
+//! directory would be reporting a demonstration nobody performed; the two were
+//! conflated once and it cost a round. Pointed at the same 30 files on
+//! 2026-09-28 the two agree: `binds` reports 30 presets, all Accumulate, 2 of
+//! them naming a schema version, and `presets` counts 2 versioned and 28 not.
 //!
 //! # Why this is worth reading at all
 //!
@@ -97,10 +114,16 @@
 //! so there is nothing here to read the convention off. The prefix itself has
 //! been run — `compatdata/359320/pfx` is there and populated — which is why
 //! the claim is about what the game wrote and not about whether it started.
-//! What that exercises — and it is the path a user most often hits — is
-//! [`crate::Source::Unwritten`]: a game that has saved nothing must be
-//! reported as exactly that, with a sentence, and not as a game whose settings
-//! are fine.
+//!
+//! What this machine *does* have is the other shape, and it is the one this
+//! module was wrong about for longer: the 30 presets Elite ships sit in
+//! `Products/elite-dangerous-odyssey-64/ControlSchemes`, with no `StartPreset`
+//! file and four things that are not presets beside them. Read on 2026-09-28,
+//! a `binds` check over that directory reports all 30 and every one of them
+//! Accumulate. Before that date the same check answered *nothing has saved a
+//! control scheme here*. Nothing in CI has those files and no test here can
+//! hold that number — what a test holds is the shape, and the number is
+//! taken again by pointing this crate's `read` example at the directory.
 //!
 //! So [`start`] is written to refuse rather than to guess. It takes one preset
 //! name per line and nothing else; a line it cannot read as a name is an
@@ -112,6 +135,18 @@
 //!
 //! The one thing [`read`] does assume is stated where it is made: see
 //! [`Bindings::superseded`].
+//!
+//! # One check over one directory is not one value
+//!
+//! A reader coming from a profile file should not carry away that a `[[check]]`
+//! asks one question and gets one answer. [`read`] opens **every** `.binds`
+//! document in the directory, and [`Bindings::presets`] is a list: one entry
+//! per name a start file holds, or, with no start file, one per document.
+//! Measured on 2026-09-28 — a directory with 4 `.binds` documents and a start
+//! file naming two presets gives two entries and names two further start
+//! files by path; Elite's shipped `ControlSchemes` gives thirty. What a check
+//! *is* bounded to is the directory it names and the one setting it names
+//! inside each document there; what it is not bounded to is a single row.
 
 use crate::{xml, Lookup, Source};
 use std::path::{Path, PathBuf};
@@ -404,10 +439,64 @@ pub(crate) fn nothing_at(missing: &str, path: &Path, claim: &str) -> String {
     }
 }
 
-/// One preset the `StartPreset` file names, and what became of it.
+/// Open every listed `.binds` document and place it by the name inside it.
+///
+/// One refusal takes the whole directory down, and it names the file. In a
+/// directory a game has run in, the reason is that the unreadable file may be
+/// the active preset, or a second file claiming its name, so no value read out
+/// of a neighbour can be shown to be the one in use. In a directory with no
+/// start file nothing is in use and that reason is gone — but the answer is
+/// the same, for the reason one step over: what a caller gets back there is a
+/// *census* of the presets a game ships, and a census that silently dropped
+/// the one document it could not open would be a confident list that is
+/// wrong. `unplaceable` is the half of the sentence those two reasons differ
+/// in, so that neither of them is printed about the other.
+///
+/// The name comes out into the tuple rather than being fished back out of
+/// [`Preset::name`] at each use: every document here has one — that is what
+/// this function refuses on — and carrying it as a [`String`] is what lets
+/// both callers stop re-matching a [`Lookup`] that cannot be anything else.
+fn read_documents(
+    paths: Vec<PathBuf>,
+    setting: &str,
+    unplaceable: &str,
+) -> Result<Vec<(PathBuf, String, Preset)>, String> {
+    let mut out: Vec<(PathBuf, String, Preset)> = Vec::new();
+    for path in paths {
+        let bytes = match crate::read(&path) {
+            Source::Read(b) => b,
+            // A file that was listed a moment ago and is gone now is not a
+            // preset nobody saved.
+            Source::Unwritten(why) | Source::Rejected(why) => return Err(why),
+        };
+        let preset = parse(&bytes, setting);
+        match &preset.name {
+            Lookup::Text(name) => {
+                let name = name.clone();
+                out.push((path, name, preset));
+            }
+            Lookup::Absent => {
+                return Err(format!(
+                    "{} is a preset with no PresetName, {unplaceable}",
+                    path.display()
+                ))
+            }
+            Lookup::Rejected(why) => return Err(format!("{} is {why}", path.display())),
+        }
+    }
+    Ok(out)
+}
+
+/// One preset the `StartPreset` file names, and what became of it — or, in a
+/// directory with no start file, one preset document and what it says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Active {
-    /// The name, spelled as the `StartPreset` file spells it.
+    /// The name, spelled as the `StartPreset` file spells it — or, with no
+    /// start file to spell it, as the document's own `PresetName` does.
+    ///
+    /// Which of the two it is, is [`Bindings::start`]'s to say, and a caller
+    /// that prints this name as *the preset in use* without asking that field
+    /// has said something no reading here supports.
     pub name: String,
     pub found: Found,
 }
@@ -435,9 +524,32 @@ pub enum Found {
 /// A directory of presets, read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bindings {
-    /// The `StartPreset` file this reader took as the current one.
-    pub start: PathBuf,
+    /// The `StartPreset` file this reader took as the current one — or
+    /// [`None`] for a directory that holds no such file, where nothing
+    /// selects among the presets and every one of them is reported.
+    ///
+    /// [`None`] is not a missing value to paper over: it is the *whole* of
+    /// the difference between the two shapes a preset directory comes in, and
+    /// a caller can match on it. A directory a game has run in has a start
+    /// file, and [`presets`](Self::presets) is then what that file names. A
+    /// directory a game has only *shipped* — Elite Dangerous' `ControlSchemes`
+    /// is one, 30 documents and no start file — has none, and
+    /// [`presets`](Self::presets) is then every document in it, in path
+    /// order, none of them in use.
+    ///
+    /// A report that prints a value without printing this is a report that
+    /// says a preset holds something without saying whether the game is
+    /// playing it. That is not this type's call to make, but it is this
+    /// field's to expose, and it is why the field is an [`Option`] rather
+    /// than a path that quietly names the directory.
+    pub start: Option<PathBuf>,
     /// The schema number in that file's name, when it has one.
+    ///
+    /// Always [`None`] when [`start`](Self::start) is: a schema number is
+    /// read off a start file's name, and there is no start file. The two
+    /// [`None`]s are not the same fact — this one can also mean
+    /// `StartPreset.start`, the older spelling with no number in it — which
+    /// is why [`start`](Self::start) is the field to ask.
     pub schema: Option<u32>,
     /// The other `StartPreset` files in the directory, lower-numbered, that
     /// were not read.
@@ -454,16 +566,73 @@ pub struct Bindings {
     /// Lower-numbered and not merely other: two start files carrying the same
     /// schema are no ordering at all, and [`read`] refuses the directory
     /// rather than let the sort break the tie on the spelling of a file name.
+    ///
+    /// Always empty when [`start`](Self::start) is [`None`]: nothing was
+    /// superseded, because nothing was chosen.
     pub superseded: Vec<PathBuf>,
-    /// One per distinct name the start file holds, in its order.
+    /// One per distinct name the start file holds, in its order — or, when
+    /// [`start`](Self::start) is [`None`], one per `.binds` document in the
+    /// directory, in path order.
+    ///
+    /// **Never one row.** It is one row per *name*, and even a directory a
+    /// game has written holds as many as its start file lists — newer
+    /// versions of the game write one line per category of binding. A caller
+    /// that renders this has a list on its hands, not a value; see [`read`].
+    ///
+    /// In the [`None`] case every entry is [`Found::Read`], because each one
+    /// was made *from* a document this reader opened rather than looked up
+    /// by a name that might match nothing. Two shipped documents calling
+    /// themselves the same thing are two entries here and not a refusal:
+    /// with nothing selecting between them there is no question of which the
+    /// game loads, and both are on the disk for the user to see.
     pub presets: Vec<Active>,
 }
 
-/// Read the presets in `dir`, asking each active one what `setting` holds.
+/// Read the presets in `dir`, asking each of them what `setting` holds.
 ///
 /// The three answers are [`crate::Source`]'s and they mean what it says:
 /// nothing has been written here, something here cannot be read, or here is
 /// what the files say.
+///
+/// # Two shapes of directory, and the one sentence that must not cover both
+///
+/// A preset directory comes in two shapes, and the difference is whether
+/// anything in it *selects* a preset:
+///
+/// * **A game has run here.** There is a `StartPreset` file; it names the
+///   presets in use; [`Bindings::start`] is [`Some`] and
+///   [`Bindings::presets`] is one entry per name that file holds.
+/// * **A game has shipped presets here and nothing has chosen among them.**
+///   There is no `StartPreset` file. [`Bindings::start`] is [`None`] and
+///   [`Bindings::presets`] is one entry per `.binds` document, in path order.
+///
+/// The second is not an absence, and this function used to answer it as one:
+/// *nothing has saved a control scheme here*, about a directory holding
+/// thirty saved control schemes. Elite Dangerous' `ControlSchemes` directory
+/// is exactly that shape — 30 `.binds` documents, no `StartPreset` file — and
+/// it is the directory the worked example in this project's own profile
+/// documentation points a check at. A reader that answers *there is nothing
+/// here* about files a user can list is the confident false negative this
+/// crate exists to prevent; that it was this crate saying it is why it is
+/// written out here rather than quietly fixed.
+///
+/// The genuine absence keeps its own sentence, and it is narrower than it
+/// was: a directory with no start file **and no `.binds` document either**
+/// holds no control scheme, saved or shipped, and that is the only shape that
+/// answers [`crate::Source::Unwritten`] with the directory in front of it.
+///
+/// Both shapes stay one `format` in a profile on purpose. Which one a
+/// directory is depends on whether the person reading the profile has ever
+/// launched the game — the profile's author cannot know that, and a profile
+/// that had to pick would be wrong for half the people who ran it.
+///
+/// # One check is not one value
+///
+/// [`Bindings::presets`] is a list, in both shapes, and it has been measured
+/// at more than one: a start file naming two presets gives two entries, and a
+/// directory of Elite's shipped presets gives thirty. A caller that renders
+/// one row per check, or a document that promises a reader one value per
+/// check, is describing something this function does not do.
 ///
 /// Every `.binds` file in the directory is opened, because a preset is matched
 /// by the `PresetName` inside it rather than by what the file is called. That
@@ -544,10 +713,42 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
     // which is what `Option`'s own ordering already says.
     starts.sort();
     let Some((schema, start_file)) = starts.pop() else {
-        return Source::Unwritten(format!(
-            "{} holds no StartPreset file: nothing has saved a control scheme here",
-            dir.display()
-        ));
+        // No start file, which is two situations and not one. Either this
+        // directory holds presets a game shipped and nothing has chosen among
+        // them — Elite Dangerous' `ControlSchemes`, thirty documents and no
+        // start file, is that — or it holds no control scheme at all. Only
+        // the second is an absence, and the one sentence they used to share
+        // was the first one's flat contradiction.
+        if presets.is_empty() {
+            return Source::Unwritten(format!(
+                "{} holds no StartPreset file and no .binds document either: \
+                 there is no control scheme here, saved or shipped",
+                dir.display()
+            ));
+        }
+        let documents = match read_documents(
+            presets,
+            setting,
+            "so this reader cannot name it among the presets here",
+        ) {
+            Ok(d) => d,
+            Err(why) => return Source::Rejected(why),
+        };
+        return Source::Read(Bindings {
+            start: None,
+            schema: None,
+            superseded: Vec::new(),
+            // In path order, which is the order they were sorted into above:
+            // nothing here ranks them, so the only reproducible order is the
+            // one the directory listing was put in.
+            presets: documents
+                .into_iter()
+                .map(|(file, name, preset)| Active {
+                    name,
+                    found: Found::Read { file, preset },
+                })
+                .collect(),
+        });
     };
     // Two of them at one schema, which the sort has no way to order. `pop`
     // would pick whichever path sorts last and call the other superseded,
@@ -573,48 +774,27 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
         Ok(n) => n,
         Err(why) => return Source::Rejected(format!("{}: {why}", start_file.display())),
     };
-    let mut read_presets: Vec<(PathBuf, Preset)> = Vec::new();
-    for path in presets {
-        let bytes = match crate::read(&path) {
-            Source::Read(b) => b,
-            Source::Unwritten(why) | Source::Rejected(why) => return Source::Rejected(why),
-        };
-        let preset = parse(&bytes, setting);
-        match &preset.name {
-            Lookup::Text(_) => read_presets.push((path, preset)),
-            // Both of these are files this reader cannot place. See the
-            // function docs: one of them may be the active preset.
-            Lookup::Absent => {
-                return Source::Rejected(format!(
-                    "{} is a preset with no PresetName, so this reader cannot \
-                     tell whether it is the one in use",
-                    path.display()
-                ))
-            }
-            Lookup::Rejected(why) => {
-                return Source::Rejected(format!("{} is {why}", path.display()))
-            }
-        }
-    }
+    let read_presets = match read_documents(
+        presets,
+        setting,
+        "so this reader cannot tell whether it is the one in use",
+    ) {
+        Ok(d) => d,
+        Err(why) => return Source::Rejected(why),
+    };
     let presets = names
         .into_iter()
         .map(|name| {
-            let matches: Vec<&(PathBuf, Preset)> = read_presets
-                .iter()
-                .filter(|(_, p)| matches!(&p.name, Lookup::Text(n) if *n == name))
-                .collect();
+            let matches: Vec<&(PathBuf, String, Preset)> =
+                read_presets.iter().filter(|(_, n, _)| *n == name).collect();
             // Near misses, kept separately rather than folded in: whether the
             // game reads them as this preset is the thing nobody here has
             // measured, and silence about them would be a confident negative
             // about a directory that plainly holds something very like it.
             let other_case: Vec<&str> = read_presets
                 .iter()
-                .filter_map(|(_, p)| match &p.name {
-                    Lookup::Text(n) if *n != name && n.eq_ignore_ascii_case(&name) => {
-                        Some(n.as_str())
-                    }
-                    _ => None,
-                })
+                .filter(|(_, n, _)| *n != name && n.eq_ignore_ascii_case(&name))
+                .map(|(_, n, _)| n.as_str())
                 .collect();
             let found = match (matches.as_slice(), other_case.as_slice()) {
                 ([], []) => Found::Absent(format!(
@@ -628,7 +808,7 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
                     dir.display(),
                     spellings.join(" and ")
                 )),
-                ([(file, preset)], _) => Found::Read {
+                ([(file, _, preset)], _) => Found::Read {
                     file: file.clone(),
                     preset: preset.clone(),
                 },
@@ -643,7 +823,7 @@ pub fn read(dir: &Path, setting: &str) -> Source<Bindings> {
         })
         .collect();
     Source::Read(Bindings {
-        start: start_file,
+        start: Some(start_file),
         schema,
         superseded: starts.into_iter().map(|(_, p)| p).collect(),
         presets,
@@ -832,7 +1012,7 @@ mod tests {
             panic!("a name no writer produces is not a second start file");
         };
         assert_eq!(b.schema, Some(4));
-        assert_eq!(b.start, dir.join("StartPreset.4.start"));
+        assert_eq!(b.start, Some(dir.join("StartPreset.4.start")));
         assert!(b.superseded.is_empty(), "{:?}", b.superseded);
         assert_eq!(b.presets[0].name, "Custom");
     }
@@ -876,13 +1056,151 @@ mod tests {
             other => panic!("a directory that is not there is not a reading: {other:?}"),
         }
         // The directory exists — a prefix can have it — and still holds no
-        // control scheme. Same answer, different sentence.
+        // control scheme, saved or shipped. Same answer, different sentence.
         std::fs::create_dir_all(&missing).expect("fixture");
-        std::fs::write(missing.join("Custom.4.0.binds"), preset_file("Custom", ""))
-            .expect("fixture");
+        std::fs::write(missing.join("DeviceMappings.xml"), b"<Root/>").expect("fixture");
         match read(&missing, "HeadlookMode") {
-            Source::Unwritten(why) => assert!(why.contains("StartPreset"), "{why}"),
-            other => panic!("presets with no StartPreset name nothing active: {other:?}"),
+            Source::Unwritten(why) => {
+                assert!(why.contains("StartPreset"), "{why}");
+                assert!(
+                    why.contains(".binds"),
+                    "the absence is of both, and a sentence naming only the \
+                     start file is the one that was wrong about a directory \
+                     full of presets: {why}"
+                );
+            }
+            other => panic!("a directory holding no control scheme is not a reading: {other:?}"),
+        }
+    }
+
+    /// The reading the maintainer's own machine needs, and the one this crate
+    /// used to be flatly wrong about.
+    ///
+    /// Elite Dangerous' `ControlSchemes` holds 30 `.binds` documents and no
+    /// `StartPreset` file — counted on this machine on 2026-09-28 — and the
+    /// answer used to be *nothing has saved a control scheme here*, about a
+    /// directory of thirty saved control schemes. The shape is what is
+    /// fixtured here; the count is on one disk and no test can hold it.
+    #[test]
+    fn a_directory_of_shipped_presets_is_read_and_not_called_an_absence() {
+        let dir = dir_with(
+            "shipped",
+            &[
+                ("Beta.binds", &preset_file("Beta", "")),
+                ("Alpha.binds", &preset_file("Alpha", "")),
+                // The other things really sitting in that directory: Elite's
+                // has a `DeviceMappings.xml`, a `Help.txt`, a `.dat` and a
+                // subdirectory beside the 30 presets. None is a preset and
+                // none is a reason to refuse.
+                ("Help.txt", b"not a preset"),
+                ("DeviceMappings.xml", b"<Root/>"),
+            ],
+        );
+        std::fs::create_dir(dir.join("DeviceButtonMaps")).expect("fixture");
+        let Source::Read(b) = read(&dir, "HeadlookMode") else {
+            panic!(
+                "a directory of presets a game ships is not a directory with \
+                 nothing in it"
+            );
+        };
+        assert_eq!(
+            b.start, None,
+            "nothing here selects a preset, and that is the fact a caller \
+             needs before it prints any of these values"
+        );
+        assert_eq!(b.schema, None);
+        assert!(b.superseded.is_empty());
+        assert_eq!(
+            b.presets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta"],
+            "one row per document, in path order"
+        );
+        for active in &b.presets {
+            let Found::Read { file, preset } = &active.found else {
+                panic!(
+                    "every row here was made from a document this reader \
+                     opened, so none of them can be a miss: {active:?}"
+                );
+            };
+            assert_eq!(file, &dir.join(format!("{}.binds", active.name)));
+            assert_eq!(
+                preset.setting,
+                Lookup::Text("Bindings_HeadlookModeAccumulate".into()),
+                "the value the whole crate exists to report"
+            );
+        }
+    }
+
+    /// Two shipped documents of one name are two rows, not the refusal a
+    /// start file's name would get.
+    ///
+    /// The refusal elsewhere in this module answers a real question — *which
+    /// of these two does the game load* — and with nothing selecting among
+    /// them that question is not being asked. Both files are on the disk and
+    /// both are reported.
+    #[test]
+    fn two_shipped_presets_of_one_name_are_two_rows_and_not_a_refusal() {
+        let dir = dir_with(
+            "shipped-twice",
+            &[
+                ("a.binds", &preset_file("Same", "")),
+                ("b.binds", &preset_file("Same", "")),
+            ],
+        );
+        let Source::Read(b) = read(&dir, "HeadlookMode") else {
+            panic!("two documents are two documents");
+        };
+        assert_eq!(b.start, None);
+        assert_eq!(b.presets.len(), 2, "{:?}", b.presets);
+        assert!(
+            b.presets.iter().all(|a| a.name == "Same"),
+            "{:?}",
+            b.presets
+        );
+        assert!(
+            b.presets
+                .iter()
+                .all(|a| matches!(a.found, Found::Read { .. })),
+            "nothing selects between them, so there is nothing to refuse: {:?}",
+            b.presets
+        );
+    }
+
+    /// One document this reader cannot open still takes the directory down,
+    /// with no start file as with one — and the reason it gives is the one
+    /// that is true here.
+    ///
+    /// The census is the point: a list of the presets a game ships that
+    /// silently dropped the document it could not read would be a confident
+    /// list that is wrong, which is the same failure one step over from the
+    /// one this whole change is about.
+    #[test]
+    fn one_unreadable_shipped_preset_refuses_the_directory_for_its_own_reason() {
+        let dir = dir_with(
+            "shipped-broken",
+            &[
+                ("Good.binds", &preset_file("Good", "")),
+                (
+                    "Anonymous.binds",
+                    b"<Root MajorVersion=\"1\" MinorVersion=\"8\"/>",
+                ),
+            ],
+        );
+        match read(&dir, "HeadlookMode") {
+            Source::Rejected(why) => {
+                assert!(why.contains("Anonymous.binds"), "{why}");
+                assert!(
+                    !why.contains("in use"),
+                    "nothing here is in use, and a reason borrowed from the \
+                     directory that has a start file would be a sentence about \
+                     a question nobody asked: {why}"
+                );
+                assert!(why.contains("among the presets here"), "{why}");
+            }
+            other => panic!("a document that cannot be placed is not nothing: {other:?}"),
         }
     }
 
