@@ -437,8 +437,9 @@ pub(crate) const UNINSTALL_TIP: &str =
 /// See [`DETAILS_TIP`].
 pub(crate) const OTHER_CLIENT_TIP: &str =
     "Install a client DLL that is not ours into this prefix — pick the folder holding its \
-     NPClient64.dll. For a game that refuses ours at the signature check. Something still has \
-     to be filling the shared mapping; the paragraph above says what.";
+     NPClient64.dll. For a game that refuses ours at the signature check. A client only \
+     reads the shared mapping; something inside the game's own session has to be filling \
+     it, and ours is what does. The paragraph above says what that costs.";
 /// See [`DETAILS_TIP`].
 pub(crate) const ADD_GAME_TIP: &str =
     "For a game Steam does not list — pick the Wine prefix it runs in, and this page can \
@@ -6661,31 +6662,46 @@ mod tests {
         );
     }
 
-    /// The route the paragraph above points at is not a route that runs
-    /// itself, and this window offers an install button over it.
+    /// The window names the second wall, and names `tobii bridge run` only to
+    /// say it is not the way over it.
     ///
     /// A third-party client answers the signature check and then *reads* the
-    /// mapping; our provider is the only thing that fills it, and `tobii bridge
-    /// run` is what starts it. It yields to a launching game on purpose — the
-    /// v0.5.0 fix — and nothing brings it back. A window that said "installed"
-    /// and stopped there would leave a user with an answered check, an empty
-    /// mapping, and no reason to suspect either.
+    /// mapping; something inside the game's own Wine session has to be filling
+    /// it. Until this commit the page said that thing was `tobii bridge run`,
+    /// and `bridge/core/src/feeder.rs` records why that is wrong for nearly
+    /// every reader: a Steam game under Proton has its own wineserver, and a
+    /// provider started from a terminal with system Wine is a different session
+    /// whose `FT_SharedMem` is a different object. The old sentence sent
+    /// somebody to run a command that could not reach their game, and then to
+    /// conclude the bridge was broken when it did not.
+    ///
+    /// So the note has to carry both halves: that a client only reads, and that
+    /// the obvious way to feed it does not reach a Proton game. A window that
+    /// said "installed" and stopped there would leave a user with an answered
+    /// check, an empty mapping, and no reason to suspect either.
     #[test]
-    fn the_window_says_that_route_needs_something_running_and_restarting() {
+    fn the_window_says_a_separate_provider_cannot_reach_a_proton_game() {
         let note =
             profile_bridge_note(profiles::Bridge::Required).expect("Required says something");
         assert!(
+            note.contains("has to be filling it"),
+            "the wall a passing signature check does not clear has to be named: {note}"
+        );
+        assert!(
             note.contains("tobii bridge run"),
-            "the command that fills the mapping has to be named: {note}"
+            "and the command a reader would otherwise reach for: {note}"
         );
         assert!(
-            note.contains("stands aside while a game is launching"),
-            "and that it gets out of a launch's way, which is why it is not running \
-             afterwards: {note}"
+            note.contains("that cannot be"),
+            "named as what will NOT do it \u{2014} which is the whole correction: {note}"
         );
         assert!(
-            note.contains("started again once the game is up"),
-            "and what the user has to do about that: {note}"
+            note.contains("a different object") && note.contains("never sees it"),
+            "with the reason, so it reads as a fact and not as a refusal: {note}"
+        );
+        assert!(
+            !note.contains("started again once the game is up"),
+            "and the instruction that was wrong is gone, not merely qualified: {note}"
         );
         // The other two arms are about a game that wants no bridge, or a
         // profile that never said — neither is a reason to explain `run`.

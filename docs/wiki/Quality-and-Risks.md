@@ -1607,8 +1607,10 @@ deleted.
   and has never been pressed.** It appears for MSFS 2024 because this project
   watched that title call `NP_GetSignature` 104 times and nothing else. That a
   third-party client would get further is inference from the ABI, not something
-  anybody has watched; and the second wall — something has to be filling the
-  shared mapping — is unaddressed by the button and is named beside it.
+  anybody has watched; and the second wall — something inside the game's own
+  Wine session has to be filling the shared mapping, which under Proton
+  `tobii bridge run` cannot be — is unaddressed by the button and is named
+  beside it.
 - **The custom-game list has no CLI.** `tobii-config::custom_games` is written
   and read only by the hub. A user without a GUI cannot add one, and
   `tobii bridge install --prefix` remains their route, which works and is not

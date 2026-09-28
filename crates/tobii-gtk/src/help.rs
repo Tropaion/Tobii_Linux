@@ -1343,11 +1343,7 @@ mod tests {
             ),
             (
                 crate::game_setup::OTHER_CLIENT_TIP,
-                &[
-                    "NPClient64.dll",
-                    "signature check",
-                    "something has to be filling it",
-                ],
+                &["NPClient64.dll", "signature check", "has to be filling it"],
             ),
             (
                 crate::game_setup::ADD_GAME_TIP,

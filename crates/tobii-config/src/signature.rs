@@ -233,8 +233,17 @@ fn tally_word(n: usize) -> String {
 /// The client that answers the signature check only *reads* the shared
 /// mapping; it does not create one. So a prefix can hold a client that passes
 /// the check and still deliver nothing, which looks from the outside exactly
-/// like the check having failed. Naming both routes is the difference between
-/// a user knowing what is missing and a user concluding the bridge is broken.
+/// like the check having failed. Naming what is missing is the difference
+/// between a user knowing that and a user concluding the bridge is broken.
+///
+/// **This used to name `tobii bridge run` as the answer, and that was wrong for
+/// the case nearly everybody is in.** `bridge/core/src/feeder.rs` records the
+/// measurement: a Steam game under Proton runs in its own wineserver, and a
+/// provider started from a terminal with system Wine is a different session
+/// whose `FT_SharedMem` is a different object — the game never sees it. That is
+/// precisely why both of our client DLLs carry the receive loop themselves.
+/// Repeating the old instruction sent somebody to run a command that could not
+/// help them and then to conclude the bridge was broken when it did not.
 ///
 /// So "the launch stopped freezing" and "the game is getting data" are two
 /// different outcomes, and this project has been found reading the first as
@@ -248,12 +257,17 @@ pub fn provider_note() -> String {
 fn build_provider_note() -> String {
     [
         "A client that answers the check only reads the shared mapping —",
-        "something has to be filling it. Today that is `tobii bridge run` in a",
-        "terminal, which stands aside while a game is",
-        "launching — it has to, or the game never starts — and does not restart",
-        "itself, so it is started again once the game is up. Until something is",
-        "filling the mapping, the game has a client answering the check and",
-        "nothing behind it.",
+        "something inside the game's own Wine session has to be filling it, and",
+        "for a Steam game under Proton that cannot be `tobii bridge run`: a",
+        "provider started from a terminal with system Wine is a different",
+        "session, its mapping is a different object, and the game never sees it.",
+        "What fills the mapping for our own client is our own client — both of",
+        "our DLLs carry the receive loop, inside the game's process, which is",
+        "the only place that is certain to be the right session. Replace the",
+        "one the game loads with somebody else's and that goes with it, unless",
+        "something else in the same session is filling the mapping. Whether",
+        "anything is, on any particular game, is not something this project has",
+        "watched.",
     ]
     .join(" ")
 }
