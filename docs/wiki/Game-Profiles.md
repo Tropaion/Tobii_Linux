@@ -70,11 +70,17 @@ rate_hz = "60"
 format = "binds-dir"
 path = "drive_c/users/steamuser/Options/Bindings"
 setting = "HeadlookMode"
-wants = "1"
-tell = "Set head look to toggle in the game's controls."
+wants = "Bindings_HeadlookModeDirect"
+tell = "Set head look to Direct in the game's controls."
 ```
 
-Two things about that example before you copy it. `[settings]` is **abridged** —
+Three things about that example before you copy it. `wants` is **the author's
+claim, not this project's measurement**: what is measured is that all 30
+presets Elite ships say `Bindings_HeadlookModeAccumulate` — the value, spelled
+exactly like that, is what a `binds-dir` check compares against — and nobody
+here has yet played the game to establish which value a head tracker wants.
+That is the sort of thing a profile records once somebody has. `[settings]` is
+**abridged** —
 a real `save` writes every setting this program has, which is about two dozen
 lines, not two. And the `path` is **the shape of a path, not a verified
 location**: nobody has yet observed where Elite Dangerous keeps a user's
@@ -114,8 +120,11 @@ because that is what you will actually find on disk.
 
 **Two formats have readers in this build**, and no others:
 
-- **`binds-dir`** — a directory of Elite Dangerous-style preset documents, plus
-  the file naming which of them is live. `path` is the **directory**.
+- **`binds-dir`** — a directory of Elite Dangerous-style preset documents.
+  `path` is the **directory**. If a `StartPreset` file there names a live
+  preset, that one is read; if none does, every preset in the directory is
+  read and the answer says none of them is in use. So one check can come back
+  with many rows.
 - **`attributes-xml`** — one flat `<Attributes>` document. `path` is the
   **file**.
 
@@ -183,21 +192,26 @@ in the code block above, and `presets` there is a **mode of that example**, not
 a `format` a check can name — the format names are the ones
 `tobii games profile check` lists.
 
-The difference matters on exactly this directory. `binds-dir` resolves through
-the file that says which preset is **live**, and a directory of *shipped*
-presets has never had one saved into it, so on 2026-09-28, on that same path:
+That conflation had a second cost, and it has been paid. `binds-dir` used to
+resolve only through the file that says which preset is **live**, so a
+directory of *shipped* presets — which has never had one saved into it —
+answered `nothing has saved a control scheme here` about thirty saved control
+schemes. A `binds-dir` check now answers both shapes, and says which it found.
+Run on this machine on 2026-09-28, on that same path:
 
 ```
 $ cargo run -q -p tobii-gameconf --example read -- binds <ControlSchemes> HeadlookMode
-nothing to read: <ControlSchemes> holds no StartPreset file: nothing has saved a
-control scheme here
+no start file: nothing here selects a preset, so these are the presets the game
+ships and none of them is in use
+preset AdvancedControlPad
+  HeadlookMode: Bindings_HeadlookModeAccumulate
+… 30 rows, every one Accumulate …
 ```
 
-Thirty saved control schemes are in that directory. Until `tobii-gameconf`
-answers differently there — it owns that half, and this page will not describe
-behaviour nobody has run — **a `binds-dir` check pointed at shipped presets
-gets that sentence**, and the example's `presets` mode is how you read them.
-[[Quality-and-Risks]] §11.3k is the record of which half is measured.
+A directory with a start file still answers with the one preset that file
+names. A directory holding neither a start file nor a `.binds` document is
+still an absence, and says so naming both. [[Quality-and-Risks]] §11.3k records
+what was measured and what was not.
 
 Two cautions that come with using it. `s:` is a Steam convention, not a wine
 one, and it points at **one** library root — a game in a second library is not
@@ -295,6 +309,18 @@ deliberately **does not open the file.** If the game has never run, it says
 there is no prefix yet and that every path below is a path with nothing to join
 it onto.
 
+To see what the check actually *answers*, open the hub, press **Set up a
+game…** on the *Head tracking for games* card, and pick the game. The third
+block runs every check in its profile and prints one row each: the value it
+found, or an honest refusal saying which. That is the only place a check is
+run — there is no CLI verb that prints a check's answer, and `check where`
+will not open a file to get one.
+
+A `binds-dir` check can come back with **many** rows. Pointed at a directory
+where a `StartPreset` file names a live preset, it reads that one. Pointed at a
+directory of presets a game ships, with nothing selecting one, it reads them
+all and says so first — thirty rows, for Elite's `ControlSchemes`.
+
 ### 5. Record *how you know* — this is the part with no field for it
 
 A profile has `format`, `path`, `setting`, `wants` and `tell`, and **not one
@@ -331,9 +357,15 @@ part of that, so this is deliberate machinery rather than luck.
   file.
 - **A check is tracked by what it reads** — `format` + `path` + `setting` — not
   by its position. So adding or removing *other* checks does not move your
-  note, and correcting a `wants` or a `tell` keeps it. Changing what the check
-  *reads* makes it a different claim, and the note is handed back rather than
-  quietly re-pointed at it.
+  note, and correcting a `wants` or a `tell` in the file keeps it. Changing
+  what the check *reads* makes it a different claim, and the note is handed
+  back rather than quietly re-pointed at it.
+
+  No command corrects a `wants` or a `tell` in place today: `check add`
+  refuses a check that already reads the same `format`, `path` and `setting`
+  and tells you to remove it first, and there is no `check edit`. So the
+  property above is reached by editing the file yourself — which is exactly
+  when it matters, because that is when your note is at risk.
 - When a comment's anchor is gone, the write still happens and the comment is
   **printed back in full** in the command's output. **That printout is the only
   remaining copy** — it is in no file any more. Keep the terminal output, or

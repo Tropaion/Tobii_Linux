@@ -1813,6 +1813,16 @@ pub(crate) fn row_text(r: &Row) -> String {
 /// Nothing else in this window would say so.
 pub(crate) fn binds_note(b: &binds::Bindings) -> Option<String> {
     let mut parts = Vec::new();
+    if b.start.is_none() {
+        parts.push(format!(
+            "nothing in this directory selects a preset, so {} below {} the {} the game \
+             ships and {} of them is in use",
+            plural(b.presets.len(), "the row", "the rows"),
+            plural(b.presets.len(), "is", "are"),
+            plural(b.presets.len(), "preset", "presets"),
+            plural(b.presets.len(), "it is not", "none"),
+        ));
+    }
     if let Some(n) = b.schema {
         parts.push(format!("read through the bindings schema {n} start file"));
     }
@@ -1910,7 +1920,10 @@ fn run_check(check: &profiles::Check, prefix: Option<&Path>) -> (Vec<Row>, Optio
                     return (
                         vec![row(
                             None,
-                            Answer::Unwritten(format!("{} names no preset", b.start.display())),
+                            Answer::Unwritten(match &b.start {
+                                Some(start) => format!("{} names no preset", start.display()),
+                                None => format!("{} holds no preset", path.display()),
+                            }),
                         )],
                         note,
                     );
@@ -3891,7 +3904,7 @@ mod tests {
     #[test]
     fn a_superseded_start_file_is_named_and_an_ordinary_one_says_nothing_extra() {
         let note = binds_note(&binds::Bindings {
-            start: PathBuf::from("/p/StartPreset.4.start"),
+            start: Some(PathBuf::from("/p/StartPreset.4.start")),
             schema: Some(4),
             superseded: vec![PathBuf::from("/p/StartPreset.3.start")],
             presets: Vec::new(),
@@ -3901,7 +3914,7 @@ mod tests {
         assert!(note.contains("rolled back"), "{note}");
 
         let quiet = binds_note(&binds::Bindings {
-            start: PathBuf::from("/p/StartPreset.start"),
+            start: Some(PathBuf::from("/p/StartPreset.start")),
             schema: None,
             superseded: Vec::new(),
             presets: Vec::new(),
@@ -4692,7 +4705,7 @@ mod tests {
     #[test]
     fn one_superseded_start_file_is_one_file_that_was_not_read() {
         let one = binds_note(&binds::Bindings {
-            start: PathBuf::from("/p/StartPreset.4.start"),
+            start: Some(PathBuf::from("/p/StartPreset.4.start")),
             schema: Some(4),
             superseded: vec![PathBuf::from("/p/StartPreset.3.start")],
             presets: Vec::new(),
@@ -4708,7 +4721,7 @@ mod tests {
         );
 
         let two = binds_note(&binds::Bindings {
-            start: PathBuf::from("/p/StartPreset.4.start"),
+            start: Some(PathBuf::from("/p/StartPreset.4.start")),
             schema: Some(4),
             superseded: vec![
                 PathBuf::from("/p/StartPreset.3.start"),

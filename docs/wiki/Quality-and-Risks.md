@@ -1227,7 +1227,7 @@ what is tested and what is known.
   **fixtures and hand-made files**, never on a claim somebody confirmed by
   playing. The plan — play Elite Dangerous once with the bridge running and
   write down what changed — has not been carried out.
-- **What is measured about the readers.** `tobii-gameconf` is 49 tests, and its
+- **What is measured about the readers.** `tobii-gameconf` is 52 tests, and its
   `binds` format was read off **30 real `.binds` documents** on one machine:
   26 with a byte-order mark and 4 without, 4 with mixed line endings, 2 naming
   a schema version and 28 naming none. All 30 answer
@@ -1268,14 +1268,18 @@ what is tested and what is known.
   full 30-document census"*. It did not. What was run is
   `cargo run -p tobii-gameconf --example read -- presets <ControlSchemes> …` —
   a **mode of an example**, pointed straight at the directory, and not a
-  `profiles::Format` a check can name at all. Re-run on 2026-09-28, a
-  `binds-dir` check's own reader answers that directory with *"holds no
-  StartPreset file: nothing has saved a control scheme here"*, because
-  `binds-dir` resolves through the live-preset file and shipped presets have
-  none. What **is** demonstrated through such a path, measured the same day: a
-  check with that `path` parses, and `tobii games profile check where`
-  resolves it onto the real directory and reports *a directory, as binds-dir
-  needs*. Naming is not reading, and this file said it was. A demonstration
+  `profiles::Format` a check can name at all. At the time that was written, a
+  `binds-dir` check's own reader answered that directory with *"holds no
+  StartPreset file: nothing has saved a control scheme here"* — an absence
+  stated over thirty saved control schemes — because it resolved only through
+  the live-preset file and shipped presets have none. That was fixed in the
+  same review: a `binds-dir` check now answers a directory with no start file
+  with one row per shipped preset, saying so first. Measured on 2026-09-28,
+  after the fix, on the real directory and again through `dosdevices/s:`:
+  **30 rows, all `Bindings_HeadlookModeAccumulate`, 2 naming schema 1.8, 0
+  refusals** — the same counts the `presets` mode reports on the same files.
+  Naming is not reading, and this file said it was; now both are true and both
+  have been run. A demonstration
   recorded in the risk register that nobody performed is the most expensive
   wrong sentence this project can hold — every later reader takes it as the
   thing they no longer have to check.
@@ -1297,8 +1301,9 @@ what is tested and what is known.
   `dosdevices` would have made the sentence true and removed something a
   profile author legitimately wants: Elite's 30 shipped presets live under
   `steamapps/common/`, this project counted them itself (with the example —
-  see above), and `s:` is how a check **names** them. So eight of the ten
-  surfaces now say what is true — **a check reaches what the prefix reaches** —
+  see above), and `s:` is how a check **names** them — and, since the reader
+  was fixed in the same review, reads them too. All ten surfaces now say what
+  is true — **a check reaches what the prefix reaches** —
   and the three guards are documented as
   what they are, a rule that keeps the path *relative* so a profile is portable
   between machines and `path_under` has something well-defined to join. The
@@ -1351,27 +1356,31 @@ what is tested and what is known.
   the comment is printed back in full — **that printout is then the only copy
   in existence.** A profile this build cannot read is the one remaining
   refusal.
-- **A known, reproduced defect in exactly that mechanism.** A comment written
-  *after a value on that value's own line* — `format = "binds-dir" # a note` —
-  is dropped by `check remove` **and does not appear in the report**: the
-  reporting path inspects whole-line comments only, while the writer now
-  orphans end-of-line ones too. Observed on 2026-09-28 on the merged tree — the
-  command exits 0, writes the file, and the note is in neither the file nor the
-  output. This is precisely the failure the comment mechanism exists to
-  prevent. The writer hands every orphan back through `save_to`'s return value;
-  the CLI does not yet take it. Until it does, provenance notes belong on
+- **A defect in exactly that mechanism, found and closed in this review.** A
+  comment written *after a value on that value's own line* —
+  `format = "binds-dir" # a note` — was dropped by `check remove` **and did not
+  appear in the report**, because the reporting path derived the loss itself by
+  scanning whole-line comments while the writer orphaned end-of-line ones too.
+  Two answers to one question, and the wrong one was the one printed. The CLI
+  now takes the orphans `save_to` returns rather than working them out again,
+  so there is one answer. Measured on 2026-09-28 on the merged tree: the
+  removal goes through and the report names the line, the comment and what it
+  sat beside. Provenance notes are safest on
   **their own line**, which is the form every command here tells you to write.
-- **Two changes landed this round that no longer agree, and the workspace does
-  not build with both.** The CLI grew a loop that strips an orphaned comment
-  and retries, matching on `profiles::CommentLoss`; the config crate deleted
-  `CommentLoss` and made the same write succeed-and-report instead. Merged,
-  `tobii-cli` does not compile, and with the compile error mechanically
-  resolved one test
-  (`a_write_this_still_refuses_names_the_file_once_and_is_not_called_an_io_failure`)
-  fails, because it pins a refusal that is deliberately no longer a refusal.
-  Both changes are individually right and individually tested; neither author
-  could see the other's. This is the **fifth consecutive round** in which two
-  groups' work merged cleanly and did not compose — see §11.5.
+- **Work that merges cleanly and does not compose — seven times in this
+  review.** Twice on this feature. Once the CLI grew a loop matching on
+  `profiles::CommentLoss` while the config crate deleted that type and made the
+  same write succeed-and-report instead; merged, `tobii-cli` did not compile,
+  and resolving the error mechanically failed a test pinning a refusal that was
+  deliberately no longer a refusal. Once the reader changed
+  `binds::Bindings::start` to an `Option` and the window, rewritten in the same
+  round, did not take the handoff — five type errors, no git conflict. Both are
+  fixed here. The pattern is the finding: every author's gates were green, no
+  merge reported a conflict, and in each case one side had reasoned about what
+  another file does instead of calling it. The rule that came out of it is in
+  §11.5 — a fix that depends on behaviour in a file you do not own must call
+  it, and a handoff must be applied by whoever owns the destination, in the
+  same round.
 - **What the fix reports themselves list as not done.** `Orphans` is not
   `#[must_use]`, which is the marking that would make silently dropping a
   comment impossible; `save_to`'s `Unreadable` branch has no end-to-end

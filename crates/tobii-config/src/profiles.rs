@@ -273,8 +273,14 @@ fn shipped_phrase(n: usize) -> String {
 /// able to name a format without the format having to be renamed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Format {
-    /// A directory of preset documents plus the `StartPreset` file naming
-    /// which of them is live — `tobii_gameconf::binds`.
+    /// A directory of preset documents — `tobii_gameconf::binds`.
+    ///
+    /// A `StartPreset` file there names the live preset and that one is read.
+    /// With no such file the directory holds presets a game ships and nothing
+    /// has selected one, so every document is read and the answer says so.
+    /// Which shape a directory is depends on whether the person running the
+    /// profile has ever launched the game, which its author cannot know — so
+    /// one format answers both rather than making the author guess.
     ///
     /// [`Check::path`] names the **directory**, not a file in it. Which
     /// preset is in force is the reader's problem, not the profile's.

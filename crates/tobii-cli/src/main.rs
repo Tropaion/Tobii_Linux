@@ -2946,9 +2946,11 @@ Each check is a block in <profiles dir>/<app id>.toml, and looks like this:
   tell    = \"Set head look to toggle in the game's controls.\"
 
   format   which reader answers this, and so what `path` names:
-             binds-dir        a directory of preset documents, plus the file
-                              naming which of them is live; `path` is the
-                              directory
+             binds-dir        a directory of preset documents; `path` is the
+                              directory. A StartPreset file there names the
+                              live preset and that one is read; with none,
+                              every preset is read and the answer says none
+                              is in use, so one check can give many rows
              attributes-xml   one flat <Attributes> document; `path` is the file
   path     where that sits, written relative to the Proton prefix — the
            directory holding drive_c. Never starting with `/`, written with
