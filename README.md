@@ -374,7 +374,9 @@ added by hand. A row is drawn at full strength when the Wine bridge is installed
 in that game's prefix and drawn back when it is not, so what is left to do is
 visible without reading. Its second line says which, and tells apart the two
 ways of not being set up — *no bridge yet* is something to press Install on, and
-*never launched* is a game Proton has not made a prefix for yet.
+*never launched* is a game Proton has not made a prefix for yet. A game added by
+hand whose folder is not on this machine right now says that instead: with the
+drive gone, this program cannot see whether the bridge is in there at all.
 
 The button beside the search box, a play triangle with no caption, shows only
 the games that are set up. On a machine with one set-up game among thirty that

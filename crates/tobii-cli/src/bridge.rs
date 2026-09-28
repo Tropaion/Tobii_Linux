@@ -1934,8 +1934,18 @@ fn install(args: &[String]) -> CmdResult {
     if third_party_np {
         // Which client fills the mapping, and -- the part that was wrong until
         // now -- whether anything outside the game can. See `third_party_needs`.
+        //
+        // Asked as "is there a `config_info` beside this prefix", which is what
+        // makes it Proton's, and NOT through `wine_from_steam_config_info`:
+        // that one answers "can I find the Proton build this prefix records",
+        // and returns `None` when the build has been pruned or moved. A Proton
+        // prefix named with `--prefix` after a Proton upgrade would then be
+        // called not-Proton and handed back the very instruction this function
+        // exists to stop printing.
         let proton = matches!(source, PrefixSource::Steam(_))
-            || wine_from_steam_config_info(&prefix).is_some();
+            || prefix
+                .parent()
+                .is_some_and(|d| d.join("config_info").is_file());
         println!("{}", third_party_needs(proton, &prefix));
     } else {
         println!(

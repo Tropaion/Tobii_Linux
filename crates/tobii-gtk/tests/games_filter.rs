@@ -24,15 +24,22 @@
 //!   count taken with `row_at_index` — there is one in `games_tab_refreshes` —
 //!   is therefore a count of the whole catalogue from now on, which is a test
 //!   that passes while measuring nothing if it was meant to follow the search.
-//! * A `GtkListBox` shows its placeholder when no row is **visible**, and not
-//!   only when it holds no rows. The list is never empty now — the filter is
-//!   what empties it — so if that were false the paragraph explaining why the
-//!   list looks empty would never appear, and the one state it was written for
-//!   would show a blank column.
+//! * The dim is a CSS class on the `GtkListBoxRow`, applied where the rows are
+//!   built. `picker` cannot see it, so nothing headless can: delete the line
+//!   that adds it and every row draws at full strength — the whole premise of
+//!   collapsing four sections into one — with the entire suite still green.
+//! * The paragraph that explains an empty list is this program's own label
+//!   beside the list, shown and hidden by `restate`. `picker` decides what it
+//!   says and is unit-tested; that pressing the toggle and typing into the
+//!   search entry actually *reach* `placeholder.set_visible(!showing)` through
+//!   a real widget tree is only true if somebody drives one.
 //!
-//! The second is the one worth the file. It was reasoned about from GTK's
-//! documented behaviour and not measured, and a window that prints a paragraph
-//! about why it is empty is not allowed to rest on that.
+//! The list deliberately does NOT use `GtkListBox::set_placeholder`, and that is
+//! why the last of those is checkable at all: GTK parents that widget where
+//! `first_child`/`next_sibling` cannot reach, so no test outside the crate could
+//! ask whether it was showing. A window that prints a paragraph explaining why
+//! it looks empty should not rest on a claim about a toolkit that nothing here
+//! can check.
 
 use gtk::prelude::*;
 use std::cell::RefCell;
@@ -64,8 +71,15 @@ fn named<T: IsA<gtk::Widget>>(root: &gtk::Widget, name: &str) -> Option<T> {
         .and_then(|w| w.downcast::<T>().ok())
 }
 
-/// Every row, and whether the filter is letting it through.
-fn rows(list: &gtk::ListBox) -> Vec<(String, bool)> {
+/// Every row: its name, whether the filter is letting it through, and whether
+/// it is drawn back.
+///
+/// The dim is the third thing and the one with nowhere else to be asserted. It
+/// is a CSS class put on the `GtkListBoxRow` in the widget-build path, so
+/// `picker` cannot see it and no unit test can: delete the line that adds it
+/// and every row draws at full strength, which is the whole premise of
+/// collapsing four sections into one, with the entire suite still green.
+fn rows(list: &gtk::ListBox) -> Vec<(String, bool, bool)> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some(row) = list.row_at_index(i) {
@@ -77,7 +91,11 @@ fn rows(list: &gtk::ListBox) -> Vec<(String, bool)> {
             .and_downcast::<gtk::Label>()
             .map(|l| l.text().to_string())
             .unwrap_or_default();
-        out.push((name, row.is_child_visible()));
+        out.push((
+            name,
+            row.is_child_visible(),
+            row.has_css_class("not-set-up"),
+        ));
         i += 1;
     }
     out
@@ -85,9 +103,9 @@ fn rows(list: &gtk::ListBox) -> Vec<(String, bool)> {
 
 #[derive(Debug, Default)]
 struct Seen {
-    before: Vec<(String, bool)>,
-    filtered: Vec<(String, bool)>,
-    filtered_and_typed: Vec<(String, bool)>,
+    before: Vec<(String, bool, bool)>,
+    filtered: Vec<(String, bool, bool)>,
+    filtered_and_typed: Vec<(String, bool, bool)>,
     placeholder_when_some_show: Option<bool>,
     placeholder_when_none_show: Option<bool>,
     placeholder_text: String,
@@ -225,10 +243,16 @@ fn the_filter_hides_rows_without_removing_them_and_an_empty_list_says_why() {
 
     assert!(s.troubles.is_empty(), "{:?}\n{s:#?}", s.troubles);
 
-    let showing = |v: &[(String, bool)]| -> Vec<String> {
+    let showing = |v: &[(String, bool, bool)]| -> Vec<String> {
         v.iter()
-            .filter(|(_, on)| *on)
-            .map(|(n, _)| n.clone())
+            .filter(|(_, on, _)| *on)
+            .map(|(n, _, _)| n.clone())
+            .collect()
+    };
+    let dimmed = |v: &[(String, bool, bool)]| -> Vec<String> {
+        v.iter()
+            .filter(|(_, _, dim)| *dim)
+            .map(|(n, _, _)| n.clone())
             .collect()
     };
 
@@ -253,6 +277,22 @@ fn the_filter_hides_rows_without_removing_them_and_an_empty_list_says_why() {
         "a hidden row is still a row, and `row_at_index` still finds it — every count \
          taken that way counts the whole catalogue: {s:#?}"
     );
+    // The dim, which is what the list says instead of a heading. Asserted over
+    // the same census as the filter so the two cannot disagree: a row the filter
+    // keeps is a row that is NOT drawn back, and that equivalence is the whole
+    // of what "one list" means here.
+    assert_eq!(
+        dimmed(&s.before),
+        vec!["Also Not Set Up".to_string(), "Never Launched".to_string()],
+        "everything without a bridge in its prefix is drawn back, and the one with a \
+         bridge is not: {s:#?}"
+    );
+    assert_eq!(
+        dimmed(&s.filtered),
+        dimmed(&s.before),
+        "pressing the filter hides rows; it must not repaint the ones it keeps: {s:#?}"
+    );
+
     assert_eq!(
         s.placeholder_when_some_show,
         Some(false),
@@ -266,9 +306,9 @@ fn the_filter_hides_rows_without_removing_them_and_an_empty_list_says_why() {
     assert_eq!(
         s.placeholder_when_none_show,
         Some(true),
-        "the list is empty because the filter emptied it, and a GtkListBox has to show its \
-         placeholder for that and not only for a list with no rows in it — if this is the \
-         assertion that failed, the paragraph has to move out of the list: {s:#?}"
+        "the list is empty because the filter emptied it, so the paragraph saying why has \
+         to be up — if this failed, `restate` is not reaching `placeholder.set_visible`, \
+         or `picker` and the filter disagree about whether anything is showing: {s:#?}"
     );
     assert!(
         s.placeholder_text.contains("zzzz") && s.placeholder_text.contains("button beside"),

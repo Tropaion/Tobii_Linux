@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "tobii-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "tobii-config",
@@ -1482,14 +1482,14 @@ dependencies = [
 
 [[package]]
 name = "tobii-config"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tobii-protocol",
 ]
 
 [[package]]
 name = "tobii-diagnostics"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tobii-config",
  "tobii-headpose",
@@ -1499,11 +1499,11 @@ dependencies = [
 
 [[package]]
 name = "tobii-gameconf"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "tobii-gtk"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "gtk4",
  "gtk4-layer-shell",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "tobii-headpose"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tobii-config",
  "tobii-protocol",
@@ -1530,11 +1530,11 @@ dependencies = [
 
 [[package]]
 name = "tobii-ipc"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "tobii-output"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "tobii-config",
@@ -1544,22 +1544,22 @@ dependencies = [
 
 [[package]]
 name = "tobii-protocol"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "tobii-recap"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "tobii-protocol",
 ]
 
 [[package]]
 name = "tobii-steam"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "tobii-update"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "tobii-config",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "tobii-usb"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rusb",
  "tobii-config",

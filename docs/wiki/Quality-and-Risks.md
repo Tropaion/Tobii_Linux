@@ -1653,20 +1653,33 @@ exclusive, so every app id was asked once, inserted once, and cleared by
 by construction.
 
 **What is measured.** `tests/games_filter.rs` is new and is the only test that
-can reach the two GTK facts the rewrite rests on: that a filtered-out row is
-still found by `row_at_index` and only `is_child_visible` tells them apart, and
-that the paragraph explaining an empty list appears when the filter is what
-emptied it. Headlessly, `keeps` is asserted as the one predicate the filter and
-`picker` share, `nothing_showing` as two sentences for the two ways of emptying
-the list, and the census as a count of Steam's manifests that does not follow
-the search box.
+can reach the three things no unit test can: that a filtered-out row is still
+found by `row_at_index` and only `is_child_visible` tells them apart; that the
+dim is on the rows the filter excludes and on no others (it is a CSS class put
+on the `GtkListBoxRow` where the rows are built, so `picker` cannot see it —
+delete the line that adds it and the whole headless suite stays green); and that
+the paragraph explaining an empty list is reached through a real widget tree when
+the filter is what emptied it. Headlessly, `keeps` is asserted as the one
+predicate the filter and `picker` share, `nothing_showing` as two sentences for
+the two ways of emptying the list, and the census as a count of Steam's
+manifests that does not follow the search box.
 
 **What is not:**
 
-- **The dimming is unasserted as an appearance.** `tests/games_filter.rs`
-  asserts which rows the filter *keeps*; that a kept row looks different from a
-  dimmed one is `row.not-set-up .row-name` in the stylesheet, and nothing here
-  renders a pixel. This is §11.3m's last bullet again, one surface further on.
+- **The dimming is asserted as a class and not as an appearance.**
+  `tests/games_filter.rs` asserts that the `not-set-up` class is on exactly the
+  rows the filter excludes; that the class makes a row *look* different is
+  `row.not-set-up .row-name` in the stylesheet, and nothing here renders a
+  pixel. This is §11.3m's last bullet again, one surface further on.
+- **`recheck` is wired and not exercised end to end.** A review found that a
+  job finishing left the row it was about stale — the pane re-stats the prefix
+  on every `refresh`, the rows carried what the catalogue said when the tab was
+  last shown — so installing a bridge left its row dimmed and outside the
+  filter, under a paragraph reading *No game on this machine has the bridge
+  installed yet*. Four job-completion callbacks now re-read the catalogue. What
+  no test covers is the whole path: a display test would have to run a real
+  `tobii bridge install` against a real prefix, which is the same gap §11.3m
+  records for the buttons themselves.
 - **The toggle has never been pressed by a person on a machine with a set-up
   game.** The display test's set-up row is a directory this test creates and
   fills; no Proton prefix was involved.

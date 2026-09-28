@@ -334,10 +334,12 @@ pub fn topics() -> Vec<Topic> {
                  strength when the Wine bridge is installed in that game's \
                  prefix and drawn back when it is not, so what is left to do is \
                  visible without reading. The second line of each row says which \
-                 it is, and tells apart the two ways of not being set up: a \
-                 prefix with no bridge in it is something to press Install on, \
-                 and a game never launched under Proton has no prefix to install \
-                 into yet.\n\n\
+                 it is, and tells the ways of not being set up apart: a prefix \
+                 with no bridge in it is something to press Install on, a game \
+                 never launched under Proton has no prefix to install into yet, \
+                 and a game added by hand whose folder is not on this machine \
+                 right now says so instead — with the drive gone, this program \
+                 cannot see whether the bridge is in there at all.\n\n\
                  The button beside the search box shows only the games that are \
                  set up. It has no caption because it is the same play triangle \
                  Steam's own library uses for the same question; resting a \

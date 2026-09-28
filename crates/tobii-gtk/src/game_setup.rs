@@ -399,8 +399,11 @@ pub(crate) const ADD_GAME_TIP: &str =
 ///
 /// Shared for the reason the ten strings beside them are: the same `format!`
 /// in `help.rs` already pulls `PROFILE_SAVE`, `TRACKER_TAB_POINTER` and the
-/// four `Group` headings across this boundary rather than copying them. These
-/// were the class left out — and the test that checks the topic mentions them
+/// commands the profile page prints across this boundary rather than copying
+/// them. (It pulled the four section headings too, until there were no
+/// sections; deleting the enum broke that `format!`, which is the mechanism
+/// working.) These were the class left out — and the test that checks the topic
+/// mentions them
 /// was checking it against a third copy of the same literal, so a rename would
 /// have left the prose naming a button that no longer exists with every test
 /// still green.
@@ -692,7 +695,7 @@ pub(crate) fn directory_notes(l: &profiles::Listing) -> Vec<String> {
         // themselves; a stray is somebody else's file and it does not touch
         // one. Offering it beside a line about strays alone would be this page
         // promising to tidy up something it will leave exactly where it is.
-        let mut tail = "`tobii games profile list` names each of them".to_string();
+        let mut tail = "`tobii games profile show` names each of them".to_string();
         if !l.leftovers.is_empty() {
             tail.push_str(", and `tobii uninstall --purge` removes the ones this program wrote");
         }
@@ -874,11 +877,14 @@ pub(crate) fn orphan_profiles_note(apps: &[App], listing: &profiles::Listing) ->
         .count();
     (n > 0).then(|| {
         format!(
-            "{n} {thing} here {is} for a game Steam does not list on this machine — a drive \
-             that is not plugged in, or a game since uninstalled. `tobii games profile show` \
-             names them.",
+            "{n} {thing} here {is} for {games} Steam does not list on this machine. The \
+             profile is not lost: it applies again the moment Steam lists the game. \
+             `tobii games profile show` names every profile here.",
             thing = plural(n, "profile", "profiles"),
             is = if n == 1 { "is" } else { "are" },
+            // Both halves of the sentence have to agree, and only one of them
+            // did: "2 profiles here are for a game Steam does not list".
+            games = if n == 1 { "a game" } else { "games" },
         )
     })
 }
@@ -3704,7 +3710,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     details_btn.add_css_class("quiet");
     details_btn.set_tooltip_text(Some(DETAILS_TIP));
     let wine_btn = crate::widget::button("Choose the Proton build…");
-    // Only ever on a row of `Group::Custom`, and it removes the ROW rather than
+    // Only ever on a row of `Origin::ByHand` — see `actions` — and it removes
+    // the ROW rather than
     // anything on disk. Named for what it does to this program's own list: an
     // ambiguous caption beside *Uninstall* is one click from somebody expecting
     // the bridge to come out of their prefix and getting the entry deleted
@@ -3785,7 +3792,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             p_body.clone(),
             rows_box.clone(),
         );
-        // The four things a row of `Group::Elsewhere` turns off and the one it
+        // The five widgets `blocks` decides the visibility of, and the one it
         // turns on. **Weak, every one of them**, and one of the five is the
         // reason: `b2` contains `b_actions`, which contains the three buttons
         // whose `clicked` handlers hold this very closure. Held strongly here
@@ -4085,205 +4092,6 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
         })
     };
 
-    // ---- the handlers
-    //
-    // There is no handler for block 1. It had one — the button that wrote
-    // `enabled` and `joystick` — and deleting it takes `games.toml` from five
-    // writers to four. Nothing in this file writes that file any more.
-
-    // The **hub's** lifetime, as one flag. Every poll reads it on its first
-    // line and stops when it is false; only the quit path sets it. See
-    // [`GamesTab::alive`] for why not `unmap`.
-    let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
-
-    {
-        let (refresh, sel, tobii, running, outcome, alive) = (
-            refresh.clone(),
-            sel.clone(),
-            tobii.clone(),
-            running.clone(),
-            outcome.clone(),
-            alive.clone(),
-        );
-        install_btn.connect_clicked(move |_| {
-            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
-                return;
-            };
-            *outcome.borrow_mut() = None;
-            let argv = install_argv(t, &app.target, &InstallWith::default());
-            let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
-            start_job(argv, &app.key(), &alive, &running, move |o| {
-                *outcome2.borrow_mut() = Some((id.clone(), o));
-                refresh2();
-            });
-            refresh();
-        });
-    }
-
-    {
-        let (refresh, sel, tobii, running, outcome, alive) = (
-            refresh.clone(),
-            sel.clone(),
-            tobii.clone(),
-            running.clone(),
-            outcome.clone(),
-            alive.clone(),
-        );
-        uninstall_btn.connect_clicked(move |_| {
-            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
-                return;
-            };
-            // The same slot the install writes into, on purpose: one job at a
-            // time, and whichever ran last is what the page reports. `Outcome`
-            // is already keyed by app id, so an uninstall finishing after the
-            // user has moved on lands on the right game or nowhere.
-            *outcome.borrow_mut() = None;
-            let argv = uninstall_argv(t, &app.target);
-            let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
-            start_job(argv, &app.key(), &alive, &running, move |o| {
-                *outcome2.borrow_mut() = Some((id.clone(), o));
-                refresh2();
-            });
-            refresh();
-        });
-    }
-
-    {
-        let (refresh, sel, tobii, running, report, alive) = (
-            refresh.clone(),
-            sel.clone(),
-            tobii.clone(),
-            running.clone(),
-            report.clone(),
-            alive.clone(),
-        );
-        details_btn.connect_clicked(move |_| {
-            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
-                return;
-            };
-            let argv = status_argv(t, &app.target);
-            let (refresh2, report2, id, t2) =
-                (refresh.clone(), report.clone(), app.key(), t.clone());
-            start_job(argv, &app.key(), &alive, &running, move |o| {
-                let mut s = String::new();
-                // A `tobii` with no `bridge status` answers with its usage and
-                // exits zero. Its words are still printed — they are the only
-                // evidence — but not on their own, as a wall of text with
-                // nothing above it saying what happened.
-                if too_old_for("status", &o) {
-                    s.push_str(&too_old_note("status", &t2));
-                    s.push_str("\n\n");
-                }
-                s.push_str(o.stdout.trim_end());
-                if !o.stderr.trim().is_empty() {
-                    if !s.is_empty() && !s.ends_with('\n') {
-                        s.push_str("\n\n");
-                    }
-                    s.push_str(o.stderr.trim_end());
-                }
-                *report2.borrow_mut() = Some((id.clone(), s));
-                refresh2();
-            });
-            refresh();
-        });
-    }
-
-    {
-        let (refresh, sel, tobii, running, outcome, alive) = (
-            refresh.clone(),
-            sel.clone(),
-            tobii.clone(),
-            running.clone(),
-            outcome.clone(),
-            alive.clone(),
-        );
-        other_btn.connect_clicked(move |b| {
-            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
-                return;
-            };
-            let parent = b.root().and_downcast::<gtk::Window>();
-            let dialog = gtk::FileDialog::new();
-            dialog.set_title("Pick the folder holding the client's NPClient64.dll");
-            dialog.set_modal(true);
-            let (t, refresh, running, outcome, alive) = (
-                t.clone(),
-                refresh.clone(),
-                running.clone(),
-                outcome.clone(),
-                alive.clone(),
-            );
-            // A folder, because that is what `--npclient` takes: the installer
-            // decides which names inside it it needs, and a file picker here
-            // would be this window having a second opinion about that.
-            dialog.select_folder(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
-                let Some(dir) = res.ok().and_then(|f| f.path()) else {
-                    return;
-                };
-                *outcome.borrow_mut() = None;
-                let argv = install_argv(
-                    &t,
-                    &app.target,
-                    &InstallWith {
-                        npclient: Some(dir),
-                        ..InstallWith::default()
-                    },
-                );
-                let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
-                start_job(argv, &app.key(), &alive, &running, move |o| {
-                    *outcome2.borrow_mut() = Some((id.clone(), o));
-                    refresh2();
-                });
-                refresh();
-            });
-        });
-    }
-
-    {
-        let (refresh, sel, tobii, running, outcome, alive) = (
-            refresh.clone(),
-            sel.clone(),
-            tobii.clone(),
-            running.clone(),
-            outcome.clone(),
-            alive.clone(),
-        );
-        wine_btn.connect_clicked(move |b| {
-            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
-                return;
-            };
-            let parent = b.root().and_downcast::<gtk::Window>();
-            let dialog = gtk::FileDialog::new();
-            dialog.set_title("Choose the Proton build's wine");
-            let (t, refresh, running, outcome, alive) = (
-                t.clone(),
-                refresh.clone(),
-                running.clone(),
-                outcome.clone(),
-                alive.clone(),
-            );
-            dialog.open(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
-                let Some(path) = res.ok().and_then(|f| f.path()) else {
-                    return;
-                };
-                *outcome.borrow_mut() = None;
-                let argv = install_argv(
-                    &t,
-                    &app.target,
-                    &InstallWith {
-                        wine: Some(path),
-                        ..InstallWith::default()
-                    },
-                );
-                let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
-                start_job(argv, &app.key(), &alive, &running, move |o| {
-                    *outcome2.borrow_mut() = Some((id.clone(), o));
-                    refresh2();
-                });
-                refresh();
-            });
-        });
-    }
-
     // ---- the pick list
 
     // EVERY row, in the order the list holds them, and never the filtered ones.
@@ -4447,6 +4255,250 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 .map(|e| e.text().to_string())
                 .unwrap_or_default();
             restate(&q);
+        });
+    }
+
+    // What a finished job changed, re-read.
+    //
+    // The two halves of this screen learn about a prefix from different places.
+    // The detail pane re-stats it on every `refresh` — `bridge_state` is called
+    // there — so it was right the moment an install finished. The ROWS carry
+    // what `read_catalog` found when the tab was last shown, and until this
+    // existed the only things that re-read were a tab switch, an add and a
+    // forget.
+    //
+    // That was survivable while the row's group was a heading: a just-installed
+    // game sat under the wrong one until you came back. It stopped being
+    // survivable when the same value started deciding whether the row is dimmed
+    // and whether the filter keeps it. Install a bridge, press the filter, and
+    // the game you had just set up was hidden — under a paragraph reading "No
+    // game on this machine has the bridge installed yet", six inches from a pane
+    // reporting the bridge it had installed thirty seconds earlier.
+    //
+    // It is the tab-switch read, paid at the one other moment the answer can
+    // change. Not on the report button, which starts nothing and changes
+    // nothing.
+    let recheck: Rc<dyn Fn()> = {
+        let (catalog, scan, rebuild, refresh) = (
+            catalog.clone(),
+            scan.clone(),
+            rebuild.clone(),
+            refresh.clone(),
+        );
+        let search_w = search.downgrade();
+        Rc::new(move || {
+            *catalog.borrow_mut() = read_catalog(&scan);
+            let q = search_w
+                .upgrade()
+                .map(|e| e.text().to_string())
+                .unwrap_or_default();
+            rebuild(&q);
+            refresh();
+        })
+    };
+
+    // ---- the handlers
+    //
+    // There is no handler for block 1. It had one — the button that wrote
+    // `enabled` and `joystick` — and deleting it takes `games.toml` from five
+    // writers to four. Nothing in this file writes that file any more.
+
+    // The **hub's** lifetime, as one flag. Every poll reads it on its first
+    // line and stops when it is false; only the quit path sets it. See
+    // [`GamesTab::alive`] for why not `unmap`.
+    let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+
+    {
+        let (refresh, recheck, sel, tobii, running, outcome, alive) = (
+            refresh.clone(),
+            recheck.clone(),
+            sel.clone(),
+            tobii.clone(),
+            running.clone(),
+            outcome.clone(),
+            alive.clone(),
+        );
+        install_btn.connect_clicked(move |_| {
+            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
+                return;
+            };
+            *outcome.borrow_mut() = None;
+            let argv = install_argv(t, &app.target, &InstallWith::default());
+            let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
+            start_job(argv, &app.key(), &alive, &running, move |o| {
+                *outcome2.borrow_mut() = Some((id.clone(), o));
+                recheck2();
+            });
+            refresh();
+        });
+    }
+
+    {
+        let (refresh, recheck, sel, tobii, running, outcome, alive) = (
+            refresh.clone(),
+            recheck.clone(),
+            sel.clone(),
+            tobii.clone(),
+            running.clone(),
+            outcome.clone(),
+            alive.clone(),
+        );
+        uninstall_btn.connect_clicked(move |_| {
+            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
+                return;
+            };
+            // The same slot the install writes into, on purpose: one job at a
+            // time, and whichever ran last is what the page reports. `Outcome`
+            // is already keyed by app id, so an uninstall finishing after the
+            // user has moved on lands on the right game or nowhere.
+            *outcome.borrow_mut() = None;
+            let argv = uninstall_argv(t, &app.target);
+            let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
+            start_job(argv, &app.key(), &alive, &running, move |o| {
+                *outcome2.borrow_mut() = Some((id.clone(), o));
+                recheck2();
+            });
+            refresh();
+        });
+    }
+
+    {
+        let (refresh, sel, tobii, running, report, alive) = (
+            refresh.clone(),
+            sel.clone(),
+            tobii.clone(),
+            running.clone(),
+            report.clone(),
+            alive.clone(),
+        );
+        details_btn.connect_clicked(move |_| {
+            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
+                return;
+            };
+            let argv = status_argv(t, &app.target);
+            let (refresh2, report2, id, t2) =
+                (refresh.clone(), report.clone(), app.key(), t.clone());
+            start_job(argv, &app.key(), &alive, &running, move |o| {
+                let mut s = String::new();
+                // A `tobii` with no `bridge status` answers with its usage and
+                // exits zero. Its words are still printed — they are the only
+                // evidence — but not on their own, as a wall of text with
+                // nothing above it saying what happened.
+                if too_old_for("status", &o) {
+                    s.push_str(&too_old_note("status", &t2));
+                    s.push_str("\n\n");
+                }
+                s.push_str(o.stdout.trim_end());
+                if !o.stderr.trim().is_empty() {
+                    if !s.is_empty() && !s.ends_with('\n') {
+                        s.push_str("\n\n");
+                    }
+                    s.push_str(o.stderr.trim_end());
+                }
+                *report2.borrow_mut() = Some((id.clone(), s));
+                refresh2();
+            });
+            refresh();
+        });
+    }
+
+    {
+        let (refresh, recheck, sel, tobii, running, outcome, alive) = (
+            refresh.clone(),
+            recheck.clone(),
+            sel.clone(),
+            tobii.clone(),
+            running.clone(),
+            outcome.clone(),
+            alive.clone(),
+        );
+        other_btn.connect_clicked(move |b| {
+            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
+                return;
+            };
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Pick the folder holding the client's NPClient64.dll");
+            dialog.set_modal(true);
+            let (t, refresh, recheck, running, outcome, alive) = (
+                t.clone(),
+                refresh.clone(),
+                recheck.clone(),
+                running.clone(),
+                outcome.clone(),
+                alive.clone(),
+            );
+            // A folder, because that is what `--npclient` takes: the installer
+            // decides which names inside it it needs, and a file picker here
+            // would be this window having a second opinion about that.
+            dialog.select_folder(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+                let Some(dir) = res.ok().and_then(|f| f.path()) else {
+                    return;
+                };
+                *outcome.borrow_mut() = None;
+                let argv = install_argv(
+                    &t,
+                    &app.target,
+                    &InstallWith {
+                        npclient: Some(dir),
+                        ..InstallWith::default()
+                    },
+                );
+                let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
+                start_job(argv, &app.key(), &alive, &running, move |o| {
+                    *outcome2.borrow_mut() = Some((id.clone(), o));
+                    recheck2();
+                });
+                refresh();
+            });
+        });
+    }
+
+    {
+        let (refresh, recheck, sel, tobii, running, outcome, alive) = (
+            refresh.clone(),
+            recheck.clone(),
+            sel.clone(),
+            tobii.clone(),
+            running.clone(),
+            outcome.clone(),
+            alive.clone(),
+        );
+        wine_btn.connect_clicked(move |b| {
+            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
+                return;
+            };
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Choose the Proton build's wine");
+            let (t, refresh, recheck, running, outcome, alive) = (
+                t.clone(),
+                refresh.clone(),
+                recheck.clone(),
+                running.clone(),
+                outcome.clone(),
+                alive.clone(),
+            );
+            dialog.open(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+                let Some(path) = res.ok().and_then(|f| f.path()) else {
+                    return;
+                };
+                *outcome.borrow_mut() = None;
+                let argv = install_argv(
+                    &t,
+                    &app.target,
+                    &InstallWith {
+                        wine: Some(path),
+                        ..InstallWith::default()
+                    },
+                );
+                let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
+                start_job(argv, &app.key(), &alive, &running, move |o| {
+                    *outcome2.borrow_mut() = Some((id.clone(), o));
+                    recheck2();
+                });
+                refresh();
+            });
         });
     }
 
@@ -4651,13 +4703,19 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // `refresh` re-reads `load_output_config` on every call, so only the
     // trigger was missing.
     //
-    // **The list**, because `tobii games profile save <appid>` in a terminal is
-    // the documented way to write a profile, and which group a game is in is
-    // read off the profiles directory. A list built once would put a game the
-    // user had just set up under "Not set up" until the hub was restarted.
-    // Only the profile half is re-read — `read_catalog` does a `readdir` of a
-    // handful of small files and stats a prefix per profile, not the Steam walk
-    // behind it, which `scan` paid for once.
+    // **The list**, because a row is read off the disk and the disk can change
+    // behind this window. `tobii bridge install --steam <appid>` in a terminal
+    // is as good a way to install the bridge as the button on this page, and
+    // `tobii games profile save <appid>` is the documented way to write a
+    // profile. A list built once would go on drawing a game back, and hiding it
+    // under the filter, after it had been set up.
+    //
+    // What it costs, since this used to claim a cheaper figure than it paid:
+    // a `readdir` of the profiles directory, plus — per row — the prefix lookup
+    // `tobii_steam::Steam::prefix` does and three `is_file` calls behind it for
+    // any row whose game has a prefix at all. Not the Steam library walk, which
+    // `scan` paid for once. `Catalog::new`'s own doc carries the arithmetic.
+    // The same read runs after a job that changes those files — see `recheck`.
     //
     // The query is taken from the search box rather than reset, so coming back
     // to a filtered list finds it as it was left.
@@ -5422,7 +5480,7 @@ mod tests {
             .find(|n| n.contains("Steam does not list"))
             .unwrap_or_else(|| panic!("no note about the orphaned profile: {:#?}", c.notes));
         assert!(
-            note.contains("1 profile here"),
+            note.contains("1 profile here is for a game"),
             "it says how many, so a machine with six does not read as one: {note}"
         );
         assert!(
@@ -5432,6 +5490,26 @@ mod tests {
         // The command is the one that exists. `profile list` was in the help
         // topic for a release and is not a subcommand.
         assert!(!note.contains("profile list"), "{note}");
+
+        // Two of them, because only half the sentence followed the count:
+        // "2 profiles here are for a game Steam does not list" was the first
+        // version, and nothing would have caught it.
+        let two = Catalog::new(
+            &apps,
+            &listed(&[("77", None), ("78", None)]),
+            &[],
+            &nothing_set_up,
+            &|_| RowBridge::Installed,
+        );
+        let note = two
+            .notes
+            .iter()
+            .find(|n| n.contains("Steam does not list"))
+            .expect("a note for two");
+        assert!(
+            note.contains("2 profiles here are for games"),
+            "both halves of the sentence have to follow the count: {note}"
+        );
 
         // And a machine with none says nothing at all, rather than "0 profiles".
         let clean = Catalog::new(
@@ -5789,9 +5867,10 @@ mod tests {
             "and a leftover is ours: {one:#?}"
         );
         assert!(
-            one[3].contains("tobii games profile list") && one[3].contains("--purge"),
+            one[3].contains("tobii games profile show") && one[3].contains("--purge"),
             "the names are one command away, and with a leftover there is a second \
-             command that removes it: {one:#?}"
+             command that removes it \u{2014} and `profile list` is not a subcommand, \
+             so a note naming it sends the reader to an error: {one:#?}"
         );
 
         // And `--purge` is offered only where there is something for it to
