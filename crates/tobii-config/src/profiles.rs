@@ -18,32 +18,53 @@
 //! that it never writes. A
 //! profile cannot ask for something the reader it names is unable to do.
 //!
-//! # A check names something inside the Proton prefix, and only that
+//! # A check is resolved under the prefix — which is not the same as contained
 //!
 //! [`Check::path`] is relative to the prefix — the directory holding
 //! `drive_c` — and [`parse`] refuses a leading `/`, a `..` component and a
-//! backslash. That is a containment property and not a formatting
-//! preference: a profile is a file one person may hand another, and a path
-//! that could climb out of the prefix would let a stranger point this
-//! program's readers at anything on the machine.
+//! backslash. Those three keep the path *relative*: that is what makes a
+//! profile portable between two machines whose prefixes sit in different
+//! places, and it is what lets [`Check::path_under`] join without producing
+//! nonsense. They are a shape rule, and this module used to describe them as
+//! a containment boundary. **They are not one, and the difference is the
+//! whole of this section.**
 //!
-//! It is also a real limit, and a profile author meets it as a refusal, so
-//! it is worth naming here what cannot be expressed. **A game's shipped
-//! files are not under the prefix.** They are under the Steam library, in
-//! `steamapps/common/<game>/`, and no check can name one of them. Elite
-//! Dangerous keeps its thirty stock control schemes there, in
-//! `Products/elite-dangerous-odyssey-64/ControlSchemes/`, and a profile
-//! cannot ask what one of them says. What a check can reach is what the game
-//! wrote for this user *inside its own prefix*, wherever that turns out to
-//! be — and for Elite specifically, where that is has not been established
-//! here: see `tobii_gameconf::binds`, which says plainly that the one
-//! install on this machine has written no such directory yet.
+//! A prefix is a *Wine* prefix, and every Wine prefix ships the way out.
+//! `dosdevices/` maps drive letters onto the rest of the machine: `z:` is `/`
+//! in every prefix wine ever made, and Steam adds an `s:` pointing at the
+//! Steam library root. Those are ordinary directory entries under the prefix,
+//! so `dosdevices/z:/etc/hostname` has no `..`, no leading `/` and no
+//! backslash, [`parse`] accepts it, and the reader it names really does open
+//! that file. Measured on this project's own Elite prefix, not reasoned
+//! about; `a_check_path_reaches_what_the_prefix_reaches` in this file pins it
+//! against a fixture.
 //!
-//! Nothing treats that as temporary. A check that has to read a shipped file
-//! needs a second root — the library path for that app id — and a second
-//! root is a grammar change, which means a [`VERSION`] bump and old builds
-//! declining the file by name. Until a game needs it, one root that cannot
-//! be escaped is the safer thing to have.
+//! So the honest sentence is: **a check reaches what the prefix reaches**,
+//! and a Wine prefix reaches the machine. That is deliberate rather than
+//! merely tolerated — a game's *shipped* files are under the Steam library,
+//! in `steamapps/common/<game>/`, and reaching them is a thing a profile
+//! author legitimately wants. Elite Dangerous keeps its thirty stock control
+//! schemes there, in `Products/elite-dangerous-odyssey-64/ControlSchemes/`,
+//! this project counted them through exactly such a path, and refusing
+//! `dosdevices` would remove that capability to preserve a sentence.
+//!
+//! # What actually bounds what a profile can do
+//!
+//! Not the path. The readers.
+//!
+//! A `[[check]]` names a `format`, and the only two formats this build has
+//! readers for — `tobii_gameconf`'s `binds` and `attrs` — **only ever read**,
+//! open one file the check names, look up the one `setting` the check names,
+//! and answer with that one value or with a refusal. There is no grammar for
+//! writing, no grammar for listing a directory the check did not name, and no
+//! path by which a check returns a file's contents.
+//!
+//! State that plainly to whoever is about to trust a profile from a forum:
+//! **a profile from a stranger can make this program read a file you can
+//! already read and tell you what one attribute of it says.** Not more than
+//! that — and not less, so a profile naming `dosdevices/z:/` somewhere
+//! personal is worth a second look before you run it, the same second look
+//! any hand-edited file from a stranger is worth.
 //!
 //! # This ships zero profiles, and that is the intended state
 //!
@@ -297,18 +318,24 @@ pub struct Check {
     /// Where the file (or, for [`Format::BindsDir`], the directory) sits
     /// **relative to the Proton prefix** — the directory holding `drive_c`.
     ///
-    /// Always relative, always `/`-separated, and never with a `..` component:
-    /// [`parse`] refuses the rest at the line that held it. A profile is a
-    /// hand-edited file whose path is joined onto a prefix and then opened,
-    /// and `..` would let one point the reader anywhere on the machine. A
-    /// backslash is refused too — it would be a literal character in a Linux
-    /// path, so a Windows-style path would not fail, it would silently name
-    /// nothing.
+    /// Always relative, always `/`-separated, and never with a `..`
+    /// component: [`parse`] refuses the rest at the line that held it. Those
+    /// three keep the path relative, which is what makes a profile portable
+    /// between machines whose prefixes live in different places and what lets
+    /// [`Self::path_under`] join it onto a prefix at all. A backslash is
+    /// refused for a plainer reason still — it is a literal character in a
+    /// Linux path, so a Windows-style path would not fail, it would silently
+    /// name nothing.
     ///
-    /// The prefix is the **only** root a check has, which puts a game's
-    /// shipped files out of reach: those are under the Steam library, in
-    /// `steamapps/common/<game>/`, and nothing a profile can write names
-    /// them. See the module docs for what that costs and why it stays.
+    /// **They are not a containment boundary, and this doc comment used to
+    /// say they were.** The prefix is the only *root*, but a Wine prefix maps
+    /// the rest of the machine into itself under `dosdevices/` — `z:` is `/`
+    /// and, on a Steam prefix, `s:` is the library root — so a path with no
+    /// `..` in it can still name a game's shipped files under
+    /// `steamapps/common/`, or anything else this user can read. That is a
+    /// capability profile authors want; see the module docs for what does
+    /// bound a check, which is that its reader only ever reads, and only the
+    /// one [`Self::setting`] it was asked for.
     pub path: String,
     /// What to ask for inside it: an element name for [`Format::BindsDir`]
     /// (`HeadlookMode` names `<HeadlookMode Value="…"/>`), an attribute name
@@ -332,9 +359,15 @@ pub struct Check {
 impl Check {
     /// This check's path under a Proton prefix.
     ///
-    /// Safe to join because [`Self::path`] is relative and has no `..`; that
-    /// is established when the profile is parsed, so it cannot be re-litigated
-    /// at every call site.
+    /// Well-defined to join because [`Self::path`] is relative and has no
+    /// `..`; that is established when the profile is parsed, so it cannot be
+    /// re-litigated at every call site.
+    ///
+    /// The result is lexically under `prefix` — it is `prefix` with relative
+    /// components pushed onto it, and nothing here canonicalises. Where it
+    /// *resolves* is another question: a Proton prefix contains
+    /// `dosdevices/z: -> /`, so a caller opening this path may well open a
+    /// file outside the prefix. That is intended; see the module docs.
     pub fn path_under(&self, prefix: &Path) -> PathBuf {
         let mut p = prefix.to_path_buf();
         for part in self.path.split('/').filter(|s| !s.is_empty()) {
@@ -1710,9 +1743,10 @@ fn check_path(p: &str, line: usize) -> Result<(), ParseError> {
     if p.starts_with('/') {
         return Err(ParseError::at(
             line,
-            "`path` is relative to the Proton prefix, so it does not start with `/`. The prefix \
-             is the only place a check can reach: a file the game ships, under \
-             `steamapps/common/`, cannot be checked by this build.",
+            "`path` is relative to the Proton prefix, so it does not start with `/` — that is \
+             what keeps a profile portable between machines. To reach outside the prefix, name \
+             a drive under `dosdevices/`: `dosdevices/s:/steamapps/common/...` for the game's \
+             own install, `dosdevices/z:/` for an absolute path.",
         ));
     }
     if p.contains('\\') {
@@ -1725,9 +1759,11 @@ fn check_path(p: &str, line: usize) -> Result<(), ParseError> {
     if p.split('/').any(|part| part == "..") {
         return Err(ParseError::at(
             line,
-            "`path` may not have a `..` component: it is joined onto a prefix and then opened. \
-             A check can only ever name something inside the prefix; a file the game ships, \
-             under `steamapps/common/`, cannot be checked by this build.",
+            "`path` may not have a `..` component: it is joined onto a prefix and then opened, \
+             and a path that climbs out of it is no longer portable between machines. To reach \
+             outside the prefix, name a drive under `dosdevices/`: \
+             `dosdevices/s:/steamapps/common/...` for the game's own install, `dosdevices/z:/` \
+             for an absolute path.",
         ));
     }
     Ok(())
@@ -2049,8 +2085,13 @@ mod tests {
 
     /// A check's path is joined onto a prefix and then opened, so the parser
     /// is where `..` and the rest stop.
+    ///
+    /// This is a *portability* rule, not a containment one — see
+    /// `a_check_path_reaches_what_the_prefix_reaches` for what a prefix
+    /// actually reaches. What must break for this to fail: `check_path`
+    /// accepting one of these five shapes, or blaming the wrong line.
     #[test]
-    fn a_check_path_may_not_leave_the_prefix() {
+    fn a_check_path_must_stay_relative() {
         let one = |path: &str| {
             format!(
                 "version = 1\n[[check]]\nformat = \"binds-dir\"\npath = {path}\n\
@@ -2071,6 +2112,85 @@ mod tests {
         // `..` as part of a name is not a parent directory.
         let ok = parse(&one("\"a/..b/c\"")).expect("a name that starts with dots");
         assert_eq!(ok.checks[0].path, "a/..b/c");
+    }
+
+    /// A `path` with no `..`, no leading `/` and no backslash still reaches
+    /// outside the prefix, because every Wine prefix maps the machine into
+    /// itself under `dosdevices/`: `z:` is `/`, and a Steam prefix adds `s:`
+    /// pointing at the library root. Measured on this project's own Elite
+    /// prefix; reproduced here against a fixture.
+    ///
+    /// This is the test the four "the prefix is the only place a check can
+    /// reach" sentences did not have. It exists so that claim cannot come
+    /// back without something going red — and because reaching
+    /// `steamapps/common/` through `s:` is a capability a profile author is
+    /// meant to have.
+    ///
+    /// What must break for this to fail: `check_path` starting to refuse
+    /// `dosdevices` or a drive-letter segment, or `path_under` resolving
+    /// symlinks instead of joining — either of which takes that capability
+    /// away.
+    #[test]
+    fn a_check_path_reaches_what_the_prefix_reaches() {
+        let d = scratch("reaches");
+        let prefix = d.join("pfx");
+        std::fs::create_dir_all(prefix.join("drive_c")).expect("drive_c");
+        std::fs::create_dir_all(prefix.join("dosdevices")).expect("dosdevices");
+        let outside = d.join("library");
+        std::fs::create_dir_all(&outside).expect("library");
+        let body = "<Attributes Headlook=\"1\"/>";
+        std::fs::write(outside.join("shipped.xml"), body).expect("write");
+        // Exactly what Steam puts in a Proton prefix, and what wine puts in
+        // every prefix it makes.
+        std::os::unix::fs::symlink(&outside, prefix.join("dosdevices").join("s:")).expect("s:");
+        std::os::unix::fs::symlink("/", prefix.join("dosdevices").join("z:")).expect("z:");
+
+        let one = |path: &str| {
+            format!(
+                "version = 1\n[[check]]\nformat = \"attributes-xml\"\npath = \"{path}\"\n\
+                 setting = \"Headlook\"\nwants = \"1\"\ntell = \"t\"\n"
+            )
+        };
+
+        // Half one: the parser accepts it. No `..`, no leading `/`, no
+        // backslash, so the three guards have nothing to say about it.
+        let via_s = "dosdevices/s:/shipped.xml";
+        let c = parse(&one(via_s))
+            .expect("a drive letter is not a `..`")
+            .checks[0]
+            .clone();
+
+        // Half two: it opens the file outside the prefix. Reading it here is
+        // the same act `tobii-gameconf` performs on the path this crate hands
+        // it, and the assertion is on the bytes, not on the shape of a path.
+        let joined = c.path_under(&prefix);
+        assert_eq!(
+            std::fs::read_to_string(&joined).expect("the file outside the prefix"),
+            body,
+            "{via_s} did not reach the fixture standing in for steamapps/common"
+        );
+        let real = std::fs::canonicalize(&joined).expect("canonicalize");
+        let real_prefix = std::fs::canonicalize(&prefix).expect("canonicalize prefix");
+        assert!(
+            !real.starts_with(&real_prefix),
+            "{real:?} was expected to resolve outside {real_prefix:?}"
+        );
+
+        // And `z:` is the general form: any absolute path this user can read,
+        // spelled without the leading `/`.
+        let abs = outside.join("shipped.xml");
+        let via_z = format!("dosdevices/z:{}", abs.to_str().expect("utf-8 temp path"));
+        let c = parse(&one(&via_z))
+            .expect("`z:` is not a `..` either")
+            .checks[0]
+            .clone();
+        assert_eq!(
+            std::fs::read_to_string(c.path_under(&prefix)).expect("through z:"),
+            body,
+            "{via_z} did not reach an absolute path"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
