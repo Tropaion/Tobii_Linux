@@ -5,8 +5,9 @@
 //! that a client which stops reading is dropped rather than allowed to block the
 //! server, and that a client going away deregisters itself.
 //!
-//! Each test binds its own socket under the temp dir, so they neither collide
-//! with each other nor with a real daemon.
+//! Each test binds its own socket under the temp dir, named for the test and
+//! for this process, so they collide neither with each other, nor with a real
+//! daemon, nor with another run of this suite on the same machine.
 
 use std::time::{Duration, Instant};
 
@@ -14,8 +15,15 @@ use tobii_ipc::codec::Msg;
 use tobii_ipc::{subs, Client, Server, StatusCode};
 
 /// A unique socket path for one test.
+///
+/// The process id is in the name, and it is load-bearing rather than tidy:
+/// this function removes the path before binding it, so two runs of this
+/// suite at once — one developer's and one agent's, or a rebuild started
+/// while the last one was finishing — had the second unlink the first's live
+/// socket and leave it failing to accept. That happened, and it read as a bug
+/// in the server.
 fn sock(name: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("tobii-ipc-test-{name}.sock"));
+    let p = std::env::temp_dir().join(format!("tobii-ipc-test-{name}-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&p);
     p
 }
