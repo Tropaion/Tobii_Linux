@@ -67,6 +67,16 @@ pub const MEASURED: [Measured; 2] = [
     },
 ];
 
+/// The measurement for a Steam app id, if this project has one.
+///
+/// For a caller that can offer something different to a title known to stop at
+/// the check — the hub's Games tab offers the one route that has been seen to
+/// get past it, and offers it there and nowhere else, because everywhere else
+/// it would be a guess about a game nobody has run.
+pub fn measured_steam(appid: &str) -> Option<&'static Measured> {
+    MEASURED.iter().find(|m| m.appid == Some(appid))
+}
+
 impl Measured {
     /// The whole observation as one clause: the title, what identifies it,
     /// and what it did.
@@ -292,6 +302,25 @@ mod tests {
             assert!(!text.contains("  "), "{what} has a run of spaces:\n{text}");
             assert_eq!(text.trim(), text, "{what} is padded:\n{text}");
         }
+    }
+
+    /// The lookup a caller uses to offer something different to a title that
+    /// is known to stop at the check.
+    ///
+    /// By app id and not by name: a name is what a store spells and a store
+    /// spells it differently in different places, and the caller has an app id
+    /// in its hand. A title measured without one — Star Citizen is not on
+    /// Steam — is unreachable this way, which is correct rather than a gap:
+    /// there is no app id to match it against.
+    #[test]
+    fn a_measured_title_can_be_found_by_its_app_id() {
+        let msfs = measured_steam("2537590").expect("MSFS 2024 is measured");
+        assert_eq!(msfs.title, "Microsoft Flight Simulator 2024");
+        assert_eq!(measured_steam("359320"), None, "Elite was never put to it");
+        assert_eq!(measured_steam(""), None, "and an empty id matches nothing");
+        // Star Citizen is measured and has no app id, so it cannot be found
+        // here — asserted so that giving it one later is a deliberate act.
+        assert!(MEASURED.iter().any(|m| m.appid.is_none()));
     }
 
     /// `named` carries whatever identifies a title and nothing it has not got,

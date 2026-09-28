@@ -369,6 +369,14 @@ pub fn topics() -> Vec<Topic> {
                  Details runs `tobii bridge status` and prints what it says \
                  without starting anything. When there is nothing to press, the \
                  bar says why instead of going blank.\n\n\
+                 \u{201c}Install another client\u{2026}\u{201d} appears for a game this \
+                 project has watched refuse ours at the signature check, and for \
+                 no other. It puts somebody else's client DLL into the prefix \
+                 instead — pick the folder holding its NPClient64.dll; opentrack \
+                 ships one. It is offered there and nowhere else because ours is \
+                 the right default everywhere else, and because a button putting \
+                 a third-party binary into every prefix on the machine would be \
+                 recommending something nobody has watched work there.\n\n\
                  The third section, the game's own options, is read-only: this \
                  program reports what those files say and never writes them. It \
                  checks them only where a profile says what to look at, and this \

@@ -1546,18 +1546,39 @@ pub(crate) fn bridge_block(
 /// window.
 ///
 /// The first element is the program; the rest are its arguments.
-pub(crate) fn install_argv(tobii: &Path, target: &Target, wine: Option<&Path>) -> Vec<OsString> {
+pub(crate) fn install_argv(tobii: &Path, target: &Target, with: &InstallWith) -> Vec<OsString> {
     let mut v: Vec<OsString> = vec![
         tobii.as_os_str().to_os_string(),
         "bridge".into(),
         "install".into(),
     ];
     target.push_flag(&mut v);
-    if let Some(w) = wine {
+    if let Some(w) = &with.wine {
         v.push("--wine".into());
         v.push(w.as_os_str().to_os_string());
     }
+    if let Some(dir) = &with.npclient {
+        v.push("--npclient".into());
+        v.push(dir.as_os_str().to_os_string());
+    }
     v
+}
+
+/// The optional halves of an install.
+///
+/// A struct rather than two positional `Option<&Path>`, because two of them
+/// side by side is a call site where the wrong one silently installs the right
+/// thing in the wrong place — and one of the two decides which client DLL a
+/// game will load, which is the whole question this page exists around.
+///
+/// `npclient` is a DIRECTORY holding somebody else's `NPClient64.dll`;
+/// opentrack ships one. Ours is the default and needs no flag. See
+/// [`tobii_config::signature`] for what the difference decides and for the two
+/// titles it has been measured on.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct InstallWith {
+    pub wine: Option<PathBuf>,
+    pub npclient: Option<PathBuf>,
 }
 
 /// The argv for `tobii bridge status`, which starts nothing and only reads —
@@ -1597,6 +1618,15 @@ pub(crate) struct Actions {
     pub details: bool,
     /// The Proton-build picker, which [`JobView`] decides is earned.
     pub wine: bool,
+    /// Whether to offer installing somebody else's client DLL instead of ours.
+    ///
+    /// Only for a title this project has MEASURED stopping at the signature
+    /// check, which today is one Steam game. Everywhere else it would be a
+    /// guess: our client is the right default, the paragraph above the bar
+    /// already names the route for anybody whose game turns out to gate, and a
+    /// button offering a third-party binary to every game on the machine would
+    /// be this page recommending something nobody has watched work there.
+    pub other_client: bool,
     /// Why there is nothing to press, when there is nothing. [`None`] when the
     /// bar has a button.
     pub blocked: Option<&'static str>,
@@ -1630,12 +1660,14 @@ pub(crate) fn actions(
     tobii: Option<&Path>,
     job: &JobView,
     reach: Reach,
+    measured: bool,
 ) -> Actions {
     let none = |why: &'static str| Actions {
         primary: None,
         uninstall: false,
         details: false,
         wine: false,
+        other_client: false,
         blocked: Some(why),
     };
     match reach {
@@ -1669,6 +1701,7 @@ pub(crate) fn actions(
         uninstall: matches!(state, BridgeState::Files { .. }),
         details: true,
         wine: job.offer_wine,
+        other_client: measured,
         blocked: None,
     }
 }
@@ -3304,6 +3337,17 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
         "Take this game out of the hub's list. It does not touch the prefix, the game, or a \
          bridge already installed in it.",
     ));
+    // Offered only to a title this project has watched stop at the signature
+    // check — see `Actions::other_client`. The caption says "another" rather
+    // than naming opentrack: opentrack ships a client and so might something
+    // else, and this page has not watched either of them deliver.
+    let other_btn = crate::widget::button("Install another client\u{2026}");
+    other_btn.add_css_class("quiet");
+    other_btn.set_tooltip_text(Some(
+        "Install a client DLL that is not ours into this prefix — pick the folder holding its \
+         NPClient64.dll. For a game that refuses ours at the signature check. Something still \
+         has to be filling the shared mapping; the paragraph above says what.",
+    ));
     let uninstall_btn = crate::widget::button("Uninstall");
     uninstall_btn.add_css_class("quiet");
     uninstall_btn.set_tooltip_text(Some(
@@ -3317,6 +3361,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     action_bar.append(&uninstall_btn);
     action_bar.append(&details_btn);
     action_bar.append(&wine_btn);
+    action_bar.append(&other_btn);
     action_bar.append(&forget_btn);
 
     // ---- the state the page draws itself from
@@ -3394,11 +3439,12 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
         );
         let action_bar_w = action_bar.downgrade();
         let (bar_w, blocked_w) = (bar.downgrade(), blocked.downgrade());
-        let (install_w, uninstall_w, details_w, wine_w, forget_w) = (
+        let (install_w, uninstall_w, details_w, wine_w, other_w, forget_w) = (
             install_btn.downgrade(),
             uninstall_btn.downgrade(),
             details_btn.downgrade(),
             wine_btn.downgrade(),
+            other_btn.downgrade(),
             forget_btn.downgrade(),
         );
         Rc::new(move || {
@@ -3544,7 +3590,11 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 Group::Custom if !app.prefix().is_some_and(|p| p.is_dir()) => Reach::FolderGone,
                 _ => Reach::Reachable,
             };
-            let acts = actions(&state, tobii.as_deref(), &job, reach);
+            // Whether this project has watched this very title stop at the
+            // signature check. One Steam game today; see `Actions::other_client`
+            // for why the offer is not made to the rest.
+            let measured = app.appid().and_then(signature::measured_steam).is_some();
+            let acts = actions(&state, tobii.as_deref(), &job, reach, measured);
             if let Some(btn) = install_w.upgrade() {
                 match acts.primary {
                     Some(a) => {
@@ -3562,6 +3612,9 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             }
             if let Some(btn) = wine_w.upgrade() {
                 btn.set_visible(acts.wine);
+            }
+            if let Some(btn) = other_w.upgrade() {
+                btn.set_visible(acts.other_client);
             }
             if let Some(btn) = forget_w.upgrade() {
                 btn.set_visible(app.group == Group::Custom);
@@ -3648,7 +3701,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 return;
             };
             *outcome.borrow_mut() = None;
-            let argv = install_argv(t, &app.target, None);
+            let argv = install_argv(t, &app.target, &InstallWith::default());
             let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
             start_job(argv, &app.key(), &alive, &running, move |o| {
                 *outcome2.borrow_mut() = Some((id.clone(), o));
@@ -3735,6 +3788,56 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             outcome.clone(),
             alive.clone(),
         );
+        other_btn.connect_clicked(move |b| {
+            let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
+                return;
+            };
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Pick the folder holding the client's NPClient64.dll");
+            dialog.set_modal(true);
+            let (t, refresh, running, outcome, alive) = (
+                t.clone(),
+                refresh.clone(),
+                running.clone(),
+                outcome.clone(),
+                alive.clone(),
+            );
+            // A folder, because that is what `--npclient` takes: the installer
+            // decides which names inside it it needs, and a file picker here
+            // would be this window having a second opinion about that.
+            dialog.select_folder(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+                let Some(dir) = res.ok().and_then(|f| f.path()) else {
+                    return;
+                };
+                *outcome.borrow_mut() = None;
+                let argv = install_argv(
+                    &t,
+                    &app.target,
+                    &InstallWith {
+                        npclient: Some(dir),
+                        ..InstallWith::default()
+                    },
+                );
+                let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
+                start_job(argv, &app.key(), &alive, &running, move |o| {
+                    *outcome2.borrow_mut() = Some((id.clone(), o));
+                    refresh2();
+                });
+                refresh();
+            });
+        });
+    }
+
+    {
+        let (refresh, sel, tobii, running, outcome, alive) = (
+            refresh.clone(),
+            sel.clone(),
+            tobii.clone(),
+            running.clone(),
+            outcome.clone(),
+            alive.clone(),
+        );
         wine_btn.connect_clicked(move |b| {
             let (Some(t), Some(app)) = (tobii.as_ref(), sel.borrow().clone()) else {
                 return;
@@ -3754,7 +3857,14 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                     return;
                 };
                 *outcome.borrow_mut() = None;
-                let argv = install_argv(&t, &app.target, Some(&path));
+                let argv = install_argv(
+                    &t,
+                    &app.target,
+                    &InstallWith {
+                        wine: Some(path),
+                        ..InstallWith::default()
+                    },
+                );
                 let (refresh2, outcome2, id) = (refresh.clone(), outcome.clone(), app.key());
                 start_job(argv, &app.key(), &alive, &running, move |o| {
                     *outcome2.borrow_mut() = Some((id.clone(), o));
@@ -4319,7 +4429,7 @@ mod tests {
             ("a prefix with it", present(), Some(tobii), Reach::Reachable),
         ];
         for (what, state, t, reach) in cases {
-            let a = actions(&state, t, &quiet_job(), reach);
+            let a = actions(&state, t, &quiet_job(), reach, false);
             let has_button = a.primary.is_some() || a.uninstall || a.details || a.wine;
             assert_ne!(
                 has_button,
@@ -4344,8 +4454,13 @@ mod tests {
     /// thing. Each case below is true of every refusal after it.
     #[test]
     fn the_bar_names_the_first_reason_and_not_a_later_one() {
-        let no_tobii_no_prefix =
-            actions(&BridgeState::NoPrefix, None, &quiet_job(), Reach::Reachable);
+        let no_tobii_no_prefix = actions(
+            &BridgeState::NoPrefix,
+            None,
+            &quiet_job(),
+            Reach::Reachable,
+            false,
+        );
         assert!(
             no_tobii_no_prefix
                 .blocked
@@ -4357,6 +4472,7 @@ mod tests {
             None,
             &quiet_job(),
             Reach::NotListedHere,
+            false,
         );
         assert!(
             elsewhere
@@ -4376,14 +4492,33 @@ mod tests {
     #[test]
     fn taking_the_bridge_back_out_is_offered_exactly_where_there_is_something_to_remove() {
         let tobii = Path::new("/usr/bin/tobii");
-        assert!(actions(&present(), Some(tobii), &quiet_job(), Reach::Reachable).uninstall);
-        assert!(!actions(&absent(), Some(tobii), &quiet_job(), Reach::Reachable).uninstall);
+        assert!(
+            actions(
+                &present(),
+                Some(tobii),
+                &quiet_job(),
+                Reach::Reachable,
+                false
+            )
+            .uninstall
+        );
+        assert!(
+            !actions(
+                &absent(),
+                Some(tobii),
+                &quiet_job(),
+                Reach::Reachable,
+                false
+            )
+            .uninstall
+        );
         assert!(
             !actions(
                 &BridgeState::NoPrefix,
                 Some(tobii),
                 &quiet_job(),
-                Reach::Reachable
+                Reach::Reachable,
+                false,
             )
             .uninstall
         );
@@ -4392,6 +4527,76 @@ mod tests {
         assert_eq!(
             argv.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
             vec!["/usr/bin/tobii", "bridge", "uninstall", "--steam", "359320"],
+        );
+    }
+
+    /// The one route measured to get past the signature check is offered to
+    /// the titles measured to stop at it, and to nothing else.
+    ///
+    /// MSFS 2024 calls `NP_GetSignature` and nothing else, for as long as it
+    /// runs; our client cannot answer it and the material that would is not
+    /// ours. A separately installed client can, and this is the button that
+    /// installs one — which is the difference between a user reading a
+    /// paragraph about their problem and being able to do something about it.
+    ///
+    /// Not offered to every game, and that is the load-bearing half. Our
+    /// client is the right default; block 2 already names the route for
+    /// anybody whose game turns out to gate; and a button putting a
+    /// third-party binary into every prefix on the machine would be this page
+    /// recommending something nobody has watched work there — over a game that
+    /// very likely never asks for a signature at all.
+    #[test]
+    fn another_client_is_offered_to_a_measured_title_and_to_no_other() {
+        let tobii = Path::new("/usr/bin/tobii");
+        let bar = |measured| {
+            actions(
+                &absent(),
+                Some(tobii),
+                &quiet_job(),
+                Reach::Reachable,
+                measured,
+            )
+        };
+        assert!(
+            bar(true).other_client,
+            "a title we watched stop at the check"
+        );
+        assert!(!bar(false).other_client, "and not the rest of the machine");
+
+        // And the flag it builds. A DIRECTORY, because that is what the
+        // installer takes — which names inside it are needed is its business.
+        let argv: Vec<String> = install_argv(
+            tobii,
+            &Target::Steam("2537590".to_string()),
+            &InstallWith {
+                npclient: Some(PathBuf::from("/opt/opentrack/win32")),
+                ..InstallWith::default()
+            },
+        )
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "/usr/bin/tobii",
+                "bridge",
+                "install",
+                "--steam",
+                "2537590",
+                "--npclient",
+                "/opt/opentrack/win32"
+            ]
+        );
+
+        // The appid the offer keys on is the one in the measurements, not one
+        // typed here — so the day a third title is measured, the button
+        // follows it.
+        assert!(
+            signature::MEASURED
+                .iter()
+                .any(|m| m.appid == Some("2537590")),
+            "the offer keys on this list, so it has to be in it"
         );
     }
 
@@ -4425,10 +4630,14 @@ mod tests {
 
         // And that is what the installer is pointed at — `--prefix`, never
         // `--steam` with a path after it.
-        let argv: Vec<String> = install_argv(Path::new("/usr/bin/tobii"), &picked.target, None)
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let argv: Vec<String> = install_argv(
+            Path::new("/usr/bin/tobii"),
+            &picked.target,
+            &InstallWith::default(),
+        )
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
         assert_eq!(
             argv,
             vec![
@@ -4507,6 +4716,7 @@ mod tests {
             Some(Path::new("/usr/bin/tobii")),
             &quiet_job(),
             Reach::FolderGone,
+            false,
         );
         assert_eq!(a.primary, None);
         assert!(
@@ -5226,7 +5436,7 @@ mod tests {
         let argv = install_argv(
             Path::new("/usr/bin/tobii"),
             &Target::Steam("359320".to_string()),
-            None,
+            &InstallWith::default(),
         );
         assert!(
             !argv.iter().any(|a| a == "--force"),
@@ -5240,7 +5450,7 @@ mod tests {
         let argv = install_argv(
             Path::new("/usr/bin/tobii"),
             &Target::Steam("359320".to_string()),
-            None,
+            &InstallWith::default(),
         );
         assert_eq!(
             argv,
@@ -5255,13 +5465,16 @@ mod tests {
         let bare = install_argv(
             Path::new("/usr/bin/tobii"),
             &Target::Steam("1".to_string()),
-            None,
+            &InstallWith::default(),
         );
         assert!(!bare.iter().any(|a| a == "--wine"), "{bare:?}");
         let chosen = install_argv(
             Path::new("/usr/bin/tobii"),
             &Target::Steam("1".to_string()),
-            Some(Path::new("/games/Proton 9.0/files/bin/wine")),
+            &InstallWith {
+                wine: Some(PathBuf::from("/games/Proton 9.0/files/bin/wine")),
+                ..InstallWith::default()
+            },
         );
         let tail: Vec<&OsString> = chosen.iter().rev().take(2).collect();
         assert_eq!(tail[1], "--wine");
@@ -6564,7 +6777,7 @@ mod tests {
         // now: `bridge_block` writes the paragraph and says nothing about
         // buttons. Asserted here because this test is about the two agreeing.
         assert!(
-            actions(&present(), None, &quiet_job(), Reach::Reachable)
+            actions(&present(), None, &quiet_job(), Reach::Reachable, false)
                 .primary
                 .is_none(),
             "nothing to run: {without}"
@@ -6745,7 +6958,7 @@ mod tests {
             "359320",
         );
         assert!(
-            actions(&present(), None, &quiet_job(), Reach::Reachable)
+            actions(&present(), None, &quiet_job(), Reach::Reachable, false)
                 .primary
                 .is_none(),
             "nothing to run: {files}"
@@ -6785,11 +6998,15 @@ mod tests {
             Some(Path::new("/opt/x")),
             "359320",
         );
-        assert!(
-            actions(&BridgeState::NoPrefix, None, &quiet_job(), Reach::Reachable)
-                .primary
-                .is_none()
-        );
+        assert!(actions(
+            &BridgeState::NoPrefix,
+            None,
+            &quiet_job(),
+            Reach::Reachable,
+            false
+        )
+        .primary
+        .is_none());
         // Asserted on a phrase both arms of `no_binary_text`'s head share.
         // The old assertion was `!none.contains("not beside this one")`,
         // which stopped being a substring of either arm the moment the head
@@ -7524,7 +7741,7 @@ mod tests {
         let text = bridge_block(&state, &[], &[], None, Some(Path::new("/opt/x")), "359320");
         // The button half is `actions`, which is the one decider: with no
         // `tobii` there is nothing to run, whatever the prefix holds.
-        let bar = actions(&state, None, &quiet_job(), Reach::Reachable);
+        let bar = actions(&state, None, &quiet_job(), Reach::Reachable, false);
         assert_eq!(bar.primary, None, "nothing to run it with: {text}");
         assert!(
             bar.blocked
@@ -7549,6 +7766,7 @@ mod tests {
             Some(Path::new("/home/x/.local/bin/tobii")),
             &quiet_job(),
             Reach::Reachable,
+            false,
         );
         assert_eq!(bar.primary, Some(Action::Install));
         assert_eq!(bar.blocked, None, "{bar:?}");
