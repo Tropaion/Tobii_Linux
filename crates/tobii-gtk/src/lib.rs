@@ -70,6 +70,33 @@ window { background-color: #0d1013; color: #e8ecef; }
 .surface { background-color: #161a1f; border: 1px solid #232a32; border-radius: 12px; }
 .panel-pad { padding: 16px; }
 .hairline { background-color: #232a32; min-height: 1px; }
+
+/* --- the tab box --------------------------------------------------------- */
+/* The two tabs used to be loose buttons in the header, beside the program
+   title, and they read as two more controls in a row of controls rather than
+   as the thing that switches the page under them. They are a tab STRIP now,
+   sitting on the page they switch: the selected tab is filled in the page's
+   own colour, has no bottom edge of its own, and overlaps the page's top
+   border by exactly the 1px that makes the two one shape.
+
+   `.tab-page` is deliberately NOT `.surface`. A card is `#161a1f`, and a page
+   of the same colour swallows the cards standing on it — so the page is a
+   single step up from the window ground and the cards are a step above that.
+   Three levels, and each border still reads. */
+.tab-strip { padding: 0 6px; }
+.tab-strip > button {
+    background-color: transparent; border: 1px solid transparent;
+    border-bottom: none; border-radius: 10px 10px 0 0;
+    padding: 8px 18px; margin-bottom: -1px; color: #8a949d;
+    font-weight: bold; }
+.tab-strip > button:hover { background-color: #12161b; color: #e8ecef; }
+/* `:checked` is what a GtkStackSwitcher sets on the button for the visible
+   page — not `:active`, which is the half-second a pointer is held down. */
+.tab-strip > button:checked {
+    background-color: #11151a; border-color: #232a32;
+    border-bottom: none; color: #e8ecef; }
+.tab-page { background-color: #11151a; border: 1px solid #232a32;
+            border-radius: 0 12px 12px 12px; padding: 16px; }
 /* The same rule stood on end, for the help window's sidebar divider. A
    separate class because `.hairline` states a MINIMUM HEIGHT, and a box that
    is one pixel tall is not a box that is one pixel wide. */
@@ -698,9 +725,22 @@ pub(crate) const EYES_HELP: &str = "If you typically squint or have poor sight i
 /// half they cannot. `help` carries the whole measurement; this is the line
 /// that has to fit on a card.
 ///
+/// # The 48-character bound, and where it comes from
+///
 /// **Under about 48 characters**, which is what fits on one line at the width
-/// this column is narrowest at — see `games::set_up_clause` for the 19px this
-/// rule was written from, and `tests/help_window.rs` for what measures it.
+/// this column is narrowest at. The rule is the record for every short line on
+/// a card, and it is a measurement rather than a preference: a wrapping label
+/// is allocated whatever width it is GIVEN, not the width it asked for, so any
+/// such line wraps at about 350px in the three-column layout the window opens
+/// in and at about 590px with room to spare. A sentence long enough to wrap to
+/// a different number of lines between the two costs a line of card in the only
+/// layout most people will ever see.
+///
+/// It was found at 19px, on the games card, as a clause appended to that card's
+/// status paragraph — `tests/help_window.rs` measures every card at both widths
+/// and is what caught it. That clause is gone; this comment is where the
+/// measurement it produced now lives, because two other lines are written to it
+/// ([`PREVIEW_UNAVAILABLE`], and the card description cap in [`description`]).
 pub(crate) const EYES_CAVEAT: &str = "The tracker may go on detecting both.";
 
 /// The caveat, for a selection that has one.
@@ -1500,13 +1540,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     //
     //   main @ 69cbc2e, one tab, "Set up a game…" on the card   1189 x 776
     //   two tabs, that row deleted                              1189 x 725
-    //   the games card's "n games set up" line added            1189 x 750
+    //   the tabs moved out of the header onto a tab page        1223 x 794
     //
-    // The third row is 25px paid back for a row deleted in the second, and it
-    // buys the one thing the Tracker tab had nothing to say about: whether
-    // there is anything on the other tab. It is a line rather than a clause on
-    // the end of the status paragraph, and `games::set_up_clause` records the
-    // 19px measurement that decided that.
+    // The third row is the tab page's own border and padding, which the window
+    // has to be wide enough for — 34px of width, and 69px of height between
+    // that padding and the tab strip above it. `page_chrome` below measures it
+    // off the widgets rather than repeating the stylesheet's numbers here.
     //
     // **At text scale 1.0, and the test pins it there**, because this machine's
     // saved scale is 1.2 and `load_css` applies it: the same pair measured
@@ -1661,24 +1700,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         "",
         &preview_row,
     ));
-    // How many games have a profile, for the games card's last sentence.
-    //
-    // A cell, counted here and re-counted when the Tracker tab becomes visible
-    // — which is the only moment the card that reads it is on screen. Not on
-    // the 33 ms tick, which is where every other thing this card reports comes
-    // from: that tick re-reads `games.toml`, one small file, and a `readdir` of
-    // the profiles directory beside it thirty times a second is a different
-    // order of cost for a number that changes when somebody runs `tobii games
-    // profile save` in a terminal.
-    let set_up = Rc::new(Cell::new(tobii_config::profiles::list().profiles.len()));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
     // tracker does, not about how this program behaves.
-    let games_row = crate::games::GamesRow::build(
-        joystick_status.clone(),
-        recentring,
-        demand.clone(),
-        set_up.clone(),
-    );
+    let games_row =
+        crate::games::GamesRow::build(joystick_status.clone(), recentring, demand.clone());
     col_games.append(&section(
         "Head tracking for games",
         // One line, and no instructions. Whatever this sentence said about how
@@ -1830,16 +1855,13 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     stack.add_titled(&games_page, Some(TAB_GAMES), "Games");
 
     let header = gtk::Box::new(Orientation::Horizontal, 12);
+    // The title takes the row's slack back. The two tabs were here, beside it,
+    // and beside a title is the one place they could not do their job: a tab
+    // says what page is under it, and there was a header, two banners and a
+    // page margin between these two and anything they switched. They read as
+    // two more buttons in a row of buttons.
+    title.set_hexpand(true);
     header.append(&title);
-    // The switcher takes the `hexpand` the title used to have, so the status
-    // dot, the help button and the cogwheel stay hard right and the two tabs
-    // sit beside the title where a user looks for them.
-    let switcher = gtk::StackSwitcher::new();
-    switcher.set_stack(Some(&stack));
-    switcher.set_hexpand(true);
-    switcher.set_halign(Align::Start);
-    switcher.set_valign(Align::Center);
-    header.append(&switcher);
     header.append(&status_bar);
     // The help window's visible door, and the only one a touch user has: F1 is
     // not discoverable, and a pointer is not the only way people use this. It
@@ -1880,7 +1902,22 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let update_banner = update::banner();
     root.append(&update_banner);
     root.append(&banner);
-    root.append(&stack);
+
+    // The tab box: the strip, and the page it stands on, with nothing between
+    // them. Zero spacing is load-bearing — the selected tab's `margin-bottom:
+    // -1px` has to land on the page's top border for the two to read as one
+    // shape, and a gap here would leave it floating a pixel above it.
+    let tabs = gtk::Box::new(Orientation::Vertical, 0);
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.add_css_class("tab-strip");
+    switcher.set_halign(Align::Start);
+    let page = gtk::Box::new(Orientation::Vertical, 0);
+    page.add_css_class("tab-page");
+    page.append(&stack);
+    tabs.append(&switcher);
+    tabs.append(&page);
+    root.append(&tabs);
 
     // How tall the content wants to be at the width the window will open at.
     // Measured before the window exists, so the window can be built around it.
@@ -1889,7 +1926,15 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // tab cannot raise the width every user opens at. The slack above their
     // minimum goes to the instrument, which is the only thing here that
     // benefits from more.
-    let default_width = (three_col_min + PAGE_MARGIN * 2).max(1180);
+    //
+    // The tab page's own border and padding are in it too, and they are
+    // MEASURED rather than typed: they are set in the stylesheet, and a
+    // number here that had to match a number in the CSS is two places to
+    // change and one to forget. Left out, the window opened 34px too narrow
+    // for its own content and GTK spent the session warning about it.
+    let page_chrome =
+        page.measure(Orientation::Horizontal, -1).0 - stack.measure(Orientation::Horizontal, -1).0;
+    let default_width = (three_col_min + PAGE_MARGIN * 2 + page_chrome).max(1180);
     let (_, natural_height, _, _) = root.measure(Orientation::Vertical, default_width);
 
     // Scroll rather than clip: a short window (or a stacked narrow one) must
@@ -2061,26 +2106,17 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         };
         REFIT.with(|c| *c.borrow_mut() = Some(fit.clone()));
 
-        // On the way back to Tracker: consume a skipped re-fit, and re-count
-        // the profiles the games card reports.
-        //
-        // The re-fit is deliberately not run on every switch — this fires only
-        // when something asked while the other tab was up, so clicking between
-        // tabs still never moves the window. The count is, and it is one
-        // `readdir` of a directory holding a handful of small files: this is
-        // the moment the card that reads it comes back on screen, and the
-        // moment after the one tab that shows what is in that directory was
-        // being looked at.
+        // Consume a skipped re-fit on the way back to Tracker. Deliberately
+        // not a re-fit on every switch: this fires only when something asked
+        // while the other tab was up, so clicking between tabs still never
+        // moves the window.
         {
             let fit = fit.clone();
             let fit_missed = Rc::clone(&fit_missed);
-            let set_up = set_up.clone();
             stack.connect_visible_child_name_notify(move |s| {
-                if s.visible_child_name().as_deref() != Some(TAB_TRACKER) {
-                    return;
-                }
-                set_up.set(tobii_config::profiles::list().profiles.len());
-                if fit_missed.replace(false) {
+                if s.visible_child_name().as_deref() == Some(TAB_TRACKER)
+                    && fit_missed.replace(false)
+                {
                     fit();
                 }
             });
@@ -3583,7 +3619,7 @@ mod tests {
     /// allocated whatever width it is given, so a line long enough to wrap
     /// differently between the width the window opens at and the width a card
     /// is measured at costs a line of card in the layout most people see.
-    /// `games::set_up_clause` records the 19px that taught this.
+    /// [`super::EYES_CAVEAT`] records the 19px that taught this.
     ///
     /// This one cannot be checked by the display tests at all, unlike the
     /// others: they run in a nested `kwin_wayland`, which supports
@@ -3619,7 +3655,7 @@ mod tests {
     /// the width its column is narrowest at and again with room to spare, and
     /// a sentence long enough to wrap differently between the two costs a line
     /// of card in the only layout most people will ever see —
-    /// `tests/help_window.rs` measures exactly that and `games::set_up_clause`
+    /// `tests/help_window.rs` measures exactly that and [`super::EYES_CAVEAT`]
     /// records the 19px it cost when it was found. That test needs a display
     /// and cannot run in CI; this bound can, and it is what keeps the line
     /// short enough for the rule to hold.

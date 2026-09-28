@@ -208,6 +208,11 @@ struct Seen {
     switcher_labels: Vec<String>,
     /// The header's children, by type, in order.
     header_order: Vec<String>,
+    /// The tab box's children, by type, in order, and the spacing between them.
+    tabbox_order: Vec<String>,
+    tabbox_spacing: i32,
+    /// Whether the stack is inside the box directly under the strip.
+    stack_is_under_the_strip: bool,
     widgets: usize,
     widgets_alive_after_quit: usize,
     controllers: usize,
@@ -312,7 +317,30 @@ fn run(app_id: &str, hold: bool) -> Seen {
                         .filter_map(|w| w.downcast::<gtk::Label>().ok())
                         .map(|l| l.text().to_string())
                         .collect();
-                    if let Some(header) = switcher.parent() {
+                    // The tab box: the strip and the page it stands on. The
+                    // switcher's parent is that box now, not the header.
+                    if let Some(tabbox) = switcher.parent() {
+                        let mut c = tabbox.first_child();
+                        while let Some(ch) = c {
+                            s.tabbox_order.push(ch.type_().to_string());
+                            c = ch.next_sibling();
+                        }
+                        if let Some(b) = tabbox.downcast_ref::<gtk::Box>() {
+                            s.tabbox_spacing = b.spacing();
+                        }
+                        s.stack_is_under_the_strip = switcher
+                            .next_sibling()
+                            .map(|page| all(&page).into_iter().any(|w| w.is::<gtk::Stack>()))
+                            .unwrap_or(false);
+                    }
+                    // And the header, which the switcher has left. Found from
+                    // the program title, which is the one thing in it that is
+                    // not going anywhere.
+                    if let Some(header) = all(h.upcast_ref())
+                        .into_iter()
+                        .find(|w| w.has_css_class("app-title"))
+                        .and_then(|t| t.parent())
+                    {
                         let mut c = header.first_child();
                         while let Some(ch) = c {
                             s.header_order.push(ch.type_().to_string());
@@ -631,21 +659,46 @@ fn check(seen: &Seen) {
         "the two words that name the halves of this program, in the order the \
          pages were added: {seen:#?}"
     );
-    // Where it sits: after the title, before everything that is pinned right.
-    // A switcher that drifted to the end of the header would read as two more
-    // icon buttons rather than as a tab bar. `GtkLabel` is the app title,
-    // `GtkBox` the status bar with the pill and the dot, then the help button
-    // and the cogwheel.
+    // Where it sits, which is the whole of what makes it a tab bar rather than
+    // two more buttons.
+    //
+    // It was in the header, beside the program title, and that is the one place
+    // a tab cannot do its job: a tab says what page is under it, and there was
+    // a header, two banners and a page margin between these two and anything
+    // they switched. So the header may no longer contain it at all — `GtkLabel`
+    // is the app title, `GtkBox` the status bar with the pill and the dot, then
+    // the help button and the cogwheel.
     assert_eq!(
         seen.header_order,
         vec![
             "GtkLabel".to_string(),
-            "GtkStackSwitcher".to_string(),
             "GtkBox".to_string(),
             "GtkButton".to_string(),
             "GtkMenuButton".to_string(),
         ],
-        "the switcher is not between the title and the status bar: {seen:#?}"
+        "the switcher is back in the header, where it reads as two more icon \
+         buttons: {seen:#?}"
+    );
+    // And what it sits on: the strip, then the page, adjacent and in that
+    // order.
+    assert_eq!(
+        seen.tabbox_order,
+        vec!["GtkStackSwitcher".to_string(), "GtkBox".to_string()],
+        "the strip and the page it stands on are not the two children of one \
+         box any more: {seen:#?}"
+    );
+    assert!(
+        seen.stack_is_under_the_strip,
+        "the box under the strip does not contain the stack, so whatever the \
+         tabs are sitting on is not the thing they switch: {seen:#?}"
+    );
+    // Zero, and it is load-bearing rather than tidy: the selected tab is drawn
+    // with `margin-bottom: -1px` so that it lands ON the page's top border and
+    // the two read as one shape. Any spacing here leaves it floating a pixel
+    // above the page, which is precisely the detached look this replaced.
+    assert_eq!(
+        seen.tabbox_spacing, 0,
+        "a gap between the tab strip and its page: {seen:#?}"
     );
 
     // 6. The Games tab ADDS no claim on the tracker, and the Tracker tab adds
