@@ -77,27 +77,45 @@ pub fn measured_steam(appid: &str) -> Option<&'static Measured> {
     MEASURED.iter().find(|m| m.appid == Some(appid))
 }
 
-/// The same question for a game nobody bought on Steam, by the name it is
-/// under.
+/// The same question for a game nobody bought on Steam, by the name a row
+/// carries.
 ///
 /// **The other half of [`measured_steam`], and it has to exist.** The first
 /// entry in [`MEASURED`] is Star Citizen, which has no app id — it is not sold
 /// on Steam — and it is the title people ask about and the reason the hub has a
 /// list of games added by hand at all. Keying the offer on the app id alone
-/// withheld it from the one measured game that can only be reached by folder.
+/// withholds it from the one measured game that can only be reached by folder.
 ///
-/// Matched on the name, case-folded and trimmed, and that is a weaker key than
-/// an app id on purpose: a name here is what the PERSON typed when they added
-/// the folder, not what a store spells, so the objection in `measured_steam`'s
-/// test — that a store spells a title differently in different places — does
-/// not carry over. What it costs is that somebody who types "star citizen" for
-/// an unrelated folder is offered a button they do not need, which is a button
-/// too many rather than an install they did not ask for.
+/// # Why the match is loose, and how loose
+///
+/// The name is not typed: the hub derives it from the folder somebody picked,
+/// so a Star Citizen prefix arrives as `StarCitizen`, `star-citizen` or
+/// `Star Citizen LIVE` depending on how they laid their disk out. An exact
+/// comparison matched none of those, which made this function — and the button
+/// it gates — dead code for its only case.
+///
+/// So both sides are reduced to lowercase letters and digits, and a candidate
+/// matches when it CONTAINS the measured title so reduced. `starcitizenlive`
+/// matches `starcitizen`; `sc` does not, and neither does
+/// `robertsspaceindustries`, which is a different name rather than a spelling
+/// of this one.
+///
+/// Erring towards matching is the right way round here, and the asymmetry is
+/// worth stating: a false match offers somebody a button they do not need,
+/// which they can ignore; a false miss withholds the one route past the check
+/// from the game it was measured on, which is what was happening.
 pub fn measured_named(name: &str) -> Option<&'static Measured> {
-    let want = name.trim().to_lowercase();
-    MEASURED
-        .iter()
-        .find(|m| m.title.trim().to_lowercase() == want)
+    let fold = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let want = fold(name);
+    if want.is_empty() {
+        return None;
+    }
+    MEASURED.iter().find(|m| want.contains(&fold(m.title)))
 }
 
 impl Measured {
@@ -356,16 +374,24 @@ mod tests {
     fn the_measured_title_with_no_app_id_is_reachable_by_name() {
         let sc = measured_named("Star Citizen").expect("measured, and not on Steam");
         assert_eq!(sc.appid, None, "which is why the app-id lookup misses it");
-        // Case and surrounding space are the person's typing, not a key.
-        for typed in ["star citizen", "  STAR CITIZEN  "] {
-            assert!(measured_named(typed).is_some(), "{typed:?}");
+        // The shapes a PREFIX FOLDER really has, because that is where the name
+        // comes from — the hub derives it from the directory somebody picked,
+        // and an exact comparison matched none of these, which made this
+        // function and the button it gates dead for its only case.
+        for folder in [
+            "Star Citizen",
+            "star-citizen",
+            "StarCitizen",
+            "star_citizen",
+            "Star Citizen LIVE",
+            "  STAR CITIZEN  ",
+        ] {
+            assert!(measured_named(folder).is_some(), "{folder:?}");
         }
-        assert_eq!(measured_named("Elden Ring"), None);
-        assert_eq!(
-            measured_named(""),
-            None,
-            "and an empty name matches nothing"
-        );
+        // And the limit: a different name rather than a spelling of this one.
+        for other in ["Elden Ring", "robertsspaceindustries", "sc", ""] {
+            assert_eq!(measured_named(other), None, "{other:?}");
+        }
     }
 
     /// `named` carries whatever identifies a title and nothing it has not got,

@@ -901,6 +901,20 @@ pub fn apply_text_scale(scale: f64) {
     }
 }
 
+/// `s` as one shell word: single-quoted, each embedded `'` closed, escaped and
+/// reopened.
+///
+/// Every surface in this program that prints a command for somebody to copy
+/// owes this to every path in it. The update banner learned it first — a folder
+/// with a space in it split an unquoted word in two — and the Games tab's
+/// "what to type instead" paragraph was printing `--prefix /home/x/My Games/…`
+/// unquoted, which is four arguments in a shell and not one. Shared rather than
+/// written twice, because the second copy is where one of them stops being
+/// applied.
+pub(crate) fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// The primary monitor, if one can be resolved.
 fn primary_monitor() -> Option<gtk::gdk::Monitor> {
     gtk::gdk::Display::default()
@@ -3654,7 +3668,15 @@ fn screen_now() -> String {
     // usable serial. Asking the id alone said "No display set up yet." over a
     // completed setup on any machine whose monitor could not be identified.
     crate::screen_pick::setup_line(
-        tobii_config::load().ok().flatten().is_some(),
+        // Three answers, not two. `Ok(Some(_))` is set up, `Ok(None)` is
+        // nothing saved, and `Err` is a file that is there and could not be
+        // read — which `.ok().flatten().is_some()` folded into "nothing saved",
+        // so an unreadable config read as "the tracker has never been told
+        // where the sensor sits".
+        match tobii_config::load() {
+            Ok(saved) => Some(saved.is_some()),
+            Err(_) => None,
+        },
         tobii_config::load_setup_monitor_id()
             .ok()
             .flatten()

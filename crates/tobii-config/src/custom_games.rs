@@ -108,17 +108,6 @@ pub fn path() -> PathBuf {
     paths::config_dir().join(paths::CUSTOM_GAMES)
 }
 
-/// Read the list, in the order the file gives.
-///
-/// A file that is not there is an empty list — nobody has added a game — and
-/// so is a file that cannot be read. This is a convenience, not a setting:
-/// refusing to show the Games tab because a list of nicknames would not open
-/// would be the tail wagging the dog, and the failure is visible the moment
-/// somebody looks for a game that is not in it.
-pub fn list() -> Vec<CustomGame> {
-    list_from(&path())
-}
-
 /// [`list`] over a given file.
 pub fn list_from(file: &Path) -> Vec<CustomGame> {
     let Ok(bytes) = std::fs::read(file) else {
@@ -157,15 +146,19 @@ pub fn parse(bytes: &[u8]) -> Vec<CustomGame> {
         if prefix.contains(&b'\t') {
             continue;
         }
-        // The name is a person's typing and must be text; the path is bytes and
-        // is kept as they are, trimmed of ASCII space only — a trailing space in
-        // a directory name is legal, and stripping it pointed the entry at a
-        // directory that does not exist.
+        // The name is a person's typing and must be text, so it is trimmed.
+        // The path is bytes and is kept EXACTLY as they are: a directory name
+        // may legally begin or end with a space, and trimming pointed the entry
+        // at a directory that does not exist.
+        //
+        // Which leaves the junk line the old trim used to catch — `Name<TAB>
+        // ` — so it is caught here instead, on its own terms: a path that is
+        // nothing but ASCII whitespace is not a path somebody meant to type.
         let Ok(name) = std::str::from_utf8(name) else {
             continue;
         };
         let name = name.trim();
-        if name.is_empty() || prefix.is_empty() {
+        if name.is_empty() || prefix.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
         let game = CustomGame {
@@ -206,11 +199,6 @@ pub fn render(games: &[CustomGame]) -> Vec<u8> {
 const HEADER: &str = "# tobii-linux custom games\n\
                       # One game per line: a name, a TAB, and the Wine prefix it lives in.\n\
                       # `tobii bridge install --prefix <that path>` is what the hub runs for one.\n";
-
-/// Write the list.
-pub fn save(games: &[CustomGame]) -> std::io::Result<()> {
-    save_to(&path(), games)
-}
 
 /// [`save`] to a given file.
 pub fn save_to(file: &Path, games: &[CustomGame]) -> std::io::Result<()> {
@@ -411,6 +399,10 @@ mod tests {
     /// the path is not.
     #[test]
     fn a_path_keeps_its_own_whitespace_and_the_name_does_not() {
+        // A line whose path is nothing but spaces is junk and is skipped — the
+        // old code caught it by trimming the path, which is what stopped a real
+        // directory called `odd ` from surviving the round trip.
+        assert!(parse(b"Name\t   \n").is_empty());
         let g = CustomGame {
             name: "Spacey".to_string(),
             prefix: PathBuf::from("/games/odd /pfx"),

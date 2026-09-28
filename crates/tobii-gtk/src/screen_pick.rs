@@ -66,9 +66,20 @@ pub fn monitor_label(m: &MonitorInfo) -> String {
 ///
 /// Matched on the saved EDID id, which is what is stored, and never on the
 /// model string: two identical monitors share a model and differ by serial.
-pub fn setup_line(set_up: bool, saved: Option<&str>, monitors: &[MonitorInfo]) -> String {
-    if !set_up {
-        return "No display set up yet.".to_string();
+pub fn setup_line(set_up: Option<bool>, saved: Option<&str>, monitors: &[MonitorInfo]) -> String {
+    match set_up {
+        // Nothing saved: nobody has done the setup.
+        Some(false) => return "No display set up yet.".to_string(),
+        // A file is there and this program could not read it — an IO error, or
+        // TOML it cannot parse. Not the same as nothing being there, and the
+        // difference is the whole argument this parameter exists for: "No
+        // display set up yet" is glossed in the help window as "the tracker has
+        // never been told where the sensor sits", which is a confident negative
+        // about a file sitting right there.
+        None => {
+            return "Set up, and this program could not read its own configuration.".to_string()
+        }
+        Some(true) => {}
     }
     let Some(id) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
         // Set up, and the monitor it was set up for cannot be named. The setup
@@ -119,9 +130,16 @@ mod tests {
         let other = mon("Dell", Some("card1-HDMI-1"), Some("DEL1234"));
 
         assert_eq!(
-            setup_line(false, None, std::slice::from_ref(&here)),
+            setup_line(Some(false), None, std::slice::from_ref(&here)),
             "No display set up yet.",
             "nothing saved at all"
+        );
+        // A file that is there and will not read. Folded into the line above,
+        // it told somebody with a config sitting on disk that the tracker had
+        // never been told where the sensor sits.
+        assert_eq!(
+            setup_line(None, Some("SAM0001"), std::slice::from_ref(&here)),
+            "Set up, and this program could not read its own configuration."
         );
         // Set up, and the monitor cannot be named — a panel whose EDID has no
         // usable serial, a VM, a container. This is the case that read as
@@ -131,24 +149,24 @@ mod tests {
         // leaves.
         for id in [None, Some("  ")] {
             assert_eq!(
-                setup_line(true, id, std::slice::from_ref(&here)),
+                setup_line(Some(true), id, std::slice::from_ref(&here)),
                 "Set up, for a monitor this machine cannot name.",
                 "{id:?}"
             );
         }
 
         assert_eq!(
-            setup_line(true, Some("SAM0001"), &[other.clone(), here.clone()]),
+            setup_line(Some(true), Some("SAM0001"), &[other.clone(), here.clone()]),
             "Set up for \u{201c}Odyssey G9\u{201d}.",
             "the monitor by name, picked out of the ones that are plugged in"
         );
         assert_eq!(
-            setup_line(true, Some("SAM0001"), std::slice::from_ref(&other)),
+            setup_line(Some(true), Some("SAM0001"), std::slice::from_ref(&other)),
             "Set up for a monitor that is not connected.",
             "monitors were read and this one is not among them"
         );
         assert_eq!(
-            setup_line(true, Some("SAM0001"), &[]),
+            setup_line(Some(true), Some("SAM0001"), &[]),
             "Set up, but no monitor could be read here.",
             "nothing was read, so nothing may be concluded about what is plugged in"
         );
@@ -168,11 +186,11 @@ mod tests {
         // Both answers name the same words, so the test that means something is
         // that the id decides which row was found — asserted by removing it.
         assert_eq!(
-            setup_line(true, Some("SAM0002"), &[left.clone(), right.clone()]),
+            setup_line(Some(true), Some("SAM0002"), &[left.clone(), right.clone()]),
             "Set up for \u{201c}Odyssey G9\u{201d}."
         );
         assert_eq!(
-            setup_line(true, Some("SAM0002"), std::slice::from_ref(&left)),
+            setup_line(Some(true), Some("SAM0002"), std::slice::from_ref(&left)),
             "Set up for a monitor that is not connected.",
             "the other panel of a matched pair is not this one"
         );

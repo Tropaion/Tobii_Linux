@@ -242,12 +242,7 @@ fn saved_archive(files: &[PathBuf], lead: &str, install: &str) -> String {
     )
 }
 
-/// `s` as one shell word: single-quoted, each embedded `'` closed, escaped and
-/// reopened. The banner's text is a command meant to be copied out and run, and
-/// a folder with a space in it split an unquoted one into two words.
-fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
+use crate::sh_quote;
 
 /// Where a download went, and the one command that installs it.
 ///

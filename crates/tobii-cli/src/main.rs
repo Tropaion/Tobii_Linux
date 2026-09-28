@@ -4148,16 +4148,32 @@ fn setup() -> CmdResult {
 
     let path = tobii_config::config_path();
     tobii_config::save(&s)?;
+    println!("saved config to {}", path.display());
     // BOTH files, as the GUI's own setup flow writes both. The hub's screen
     // card names the monitor from this id, so a CLI setup that wrote only the
     // geometry left the card saying it could not name the monitor — on a
     // machine whose monitor is perfectly nameable, for every session after.
-    // A monitor with no usable EDID id saves `None`, which is the same thing
-    // the flow saves and which the card has its own sentence for.
-    let _ = tobii_config::save_setup_monitor_id(
-        tobii_config::pick_monitor(&monitors).and_then(|m| m.id.as_deref()),
-    );
-    println!("saved config to {}", path.display());
+    //
+    // Only when there IS one to record, and never `None`: `save_setup_monitor_id`
+    // REMOVES the file for `None`, so a run of this command over SSH, or in a
+    // container, or on a panel whose EDID has no serial, would delete an id the
+    // GUI had recorded correctly and leave the card worse than it found it.
+    // And said out loud rather than swallowed, because this overwrites a
+    // monitor the user may have chosen by hand in the GUI flow — which this
+    // command does not ask about — so it has to be visible that it did.
+    match tobii_config::pick_monitor(&monitors).and_then(|m| m.id.as_deref()) {
+        Some(id) => match tobii_config::save_setup_monitor_id(Some(id)) {
+            Ok(()) => println!("recorded this setup against monitor {id}"),
+            Err(e) => eprintln!(
+                "note: config saved, but the monitor it was set up for could not be \
+                 recorded ({e}); the hub will say it cannot name the monitor."
+            ),
+        },
+        None => println!(
+            "note: no monitor could be identified, so nothing was recorded about which one \
+             this setup is for; anything already recorded is left alone."
+        ),
+    }
 
     match UsbTransport::open() {
         Ok(t) => match apply_to_device(t, &c) {

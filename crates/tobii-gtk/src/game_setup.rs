@@ -186,7 +186,10 @@ pub struct Scan {
     /// re-derived for 29 titles every time somebody clicked Games. The comment
     /// on `Catalog` already claimed this machine's prefixes were "a walk each
     /// and deliberately paid once"; this is what makes that true. A prefix
-    /// appears when a game is first launched, which this program never does.
+    /// appears when a game is first launched — which this program never does,
+    /// but the user does, and is told to. [`Scan::forget_prefixes`] is what
+    /// makes the cache a within-one-read memo rather than a claim for the life
+    /// of the process.
     prefix_cache: RefCell<std::collections::HashMap<String, Option<PathBuf>>>,
     /// Where the hand-added games are kept.
     ///
@@ -240,9 +243,17 @@ impl Scan {
         }
     }
 
-    /// The Proton prefix for an app id, asked of the disk once.
+    /// Forget every prefix answer, so the next read asks the disk again.
     ///
-    /// See [`Scan::prefix_cache`].
+    /// Called at the top of `read_catalog`, which is the moment something may
+    /// have changed — see there.
+    pub fn forget_prefixes(&self) {
+        self.prefix_cache.borrow_mut().clear();
+    }
+
+    /// The Proton prefix for an app id, asked of the disk once per read.
+    ///
+    /// See [`Scan::prefix_cache`] and [`Scan::forget_prefixes`].
     pub fn prefix(&self, appid: &str) -> Option<PathBuf> {
         if let Some(hit) = self.prefix_cache.borrow().get(appid) {
             return hit.clone();
@@ -1309,6 +1320,19 @@ pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<Str
     ))
 }
 
+/// Whether [`profile_bridge_note`] prints the signature gate for this answer.
+///
+/// One predicate, two readers, rather than one reader guessing from the other's
+/// words. [`measured_note`] needs to know whether the gate has been said
+/// already, and it used to find out by searching the note for the word
+/// "signature" — a coupling nothing enforced, which a rewording of the gate
+/// would have broken silently and which answered wrongly for
+/// [`profiles::Bridge::NotNeeded`]: a measured game with such a profile printed
+/// "this game does not need the bridge" and the whole gate underneath it.
+pub(crate) fn bridge_says_the_gate(bridge: profiles::Bridge) -> bool {
+    matches!(bridge, profiles::Bridge::Required)
+}
+
 /// What a profile says about the bridge, for block 2.
 ///
 /// [`None`] for [`profiles::Bridge::Unstated`], and that is the whole point of
@@ -1325,9 +1349,15 @@ pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<Str
 /// [`tobii_config::signature::trackir_gate`] rather than written here: `tobii
 /// bridge install` says the same thing in a terminal, and a window that
 /// retyped it is how the two start disagreeing.
+// receives nothing. It is asked of
+/// [`tobii_config::signature::trackir_gate`] rather than written here: `tobii
+/// bridge install` says the same thing in a terminal, and a window that
+/// retyped it is how the two start disagreeing.
 ///
 /// [`provider_note`] is appended after it, for the reason given there.
 pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
+    // `bridge_says_the_gate` is the predicate for "does this arm print the
+    // gate", and this match has to agree with it — see there.
     match bridge {
         profiles::Bridge::Unstated => None,
         profiles::Bridge::Required => Some(format!(
@@ -1359,9 +1389,19 @@ pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
 /// print the gate twice on a game that has both a profile and a measurement.
 pub(crate) fn measured_note(m: Option<&signature::Measured>, already: bool) -> Option<String> {
     let m = m?;
+    // The gate ALREADY names every measurement, this one included — it is
+    // built by interpolating each `clause()` — so printing the clause here and
+    // the gate below it read the same sentence twice in adjacent paragraphs.
+    // What this paragraph adds is that the measurement is about THIS game, so
+    // it says that and lets the gate carry the wording.
     let mut s = format!(
-        "This program has watched this very game meet that check. {}\n\n         So installing our client into this prefix is very unlikely to give it head tracking,          however cleanly it installs. That is what the button offering somebody else's client          is for.",
-        m.clause()
+        "This program has watched this very game meet that check: {}.",
+        m.behaviour
+    );
+    s.push_str(
+        " So installing our client into this prefix is very unlikely to give it head \
+         tracking, however cleanly it installs \u{2014} which is what the button offering \
+         somebody else's client is for.",
     );
     if !already {
         s = format!("{}\n\n{s}", signature::trackir_gate());
@@ -1770,7 +1810,7 @@ pub(crate) fn bridge_block(
 ///
 /// The first element is the program; the rest are its arguments.
 pub(crate) fn install_argv(tobii: &Path, target: &Target, with: &InstallWith) -> Vec<OsString> {
-    let mut v = bridge_argv(tobii, "install", target);
+    let mut v = bridge_argv(tobii, Verb::Install, target);
     if let Some(w) = &with.wine {
         v.push("--wine".into());
         v.push(w.as_os_str().to_os_string());
@@ -1802,7 +1842,7 @@ pub(crate) struct InstallWith {
 /// The argv for `tobii bridge status`, which starts nothing and only reads —
 /// which is why this window is allowed to run it behind a plain button.
 pub(crate) fn status_argv(tobii: &Path, target: &Target) -> Vec<OsString> {
-    bridge_argv(tobii, "status", target)
+    bridge_argv(tobii, Verb::Status, target)
 }
 
 /// What the action bar can do for the game on screen, and what to say when it
@@ -1959,7 +1999,30 @@ pub(crate) fn bridge_action(state: &BridgeState) -> Option<Action> {
 /// between them would be one character away from removing what somebody meant
 /// to install.
 pub(crate) fn uninstall_argv(tobii: &Path, target: &Target) -> Vec<OsString> {
-    bridge_argv(tobii, "uninstall", target)
+    bridge_argv(tobii, Verb::Uninstall, target)
+}
+
+/// Which `tobii bridge` subcommand an argv is for.
+///
+/// A type and not a `&str`, because the doc below says the three stay three
+/// functions so that nothing is "one character away from removing what somebody
+/// meant to install" — and handing the verb over as a string put it back one
+/// character away. `"uninstal"` is not a compile error; this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Install,
+    Uninstall,
+    Status,
+}
+
+impl Verb {
+    fn word(self) -> &'static str {
+        match self {
+            Verb::Install => "install",
+            Verb::Uninstall => "uninstall",
+            Verb::Status => "status",
+        }
+    }
 }
 
 /// `tobii bridge <verb>` pointed at a target — the half the three verbs share.
@@ -1969,11 +2032,11 @@ pub(crate) fn uninstall_argv(tobii: &Path, target: &Target) -> Vec<OsString> {
 /// from removing what somebody meant to install. What is shared here is only
 /// the preamble, which had drifted into three copies that all had to agree the
 /// subcommand is `bridge`.
-fn bridge_argv(tobii: &Path, verb: &str, target: &Target) -> Vec<OsString> {
+fn bridge_argv(tobii: &Path, verb: Verb, target: &Target) -> Vec<OsString> {
     let mut v: Vec<OsString> = vec![
         tobii.as_os_str().to_os_string(),
         "bridge".into(),
-        verb.into(),
+        verb.word().into(),
     ];
     target.push_flag(&mut v);
     v
@@ -2119,7 +2182,8 @@ pub(crate) fn outcome_text(o: &Outcome, after: &BridgeState) -> String {
                 "The installer reported no error, and a stat of the prefix afterwards says \
                  otherwise. {found} This window will not call that an install.\n\n\
                  An exit code is all a program hands back, and one that understood nothing \
-                 and exited zero looks exactly like one that did the work. Press Details to \
+                 and exited zero looks exactly like one that did the work. Press \
+                 {DETAILS_CAPTION} to \
                  see what the prefix holds, and read what this run said below.",
                 found = absent_sentence(&prefix.join(BRIDGE_SUBDIR), present),
             ),
@@ -2131,10 +2195,11 @@ pub(crate) fn outcome_text(o: &Outcome, after: &BridgeState) -> String {
         }
     } else {
         match o.code {
-            None => "The installer stopped before it could report a result — it was killed, \
-                     or it crashed. What it had done by then is not something this window \
-                     can say; press Details to read the prefix as it stands."
-                .to_string(),
+            None => format!(
+                "The installer stopped before it could report a result — it was killed, or it \
+                 crashed. What it had done by then is not something this window can say; press \
+                 {DETAILS_CAPTION} to read the prefix as it stands."
+            ),
             Some(code) if said => format!("The installer stopped, exit status {code}. It said:"),
             // "It said:" with nothing under it is a colon pointing at a gap. A
             // child that exits non-zero having printed nothing at all is the
@@ -2142,7 +2207,8 @@ pub(crate) fn outcome_text(o: &Outcome, after: &BridgeState) -> String {
             // the sentence has to stand on its own.
             Some(code) => format!(
                 "The installer stopped, exit status {code}, and printed nothing at all — no \
-                 error, and no word about what it had done. Press Details to read the prefix \
+                 error, and no word about what it had done. Press {DETAILS_CAPTION} to read \
+                 the prefix \
                  as it stands."
             ),
         }
@@ -2375,7 +2441,11 @@ pub(crate) fn no_binary_text(action: Action, beside: Option<&Path>, target: &Tar
     // pairing `Target::push_flag` exists to make impossible.
     let flag = match target {
         Target::Steam(id) => format!("--steam {id}"),
-        Target::Prefix(p) => format!("--prefix {}", p.display()),
+        // Quoted, because this is a command somebody is about to paste: a
+        // prefix under `My Games` is four shell words unquoted, and `--prefix`
+        // gets the first of them. `install_argv` is unaffected — it builds an
+        // `OsString` argv — so only the half the user acts on was wrong.
+        Target::Prefix(p) => format!("--prefix {}", crate::sh_quote(&p.to_string_lossy())),
     };
     // The first clause is the one that used to be printed over a place
     // nothing had looked at. `tobii_binary` only stats the directory beside
@@ -2413,7 +2483,8 @@ pub(crate) fn no_binary_text(action: Action, beside: Option<&Path>, target: &Tar
         Action::Reinstall => format!(
             "{head}\n\n\
              Until then nothing here can be run against this prefix — neither a reinstall \
-             nor the registry read behind Details, which is why that button is not on the \
+             nor the whole report behind {DETAILS_CAPTION}, which is why that button is not \
+             on the \
              page either:\n\n\
              tobii bridge status {flag}\n\
              tobii bridge install {flag}\n\n\
@@ -3229,6 +3300,15 @@ pub struct GamesTab {
 /// over [`bridge_state`], the same function block 2 is worded from, so a row
 /// saying *bridge installed* and the page it opens cannot disagree.
 fn read_catalog(scan: &Scan) -> Catalog {
+    // The prefix answers go first, and that is not a tidy-up. A prefix appears
+    // when a game is first launched under Proton, and this page's own words are
+    // "run the game once under Proton and come back" — so the one moment the
+    // cache must not survive is the one this function is called at. Kept, it
+    // told a user who had done exactly that that their game had still never
+    // been launched, while block 2 beside it (which asks `Steam` directly)
+    // found the prefix and offered to install into it. The memoisation is for
+    // the many asks WITHIN one read, which is where the cost was.
+    scan.forget_prefixes();
     let listing = profiles::list_from(&scan.profiles_dir, profiles::BUILTIN);
     let custom = tobii_config::custom_games::list_from(&scan.custom_games);
     Catalog::new(
@@ -3360,6 +3440,17 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     let notes = small("");
     notes.add_css_class("section-warn");
     notes.set_visible(false);
+    // What the last press of "Add a game by folder…" said, if it refused.
+    //
+    // Its own label and not `notes`: `rebuild` owns that one and rewrites it
+    // on every keystroke, every tab switch and every successful add, so a
+    // refusal put there was wiped by the next character typed — leaving the
+    // dialog closed, no row added, and nothing on screen. The two also say
+    // different kinds of thing: `notes` is a standing fact about the profiles
+    // directory, this is the answer to something the user just did.
+    let add_said = small("");
+    add_said.add_css_class("section-warn");
+    add_said.set_visible(false);
     // The one control on the list side, under it rather than beside the search
     // box: it is not a way of finding a game, it is a way of adding one that
     // searching can never find. `tobii bridge install --prefix PATH` has always
@@ -3373,6 +3464,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     pick.append(&list_scroll);
     pick.append(&census);
     pick.append(&notes);
+    pick.append(&add_said);
     pick.append(&add_btn);
 
     // ---- the detail pane, state one: nothing picked yet
@@ -3833,9 +3925,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 text.push_str(&note);
             }
             let profile_said = profile.and_then(|p| profile_bridge_note(p.bridge));
-            let said_the_gate = profile_said
-                .as_deref()
-                .is_some_and(|n| n.contains("signature"));
+            let said_the_gate = profile.is_some_and(|p| bridge_says_the_gate(p.bridge));
             if let Some(note) = &profile_said {
                 text.push_str("\n\n");
                 text.push_str(note);
@@ -4289,7 +4379,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             rebuild.clone(),
             refresh.clone(),
         );
-        let (search_w, notes_top) = (search.downgrade(), notes.downgrade());
+        let (search_w, notes_top) = (search.downgrade(), add_said.downgrade());
         add_btn.connect_clicked(move |b| {
             let parent = b.root().and_downcast::<gtk::Window>();
             let dialog = gtk::FileDialog::new();
@@ -7207,6 +7297,44 @@ mod tests {
             !said.contains("The bridge's files are not in it"),
             "the same two files are on disk here too: {said}"
         );
+    }
+
+    /// The gate is printed once, whatever the profile says.
+    ///
+    /// `measured_note` asked whether the profile note had already printed it by
+    /// searching that note for the word "signature". It worked only while one
+    /// sentence of the gate happened to contain the word — reword it and every
+    /// profiled, measured game prints the whole gate twice with no test failing
+    /// — and it answered NO for a profile saying the bridge is NOT needed, so
+    /// such a game read "this game does not need the bridge" followed by the
+    /// full gate. One predicate, two readers.
+    #[test]
+    fn a_measured_game_with_a_profile_is_not_told_the_gate_twice() {
+        let msfs = signature::measured_steam("2537590").expect("measured");
+        for (bridge, says) in [
+            (profiles::Bridge::Required, true),
+            (profiles::Bridge::NotNeeded, false),
+            (profiles::Bridge::Unstated, false),
+        ] {
+            assert_eq!(bridge_says_the_gate(bridge), says, "{bridge:?}");
+            // And the predicate matches what the note actually does.
+            let note = profile_bridge_note(bridge).unwrap_or_default();
+            assert_eq!(
+                note.contains(&signature::trackir_gate()),
+                says,
+                "{bridge:?}: the predicate and the paragraph have to agree: {note}"
+            );
+            // Which is what keeps the page from printing it twice.
+            let whole = format!(
+                "{note}{}",
+                measured_note(Some(msfs), bridge_says_the_gate(bridge)).unwrap_or_default()
+            );
+            assert_eq!(
+                whole.matches(&signature::trackir_gate()).count(),
+                1,
+                "{bridge:?}: the gate is on this page exactly once: {whole}"
+            );
+        }
     }
 
     /// The registry line reports the VALUE and judges nothing.

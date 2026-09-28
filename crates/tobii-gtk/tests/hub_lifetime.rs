@@ -89,6 +89,9 @@ struct Seen {
     widgets_alive: usize,
     controllers: usize,
     controllers_alive: usize,
+    /// The visible tab after each press, so a census that never saw the
+    /// Games tab cannot pass quietly.
+    walked: Vec<Option<String>>,
     /// What is still alive, by type and by any text it carries — a count says
     /// there is a cycle and this says where to start looking.
     survivors: Vec<String>,
@@ -126,12 +129,24 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
             // sees the ones that exist at quit: a cycle in a row's own widgetry
             // would sail through it.
             {
-                let h = hub.clone();
-                at(600, move || press(&h, gtk::gdk::Key::Page_Down));
+                let (h, s) = (hub.clone(), seen.clone());
+                at(600, move || {
+                    press(&h, gtk::gdk::Key::Page_Down);
+                    // Recorded, because the census below is worthless without
+                    // it: if this key stops reaching the controller the Games
+                    // tab is never mapped, its rows are never built, and the
+                    // census weak-references the rows-free tree the reorder
+                    // exists to avoid — while `widgets > 300` stays satisfied
+                    // by the Tracker tab alone and the test goes green.
+                    s.borrow_mut().walked.push(visible_tab(&h));
+                });
             }
             {
-                let h = hub.clone();
-                at(900, move || press(&h, gtk::gdk::Key::Page_Up));
+                let (h, s) = (hub.clone(), seen.clone());
+                at(900, move || {
+                    press(&h, gtk::gdk::Key::Page_Up);
+                    s.borrow_mut().walked.push(visible_tab(&h));
+                });
             }
 
             // The census is taken over the window's CHILD rather than the
@@ -220,6 +235,13 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
         "a step could not run: {:?}\n{s:#?}",
         s.troubles
     );
+    assert_eq!(
+        s.walked.iter().map(Option::as_deref).collect::<Vec<_>>(),
+        vec![Some(tobii_gtk::TAB_GAMES), Some(tobii_gtk::TAB_TRACKER)],
+        "the Ctrl+Page keys did not walk the tabs, so the Games tab was never \
+         mapped and its rows were never built — the census below is over a tree \
+         with no rows in it: {s:#?}"
+    );
     assert!(
         s.widgets > 300 && s.controllers > 10,
         "the census is too small to be the whole hub ({} widgets, {} controllers) — the \
@@ -241,6 +263,26 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
         s.controllers,
         s.survivors,
     );
+}
+
+/// Which tab the hub is showing.
+fn visible_tab(hub: &impl IsA<gtk::Widget>) -> Option<String> {
+    fn find(w: &gtk::Widget) -> Option<gtk::Stack> {
+        if w.widget_name() == tobii_gtk::HUB_STACK_NAME {
+            return w.clone().downcast().ok();
+        }
+        let mut c = w.first_child();
+        while let Some(ch) = c {
+            if let Some(hit) = find(&ch) {
+                return Some(hit);
+            }
+            c = ch.next_sibling();
+        }
+        None
+    }
+    find(hub.as_ref())
+        .and_then(|s| s.visible_child_name())
+        .map(Into::into)
 }
 
 /// Ctrl+`key` on the window's own controllers, the way the window sees it.
