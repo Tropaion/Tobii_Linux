@@ -88,20 +88,41 @@ pinned; see [[Architecture-Decisions]] §18.
 |---|---|---|
 | `tobii-protocol` | 82 | Inline unit tests over captured real frames |
 | `tobii-usb` | 51 | 43 unit + 8 replay (see below) |
-| `tobii-config` | 73 | Unit; SHA-256 cross-checked against coreutils |
+| `tobii-config` | 106 | Unit; SHA-256 cross-checked against coreutils. Includes the profile parser, writer and comment-anchoring |
 | `tobii-headpose` | 112 (+7 ignored) | The ignored ones need the 13 MB model |
 | `tobii-update` | 104 | 96 unit + 8 install end-to-end |
 | `tobii-diagnostics` | 28 | The report and the log; a test fails if it leaks a home path |
-| `tobii-cli` | 225 | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, the Wine-bridge registry against a stateful fake `wine` (and, for the commands that must not run one at all, against a `wine` that wrecks the prefix if it runs), the `user.reg` reader against files real wine wrote, and the wineserver lock's `/proc/locks` parsing |
+| `tobii-cli` | 280 | Argument parsing, text helpers, `tobii uninstall`'s plan and execute on temporary trees, the Wine-bridge registry against a stateful fake `wine` (and, for the commands that must not run one at all, against a `wine` that wrecks the prefix if it runs), the `user.reg` reader against files real wine wrote, and the wineserver lock's `/proc/locks` parsing |
 | `tobii-ipc` | 42 | 33 unit + 9 in `tests/roundtrip.rs` |
 | `tobii-output` | 142 (+1 ignored) | Unit |
-| `tobii-gtk` | 308 (+5 ignored) | Inline; pure logic split out from widget code. The ignored five need a display — four of them whole integration tests (`tests/`), including the one that drives the real hub and the real help window |
+| `tobii-gtk` | 367 (+6 ignored) | Inline; pure logic split out from widget code. The ignored six need a display — five of them whole integration tests (`tests/`), including the ones that drive the real hub, the real help window and the real game-setup window |
 | `tobii-recap` | 32 | 29 unit + 3 integration |
-| **Total** | **1199 (+13 ignored)** | |
+| `tobii-steam` | 18 | Unit, over Steam manifest and library-folder text |
+| `tobii-gameconf` | 49 | 48 unit + `tests/writes_nothing.rs`, one test that walks a fixture tree and fails if any byte of it moves |
+| **Total** | **1413 (+14 ignored)** | |
 
-Counted with `cargo test -p <crate>`, not from memory: this table said "41 unit
-+ 6 replay" for `tobii-usb` long after both numbers had moved, which is the
-failure mode of every hand-maintained count.
+The `tobii-cli` figure is a count of tests, not a count of passing ones: see
+[[Quality-and-Risks]] §11.3k for the one in that crate that currently fails,
+and why.
+
+Counted with `cargo test -p <crate>` on 2026-09-28, not from memory: this table
+said "41 unit + 6 replay" for `tobii-usb` long after both numbers had moved,
+which is the failure mode of every hand-maintained count. Re-measure the whole
+column with:
+
+```sh
+cargo test --workspace --offline --locked 2>&1 | grep -E 'Running|test result'
+```
+
+The ignored 14 are 7 in `tobii-headpose` (they need the 13 MB model), 1 in
+`tobii-output`, and 6 in `tobii-gtk` (they need a display). CI runs as root
+with no display, which is why the display tests are `#[ignore]`d rather than
+skipped at runtime; run them under a nested compositor, never the session's:
+
+```sh
+kwin_wayland --virtual --width 1600 --height 1200 --socket wl-test &
+WAYLAND_DISPLAY=wl-test cargo test -p tobii-gtk -- --ignored
+```
 
 There are almost no integration-test directories: the convention is inline
 `#[cfg(test)]` modules next to the code, with pure logic deliberately factored

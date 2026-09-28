@@ -126,15 +126,15 @@ Five decisions that shape everything else. Each is expanded in
 
 ### Level 1 — the workspace
 
-Eleven crates, one acyclic dependency graph, ~75,700 lines. Counts measured
-with `find crates -name '*.rs' | xargs wc -l`, September 2026 — every figure in
+Thirteen crates, one acyclic dependency graph, 92,833 lines. Counts measured
+with `find crates -name '*.rs' | xargs wc -l` on 2026-09-28 — every figure in
 this diagram had gone stale before, which is what a hand-maintained count does.
 
 ```
-                    tobii-protocol  (3,549)  no dependencies at all
-                     ▲    ▲     ▲                tobii-ipc (1,917)
-        ┌────────────┘    │     └──────────────┐  no dependencies either
-   tobii-usb (2,342)  tobii-config (2,677)  tobii-recap (1,600)
+                    tobii-protocol  (3,552)  no dependencies at all
+                     ▲    ▲     ▲
+        ┌────────────┘    │     └──────────────┐
+   tobii-usb (2,346)  tobii-config (5,341)  tobii-recap (1,600)
         ▲                ▲     ▲
         │      ┌─────────┘     └──────────┐
         │  tobii-headpose (5,659)   tobii-update (5,956)
@@ -145,8 +145,24 @@ this diagram had gone stale before, which is what a hand-maintained count does.
         │      │      │            ▲
         └──────┴──────┴────────────┴──────┐
                           │                │
-          tobii-cli (18,166)      tobii-gtk (24,483)
+          tobii-cli (21,555)      tobii-gtk (30,129)
 ```
+
+Three crates hang off the two top-level binaries with **no dependencies at
+all**, internal or external, and are drawn separately because an edge from each
+to its users would cross the whole graph:
+
+```
+   tobii-ipc      (1,917)  ──▶ tobii-cli, tobii-gtk
+   tobii-steam    (1,107)  ──▶ tobii-cli, tobii-gtk
+   tobii-gameconf (4,353)  ──▶ tobii-gtk
+```
+
+Dependency-freedom is load-bearing for the last two rather than incidental:
+`tobii-steam` stays callable from the hub without dragging the CLI's world
+along, and `tobii-gameconf` — the crate that reads other people's game files —
+keeps a surface small enough that "it cannot write anything" is a claim a
+reader can check rather than take on trust.
 
 | Crate | Responsibility | Notable |
 |---|---|---|
@@ -157,10 +173,12 @@ this diagram had gone stale before, which is what a hand-maintained count does.
 | `tobii-update` | Release checking, download integrity, installation with rollback. | All network access funnels through `net.rs`. No signature — see [[Quality-and-Risks]]. |
 | `tobii-diagnostics` | The `tobii debug` report, its redaction, and the log the report quotes. | Its own tests fail if a home path, hostname or raw monitor id reaches the output. |
 | `tobii-cli` | The `tobii` binary: user commands *and* the protocol diagnostics used to do the reverse engineering. | Five modules since the Wine bridge and `tobii uninstall` landed (`main.rs`, `bridge.rs`, `userreg.rs`, `wineserver.rs`, `uninstall.rs`); hand-rolled argument matching throughout. |
-| `tobii-gtk` | The hub, the guided flows, the overlay, and the one device thread. | 32% of the workspace. |
+| `tobii-gtk` | The hub, the guided flows, the game-setup window, the overlay, and the one device thread. | 32% of the workspace. |
 | `tobii-recap` | Decodes a usbmon pcap into a TTP op catalog. | Offline tool; how the protocol was mapped in the first place. |
 | `tobii-ipc` | The socket the hub serves tracking data on: its path, the framed codec, the server and the client. | No workspace dependencies at all, so both ends of the socket share one codec. |
 | `tobii-output` | Game output: the `games.toml` settings, the compose pipeline (Extended View, neutral, recentre), the opentrack port watch, and the sinks — UDP, virtual joystick, TrackIR/FreeTrack bridge. | Cross-compiles to `x86_64-pc-windows-gnu` for the Wine bridge, which is why the `/proc` watch is behind `cfg(target_os = "linux")`. |
+| `tobii-steam` | Reading Valve's own files: library folders, installed application manifests, and where a title's Proton prefix is. | No dependencies, internal or external. It reports what Steam's files say and knows nothing about any particular game. |
+| `tobii-gameconf` | Two read-only readers for a game's own configuration: `binds` (a directory of Elite Dangerous-style preset documents) and `attrs` (a flat `<Attributes>` document). | **Never writes, and that is the whole promise.** No dependencies, no `unsafe`, and `tests/writes_nothing.rs` fails if any byte of a fixture tree moves. It knows two file formats and no games: which file and which setting is a profile's business, and this project ships no profiles. A value it cannot decode exactly is `Rejected`, never reported as absent. |
 
 ### Level 2 — the pieces that carry the design
 

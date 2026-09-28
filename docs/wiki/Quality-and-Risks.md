@@ -1208,6 +1208,108 @@ what belongs here is how much of it is measured and how much is reasoning.
   for every subcommand, and `games`, which reads no flags at all, refuses them
   too.
 
+### 11.3k Per-game setup: the window, the profile format, and the game nobody has played yet (new in v0.5.0)
+
+The hub gained **Set up a game…**, a window that lists installed Steam titles
+and, for one of them, the three things that have to be configured: this
+program's settings, the Wine bridge in that game's Proton prefix, and the
+game's own configuration files. The third is answered from a **profile** —
+`$XDG_CONFIG_HOME/tobii-linux/profiles/<appid>.toml` — authored by
+`tobii games profile save|apply|show|forget` and
+`tobii games profile check where|add|remove`. The format and the authoring
+walkthrough are in [[Game-Profiles]]; what belongs here is the distance between
+what is tested and what is known.
+
+- **The headline: no profile has ever been verified against a running game.**
+  Not one. `profiles::BUILTIN` is empty, every user is on day one, and this
+  project's first per-game fact does not exist yet. Everything below about
+  parsing, writing, anchoring and reporting is machinery exercised on
+  **fixtures and hand-made files**, never on a claim somebody confirmed by
+  playing. The plan — play Elite Dangerous once with the bridge running and
+  write down what changed — has not been carried out.
+- **What is measured about the readers.** `tobii-gameconf` is 49 tests, and its
+  `binds` format was read off **30 real `.binds` documents** on one machine:
+  26 with a byte-order mark and 4 without, 4 with mixed line endings, 2 naming
+  a schema version and 28 naming none. All 30 answer
+  `Bindings_HeadlookModeAccumulate` for `HeadlookMode` — counted, not sampled,
+  and re-measured on 2026-09-28 with
+  `cargo run -p tobii-gameconf --example read -- presets <ControlSchemes> HeadlookMode`.
+  Nothing in CI has those files, so no test holds those numbers; that example
+  is what re-takes them.
+- **What is NOT measured about the readers: the directory convention.** This is
+  the honest limit. The one Elite Dangerous install on this machine has a
+  populated Proton prefix (`compatdata/359320/pfx`) and **no Frontier user
+  directory, and no `Options` or `Bindings` directory anywhere inside it** —
+  confirmed again on 2026-09-28. So the path a real check would name has never
+  been observed, and the example path printed by `tobii games profile check` is
+  an **illustration of the shape, not a verified location.** What the empty
+  prefix does exercise is the case a user most often hits first: a game that
+  has saved nothing must be reported as exactly that, with a sentence, and
+  never as a game whose settings are fine.
+- **A check can never reach a game's install directory, by construction.**
+  `path` is relative to the prefix, and `check_path` refuses a leading `/`, a
+  `..` component and a backslash at the line that held it. Elite's 30 shipped
+  presets live under `steamapps/common/`, which is the Steam library and not
+  the prefix, so **no profile this build can parse can name one of them.** That
+  is a deliberate containment choice — a profile is a hand-edited file whose
+  path is joined onto a prefix and then opened — and its cost is that the files
+  which would prove the Accumulate default are exactly the files out of reach.
+- **The bridge-install path inside this window has never run against a real
+  game launch.** The window can install the bridge into a prefix, and block 2's
+  reporting was corrected this round so that the page and the install report
+  count the same files (only `freetrackclient64.dll` is required; the other two
+  are optional and the installer says `skipping`). But no game has been started
+  from this window afterwards to see whether it loads anything. §11.3j's
+  conclusion stands unchanged and applies here: **the only title ever measured
+  against NaturalPoint's signature check rejected our `NPClient64.dll`**, and
+  nothing in this window may be read as evidence that any game accepts it. The
+  verified route remains FreeTrack.
+- **The window is display-tested for lifecycle, not for the correctness of what
+  it says.** `tests/game_setup_window.rs` opens it, closes it, and asserts it
+  frees itself and takes no claim on the tracker — run under a nested
+  `kwin_wayland --virtual`, and `#[ignore]`d because CI has no display. Every
+  claim about the *text* is a unit test over the string-building functions.
+  That is a real seam: a sentence can be correct in `bridge_block` and never
+  reach a user because the widget wiring changed.
+- **Comment provenance is the format's only memory, and it is newly
+  load-bearing.** A `[[check]]` has no field for who verified it, when, or
+  against which build of the game. The one place that can live is a `#` line,
+  so the editing commands preserve comments across a rewrite and anchor a
+  check's note to **what the check reads** (`format` + `path` + `setting`)
+  rather than to its position. When an anchor is gone the write proceeds and
+  the comment is printed back in full — **that printout is then the only copy
+  in existence.** A profile this build cannot read is the one remaining
+  refusal.
+- **A known, reproduced defect in exactly that mechanism.** A comment written
+  *after a value on that value's own line* — `format = "binds-dir" # a note` —
+  is dropped by `check remove` **and does not appear in the report**: the
+  reporting path inspects whole-line comments only, while the writer now
+  orphans end-of-line ones too. Observed on 2026-09-28 on the merged tree — the
+  command exits 0, writes the file, and the note is in neither the file nor the
+  output. This is precisely the failure the comment mechanism exists to
+  prevent. The writer hands every orphan back through `save_to`'s return value;
+  the CLI does not yet take it. Until it does, provenance notes belong on
+  **their own line**, which is the form every command here tells you to write.
+- **Two changes landed this round that no longer agree, and the workspace does
+  not build with both.** The CLI grew a loop that strips an orphaned comment
+  and retries, matching on `profiles::CommentLoss`; the config crate deleted
+  `CommentLoss` and made the same write succeed-and-report instead. Merged,
+  `tobii-cli` does not compile, and with the compile error mechanically
+  resolved one test
+  (`a_write_this_still_refuses_names_the_file_once_and_is_not_called_an_io_failure`)
+  fails, because it pins a refusal that is deliberately no longer a refusal.
+  Both changes are individually right and individually tested; neither author
+  could see the other's. This is the **fifth consecutive round** in which two
+  groups' work merged cleanly and did not compose — see §11.5.
+- **What the fix reports themselves list as not done.** `Orphans` is not
+  `#[must_use]`, which is the marking that would make silently dropping a
+  comment impossible; `save_to`'s `Unreadable` branch has no end-to-end
+  coverage through the CLI, because all three callers refuse earlier;
+  `profiles::shipped_profiles()` exists so that the "this build ships …"
+  sentence has a single owner, but **nothing calls it** — the hub and the help
+  window still spell it out by hand, so that count lives in three places and
+  the function is not yet one of them.
+
 ### 11.4 Environmental
 
 - **Glyph clipping at fractional display scale.** Tops of tall glyphs appear
