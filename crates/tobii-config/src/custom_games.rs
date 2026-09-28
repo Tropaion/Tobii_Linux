@@ -108,7 +108,12 @@ pub fn path() -> PathBuf {
     paths::config_dir().join(paths::CUSTOM_GAMES)
 }
 
-/// [`list`] over a given file.
+/// Every custom game recorded in `path`, in the order they are written.
+///
+/// A file that is not there is an empty list, not an error: nobody has added
+/// one yet, which is the ordinary state. Neither is a file that will not read
+/// — refusing to show the Games tab because a list of nicknames would not open
+/// would be the tail wagging the dog.
 pub fn list_from(file: &Path) -> Vec<CustomGame> {
     let Ok(bytes) = std::fs::read(file) else {
         return Vec::new();
@@ -200,7 +205,10 @@ const HEADER: &str = "# tobii-linux custom games\n\
                       # One game per line: a name, a TAB, and the Wine prefix it lives in.\n\
                       # `tobii bridge install --prefix <that path>` is what the hub runs for one.\n";
 
-/// [`save`] to a given file.
+/// Write `games` to `path`, replacing whatever is there.
+///
+/// Byte-exact: see [`render`], which is what makes a prefix this program
+/// cannot decode survive a round trip through the hub.
 pub fn save_to(file: &Path, games: &[CustomGame]) -> std::io::Result<()> {
     crate::write_atomic(file, &render(games))
 }

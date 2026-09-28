@@ -23,10 +23,13 @@
 //!   the system wine to write two values could rewrite a Proton prefix out from
 //!   under the game that owns it. Steam records the answer in the prefix's own
 //!   `config_info`, and that is what [`wine_from_steam_config_info`] reads.
-//! * The one remaining case that needs `tobii bridge run`: a TrackIR game
-//!   pointed at a third-party client DLL. That DLL is a pure consumer of
+//! * The one case that still wants `tobii bridge run`: a TrackIR game pointed
+//!   at a third-party client DLL. That DLL is a pure consumer of
 //!   `FT_SharedMem`, and a TrackIR-only game never loads ours — so something
-//!   must fill the mapping, in the game's own session.
+//!   must fill the mapping, in the game's own session. **Which is why that case
+//!   has no answer under Proton**, by the paragraph above: a provider started
+//!   from a terminal is a different session. See [`third_party_needs`], which
+//!   is what the install output says about it.
 //!
 //! # What this command promises about the registry, and what it refuses to
 //!
@@ -1100,7 +1103,7 @@ fn read_keys_read_only(prefix: &Path) -> (Vec<(KeyEntry, Reading)>, Option<Strin
         };
         out.push((
             entry,
-            match tobii_config::userreg::lookup(&text, path, "Path") {
+            match tobii_config::userreg::lookup(&text, path, tobii_config::userreg::PATH_VALUE) {
                 tobii_config::userreg::Lookup::Absent => Reading::Absent,
                 tobii_config::userreg::Lookup::Text(v) => Reading::Plain(v),
                 tobii_config::userreg::Lookup::Rejected(why) => Reading::Other(why),
@@ -1584,6 +1587,66 @@ fn refusal(prefix: &Path, wine: &Path, origin: WineOrigin, taken: &[Taken]) -> S
     msg
 }
 
+/// What a third-party TrackIR client still needs behind it, and whether this
+/// prefix can supply it.
+///
+/// # The sentence this replaces was false for the case it was printed in
+///
+/// It read *"For TrackIR through that third-party client you must also run:
+/// `tobii bridge run --prefix …`"*, unconditionally. This module's own opening
+/// paragraph says why that cannot be right for a Steam title: a Proton game has
+/// its own wineserver, a provider started from a terminal is a different
+/// session, its `FT_SharedMem` is a different object, and the game never sees
+/// it. `bridge/core/src/feeder.rs` records the same measurement, and it is the
+/// reason the receive loop lives in the DLL at all.
+///
+/// So the old line sent exactly the user who has no other route to run a
+/// command that could not help them, and then to conclude the bridge was broken
+/// when it did not. The hub's own paragraph had the same defect and was
+/// corrected with it.
+///
+/// `proton` is passed rather than derived so the two ways of recognising one —
+/// `--steam`, and a `config_info` beside the prefix — stay at the call site
+/// where both are in hand, and so this is testable without a prefix on disk.
+fn third_party_needs(proton: bool, prefix: &Path) -> String {
+    // The half that is true either way, and it is the half that matters: the
+    // client just registered is a consumer. Something else fills the mapping.
+    let head = "That client is a plain consumer of the shared memory our own DLLs create,\n\
+                and a TrackIR-only game never loads ours — so something inside the game's\n\
+                own wineserver session has to fill it.\n\n";
+    if proton {
+        return format!(
+            "{head}\
+             For a Steam title under Proton, `tobii bridge run` cannot be that. Started\n\
+             from a terminal it is a different wineserver session: its FT_SharedMem is a\n\
+             different object and the game never sees it, which is why our own DLL\n\
+             carries the receive loop inside the game's own process instead.\n\
+             \n\
+             You have just pointed the game at somebody else's DLL, so that is gone.\n\
+             This registration is worth trying only if something else in the game's own\n\
+             session fills the mapping. Whether anything does, on any particular game,\n\
+             is not something this project has watched.\n\
+             FreeTrack games need nothing running."
+        );
+    }
+    format!(
+        "{head}\
+         On this prefix a separate provider can be that, because it is not Proton's:\n  \
+         tobii bridge run --prefix {p}\n\
+         It has to be the same wine build that runs the game, or it is a second\n\
+         wineserver and the game sees nothing — the warning above says so if they\n\
+         differ.\n\
+         \n\
+         Start the game FIRST and that command second. While it runs it is a\n\
+         wineserver on this prefix, and Steam waits for every wineserver on a\n\
+         prefix to exit before it spawns the game — so a bridge started first\n\
+         leaves the launch sitting there. The command says this before it starts,\n\
+         and stops itself if a launch starts waiting behind it.\n\
+         FreeTrack games need nothing running.",
+        p = shell_quoted(prefix)
+    )
+}
+
 /// What `--force` replaced, in the words `--force` was given in: what was
 /// there is gone, and nothing here will bring it back.
 ///
@@ -1869,20 +1932,11 @@ fn install(args: &[String]) -> CmdResult {
     print!("{}", replaced(&taken));
     println!();
     if third_party_np {
-        println!(
-            "For TrackIR through that third-party client you must also run:\n  \
-             tobii bridge run --prefix {}\n\
-             It is a plain consumer of the shared memory our own DLLs create, and a\n\
-             TrackIR-only game never loads ours — so something has to fill it.\n\
-             \n\
-             Start the game FIRST and that command second. While it runs it is a\n\
-             wineserver on this prefix, and Steam waits for every wineserver on a\n\
-             prefix to exit before it spawns the game — so a bridge started first\n\
-             leaves the launch sitting there. The command says this before it starts,\n\
-             and stops itself if a launch starts waiting behind it.\n\
-             FreeTrack games need nothing running.",
-            prefix.display()
-        );
+        // Which client fills the mapping, and -- the part that was wrong until
+        // now -- whether anything outside the game can. See `third_party_needs`.
+        let proton = matches!(source, PrefixSource::Steam(_))
+            || wine_from_steam_config_info(&prefix).is_some();
+        println!("{}", third_party_needs(proton, &prefix));
     } else {
         println!(
             "Nothing else to run. The DLL receives tracking itself, inside the game's\n\
@@ -5875,6 +5929,99 @@ exit 0
             assert!(
                 hkcu_path(key).is_some(),
                 "{abi} ({key}) is not under HKCU, so it is not in user.reg"
+            );
+        }
+    }
+
+    /// The two key paths this file spells and the two `tobii-config` spells are
+    /// the same two paths.
+    ///
+    /// They were one constant each until the hub needed to read the registry
+    /// too, and a `[[bin]]` cannot be linked — so the reader moved to
+    /// `tobii-config` and took a copy of the spellings with it. Nothing tied
+    /// the copies together. `userreg`'s own doc states the stake: one character
+    /// wrong reads as "nothing is registered", which is a confident negative
+    /// about the single fact that decides whether a game loads anything, and
+    /// the two surfaces would then answer opposite questions about one prefix
+    /// with every test still green.
+    ///
+    /// Asserted rather than deduplicated because the two spellings are not
+    /// interchangeable: these carry the `HKCU\` prefix that `reg add` needs on
+    /// its argv, and `tobii-config` reads a file in which the section has no
+    /// prefix at all.
+    #[test]
+    fn this_files_key_paths_are_tobii_configs_key_paths() {
+        assert_eq!(
+            hkcu_path(NP_KEY),
+            Some(tobii_config::userreg::NPCLIENT_KEY),
+            "the TrackIR key is spelled differently here and in tobii-config"
+        );
+        assert_eq!(
+            hkcu_path(FT_KEY),
+            Some(tobii_config::userreg::FREETRACK_KEY),
+            "the FreeTrack key is spelled differently here and in tobii-config"
+        );
+    }
+
+    /// A prefix Proton serves is not told to run a provider beside the game,
+    /// because it cannot work there.
+    ///
+    /// This is the same defect the hub's own paragraph had, fixed in the same
+    /// pass: `tobii bridge run` fills `FT_SharedMem` in the session it runs in,
+    /// and a Steam game under Proton is a different session — this module's
+    /// opening paragraph and `bridge/core/src/feeder.rs` both record it. The
+    /// line was printed unconditionally, so the one user with no other route
+    /// was sent to a command that could not reach their game, and left to
+    /// conclude the bridge was broken when it did not.
+    ///
+    /// The prefix used here has a space in it, which is the other half: this is
+    /// the one line in the output whose whole job is to be pasted, and an
+    /// unquoted Steam library path pastes back as four arguments.
+    #[test]
+    fn only_a_prefix_proton_does_not_serve_is_told_to_run_a_provider() {
+        let dir = "/run/media/My Games/SteamLibrary/steamapps/compatdata/2537590/pfx";
+        let p = std::path::Path::new(dir);
+        let (proton, plain) = (third_party_needs(true, p), third_party_needs(false, p));
+
+        // Named, but never as something to paste. The distinction is the whole
+        // correction: a reader who has heard of `tobii bridge run` is owed the
+        // sentence saying it will not reach their game, and a reader who has
+        // not must never be handed an invocation of it here.
+        assert!(
+            !proton.contains("tobii bridge run --prefix"),
+            "a Proton prefix is handed a command that cannot reach its game:\n{proton}"
+        );
+        assert!(
+            proton.contains("`tobii bridge run` cannot be that"),
+            "and the command is not named as the thing that will not work, so a reader \
+             who has heard of it elsewhere is left believing it:\n{proton}"
+        );
+        assert!(
+            proton.contains("different wineserver session") && proton.contains("never sees it"),
+            "without the reason it reads as a refusal rather than a fact:\n{proton}"
+        );
+
+        assert!(
+            plain.contains("tobii bridge run --prefix "),
+            "a prefix where a provider does work is not told about it:\n{plain}"
+        );
+        assert!(
+            plain.contains(&format!("--prefix '{dir}'")),
+            "the one line meant to be pasted is not quoted, so a library path with a \
+             space in it pastes back as four arguments:\n{plain}"
+        );
+
+        // The half that is true either way. A reader who takes only one
+        // sentence from this should take this one: the DLL just registered
+        // does not fill the mapping, whatever else is or is not possible.
+        for t in [&proton, &plain] {
+            assert!(
+                t.contains("plain consumer") && t.contains("has to fill it"),
+                "the consumer/provider split is the whole point and is missing:\n{t}"
+            );
+            assert!(
+                t.contains("FreeTrack games need nothing running"),
+                "the FreeTrack reader loses the line that tells them to stop reading:\n{t}"
             );
         }
     }

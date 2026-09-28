@@ -366,7 +366,7 @@ pub fn topics() -> Vec<Topic> {
                  The buttons under the page act on the Wine bridge and on \
                  nothing else. Install puts it into the prefix, Reinstall does it \
                  again over what is there, Uninstall takes it back out, and \
-                 and the last runs `tobii bridge status` and prints its whole \
+                 \u{201c}{details}\u{201d} runs `tobii bridge status` and prints its whole \
                  report without starting anything. When there is nothing to press, the \
                  bar says why instead of going blank.\n\n\
                  \u{201c}{other}\u{201d} appears for a game this \
@@ -435,6 +435,7 @@ pub fn topics() -> Vec<Topic> {
                 elsewhere = crate::game_setup::Group::Elsewhere.heading(),
                 custom = crate::game_setup::Group::Custom.heading(),
                 add_btn = crate::game_setup::ADD_GAME_CAPTION,
+                details = crate::game_setup::DETAILS_CAPTION,
                 forget = crate::game_setup::FORGET_CAPTION,
                 other = crate::game_setup::OTHER_CLIENT_CAPTION,
             ),

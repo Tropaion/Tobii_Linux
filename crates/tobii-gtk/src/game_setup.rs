@@ -1350,10 +1350,6 @@ pub(crate) fn bridge_says_the_gate(bridge: profiles::Bridge) -> bool {
 /// [`tobii_config::signature::trackir_gate`] rather than written here: `tobii
 /// bridge install` says the same thing in a terminal, and a window that
 /// retyped it is how the two start disagreeing.
-// receives nothing. It is asked of
-/// [`tobii_config::signature::trackir_gate`] rather than written here: `tobii
-/// bridge install` says the same thing in a terminal, and a window that
-/// retyped it is how the two start disagreeing.
 ///
 /// [`provider_note`] is appended after it, for the reason given there.
 pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {

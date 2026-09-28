@@ -112,9 +112,6 @@ pub fn measured_named(name: &str) -> Option<&'static Measured> {
             .collect()
     };
     let want = fold(name);
-    if want.is_empty() {
-        return None;
-    }
     MEASURED.iter().find(|m| want.contains(&fold(m.title)))
 }
 

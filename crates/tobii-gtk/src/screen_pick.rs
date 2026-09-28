@@ -46,6 +46,28 @@ pub fn monitor_label(m: &MonitorInfo) -> String {
     "Unknown display".to_string()
 }
 
+/// What the saved configuration says, before the monitor it names is looked up.
+///
+/// Three answers and not two, and the third is why this is not a `bool`. A
+/// configuration file that is *there* and will not parse is not the same thing
+/// as no configuration at all, and folding them said "No display set up yet."
+/// — glossed in the help window as "the tracker has never been told where the
+/// sensor sits" — over a file sitting on disk.
+///
+/// Named rather than spelled `Option<bool>`, which is what it was: `Some(false)`
+/// meant "nothing saved" and `None` meant "unreadable", the least guessable
+/// spelling available for either, and every call site had to carry a comment
+/// saying so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    /// A configuration is saved and was read.
+    Done,
+    /// Nothing is saved: nobody has run the setup here.
+    Never,
+    /// Something is saved and this program could not read it.
+    Unreadable,
+}
+
 /// What the "Change screen" card says it is set up for.
 ///
 /// The card's description was *"Needed if the sensor moves to another
@@ -56,30 +78,29 @@ pub fn monitor_label(m: &MonitorInfo) -> String {
 /// not lost: it is in the help topic, with the consequence there was no room
 /// for on a card.
 ///
-/// Four answers and not three, and the fourth is the reason this is not two
-/// lines of `if`. A saved id that matches nothing is *"not connected"* only
-/// when there were monitors to compare it against; with none read at all —
-/// no `/sys/class/drm`, a container, a permission — "that monitor is not
-/// connected" is a confident negative about hardware this program could not
-/// look at, which is the one shape of claim the rest of this tree is written
-/// against.
+/// Five answers, and the fifth is the reason this is not two lines of `if`. A
+/// saved id that matches nothing is *"not connected"* only when there were
+/// monitors to compare it against; with none read at all — no `/sys/class/drm`,
+/// a container, a permission — "that monitor is not connected" is a confident
+/// negative about hardware this program could not look at, which is the one
+/// shape of claim the rest of this tree is written against.
+///
+/// `saved` folds "no id was stored" and "the id could not be read" together,
+/// and that is deliberate rather than the defect [`Setup::Unreadable`] exists
+/// to prevent: both come out as *"for a monitor this machine cannot name"*,
+/// which is true of each. The distinction that mattered was between a setup
+/// having happened and not, because only one of those is a claim about what the
+/// user has done.
 ///
 /// Matched on the saved EDID id, which is what is stored, and never on the
 /// model string: two identical monitors share a model and differ by serial.
-pub fn setup_line(set_up: Option<bool>, saved: Option<&str>, monitors: &[MonitorInfo]) -> String {
-    match set_up {
-        // Nothing saved: nobody has done the setup.
-        Some(false) => return "No display set up yet.".to_string(),
-        // A file is there and this program could not read it — an IO error, or
-        // TOML it cannot parse. Not the same as nothing being there, and the
-        // difference is the whole argument this parameter exists for: "No
-        // display set up yet" is glossed in the help window as "the tracker has
-        // never been told where the sensor sits", which is a confident negative
-        // about a file sitting right there.
-        None => {
+pub fn setup_line(setup: Setup, saved: Option<&str>, monitors: &[MonitorInfo]) -> String {
+    match setup {
+        Setup::Never => return "No display set up yet.".to_string(),
+        Setup::Unreadable => {
             return "Set up, and this program could not read its own configuration.".to_string()
         }
-        Some(true) => {}
+        Setup::Done => {}
     }
     let Some(id) = saved.map(str::trim).filter(|s| !s.is_empty()) else {
         // Set up, and the monitor it was set up for cannot be named. The setup
@@ -116,8 +137,8 @@ mod tests {
         }
     }
 
-    /// The card answers the question its old sentence provoked, in all four
-    /// states — and the fourth is the one worth having a test for.
+    /// The card answers the question its old sentence provoked, in all five
+    /// states — and the last is the one worth having a test for.
     ///
     /// "Set up for a monitor that is not connected" is a confident negative:
     /// it says this program looked at what is plugged in and did not find that
@@ -130,7 +151,7 @@ mod tests {
         let other = mon("Dell", Some("card1-HDMI-1"), Some("DEL1234"));
 
         assert_eq!(
-            setup_line(Some(false), None, std::slice::from_ref(&here)),
+            setup_line(Setup::Never, None, std::slice::from_ref(&here)),
             "No display set up yet.",
             "nothing saved at all"
         );
@@ -138,7 +159,11 @@ mod tests {
         // it told somebody with a config sitting on disk that the tracker had
         // never been told where the sensor sits.
         assert_eq!(
-            setup_line(None, Some("SAM0001"), std::slice::from_ref(&here)),
+            setup_line(
+                Setup::Unreadable,
+                Some("SAM0001"),
+                std::slice::from_ref(&here)
+            ),
             "Set up, and this program could not read its own configuration."
         );
         // Set up, and the monitor cannot be named — a panel whose EDID has no
@@ -149,24 +174,24 @@ mod tests {
         // leaves.
         for id in [None, Some("  ")] {
             assert_eq!(
-                setup_line(Some(true), id, std::slice::from_ref(&here)),
+                setup_line(Setup::Done, id, std::slice::from_ref(&here)),
                 "Set up, for a monitor this machine cannot name.",
                 "{id:?}"
             );
         }
 
         assert_eq!(
-            setup_line(Some(true), Some("SAM0001"), &[other.clone(), here.clone()]),
+            setup_line(Setup::Done, Some("SAM0001"), &[other.clone(), here.clone()]),
             "Set up for \u{201c}Odyssey G9\u{201d}.",
             "the monitor by name, picked out of the ones that are plugged in"
         );
         assert_eq!(
-            setup_line(Some(true), Some("SAM0001"), std::slice::from_ref(&other)),
+            setup_line(Setup::Done, Some("SAM0001"), std::slice::from_ref(&other)),
             "Set up for a monitor that is not connected.",
             "monitors were read and this one is not among them"
         );
         assert_eq!(
-            setup_line(Some(true), Some("SAM0001"), &[]),
+            setup_line(Setup::Done, Some("SAM0001"), &[]),
             "Set up, but no monitor could be read here.",
             "nothing was read, so nothing may be concluded about what is plugged in"
         );
@@ -186,11 +211,11 @@ mod tests {
         // Both answers name the same words, so the test that means something is
         // that the id decides which row was found — asserted by removing it.
         assert_eq!(
-            setup_line(Some(true), Some("SAM0002"), &[left.clone(), right.clone()]),
+            setup_line(Setup::Done, Some("SAM0002"), &[left.clone(), right.clone()]),
             "Set up for \u{201c}Odyssey G9\u{201d}."
         );
         assert_eq!(
-            setup_line(Some(true), Some("SAM0002"), std::slice::from_ref(&left)),
+            setup_line(Setup::Done, Some("SAM0002"), std::slice::from_ref(&left)),
             "Set up for a monitor that is not connected.",
             "the other panel of a matched pair is not this one"
         );

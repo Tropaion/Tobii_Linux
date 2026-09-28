@@ -3668,14 +3668,14 @@ fn screen_now() -> String {
     // usable serial. Asking the id alone said "No display set up yet." over a
     // completed setup on any machine whose monitor could not be identified.
     crate::screen_pick::setup_line(
-        // Three answers, not two. `Ok(Some(_))` is set up, `Ok(None)` is
-        // nothing saved, and `Err` is a file that is there and could not be
-        // read — which `.ok().flatten().is_some()` folded into "nothing saved",
-        // so an unreadable config read as "the tracker has never been told
-        // where the sensor sits".
+        // Three answers, not two, and `Err` is the one that was being lost:
+        // a file that is there and could not be read folded into "nothing
+        // saved", so an unreadable config said "the tracker has never been
+        // told where the sensor sits" about a setup that had happened.
         match tobii_config::load() {
-            Ok(saved) => Some(saved.is_some()),
-            Err(_) => None,
+            Ok(Some(_)) => crate::screen_pick::Setup::Done,
+            Ok(None) => crate::screen_pick::Setup::Never,
+            Err(_) => crate::screen_pick::Setup::Unreadable,
         },
         tobii_config::load_setup_monitor_id()
             .ok()
