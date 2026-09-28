@@ -179,11 +179,21 @@ pub enum Source<T> {
     /// be printed.
     ///
     /// It is also the answer for a directory that is there and holds nothing
-    /// that names a saved configuration — [`binds::read`] gives it for a
-    /// preset directory with no `StartPreset` file in it, however many
-    /// `.binds` documents are sitting next to the missing one, because a game
-    /// ships those and a game that has run writes the other. The string says
-    /// which of the cases it was: they share an answer, not a wording.
+    /// a reader here recognises at all — for [`binds::read`], one with no
+    /// `StartPreset` file *and* no `.binds` document. The string says which
+    /// of the cases it was: they share an answer, not a wording.
+    ///
+    /// What it is emphatically not is the answer for a directory of presets a
+    /// game *ships*. That was this variant's wording until 2026-09-28, and on
+    /// the one machine that has the files it was a flat contradiction: Elite
+    /// Dangerous' `ControlSchemes` holds 30 `.binds` documents and no
+    /// `StartPreset` file, and *nothing has saved a control scheme here* is
+    /// exactly the confident false negative this type exists to prevent,
+    /// printed by the type that exists to prevent it. [`binds::read`] now
+    /// reads such a directory and reports every document in it, with
+    /// [`binds::Bindings::start`] as [`None`] to say that none is selected.
+    /// The lesson generalises past the one bug: *this directory is not what
+    /// I expected* is never an absence.
     Unwritten(String),
     /// Something is there that cannot be read back exactly.
     Rejected(String),

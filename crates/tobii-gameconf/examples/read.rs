@@ -7,10 +7,17 @@
 //! cargo run -p tobii-gameconf --example read -- presets <directory> <Element>
 //! ```
 //!
-//! `presets` is the one that does not go through a `StartPreset` file: it
-//! reads every `.binds` document in a directory on its own, which is what the
-//! presets a game *ships* look like — there is no active one among them. It
-//! also counts the writing habits `tobii_gameconf::binds` states a census of:
+//! `binds` is the reader a `[[check]]` in a profile actually reaches, and it
+//! answers both shapes a preset directory comes in: one a game has run in,
+//! through its `StartPreset` file, and one holding only the presets a game
+//! ships, where it reports every document and says that none is selected.
+//! Point it at Elite Dangerous' `ControlSchemes` and it prints the 30.
+//!
+//! `presets` is not a second reader and reaching for it to answer a question
+//! about a check is how this project once recorded a demonstration nobody
+//! performed. It reads every `.binds` document in a directory on its own, and
+//! what it has that `binds` does not is the counting: the writing habits
+//! `tobii_gameconf::binds` states a census of —
 //! byte-order marks, bare line feeds, the spacing of the declaration, the
 //! lines indented with spaces where the rest of the file uses tabs, down to
 //! how wide those indents are, and how many of the files name a schema version
@@ -46,6 +53,16 @@ fn main() {
     }
 }
 
+/// `one` when there is one of it. A census that says "1 presets" is a census
+/// somebody wrote without looking at its output.
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
 fn say(label: &str, lookup: &Lookup) {
     match lookup {
         Lookup::Absent => println!("  {label}: not in the file"),
@@ -59,8 +76,20 @@ fn bindings(dir: &Path, setting: &str) {
         Source::Unwritten(why) => println!("nothing to read: {why}"),
         Source::Rejected(why) => println!("could not be read: {why}"),
         Source::Read(b) => {
-            println!("start file: {}", b.start.display());
-            println!("schema in its name: {:?}", b.schema);
+            match &b.start {
+                Some(file) => {
+                    println!("start file: {}", file.display());
+                    println!("schema in its name: {:?}", b.schema);
+                }
+                // Printed as loudly as the start file is, because it is the
+                // one thing that decides what the rows below are: presets a
+                // game has chosen among, or presets it merely ships.
+                None => println!(
+                    "no start file: nothing here selects a preset, so these are the {} \
+                     the game ships and none of them is in use",
+                    plural(b.presets.len(), "preset", "presets"),
+                ),
+            }
             for older in &b.superseded {
                 println!("superseded start file: {}", older.display());
             }
