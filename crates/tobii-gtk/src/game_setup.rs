@@ -69,7 +69,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tobii_config::profiles;
+use tobii_config::{profiles, signature};
 use tobii_gameconf::{attrs, binds, Lookup, Source};
 use tobii_output::games::OutputConfig;
 use tobii_steam::App;
@@ -610,20 +610,62 @@ pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<Str
     ))
 }
 
+/// The opentrack route is not one that runs itself, and why it is not running
+/// after a launch.
+///
+/// Not part of [`tobii_config::signature::trackir_gate`], because that seam is
+/// about the check and this is about a command. It belongs beside the gate
+/// wherever the gate is shown: the client that answers the check is a pure
+/// consumer of the shared mapping, so something has to fill it, and that is
+/// `tobii bridge run`. `run` yields to a launching game on purpose — a wine
+/// process alive on the prefix makes Proton's own `wineserver -w` wait forever
+/// and the game never starts — and it does not come back by itself.
+///
+/// So "the launch stopped freezing" and "the game is getting data" are two
+/// different outcomes, and this project has already been found reading the
+/// first as the second. A page that offers an install button and names only
+/// the first would be making that mistake in front of a user.
+///
+/// A constant rather than a sentence in each place that needs it:
+/// [`profile_bridge_note`] shows it in the window and [`crate::help`] shows it
+/// in the F1 manual, and two hand-typed copies is how the two start
+/// disagreeing.
+pub(crate) const PROVIDER_NOTE: &str =
+    "That third-party client only reads the shared mapping, so it needs `tobii bridge run` in \
+     a terminal to be filling it. That command stands aside while a game is launching — it has \
+     to, or the game never starts — and it does not restart itself, so it is started again \
+     once the game is up. Until it is, the game has a client answering the check and nothing \
+     behind it.";
+
 /// What a profile says about the bridge, for block 2.
 ///
 /// [`None`] for [`profiles::Bridge::Unstated`], and that is the whole point of
 /// that variant: a profile that does not mention the bridge has not said the
 /// game does without one, and printing "this game does not need the bridge"
 /// from an absence would be a claim nobody made.
+///
+/// [`profiles::Bridge::Required`] carries the signature check with it, because
+/// this is the one place the window knows a game wants TrackIR or FreeTrack —
+/// and which of the two it is decides whether installing the bridge can
+/// deliver anything at all. The rest of block 2 is about files, a directory
+/// and two registry values, every word of which can be true while the game
+/// receives nothing. It is asked of
+/// [`tobii_config::signature::trackir_gate`] rather than written here: `tobii
+/// bridge install` says the same thing in a terminal, and a window that
+/// retyped it is how the two start disagreeing.
+///
+/// [`PROVIDER_NOTE`] is appended after it, for the reason given there.
 pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
     match bridge {
         profiles::Bridge::Unstated => None,
-        profiles::Bridge::Required => Some(
+        profiles::Bridge::Required => Some(format!(
             "The profile for this game says it reads TrackIR or FreeTrack, so the bridge is \
-             what it needs — the virtual joystick above will not reach it."
-                .to_string(),
-        ),
+             what it needs — the virtual joystick above will not reach it.\n\n\
+             Which of the two it speaks decides what installing the bridge can do for it. \
+             {gate}\n\n\
+             {PROVIDER_NOTE}",
+            gate = signature::trackir_gate(),
+        )),
         profiles::Bridge::NotNeeded => Some(
             "The profile for this game says it does not need the bridge. Head tracking for it \
              goes through the settings above instead."
@@ -3909,6 +3951,86 @@ mod tests {
             "{not_needed}"
         );
         assert_ne!(required, not_needed);
+    }
+
+    /// The one fact that decides whether installing the bridge can deliver
+    /// anything, on the page that offers to install it.
+    ///
+    /// Everything else block 2 says is about files, a directory and two
+    /// registry values — all of which can be right while a TrackIR game
+    /// receives nothing, because it checks a signature our DLL cannot answer.
+    /// A terminal user is told that by `tobii bridge install`; before this
+    /// test, somebody who installed from the window and got nothing had been
+    /// told nothing at all.
+    ///
+    /// Asserted against [`tobii_config::signature::MEASURED`] rather than
+    /// against sentences typed here: that is what makes it a test of the two
+    /// surfaces sharing one source, and it fails if the note is ever forked
+    /// back into a local copy that drifts.
+    #[test]
+    fn a_game_that_needs_the_bridge_is_told_about_the_signature_check() {
+        let note =
+            profile_bridge_note(profiles::Bridge::Required).expect("Required says something");
+        assert!(
+            note.contains("signature"),
+            "the gate itself has to be named: {note}"
+        );
+        for m in signature::MEASURED {
+            assert!(
+                note.contains(m.title) && note.contains(m.date),
+                "{} was measured against that check and the window does not say so: {note}",
+                m.title,
+            );
+        }
+        assert!(
+            note.contains("Two titles are not a rule"),
+            "and it must not read as a rule about the user's own game: {note}"
+        );
+        assert!(
+            note.contains("FreeTrack"),
+            "the ungated route is the one that works today: {note}"
+        );
+        assert_eq!(
+            note.matches("NaturalPoint").count(),
+            1,
+            "one copy of this, asked of tobii-config, never two: {note}"
+        );
+    }
+
+    /// The route the paragraph above points at is not a route that runs
+    /// itself, and this window offers an install button over it.
+    ///
+    /// A third-party client answers the signature check and then *reads* the
+    /// mapping; our provider is the only thing that fills it, and `tobii bridge
+    /// run` is what starts it. It yields to a launching game on purpose — the
+    /// v0.5.0 fix — and nothing brings it back. A window that said "installed"
+    /// and stopped there would leave a user with an answered check, an empty
+    /// mapping, and no reason to suspect either.
+    #[test]
+    fn the_window_says_that_route_needs_something_running_and_restarting() {
+        let note =
+            profile_bridge_note(profiles::Bridge::Required).expect("Required says something");
+        assert!(
+            note.contains("tobii bridge run"),
+            "the command that fills the mapping has to be named: {note}"
+        );
+        assert!(
+            note.contains("stands aside while a game is launching"),
+            "and that it gets out of a launch's way, which is why it is not running \
+             afterwards: {note}"
+        );
+        assert!(
+            note.contains("started again once the game is up"),
+            "and what the user has to do about that: {note}"
+        );
+        // The other two arms are about a game that wants no bridge, or a
+        // profile that never said — neither is a reason to explain `run`.
+        assert!(
+            !profile_bridge_note(profiles::Bridge::NotNeeded)
+                .expect("NotNeeded says something")
+                .contains("tobii bridge run"),
+            "a game that does not need the bridge is not told how to feed it"
+        );
     }
 
     // ------------------------------------------------------------ the rows

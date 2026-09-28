@@ -435,7 +435,8 @@ prefix and the wine it resolved, lists which of the three artifacts are in
 `drive_c/tobii-bridge`, says what each discovery key holds and whether this
 installer wrote it, and says whether a wineserver is serving the prefix. It
 reports **what is registered, not whether a game will accept it** — the only
-title ever measured against NaturalPoint's signature check is Star Citizen.
+titles ever measured against NaturalPoint's signature check are Star Citizen
+and Microsoft Flight Simulator 2024, and both stopped at it.
 
 **It starts no process at all.** `wine reg query` is still `wine`, and wine
 initialises or upgrades whatever prefix it is pointed at before it answers
@@ -552,16 +553,20 @@ A Proton title runs under **its own wineserver**, with its own prefix, Proton
 build and environment. A `tobii bridge run` started from a terminal with system
 Wine is a different session: its `FT_SharedMem` is a different object in a
 different server, and the game never sees it. Getting a second executable into
-the game's session means reproducing Proton's entire launch environment.
+the game's session was long taken here to mean reproducing Proton's entire
+launch environment.
 
-(That last claim is this project's working assumption and has never been
+(That last claim was this project's working assumption and has never been
 measured from both sides. `run` now resolves the prefix's own Proton build
 rather than the system wine, and the prefix's server directory is derived from
 the prefix's inode, which a container shares — so *whether* a bridge started
 from outside now joins the game's wineserver is genuinely open. It is written
-up as unknown under [Ordering](#ordering-the-game-first-the-bridge-second),
-and nothing below depends on the answer: the DLL feeding itself needs no
-second process either way.)
+up as unknown under [Ordering](#ordering-the-game-first-the-bridge-second).
+What is no longer open is whether reproducing the environment is the only way
+in: it is not, and
+[A launcher that never fights the lock](#a-launcher-that-never-fights-the-lock)
+below says what the alternative is. Nothing in this section depends on either
+answer: the DLL feeding itself needs no second process at all.)
 
 The DLL is already inside the game's process. So the receive loop lives there:
 same wineserver by construction, no second process, no environment to
@@ -775,6 +780,78 @@ claims either:
   game's own session would then be the next thing to try.
 * Whether any of this makes a game **use** the data. It only stops a second
   process from breaking the launch.
+
+**And on the one configuration that needs it, what yielding leaves behind is an
+empty mapping.** Our own client DLLs create and fill `FT_SharedMem` from their
+own feeder thread and need nothing else running — that is the whole reason
+`tobii-bridge.exe` stopped being a required artifact. The exception is the
+configuration this section is about: TrackIR pointed at a third-party client,
+which only *reads* the mapping, with our DLLs never loaded at all. There the
+provider is the only thing that can fill it, and the provider is the process
+that stands down — so from the moment `run` yields until somebody starts it
+again by hand, that client is reading a mapping nobody is writing. The launch
+is unblocked and the head tracking is absent. Those are two different outcomes
+and this page does not merge them.
+
+### A launcher that never fights the lock
+
+The lock is not something to beat. A user's launcher for opentrack
+(`https://github.com/markx86/opentrack-launcher`, GPL-3.0) arranges never to be
+on the wrong side of it, and it is read here for mechanism only — nothing from
+it is fetched, vendored or copied.
+
+Its whole trick is ordering. It takes Steam's `%command%`, finds the trailing
+`.exe`, and substitutes a three-line batch file that re-runs Steam's own
+command otherwise unchanged:
+
+```bat
+start "" "Z:\...\helper.exe"
+start /wait "" "Z:\...\game.exe" <args>
+taskkill /IM helper.exe /F >nul 2>&1
+```
+
+Proton is then invoked exactly as Steam meant to invoke it: **one**
+`waitforexitandrun`, therefore **one** `wineserver -w`, and both processes are
+born after it has already returned. Neither of them can block it, because
+neither of them exists when it runs. Three details carry the rest:
+
+* `start /wait` keeps `cmd.exe` alive for exactly as long as the game, so
+  Steam's own bookkeeping — playtime, the "Stop" button, the overlay — sees the
+  process lifetime it expects.
+* The helper is started *first* and unwaited, so it is up before the game asks
+  for data.
+* The `taskkill` is not tidiness. A surviving helper is precisely the wine
+  process that would make the **next** launch's `wineserver -w` block, which is
+  the freeze this whole page is about, one launch later.
+
+**What this settles for us.** Our reading of the lock was right as far as it
+went: `wineserver -w` runs before the game, it waits for every wine process on
+the prefix, and a provider started beforehand is one. It was **incomplete as an
+explanation**, because it was carried alongside the assumption that the only
+way into the game's session is to reproduce Proton's launch environment. This
+launcher reproduces nothing. It gets in by being inside the launch Steam was
+already going to make.
+
+**Reported, not verified here.** One user reports getting head tracking working
+in Microsoft Flight Simulator 2024 by running opentrack's *Windows* build
+inside the game's Proton prefix, sequenced with the game in a single Proton
+launch, using that launcher. **Nobody on this project has run it**, with that
+launcher or any other. It is recorded because it is the only account anywhere
+in our notes of that title tracking at all — and because MSFS 2024 is one of
+the two titles we have measured stopping dead at the signature check. It is not
+a recommendation, it is not a supported route, and no part of this program will
+set it up, fetch anything, or write anything into Steam.
+
+**Still unmeasured, here, as of 2026-09-28:**
+
+* That the reported configuration works — at all, or for the reason given. We
+  have one user's account and no run of our own.
+* Whether our provider, started this way, is seen by a client DLL in the same
+  launch. The mechanism says it should be the same wineserver; nothing here has
+  watched `FT_SharedMem` cross that boundary.
+* Whether a game gated by the signature check then *uses* the data. An
+  answering client and a filled mapping are two conditions, and both titles we
+  measured failed at the first one with our own DLL.
 
 ### The provider no longer writes the registry unless asked
 

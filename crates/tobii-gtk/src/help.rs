@@ -128,6 +128,17 @@ pub const BODY_SCROLL_NAME: &str = "help-topic-scroller";
 /// The stack page shown when a query matches nothing.
 pub const NO_MATCH_PAGE: &str = "no-match";
 
+/// The third-party launcher one user reports getting Microsoft Flight
+/// Simulator 2024 tracking with.
+///
+/// Plain text and never a link widget, and that is the whole design of it.
+/// This window's topic bodies are selectable labels, so the address can be
+/// read and copied and nothing here opens it; there is no button, nothing is
+/// fetched, and nothing is written into Steam. The account is a user's, not a
+/// measurement of ours — the sentence around it says so in those words — and a
+/// clickable control beside it would turn a report into an offer.
+const REPORTED_LAUNCHER: &str = "https://github.com/markx86/opentrack-launcher";
+
 /// The stack page name for topic `i`.
 fn page_name(i: usize) -> String {
     format!("t{i}")
@@ -287,8 +298,33 @@ pub fn topics() -> Vec<Topic> {
                  own files, and what it should say. Run `{check}` on its own for \
                  what those fields mean and which file formats this build reads, \
                  and `{check_where} <app id>` for the directory the paths are \
-                 taken as relative to.",
+                 taken as relative to.\n\n\
+                 The second of that window's three sections, the Wine bridge, \
+                 is the one that can be set up correctly and still deliver \
+                 nothing, which is worth knowing before you judge it broken. \
+                 {gate}\n\n\
+                 {provider}\n\n\
+                 Reported, and not verified by anyone here: one user reports \
+                 getting head tracking working in Microsoft Flight Simulator \
+                 2024 by running opentrack's Windows build inside that game's \
+                 own Proton prefix, started together with the game in a single \
+                 Proton launch, using a third-party launcher — \
+                 {launcher}. Nobody on this project has run that, with that \
+                 launcher or any other. It is written down here because it is \
+                 the only account we have of that title tracking at all, and \
+                 for no other reason: it is not a recommendation, it is not a \
+                 route this program supports, and nothing here will set it up, \
+                 fetch anything or change anything in Steam.",
                 switch = switch,
+                // The setup window and this page are the two surfaces a user
+                // without a terminal reads, and a sentence typed into both is
+                // a sentence that gets corrected in one of them. So the check
+                // comes from `tobii-config`, which `tobii bridge install` also
+                // asks, and what has to be running comes from the block that
+                // offers the install.
+                gate = tobii_config::signature::trackir_gate(),
+                provider = crate::game_setup::PROVIDER_NOTE,
+                launcher = REPORTED_LAUNCHER,
                 profiles = tobii_config::profiles::profiles_dir().display(),
                 // Asked rather than asserted: this sentence, the hub's own
                 // and the CLI's all used to carry a hand-typed "ships none".
@@ -1138,6 +1174,74 @@ mod tests {
         // And the same sentence the window prints, so somebody reading the
         // help gets the flags rather than being sent back to guess.
         assert!(text.contains(crate::game_setup::ADD_FLAGS), "{text}");
+    }
+
+    /// The manual says why an installed bridge can still deliver nothing.
+    ///
+    /// A user who never opens a terminal reads two surfaces: the setup window
+    /// and this one. `tobii bridge install` tells a terminal user that TrackIR
+    /// clients are gated by a signature check ours cannot answer, which titles
+    /// were measured against it, and that the answering client is a pure
+    /// consumer that needs something filling the mapping behind it. Neither
+    /// GTK surface said any of it, so "the bridge is installed" was the last
+    /// thing the hub had to say to somebody who then got nothing.
+    ///
+    /// Asserted off the two sources rather than off sentences typed here —
+    /// `tobii_config::signature` for the check and
+    /// [`crate::game_setup::PROVIDER_NOTE`] for what has to be running — which
+    /// is what makes this a test that the three surfaces share one wording
+    /// instead of three that happen to agree today.
+    #[test]
+    fn the_help_window_says_why_an_installed_bridge_can_still_give_nothing() {
+        let text = super::topics()
+            .iter()
+            .map(super::Topic::text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(
+            text.contains(&tobii_config::signature::trackir_gate()),
+            "the signature gate is not in any topic, so a keyboard-only user reads that the \
+             bridge was installed and nothing about why their game is silent:\n{text}"
+        );
+        assert!(
+            text.contains(crate::game_setup::PROVIDER_NOTE),
+            "and nothing says the answering client needs the provider behind it:\n{text}"
+        );
+    }
+
+    /// The MSFS 2024 account is a user's report and has to read as one.
+    ///
+    /// It is in here because it is the only account anywhere in this project's
+    /// notes of that title tracking at all, and MSFS 2024 is also one of the
+    /// two titles we measured stopping dead at the signature check. That makes
+    /// it worth a reader's time and makes it dangerous: this project has twice
+    /// been found recording a demonstration nobody performed. So the
+    /// disclaimer is asserted, not the address alone — a paragraph that named
+    /// the launcher and dropped the sentence saying nobody here has run it
+    /// would pass a test that only looked for the link.
+    #[test]
+    fn the_reported_launcher_is_marked_as_nobody_here_having_run_it() {
+        let text = super::topics()
+            .iter()
+            .map(super::Topic::text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(
+            text.contains(super::REPORTED_LAUNCHER),
+            "the report names where it came from, or a reader cannot check it:\n{text}"
+        );
+        for said in [
+            "not verified by anyone here",
+            "Nobody on this project has run that",
+            "it is not a recommendation",
+            "nothing here will set it up",
+        ] {
+            assert!(
+                text.contains(said),
+                "a user's report is one paragraph away from reading as a supported route, \
+                 and {said:?} is what stops it:\n{text}"
+            );
+        }
     }
 
     /// The topics are the hub's own order, so a topic sits where its card sits.

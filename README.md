@@ -574,12 +574,13 @@ report says so when it finds a live wineserver.
 **Nothing has to be left running.** The client DLL the game loads receives the
 tracking itself, in a background thread inside the game's own process, and
 publishes it into `FT_SharedMem` where the game reads it. A second executable
-would have to run inside the game's own wineserver session — and that, for a
-Steam game, is taken to mean reproducing Proton's entire launch environment.
-That second half is this project's working assumption and not a measurement,
-and is written up as open in [Game-Output](docs/wiki/Game-Output.md). The DLL
-is already in there either way, which is why nothing here depends on the
-answer.
+would have to run inside the game's own wineserver session. This project long
+took that to mean reproducing Proton's entire launch environment, which was an
+assumption and not a measurement; a third-party launcher we have read does it
+without reproducing anything, by making Steam's own single Proton invocation
+start both processes. That is written up, with what it does and does not
+settle, in [Game-Output](docs/wiki/Game-Output.md). The DLL is already in there
+either way, which is why nothing on the FreeTrack route depends on the answer.
 
 **64-bit games only.** A 32-bit game asks for `freetrackclient.dll` without the
 `64` and finds nothing — see
@@ -669,6 +670,27 @@ started first leaves the launch sitting there doing nothing. The command says
 that before it starts, names the lock, and stops itself if something does start
 waiting behind it. Late is not too late — a client DLL picks up the shared
 mapping when it appears.
+
+**Standing down is not the same as working.** In this configuration — and only
+this one, because our own DLLs fill the mapping themselves — a third-party
+client merely *reads* `FT_SharedMem` and the provider is the only thing that
+fills it. So from the moment it yields until you start it again, that client is
+reading a mapping nobody is writing and the game gets no head tracking. That is
+the whole of what v0.5.0 changed here: the launch goes through instead of
+hanging. Getting tracking out of such a title still means having the provider
+inside the game's own wineserver session, which this project does not yet do —
+see [Game-Output](docs/wiki/Game-Output.md).
+
+**Reported, not verified here.** One user reports getting head tracking in
+Microsoft Flight Simulator 2024 by running opentrack's *Windows* build inside
+the game's Proton prefix, sequenced with the game in a single Proton launch, by
+way of a third-party launcher
+(`https://github.com/markx86/opentrack-launcher`, GPL-3.0). **Nobody on this
+project has run it.** It is recorded because it is the only account anywhere in
+our notes of that title tracking at all; it is not a recommendation, it is not
+a supported route,
+and nothing in this program will set it up for you. What it is good for is
+written up in [Game-Output](docs/wiki/Game-Output.md).
 
 `tobii bridge uninstall --prefix PATH` removes it again.
 </details>
@@ -1385,17 +1407,28 @@ not a missing test: the checksums are an integrity check, not a signature.
   writing — exercised against a stateful fake wine and against live wine 11.18
   in throwaway prefixes, never against a game's Proton prefix with a Windows
   opentrack registered inside it.
-- **Whether any game accepts our own `NPClient64.dll` is unknown.** One title
-  has ever been measured against NaturalPoint's signature check, and it
-  *rejected* it: on 2026-08-15 Star Citizen called `NP_GetSignature`, got
-  nothing it recognised from a clean-room DLL, and never asked for data again.
-  That is why `install` points TrackIR at an already-installed client instead,
-  and it is the whole of the evidence in either direction — `--npclient ours`
-  is offered for a game that does not check, and no such game has been
-  measured. FreeTrack is the verified route (Elite Dangerous, above); the
-  registry work, the `status` report and the wineserver yield are all about
-  what is *registered* and what does not break a launch, and none of them says
-  a game will use the data.
+- **Whether any game accepts our own `NPClient64.dll` is unknown.** Two titles
+  have ever been measured against NaturalPoint's signature check, and both
+  stopped at it: on 2026-08-15 Star Citizen called `NP_GetSignature`, got
+  nothing it recognised from a clean-room DLL, and never asked for data again;
+  on 2026-09-27 Microsoft Flight Simulator 2024 (Steam app id 2537590, Proton
+  Experimental) called it 104 times in 1m45s, called nothing else at all, and
+  went on retrying for as long as it ran. That is why `install` points TrackIR
+  at an already-installed client instead, and it is the whole of the evidence
+  in either direction — `--npclient ours` is offered for a game that does not
+  check, and no such game has been measured. Two titles are not a rule about
+  the rest, and nothing here knows which kind a given game is. FreeTrack is the
+  verified route (Elite Dangerous, above); the registry work, the `status`
+  report and the wineserver yield are all about what is *registered* and what
+  does not break a launch, and none of them says a game will use the data.
+- **Yielding to the wineserver lock fixes the launch freeze and nothing else.**
+  A TrackIR title pointed at a third-party client reads `FT_SharedMem`; our
+  provider is what fills it; and the provider is the process that stands down.
+  So on such a title the v0.5.0 behaviour clears the launch and leaves **the
+  mapping empty** until the provider is started again by hand once the game is
+  up. Neither half of that has been watched on a real Proton title — the yield
+  was measured on a throwaway prefix — and "the freeze is fixed" must not be
+  read as "the game gets tracking".
 - **No per-game profile has ever been verified against a running game.** The
   hub's *Set up a game…* window can report what a game's own configuration
   files say, but only where a profile names a setting to look at — and **zero
@@ -1421,8 +1454,9 @@ not a missing test: the checksums are an integrity check, not a signature.
 The full list, per release, is in
 [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) — §11.3c for v0.3.1,
 §11.3f and §11.3g for v0.4.1, §11.3h–§11.3j for the help window, the
-wineserver lock and the prefix reads that no longer run wine, and §11.3k for
-the per-game setup window and the profile format.
+wineserver lock and the prefix reads that no longer run wine, §11.3k for
+the per-game setup window and the profile format, and §11.3l for the launcher
+whose ordering answers the lock.
 
 **Reporting a problem:** `tobii debug` prints the report an issue asks for, and
 the hub's cogwheel can copy or save it. Since v0.4.1 it carries a **game

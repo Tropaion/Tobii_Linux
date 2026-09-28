@@ -1060,12 +1060,23 @@ means for a real game is not.
   inode on both sides), which is why the lock contends at all — but the joining
   half is unconfirmed. If it does not join, yielding still fixes the freeze and
   the user still gets no tracking from `bridge run`.
-- **And it does not make a game accept the data.** Nothing here has been run
-  against MSFS 2024 or any other title: this tree's only evidence that a game
-  reads `HKCU\…\NPClient Location` at all is `StarCitizen.exe`
-  (`bridge/core/src/lib.rs`). The change stops a second process breaking the
-  launch. That is its entire claim, and the messages are worded to claim no
+- **And it does not make a game accept the data.** None of the lock work has
+  been run against a real title at all; the two titles that *have* been put in
+  front of our `NPClient64.dll` — Star Citizen and MSFS 2024 — both stopped at
+  the signature check, which is the whole of this tree's evidence that a game
+  reads `HKCU\…\NPClient Location`. The change stops a second process breaking
+  the launch. That is its entire claim, and the messages are worded to claim no
   more.
+- **What the yield leaves behind is a mapping nobody fills.** On the one
+  configuration that needs `bridge run` — TrackIR pointed at a third-party
+  client, which is a pure consumer — the provider is the process that stands
+  down, and our own DLLs are never loaded because the game loaded the other
+  client. So between the stand-down and a manual restart the game has an
+  answered signature and an empty `FT_SharedMem`. **"The freeze is fixed" is
+  not "the game works"**, and a review of this project found the two had been
+  read as the same thing. Every surface that describes this fix
+  ([[Game-Output]], the README, the risk register, the hub's setup window) is
+  worded to keep them apart.
 - **The device in `/proc/locks` is not the device `stat` reports, and getting
   that wrong disabled the whole stand-down on this machine's filesystem.**
   `/proc/locks` prints the *superblock's* device; `btrfs_getattr` hands `stat`
@@ -1186,15 +1197,19 @@ what belongs here is how much of it is measured and how much is reasoning.
 - **And none of it says a game will use the data.** The report is worded to
   describe the prefix and never to predict the title, and a test forbids the
   words "ready", "working", "will work" and "you are all set" in its output
-  (`status_never_predicts_what_the_game_will_do`). The reason is one
-  measurement: on 2026-08-15 Star Citizen called `NP_GetSignature`, got nothing
-  it recognised from our clean-room `NPClient64.dll`, and never asked for data
-  again (`NpSource::Installed`, `bridge.rs:127-142`). That is the only title
-  ever measured against NaturalPoint's check, and it is a **rejection**;
-  whether any game accepts our NPClient is unknown, and nothing in `status`,
-  in the refusals or in the `--wine` warnings may be read as evidence either
-  way. The verified route is still FreeTrack, on a real Elite Dangerous Proton
-  prefix — see [[Game-Output]].
+  (`status_never_predicts_what_the_game_will_do`). The reason is two
+  measurements, and both are refusals (`NpSource::Installed`,
+  `bridge.rs:127-142`): on 2026-08-15 Star Citizen called `NP_GetSignature`,
+  got nothing it recognised from our clean-room `NPClient64.dll`, and never
+  asked for data again; on 2026-09-27 Microsoft Flight Simulator 2024 (Steam
+  app id 2537590, Proton Experimental) called it 104 times in 1m45s, called
+  nothing else at all, and went on retrying for as long as it ran. Those are
+  the only two titles ever measured against NaturalPoint's check, and neither
+  got past it; whether any game accepts our NPClient is unknown, two titles are
+  not a rule about the rest, and nothing in `status`, in the refusals or in the
+  `--wine` warnings may be read as evidence either way. The verified route is
+  still FreeTrack, on a real Elite Dangerous Proton prefix — see
+  [[Game-Output]].
 - **The flag gate now also refuses a bare positional**, before anything is
   resolved or written (`reject_unknown_flags`, `bridge.rs:2969-2998`, driven
   from the one `SUBS` table at `bridge.rs:3013-3031` so a subcommand cannot be
@@ -1388,9 +1403,70 @@ what is tested and what is known.
   comment impossible; `save_to`'s `Unreadable` branch has no end-to-end
   coverage through the CLI, because all three callers refuse earlier;
   `profiles::shipped_profiles()` exists so that the "this build ships …"
-  sentence has a single owner, but **nothing calls it** — the hub and the help
-  window still spell it out by hand, so that count lives in three places and
-  the function is not yet one of them.
+  sentence has a single owner, and the two GTK surfaces now ask it
+  (`game_setup.rs:1648`, `help.rs:295`) — but `tobii-cli` still hand-types
+  "this build ships no profile for any game" in two places
+  (`main.rs:2495`, `main.rs:2550`), so the count is hard-coded wherever a
+  terminal user reads it.
+
+### 11.3l The launcher that answers the lock, and what it does not answer (2026-09-28)
+
+§11.3i established that `wineserver -w` is what blocks a Proton launch, and
+made `tobii bridge run` yield to it. That diagnosis was right and **incomplete
+as an explanation**, and what showed it up is a user's own solution to the same
+problem: `https://github.com/markx86/opentrack-launcher` (GPL-3.0). It was read
+here for mechanism only. Nothing from it has been fetched, vendored or copied,
+and none of what follows was run by anybody on this project.
+
+- **What it does.** It takes Steam's `%command%`, finds the trailing `.exe`,
+  and substitutes a three-line batch file that re-runs Steam's own command
+  otherwise unchanged: `start "" helper.exe`, then
+  `start /wait "" game.exe <args>`, then `taskkill /IM helper.exe /F`.
+- **Why the ordering works.** Steam still invokes Proton exactly once, with the
+  verb it always used, so there is exactly **one** `waitforexitandrun` and
+  therefore exactly **one** `wineserver -w`. Both processes are created after
+  it has returned. They do not beat the lock; they are never on the wrong side
+  of it. `start /wait` holds `cmd.exe` open for the game's lifetime, so Steam's
+  playtime, Stop button and overlay see what they expect, and the `taskkill` is
+  load-bearing rather than tidy: a surviving helper is exactly the wine process
+  that would make the **next** launch's `wineserver -w` block.
+- **What it confirms about our diagnosis.** That `wineserver -w` runs before
+  the game, waits for every wine process on the prefix, and that a provider
+  started beforehand is one of them. An independent implementation built on the
+  same mechanism is the strongest corroboration this project has for §11.3i.
+- **Where our diagnosis fell short.** It was carried alongside the assumption —
+  stated as an assumption in [[Game-Output]], never measured — that getting a
+  second executable into a Steam title's wineserver session means reproducing
+  Proton's entire launch environment. This launcher reproduces none of it. The
+  assumption was not wrong about what it would take to *re-create* the session;
+  it was the wrong question, because the session can be joined from inside the
+  launch Steam was already going to make. **"Start the game, then start the
+  bridge" was a workaround for a problem that has an ordering fix, and this
+  register did not say so.**
+- **One user reports MSFS 2024 tracking through this route** — opentrack's
+  Windows build run inside the game's Proton prefix, sequenced with the game in
+  a single Proton launch, by that launcher. **Nobody here has run it.** It is
+  recorded because MSFS 2024 is also one of the two titles measured stopping
+  dead at the signature check (§11.3j), so the account and our own measurement
+  are about the same title and do not contradict each other — ours says what
+  that title does with *our* DLL, theirs says what it did with opentrack's. Why
+  their configuration worked is not established here; the obvious reading, that
+  a third-party client answered the check and the sequencing filled the mapping
+  behind it, is a reading and not a measurement. It is not a recommendation and
+  not a supported route.
+- **Unmeasured here, as of 2026-09-28.** That the reported configuration works,
+  or works for the reason given. That our provider started this way is seen by
+  a client DLL in the same launch — the mechanism says one wineserver, but
+  nothing here has watched `FT_SharedMem` cross that boundary. That a
+  signature-gated title then *uses* the data: an answering client and a filled
+  mapping are two conditions and we have measured neither together.
+- **This entry describes a launcher we read, not code we ship.** The wrapper
+  group is building this project's own sequencing in the same round as this
+  entry; at the time of writing their result is not in front of me, so nothing
+  here claims anything about it. **When it lands, this section needs a line
+  saying what we built, what was run, and what it delivered** — and until that
+  line exists, this register has recorded a mechanism and no demonstration of
+  it.
 
 ### 11.4 Environmental
 
