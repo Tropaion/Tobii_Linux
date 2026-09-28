@@ -130,6 +130,32 @@ fn count_word(n: usize) -> &'static str {
     }
 }
 
+/// What has to be running behind a third-party client, and the two ways to
+/// make it so.
+///
+/// Unwrapped, for [`trackir_gate`]'s reasons.
+///
+/// The client that answers the signature check only *reads* the shared
+/// mapping; it does not create one. So a prefix can hold a client that passes
+/// the check and still deliver nothing, which looks from the outside exactly
+/// like the check having failed. Naming both routes is the difference between
+/// a user knowing what is missing and a user concluding the bridge is broken.
+pub fn provider_note() -> String {
+    [
+        "A client that answers the check only reads the shared mapping —",
+        "something has to be filling it. Wrapping the game does that inside the",
+        "game's own session: put `tobii game -- %command%` in its Steam launch",
+        "options, and with the bridge installed in that prefix the provider is",
+        "started with the game and stops with it. The other way is",
+        "`tobii bridge run` in a terminal, which stands aside while a game is",
+        "launching — it has to, or the game never starts — and does not restart",
+        "itself, so it is started again once the game is up. Until something is",
+        "filling the mapping, the game has a client answering the check and",
+        "nothing behind it.",
+    ]
+    .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,9 +217,18 @@ mod tests {
     /// chosen here is one neither of them can take out.
     #[test]
     fn the_gate_leaves_the_wrapping_to_whoever_prints_it() {
-        let text = trackir_gate();
-        assert!(!text.contains('\n'), "no line breaks of its own:\n{text}");
-        assert!(!text.contains("  "), "no run of spaces:\n{text}");
+        // Both of them, by name: the first was written with this rule in mind
+        // and the second was added later and broke it, with a run of spaces
+        // where a line continuation should have closed up. A test naming one
+        // function is a test the next function does not have.
+        for (what, text) in [
+            ("trackir_gate", trackir_gate()),
+            ("provider_note", provider_note()),
+        ] {
+            assert!(!text.contains('\n'), "{what} breaks its own lines:\n{text}");
+            assert!(!text.contains("  "), "{what} has a run of spaces:\n{text}");
+            assert_eq!(text.trim(), text, "{what} is padded:\n{text}");
+        }
     }
 
     /// `named` carries whatever identifies a title and nothing it has not got,

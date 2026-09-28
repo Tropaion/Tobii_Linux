@@ -323,7 +323,7 @@ pub fn topics() -> Vec<Topic> {
                 // asks, and what has to be running comes from the block that
                 // offers the install.
                 gate = tobii_config::signature::trackir_gate(),
-                provider = crate::game_setup::PROVIDER_NOTE,
+                provider = crate::game_setup::provider_note(),
                 launcher = REPORTED_LAUNCHER,
                 profiles = tobii_config::profiles::profiles_dir().display(),
                 // Asked rather than asserted: this sentence, the hub's own
@@ -1188,7 +1188,7 @@ mod tests {
     ///
     /// Asserted off the two sources rather than off sentences typed here —
     /// `tobii_config::signature` for the check and
-    /// [`crate::game_setup::PROVIDER_NOTE`] for what has to be running — which
+    /// [`crate::game_setup::provider_note`] for what has to be running — which
     /// is what makes this a test that the three surfaces share one wording
     /// instead of three that happen to agree today.
     #[test]
@@ -1204,7 +1204,7 @@ mod tests {
              bridge was installed and nothing about why their game is silent:\n{text}"
         );
         assert!(
-            text.contains(crate::game_setup::PROVIDER_NOTE),
+            text.contains(&crate::game_setup::provider_note()),
             "and nothing says the answering client needs the provider behind it:\n{text}"
         );
     }

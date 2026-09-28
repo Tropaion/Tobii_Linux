@@ -630,12 +630,15 @@ pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<Str
 /// [`profile_bridge_note`] shows it in the window and [`crate::help`] shows it
 /// in the F1 manual, and two hand-typed copies is how the two start
 /// disagreeing.
-pub(crate) const PROVIDER_NOTE: &str =
-    "That third-party client only reads the shared mapping, so it needs `tobii bridge run` in \
-     a terminal to be filling it. That command stands aside while a game is launching — it has \
-     to, or the game never starts — and it does not restart itself, so it is started again \
-     once the game is up. Until it is, the game has a client answering the check and nothing \
-     behind it.";
+/// What has to be running behind a client that answers the check.
+///
+/// [`tobii_config::signature::provider_note`] owns the words: the CLI says the
+/// same thing when it installs, and this window and the help topic both show
+/// it, so it lives where all three can ask rather than in whichever of them
+/// was edited last.
+pub(crate) fn provider_note() -> String {
+    tobii_config::signature::provider_note()
+}
 
 /// What a profile says about the bridge, for block 2.
 ///
@@ -654,7 +657,7 @@ pub(crate) const PROVIDER_NOTE: &str =
 /// bridge install` says the same thing in a terminal, and a window that
 /// retyped it is how the two start disagreeing.
 ///
-/// [`PROVIDER_NOTE`] is appended after it, for the reason given there.
+/// [`provider_note`] is appended after it, for the reason given there.
 pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
     match bridge {
         profiles::Bridge::Unstated => None,
@@ -663,8 +666,9 @@ pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
              what it needs — the virtual joystick above will not reach it.\n\n\
              Which of the two it speaks decides what installing the bridge can do for it. \
              {gate}\n\n\
-             {PROVIDER_NOTE}",
+             {note}",
             gate = signature::trackir_gate(),
+            note = provider_note(),
         )),
         profiles::Bridge::NotNeeded => Some(
             "The profile for this game says it does not need the bridge. Head tracking for it \

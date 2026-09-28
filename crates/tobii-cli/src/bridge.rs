@@ -262,22 +262,44 @@ fn ours_for_trackir(explicit: bool, installed: Option<&Path>) -> String {
              registered\n      for TrackIR."
             .to_string(),
     };
-    format!(
-        "note: {opening}\n      \
-         Ours cannot answer NaturalPoint's signature check, and the material\n      \
-         that would answer it is theirs: reproducing it is not this project's\n      \
-         to do.\n      \
-         Both titles ever measured against that check stop at it:\n        \
-         Star Citizen (2026-08-15) rejects ours and never asks for data again.\n        \
-         Microsoft Flight Simulator 2024 (Steam appid 2537590, Proton\n        \
-         Experimental, 2026-09-27) calls the check 104 times in 1m45s, calls\n        \
-         nothing else at all, and goes on retrying for as long as it runs.\n      \
-         Two titles are not a rule about the rest, and nothing here knows what your\n      \
-         game does. Installing opentrack provides a client that answers the check,\n      \
-         which `--npclient auto` then registers with our data behind it. FreeTrack\n      \
-         has no signature check, so a game that speaks FreeTrack works with ours\n      \
-         today."
-    )
+    let body = [
+        tobii_config::signature::trackir_gate(),
+        tobii_config::signature::provider_note(),
+        // This command's own, and deliberately not the seam's: the seam is
+        // shared with a window that has no flags, and a flag named there would
+        // be a flag the hub cannot offer. `install` is where the spelling
+        // belongs.
+        "`--npclient auto` is what registers an installed client instead of ours.".to_string(),
+    ]
+    .join(" ");
+    format!("note: {opening}\n{}", wrapped(&body, "      ", 78))
+}
+
+/// `text` folded to `width` columns with every line under `indent`.
+///
+/// The seam this borrows its sentences from renders them unwrapped on purpose:
+/// a GTK label wraps itself, and a terminal knows a width the label does not.
+/// This is the terminal knowing it. Splitting on spaces is enough because the
+/// text it is given is prose — there is nothing in it that must not be broken,
+/// and a word longer than the width takes its own line rather than being cut.
+fn wrapped(text: &str, indent: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && indent.len() + line.len() + 1 + word.len() > width {
+            out.push_str(indent);
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    out.push_str(indent);
+    out.push_str(&line);
+    out
 }
 
 /// The one artifact without which there is no installation — also what
@@ -3778,7 +3800,7 @@ mod tests {
             "it still says what it registered:\n{ours}"
         );
         assert!(
-            ours.contains("NaturalPoint's signature check"),
+            ours.contains("NaturalPoint"),
             "and what that costs, in the same breath:\n{ours}"
         );
 
@@ -3810,16 +3832,18 @@ mod tests {
     fn asking_for_ours_by_name_is_still_told_what_it_costs() {
         for explicit in [true, false] {
             let note = ours_for_trackir(explicit, None);
-            assert!(
-                note.contains("NaturalPoint's signature check"),
-                "explicit={explicit}: {note}"
-            );
-            for measured in [
-                "Star Citizen (2026-08-15)",
-                "Microsoft Flight Simulator 2024",
-                "2026-09-27",
-            ] {
-                assert!(note.contains(measured), "explicit={explicit}: {note}");
+            assert!(note.contains("NaturalPoint"), "explicit={explicit}: {note}");
+            // Over the measurements themselves, not over three strings typed
+            // here: a third title has to reach this output, and a test that
+            // names two would not notice it missing. Wrapping is stripped
+            // because this renders folded to a terminal width.
+            let flat = note.split_whitespace().collect::<Vec<_>>().join(" ");
+            for m in tobii_config::signature::MEASURED {
+                assert!(
+                    flat.contains(m.title) && flat.contains(m.date),
+                    "explicit={explicit}: {} is missing from:\n{note}",
+                    m.title
+                );
             }
             // It says what was measured, not what this user's game will do.
             assert!(

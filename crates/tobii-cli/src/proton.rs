@@ -434,12 +434,29 @@ mod tests {
     /// Anchoring on the word alone makes `--` the game.
     #[test]
     fn the_runtimes_own_verb_is_not_mistaken_for_protons() {
-        let cmd = steam_command("/games/common/Thing/Thing.exe");
+        // The real chain spells the runtime's verb `--verb=waitforexitandrun`,
+        // which can never equal `VERB` — so that fixture alone exercises the
+        // string comparison and nothing else, and passes with the `proton`
+        // check deleted outright. What the check is for is a *bare*
+        // `waitforexitandrun` earlier in the line, which the separated
+        // spelling of that same flag produces.
+        let mut cmd = steam_command("/games/common/Thing/Thing.exe");
         let entry = cmd
             .iter()
             .position(|a| a == "--verb=waitforexitandrun")
             .expect("the entry point's verb is in the fixture");
-        assert!(proton_target(&cmd).expect("a target") > entry + 1);
+        cmd.splice(entry..=entry, args(&["--verb", "waitforexitandrun"]));
+
+        // Proton's own pair is still the anchor, so the game is still the game.
+        let at = proton_target(&cmd).expect("a target");
+        assert_eq!(cmd[at], "/games/common/Thing/Thing.exe", "{cmd:?}");
+        assert_eq!(cmd[at - 1], VERB);
+        assert!(
+            Path::new(&cmd[at - 2])
+                .file_name()
+                .is_some_and(|n| n == "proton"),
+            "the anchor is Proton's own pair: {cmd:?}"
+        );
     }
 
     /// Everything after the real anchor is the game's, so a game argument that
