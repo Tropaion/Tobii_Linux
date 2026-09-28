@@ -280,15 +280,39 @@ pub fn topics() -> Vec<Topic> {
                  the tooltip names them all in the same sentence rather than one \
                  at a time — so what you read there may be a longer sentence than \
                  any of these four.\n\n\
-                 Set up a game… — {game_setup}\n\n\
-                 It opens a window with one section per thing that has to be \
-                 configured. The third of them, the game's own options, is \
-                 read-only: this program reports what those files say and never \
-                 writes them. It checks them only where a profile says what to \
-                 look at, and this build ships {shipped}, so on a fresh \
-                 install that section says so rather than guessing.\n\n\
+                 Every control on this card is global: there is no such thing as \
+                 the joystick for one game. What one particular game needs is the \
+                 Games tab.",
+                switch = switch,
+                strength = crate::games::STRENGTH_TOOLTIP,
+                joystick = crate::games::JOYSTICK_TOOLTIP,
+                recentre = crate::games::RECENTRE_TOOLTIP,
+                refusals = refusals,
+            ),
+        ),
+        // The four paragraphs below were bolted onto the topic above while the
+        // only door to them was a button on that card. The door is a tab now,
+        // and a topic of its own is what a tab gets.
+        topic(
+            "Games",
+            format!(
+                "Pick an installed Steam game on the left and the page beside it \
+                 shows the three things that have to be configured for it: this \
+                 program's own settings, the Wine bridge inside that game's \
+                 Proton prefix, and the game's own options. It reads a game's own \
+                 files and never changes them.\n\n\
+                 The first section reports and never writes. {pointer} The tracker \
+                 goes dark while this tab is showing, for the same reason it does \
+                 when you look at another window: nothing here needs the sensor, \
+                 and lighting the illuminators to show somebody a paragraph is \
+                 what this program is written not to do. Ctrl+Page Up comes back.\n\n\
+                 The third section, the game's own options, is read-only: this \
+                 program reports what those files say and never writes them. It \
+                 checks them only where a profile says what to look at, and this \
+                 build ships {shipped}, so on a fresh install that section says \
+                 so rather than guessing.\n\n\
                  A profile is a file per game in {profiles}, named by app id, and \
-                 you write it from a terminal — that window prints the same two \
+                 you write it from a terminal — that page prints the same two \
                  commands with the app id already filled in for the game you \
                  picked:\n\n\
                  {save} <app id>\n\
@@ -299,10 +323,9 @@ pub fn topics() -> Vec<Topic> {
                  what those fields mean and which file formats this build reads, \
                  and `{check_where} <app id>` for the directory the paths are \
                  taken as relative to.\n\n\
-                 The second of that window's three sections, the Wine bridge, \
-                 is the one that can be set up correctly and still deliver \
-                 nothing, which is worth knowing before you judge it broken. \
-                 {gate}\n\n\
+                 The second section, the Wine bridge, is the one that can be set \
+                 up correctly and still deliver nothing, which is worth knowing \
+                 before you judge it broken. {gate}\n\n\
                  {provider}\n\n\
                  Reported, and not verified by anyone here: one user reports \
                  getting head tracking working in Microsoft Flight Simulator \
@@ -315,13 +338,12 @@ pub fn topics() -> Vec<Topic> {
                  for no other reason: it is not a recommendation, it is not a \
                  route this program supports, and nothing here will set it up, \
                  fetch anything or change anything in Steam.",
-                switch = switch,
-                // The setup window and this page are the two surfaces a user
-                // without a terminal reads, and a sentence typed into both is
-                // a sentence that gets corrected in one of them. So the check
-                // comes from `tobii-config`, which `tobii bridge install` also
-                // asks, and what has to be running comes from the block that
-                // offers the install.
+                // The tab and this page are the two surfaces a user without a
+                // terminal reads, and a sentence typed into both is a sentence
+                // that gets corrected in one of them. So the check comes from
+                // `tobii-config`, which `tobii bridge install` also asks, and
+                // what has to be running comes from the block that offers the
+                // install.
                 gate = tobii_config::signature::trackir_gate(),
                 provider = tobii_config::signature::provider_note(),
                 launcher = REPORTED_LAUNCHER,
@@ -329,18 +351,14 @@ pub fn topics() -> Vec<Topic> {
                 // Asked rather than asserted: this sentence, the hub's own
                 // and the CLI's all used to carry a hand-typed "ships none".
                 shipped = tobii_config::profiles::shipped_profiles(),
-                // The same constants the game-setup window types, so the two
-                // surfaces that name these commands cannot drift apart.
+                // The same constants the Games tab types, so the two surfaces
+                // that name these commands cannot drift apart.
                 save = crate::game_setup::PROFILE_SAVE,
                 add = crate::game_setup::PROFILE_CHECK_ADD,
                 add_flags = crate::game_setup::ADD_FLAGS,
                 check = crate::game_setup::PROFILE_CHECK,
                 check_where = crate::game_setup::PROFILE_CHECK_WHERE,
-                strength = crate::games::STRENGTH_TOOLTIP,
-                joystick = crate::games::JOYSTICK_TOOLTIP,
-                recentre = crate::games::RECENTRE_TOOLTIP,
-                game_setup = crate::games::GAME_SETUP_TOOLTIP,
-                refusals = refusals,
+                pointer = crate::game_setup::TRACKER_TAB_POINTER,
             ),
         ),
         topic(
@@ -378,6 +396,9 @@ pub fn topics() -> Vec<Topic> {
             // that table.
             "F1 opens this window, and closes it again. Esc closes it too, from \
              anywhere in it, and closes a full-screen setup or calibration flow.\n\n\
+             On the hub, Ctrl+Page Down goes to the Games tab and Ctrl+Page Up \
+             comes back to Tracker. Tab reaches the two tab buttons as well, and \
+             then Left and Right walk them.\n\n\
              It opens with the search box focused, so you can type your question \
              straight away: the search reads every topic's heading and all of its \
              text, so a word from the thing you are asking about — \"joystick\", \
@@ -1120,7 +1141,6 @@ mod tests {
             crate::games::STRENGTH_TOOLTIP.to_string(),
             crate::games::JOYSTICK_TOOLTIP.to_string(),
             crate::games::RECENTRE_TOOLTIP.to_string(),
-            crate::games::GAME_SETUP_TOOLTIP.to_string(),
         ];
         // And the reasons the Recentre button greys itself out, which the
         // pointer user reads in the row's tooltip and nobody else could.
@@ -1245,6 +1265,13 @@ mod tests {
     }
 
     /// The topics are the hub's own order, so a topic sits where its card sits.
+    ///
+    /// "Games" goes after the six cards and before the cogwheel, which is where
+    /// the tab it documents sits: to the right of everything on tab 1 and left
+    /// of the settings that are not on a tab at all. The order is also what
+    /// [`super::best_match`] falls back to, so moving this row moves which
+    /// topic a word that is in two bodies opens — see
+    /// `the_word_on_the_control_opens_the_topic`.
     #[test]
     fn the_topics_are_in_the_order_the_hub_reads() {
         let titles: Vec<&str> = super::topics().iter().map(|t| t.title).collect();
@@ -1258,6 +1285,7 @@ mod tests {
                 "Head tracking",
                 "Preview my gaze",
                 "Head tracking for games",
+                "Games",
                 "Settings, behind the cogwheel",
                 "Keyboard",
             ]
@@ -1366,9 +1394,11 @@ mod tests {
         let opened = |q: &str| super::best_match(&all, q).map(|i| all[i].title);
 
         // Words the user can read off the hub: a check-button caption
-        // (`games::check_row`), a button caption, or a settings-row
-        // description, which `lib::settings_row` draws as a visible label. Each
-        // must open the one topic that is about that control.
+        // (`games::check_row`), a button caption, a tab caption, or a
+        // settings-row description, which `lib::settings_row` draws as a
+        // visible label. Each must open the one topic that is about that
+        // control.
+        //
         const PRINTED_ON_THE_HUB: [(&str, &str); 4] = [
             ("joystick", "Head tracking for games"),
             ("recentre", "Head tracking for games"),
@@ -1385,6 +1415,22 @@ mod tests {
             );
         }
 
+        // KNOWN GAP, measured rather than guessed: **"games" is now a word
+        // printed on the hub** — it is one of the two captions in the tab
+        // switcher, so it is the name of half the program — and typing it
+        // opens "Head tracking for games", not "Games". `best_match`'s
+        // tie-break gives the pane to the topic whose HEADING takes every word
+        // of the query, and both headings do; the card's comes first.
+        //
+        // That is not a bug in the tie-break, it is the collision the tab name
+        // created: a card called "Head tracking for games" sitting under a tab
+        // called Games. Renaming the card to "Game output" dissolves it, which
+        // is a change of its own with its own test churn (this table, `CARDS`
+        // in `tests/help_window.rs`, and the topic title). Until then the
+        // answer a user gets is the card, which is at least a topic about
+        // games and not the no-match page — so this is recorded and not
+        // asserted, because asserting today's answer would cement it.
+        //
         // KNOWN GAP, stated rather than asserted: the three strength presets
         // are captioned `Subtle`, `Normal` and `Strong` (`games::STRENGTHS`),
         // their row carries no caption of its own, and none of those three

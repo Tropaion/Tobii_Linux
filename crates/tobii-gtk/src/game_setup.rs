@@ -1,26 +1,34 @@
-//! The hub's game-setup window: pick an installed game, see the three things
-//! that have to be configured for it, and do the two this program owns.
+//! The hub's **Games** tab: pick an installed game, and see the three things
+//! that have to be configured for it.
 //!
 //! # The three things
 //!
 //! 1. **This program's own settings** — game output on, and a destination to
-//!    send to. Written here, through [`crate::games::edit_config`], into the
-//!    same `games.toml` the card behind this window reads.
+//!    send to. **Reported here and edited nowhere in this file.** The one
+//!    editor of them is the games card on the Tracker tab: every control on
+//!    that card is global — there is no such thing as "the joystick, for Elite
+//!    Dangerous" — so a per-game page that also wrote them was one setting with
+//!    two editors, which is what the modal this tab replaces was modal to
+//!    prevent. The race is deleted rather than blocked.
 //! 2. **The Wine bridge** — the TrackIR/FreeTrack registration inside the
 //!    game's Proton prefix. Installed by shelling out to `tobii bridge install
-//!    --steam <appid>` and showing that program's words verbatim.
+//!    --steam <appid>` and showing that program's words verbatim. The one
+//!    thing on this tab that changes anything.
 //! 3. **The game's own configuration files** — read-only, always, and only
 //!    where a profile says what to read. This program never writes them.
 //!
-//! # What this window may not do
+//! # What this tab may not do
 //!
-//! It takes **no claim on the tracker**. It reads files and runs one
-//! subprocess; it wants no frames, and [`crate::hold_while_open`] is called
-//! from nowhere in here. The argument is [`crate::help`]'s, word for word:
-//! lighting the illuminators to show somebody a paragraph is precisely the
-//! behaviour the whole demand mechanism exists to prevent.
-//! `tests/game_setup_window.rs` asserts it against the device thread's own
-//! list of claim reasons.
+//! It takes **no claim on the tracker**, and after the merge into the hub that
+//! is a stronger statement than it was: a modal window took the focus off the
+//! hub and dropped the hub's own claim as a side effect, where a tab does not.
+//! So the hub holds `"the hub window"` only while the **Tracker** tab is
+//! showing — see `crate::build_hub`'s tick — and nothing in here calls
+//! [`crate::hold_while_open`] or takes a `DemandGuard`. The argument is
+//! [`crate::help`]'s, word for word: lighting the illuminators to show
+//! somebody a paragraph is precisely the behaviour the whole demand mechanism
+//! exists to prevent. `tests/games_tab.rs` asserts it against the device
+//! thread's own list of claim reasons.
 //!
 //! It never spawns `wine`, on any path, and it never passes `--force` to the
 //! installer — see [`install_argv`].
@@ -34,7 +42,7 @@
 //!
 //! # The split
 //!
-//! Every sentence this window shows is produced by a function that takes its
+//! Every sentence this tab shows is produced by a function that takes its
 //! inputs and returns a `String`, so it can be asserted in CI, which has no
 //! display. The widgets only show what those functions said. The one function
 //! that touches the filesystem on its own account is [`scan`], whose `home` is
@@ -44,23 +52,23 @@
 //!
 //! # Why there is no timer
 //!
-//! The `refresh` closure in [`open_with`] recomputes the whole page from disk
-//! and rewrites every label. It runs on entering the game page, after a write,
-//! and when a subprocess this window started finishes — and **not** on the
-//! 33 ms hub tick that drives [`crate::games::GamesRow::refresh`]. That card
-//! has to follow a file a terminal can edit under it. This window is modal
-//! over the hub, is itself the thing editing the file, and the installer it
-//! started reports itself.
+//! The `refresh` closure in [`build_with`] recomputes the whole detail pane
+//! from disk and rewrites every label. It runs on a selection change and when
+//! a subprocess this tab started finishes — and **not** on the 33 ms hub tick
+//! that drives [`crate::games::GamesRow::refresh`]. That card has to follow a
+//! file a terminal can edit under it. This tab stats prefixes and reads
+//! profiles, which is not work to do thirty times a second for a pane that is
+//! usually not even showing, and the installer it started reports itself.
 //!
 //! It does read one fact it does not own: what the device thread made of the
 //! virtual joystick ([`crate::device::JoystickStatus`]). That is read on each
 //! refresh and never polled, so a joystick that fails a second after this page
-//! is drawn is reported on the next pass and not before. The card behind this
-//! window is the live account of what is happening, and it is the one on the
-//! 33 ms tick.
+//! is drawn is reported on the next pass and not before. The games card on the
+//! Tracker tab is the live account of what is happening, and it is the one on
+//! the 33 ms tick.
 
 use gtk::prelude::*;
-use gtk::{glib, Align, Application, Label, Orientation};
+use gtk::{glib, Align, Label, Orientation};
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
@@ -107,23 +115,27 @@ const BRIDGE_FILES: [&str; 3] = [
 ];
 const BRIDGE_ARTIFACT: &str = "freetrackclient64.dll";
 
-/// The window's title, which is also how the display test finds it.
-pub const TITLE: &str = "Set up a game";
+/// The heading over the detail pane before a game has been picked.
+///
+/// It was the modal's window title, and it is the one line on this tab that
+/// says what the tab is for to somebody who has just landed on it.
+const HEADING: &str = "Set up a game";
 
-/// The stack, so the display test can find it without matching on text.
-pub const STACK_NAME: &str = "gamesetup-stack";
-/// The search box, likewise.
+/// The search box, so the display test can find it without matching on text.
 pub const SEARCH_NAME: &str = "gamesetup-search";
 /// The list of games, likewise.
 pub const LIST_NAME: &str = "gamesetup-games";
 
-/// The page with the game list on it.
-pub const PAGE_PICK: &str = "pick";
-/// The page for one game.
-pub const PAGE_GAME: &str = "game";
-/// The page for a machine with no installed games. Only ever the page the
-/// window OPENS on: there is no path from a game back to it.
-pub const PAGE_NOTHING: &str = "nothing";
+/// How wide the list of games asks to be, and how wide the detail pane does.
+///
+/// Neither is what they end up at — both panes expand — and neither may set
+/// the hub's opening width. `crate::build_hub` derives `default_width` from the
+/// control rack alone, so this tab cannot raise it; what these floors have to
+/// do is stay comfortably *under* it, because GTK warns and clips when a
+/// stack's non-visible child measures a minimum wider than the window it is
+/// in. Their sum plus the gap is about 700px against the rack's 1152px.
+const LIST_WIDTH: i32 = 300;
+const DETAIL_WIDTH: i32 = 380;
 
 // ------------------------------------------------------------------- the scan
 
@@ -357,15 +369,18 @@ pub(crate) fn picker(catalog: &Catalog, missing: &[PathBuf], query: &str) -> Pic
     }
 }
 
-/// The page shown when Steam has nothing installed at all.
+/// What the detail pane says when Steam has nothing installed at all.
 ///
-/// Its own page rather than an empty list, because an empty list under a
-/// search box invites somebody to keep typing at it.
+/// It was a page of the modal's stack, and it was a page nothing could leave —
+/// the window opened on it or never reached it. As a **state of the pane** it
+/// is the same words doing the same job without the dead end, which is what it
+/// always was: an empty list under a search box invites somebody to keep typing
+/// at it, so the pane beside the list says why the list is empty.
 pub(crate) fn nothing_text(missing: &[PathBuf]) -> String {
     let mut s = "No installed Steam games were found on this machine.\n\n\
                  Steam records what is installed in a manifest beside each game. If Steam is \
                  installed somewhere this program does not look, nothing here will see it, \
-                 and the rest of this window has nothing to work on."
+                 and the rest of this tab has nothing to work on."
         .to_string();
     if let Some(note) = missing_note(missing) {
         s.push_str("\n\n");
@@ -410,8 +425,8 @@ fn destinations(cfg: &OutputConfig, joystick: &JoystickStatus) -> (Vec<String>, 
             JoystickStatus::Failed(why) => {
                 trouble = Some(format!(
                     "The virtual joystick is asked for in the settings and could not be \
-                     created — {why}. Nothing is reaching it, so this window does not count \
-                     it as a destination; the card behind this window says the same."
+                     created — {why}. Nothing is reaching it, so this page does not count \
+                     it as a destination; the card on the Tracker tab says the same."
                 ))
             }
             JoystickStatus::Off | JoystickStatus::Present => {
@@ -466,29 +481,43 @@ fn joystick_paragraph(bridge: profiles::Bridge) -> String {
     s
 }
 
-/// Block 1: this program's own settings, and the one button that changes them.
+/// What every state of block 1 ends with, because block 1 has no controls.
 ///
-/// Returns the body and the button's caption, [`None`] when there is nothing
-/// to press. Three states rather than the two an `enabled && joystick` gate
-/// would give, because the middle one is real: somebody who has already set up
-/// opentrack has game output on and no joystick, and telling them to "turn on"
-/// a switch that is on is the kind of small untruth this whole window exists
-/// not to tell.
+/// It had one — a button that set `enabled` and `joystick` together — and that
+/// button was the whole of the duplication the modal was modal to survive: two
+/// live editors of one global setting. Deleting it leaves a block that reports
+/// and never writes, and a block of prose about settings, with nothing on it to
+/// press, has to say where the controls are or it reads as a page that has
+/// forgotten its own buttons.
 ///
-/// # Why the caption is built rather than written
+/// `pub(crate)` so the help topic and the tests quote it rather than retyping
+/// it.
+pub(crate) const TRACKER_TAB_POINTER: &str =
+    "These are the Tracker tab's own settings; this page only reports them.";
+
+/// Block 1: this program's own settings, reported.
 ///
-/// The button sets `enabled` **and** `joystick`, and `enabled` is the switch
-/// every other destination hangs off. With opentrack and a bridge port already
-/// in the file, a caption reading "Turn on and send to a virtual joystick"
-/// promised one destination and produced three. This module's own doctrine is
-/// that a button must not do more than its caption says, so the caption names
-/// the destinations the press will leave running, worded by the same
-/// [`destinations`] the body is worded by.
+/// Three states rather than the two an `enabled && joystick` gate would give,
+/// because the middle one is real: somebody who has already set up opentrack
+/// has game output on and no joystick, and telling them to "turn on" a switch
+/// that is on is the kind of small untruth this whole tab exists not to tell.
+///
+/// # Why there is no caption any more
+///
+/// There was a button, and it built its caption rather than stating one: it set
+/// `enabled` **and** `joystick`, `enabled` is the switch every other
+/// destination hangs off, and with opentrack and a bridge port already in the
+/// file a fixed caption reading "Turn on and send to a virtual joystick"
+/// promised one destination and produced three. The button is gone with the
+/// modal — see [`TRACKER_TAB_POINTER`] — so what survives is the half of that
+/// argument the body was already making: the destinations already in the file
+/// are named **before** anything is touched, because the switch on the other
+/// tab starts all of them and not just the one somebody has in mind.
 pub(crate) fn settings_block(
     cfg: &OutputConfig,
     bridge: profiles::Bridge,
     joystick: &JoystickStatus,
-) -> (String, Option<String>) {
+) -> String {
     let (sinks, trouble) = destinations(cfg, joystick);
 
     if cfg.enabled && cfg.joystick {
@@ -503,28 +532,30 @@ pub(crate) fn settings_block(
             ),
         };
         match &trouble {
-            // Nothing wrong and nothing left to press, said out loud rather
-            // than left as a block with no button under it.
+            // Nothing wrong and nothing to do about it, said out loud: every
+            // other state of this block ends by naming something that could be
+            // changed, and silence here would read as the same list cut short.
             None => body.push_str(" Nothing to change here."),
             Some(t) => {
                 body.push_str("\n\n");
                 body.push_str(t);
             }
         }
-        return (body, None);
+        body.push_str("\n\n");
+        body.push_str(TRACKER_TAB_POINTER);
+        return body;
     }
 
     let mut body = if !cfg.enabled {
         match sinks.as_slice() {
             [] => "Head tracking for games is off.".to_string(),
             // The destinations already in the file, named before the switch is
-            // touched. They are what the one button below will also start, and
-            // a page that mentioned them only once the switch was on told
+            // touched. They are all started by the one switch on the Tracker
+            // tab, and a page that mentioned them only once it was on told
             // somebody they were turning on a joystick and gave them three.
             _ => format!(
                 "Head tracking for games is off. It is already configured to send to {list}, \
-                 {strength} — turning it on starts all of that, not only what the button \
-                 below adds.",
+                 {strength} — turning it on, on the Tracker tab, starts all of that.",
                 list = join_and(&sinks),
                 strength = strength_clause(cfg),
             ),
@@ -545,26 +576,9 @@ pub(crate) fn settings_block(
     }
     body.push_str("\n\n");
     body.push_str(&joystick_paragraph(bridge));
-
-    let caption = if cfg.enabled {
-        // It is already on. Saying "turn on" here would be a caption that
-        // describes something that has already happened, and the press adds
-        // the joystick and nothing else.
-        "Send to a virtual joystick".to_string()
-    } else {
-        // What the file will say once the press has landed.
-        let mut after = cfg.clone();
-        after.enabled = true;
-        after.joystick = true;
-        let (mut list, _) = destinations(&after, joystick);
-        if list.is_empty() {
-            // Only reachable with a joystick that has already failed. The
-            // press still asks for one, so the caption says it asks for one.
-            list.push("a virtual joystick".to_string());
-        }
-        format!("Turn on and send to {}", join_and(&list))
-    };
-    (body, Some(caption))
+    body.push_str("\n\n");
+    body.push_str(TRACKER_TAB_POINTER);
+    body
 }
 
 /// `a`, `a and b`, `a, b and c` — or "nothing" for an empty list, which no
@@ -642,19 +656,6 @@ pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
                 .to_string(),
         ),
     }
-}
-
-/// What is appended to block 1 after a write, because a modal window that
-/// changes a control the user cannot see is otherwise a leap of faith.
-///
-/// True by construction: the hub tick calls [`crate::games::GamesRow::refresh`],
-/// which re-reads the same file and compares before writing, so an equal write
-/// cannot re-enter the save handlers listening to those very widgets.
-fn wrote_line(path: &Path) -> String {
-    format!(
-        "Written to {}. The card behind this window reads the same file and will follow.",
-        path.display()
-    )
 }
 
 // ------------------------------------------------------- block 2: the bridge
@@ -1294,10 +1295,12 @@ pub(crate) fn job_view(
     if let Some(cmd) = mine(running) {
         text.push_str(&format!(
             "\n\nRunning now:\n{cmd}\n\n\
-             Closing this window does not stop it — this window stops watching and the \
-             installer finishes. It copies each file beside its target and renames it, so a \
-             half-finished copy cannot be loaded; stopping it between the copy and the \
-             registry write is the one way to leave a prefix inconsistent."
+             Closing this window does not stop it, and does not stop this page watching \
+             either: the installer finishes and the result is here when you come back. \
+             Quitting stops the watching; the installer still finishes. It copies each file \
+             beside its target and renames it, so a half-finished copy cannot be loaded; \
+             stopping it between the copy and the registry write is the one way to leave a \
+             prefix inconsistent."
         ));
     } else if let Some((_, o)) = outcome.filter(|(id, _)| id == appid) {
         text.push_str("\n\n");
@@ -2009,29 +2012,22 @@ fn run_check(check: &profiles::Check, prefix: Option<&Path>) -> (Vec<Row>, Optio
     }
 }
 
-// ----------------------------------------------------------------- the window
+// -------------------------------------------------------------------- the tab
 
-thread_local! {
-    /// The game-setup window, while one is open.
-    ///
-    /// A **weak** reference, which is the v0.3.1 rule written as code: a strong
-    /// one here would keep the window alive after it was closed, and with it
-    /// everything it holds. Nothing else in this module holds the window
-    /// either — the Close button finds it from itself at click time
-    /// ([`crate::close_on_click`]), the Esc controller holds a weak ref
-    /// ([`crate::add_escape_to_close`]), and Back finds the stack as a weak
-    /// reference to a descendant rather than walking up to the window.
-    static OPEN: RefCell<glib::WeakRef<gtk::Window>> = RefCell::new(glib::WeakRef::new());
-}
-
-/// What the pick page says above the list.
+/// What the detail pane says before a game has been picked.
 ///
-/// "…and do the two it can" is true of a machine that has a `tobii` to run.
-/// Without one the bridge block has no button at all — [`bridge_block`]
-/// replaces it with the command to type — so the page does one of the three
-/// and the lead promised two before the user had picked anything. The count is
-/// the one thing about it knowable before a game is picked, so it is the one
-/// thing this branches on; everything per-game is block 2's to say.
+/// **It says "the one it can", and that number is the whole reason this
+/// function is not the one the modal had.** The modal did two of the three: it
+/// wrote this program's own settings from block 1's button, and it installed
+/// the bridge. Block 1's button is gone with the modal — the settings have one
+/// editor now, on the Tracker tab — so the count is one, and a lead still
+/// offering two would be this tab promising a button that no longer exists
+/// before the user has picked anything.
+///
+/// It is still the count that this branches on, for the same reason it always
+/// was: without a `tobii` to run, [`bridge_block`] replaces the install button
+/// with the command to type, and then the tab does **none** of the three.
+/// Everything per-game is block 2's to say.
 ///
 /// The `None` arm names only the `$PATH` half of the search. It used to open
 /// "which is not beside this one", which [`tobii_binary`] has not necessarily
@@ -2039,20 +2035,49 @@ thread_local! {
 /// of the two places were looked at; this line, printed before a game is
 /// picked and with no room for the distinction, says the half that is true
 /// either way and leaves the rest to the page that can be precise about it.
+/// What the detail pane says before a game has been picked: a heading, a
+/// paragraph, and — when there is a list to pick from — what to do next.
+///
+/// A function rather than three `if`s among the widgets, because this file's
+/// rule is that every sentence it shows is produced by something CI can assert
+/// without a display, and the pane that every new user lands on is a poor place
+/// to start making exceptions. Zero profiles ship, so this IS the first screen
+/// of the Games tab for everyone.
+///
+/// The `empty` arm is the modal's old third page, which was a page nothing
+/// could leave. As a state of the pane it says exactly what it said before, and
+/// it drops the instruction: there is nothing on the left to pick.
+fn intro_text(
+    tobii: Option<&Path>,
+    empty: bool,
+    missing: &[PathBuf],
+) -> (&'static str, String, Option<&'static str>) {
+    if empty {
+        return ("No games found", nothing_text(missing), None);
+    }
+    (HEADING, lead(tobii).to_string(), Some(PICK_ONE))
+}
+
+/// The one instruction on the Games tab.
+///
+/// A master–detail pane with nothing selected has to say which half to use, or
+/// it reads as a page that failed to load. It is the only sentence this stage
+/// adds that was not somewhere in the modal already.
+const PICK_ONE: &str = "Pick a game on the left.";
+
 fn lead(tobii: Option<&Path>) -> &'static str {
     match tobii {
         Some(_) => {
-            "Everything Steam says is installed on this machine. Pick one and this window \
-             will show the three things that have to be configured for it, and do the two it \
-             can."
+            "Everything Steam says is installed on this machine. Pick one and this page will \
+             show the three things that have to be configured for it, and do the one it can."
         }
         None => {
-            "Everything Steam says is installed on this machine. Pick one and this window \
-             will show the three things that have to be configured for it. It can set this \
-             program's own settings; the Wine bridge needs the command-line program `tobii`, \
-             which this window could not find — it is not on the PATH this window was \
-             started with, and a terminal's is often not the same — so for that one the \
-             window says what to type there instead."
+            "Everything Steam says is installed on this machine. Pick one and this page will \
+             show the three things that have to be configured for it. The one it can do is \
+             install the Wine bridge, and that needs the command-line program `tobii`, which \
+             this window could not find — it is not on the PATH this window was started with, \
+             and a terminal's is often not the same — so for that one the page says what to \
+             type there instead."
         }
     }
 }
@@ -2138,16 +2163,23 @@ fn pretty(argv: &[OsString]) -> String {
 /// it a cancelled run "left a 5 Hz timeout running for the life of the process,
 /// holding every widget in this window alive with it".
 ///
-/// **Closing the window mid-install does not kill the child.** The poll stops;
-/// the process finishes. `bridge.rs`'s install stages each DLL beside its
-/// target and renames it, exactly so a half-finished copy cannot be loaded, and
-/// killing it between the copy and the registry write is the one way to leave a
-/// prefix inconsistent.
+/// **Nothing here kills the child, ever.** `bridge.rs`'s install stages each
+/// DLL beside its target and renames it, exactly so a half-finished copy cannot
+/// be loaded, and killing it between the copy and the registry write is the one
+/// way to leave a prefix inconsistent. The poll only stops watching.
+///
+/// `alive` is **the hub's** lifetime and not this page's, which is what the tab
+/// bought over the modal it replaces: closing the hub to the tray used to close
+/// the modal, which set `alive` false and threw away a running install's
+/// result. Now the poll keeps running while the hub is hidden and the outcome
+/// lands in its slot, where [`JobView`] finds it — keyed by appid, which it
+/// already was — the next time the page is drawn. Only the quit path sets this
+/// false. See [`GamesTab::shutdown`].
 ///
 /// `appid` is stored beside the command line and is what the page keys its
-/// "Running now:" line to. One job at a time in this window, whichever game it
+/// "Running now:" line to. One job at a time on this tab, whichever game it
 /// was started for — the guard below is on `running` itself and not on a
-/// per-game slot, because one child process is what this window is prepared to
+/// per-game slot, because one child process is what this tab is prepared to
 /// wait for and a second `tobii bridge install` running beside the first is
 /// not an improvement.
 fn start_job(
@@ -2175,7 +2207,7 @@ fn start_job(
     let alive = alive.clone();
     let running = running.clone();
     glib::timeout_add_local(Duration::from_millis(150), move || {
-        // First line, before anything is touched: the window may be gone.
+        // First line, before anything is touched: the hub may be gone.
         if !alive.get() {
             return glib::ControlFlow::Break;
         }
@@ -2205,71 +2237,77 @@ fn start_job(
     });
 }
 
-/// Open the game-setup window, or raise the one that is already open.
+/// The Games tab, and the one thing about it the hub has to be told.
+///
+/// Two fields, and they are deliberately not one struct the hub keeps: `root`
+/// goes straight into the hub's `Stack`, which owns it, and `alive` is what the
+/// hub's **quit** path sets. If the hub's close handler held this whole struct
+/// it would hold `root`, which is a descendant of the window that holds the
+/// handler — a strong reference from a window to its own subtree, which is the
+/// sibling cycle GTK never breaks. So [`crate::build_hub`] takes the two apart
+/// the moment it has them and only `alive` goes into a closure.
+pub struct GamesTab {
+    /// The widget the hub adds to its `Stack`.
+    pub root: gtk::Box,
+    /// See [`GamesTab::shutdown`].
+    pub alive: Rc<Cell<bool>>,
+}
+
+impl GamesTab {
+    /// Stop watching whatever subprocess is running, because the program is
+    /// ending.
+    ///
+    /// **From the quit path and not from `unmap`.** The modal this tab replaces
+    /// was closed by the hub's unmap handler — that is, by hiding to the tray —
+    /// and closing it set this flag, so hiding the hub in the middle of a
+    /// `tobii bridge install` threw the result away while the installer carried
+    /// on. A tab is not closed by hiding, so the poll keeps running, the
+    /// outcome lands in its per-appid slot, and the page shows it when the hub
+    /// comes back. That is strictly better and it is why this is not wired to
+    /// `unmap`.
+    pub fn shutdown(&self) {
+        self.alive.set(false);
+    }
+}
+
+/// Build the Games tab.
 ///
 /// Reads `$HOME` and this user's profile directory, and hands both to
-/// [`open_with`]. Nothing in CI calls this.
+/// [`build_with`]. Nothing in CI calls this.
 ///
-/// `joystick` is the device thread's own answer, the one the hub's card
-/// reports from — see [`destinations`] for why the checkbox is not enough. It
-/// is an `Arc<Mutex<_>>` and holds no widget, so carrying it into the button
-/// handler that opens this window cannot be half of a GTK reference cycle.
-pub fn open(
-    app: &Application,
-    parent: &impl IsA<gtk::Window>,
-    joystick: Arc<Mutex<JoystickStatus>>,
-) -> gtk::Window {
-    // Asked before the disk is read, not after. `open_with` returns the window
-    // that is already up if one is, and building the `Scan` first meant every
-    // press of a button that is already showing its window read four
-    // `libraryfolders.vdf` files and twenty-nine manifests — measured at about
-    // 400 µs and 81 filesystem calls — and threw the answer away, on the main
-    // loop.
-    if let Some(win) = OPEN.with(|c| c.borrow().upgrade()) {
-        win.present();
-        return win;
-    }
+/// The scan is a measured ~400 µs and 81 filesystem calls, and it is now paid
+/// once when the hub is built rather than on the first press of a button. That
+/// is the trade the tab makes: it used to be paid on every press of a door that
+/// had already opened its window, which was worse, and it is why [`open`]'s
+/// registry check came before the disk read.
+///
+/// `joystick` is the device thread's own answer, the one the games card reports
+/// from — see [`destinations`] for why the checkbox is not enough.
+///
+/// [`open`]: GamesTab
+pub fn build(joystick: Arc<Mutex<JoystickStatus>>) -> GamesTab {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
     let dir = profiles::profiles_dir();
-    open_with(app, parent, scan(&home, &dir), joystick)
+    build_with(scan(&home, &dir), joystick)
 }
 
-/// Close the window if one is open.
+/// The tab, over a scan that was handed in.
 ///
-/// Called when the hub hides itself to the tray. `destroy_with_parent` does not
-/// cover *hiding* a parent, and a modal transient whose parent is hidden is
-/// left to the compositor — on some it floats alone on an empty desktop with
-/// nothing behind it to be modal over.
-pub(crate) fn close() {
-    if let Some(win) = OPEN.with(|c| c.borrow().upgrade()) {
-        win.close();
-    }
-}
-
-/// The window, over a scan that was handed in.
-///
-/// Modal and transient for the hub. Modal because the one control it writes —
-/// game output and its destination — is also on the card behind it, and two
-/// live editors of one setting side by side is a race the user can see.
+/// **Master–detail, horizontal, and no pages.** The modal needed a page stack
+/// and a Back button because it was 620px wide and could show one or the other;
+/// a tab is over 1200px, both panes fit side by side, and a selection that
+/// survives is how somebody compares two games. The list keeps its selection
+/// while the tab is hidden.
 ///
 /// It takes **no claim on the tracker**: [`crate::hold_while_open`] is not
-/// called, no `DemandGuard` is taken, and this window is not in
-/// `device::EXCLUSIVE` and is not a candidate for it. See the module docs.
+/// called, no `DemandGuard` is taken, and nothing here is in
+/// `device::EXCLUSIVE` or a candidate for it. See the module docs.
 ///
-/// `joystick` is read, never written: this window asks the device thread what
-/// became of the tick, the same fact the card behind it reports.
-pub fn open_with(
-    app: &Application,
-    parent: &impl IsA<gtk::Window>,
-    scanned: Scan,
-    joystick: Arc<Mutex<JoystickStatus>>,
-) -> gtk::Window {
-    if let Some(win) = OPEN.with(|c| c.borrow().upgrade()) {
-        win.present();
-        return win;
-    }
+/// `joystick` is read, never written: this tab asks the device thread what
+/// became of the tick, the same fact the games card reports.
+pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesTab {
     let scan = Rc::new(scanned);
 
     // This machine's Steam install, read once and asked everything: which
@@ -2303,19 +2341,15 @@ pub fn open_with(
     let beside: Rc<Option<PathBuf>> = Rc::new(search.beside);
     let tobii: Rc<Option<PathBuf>> = Rc::new(search.found);
 
-    // ---- the pick page
+    // ---- the master pane: the search box, the list, the census
+    //
+    // The pick page's widgets in the same order, minus its heading and its
+    // lead. Those two are not about the list — they are about what picking
+    // something will do — so they belong to the pane that shows it, and that is
+    // where the empty state below puts them.
 
     let pick = gtk::Box::new(Orientation::Vertical, 10);
-    let pick_head = Label::new(Some("Which game?"));
-    pick_head.set_halign(Align::Start);
-    pick_head.set_xalign(0.0);
-    pick_head.add_css_class("dialog-heading");
-    let lead = Label::new(Some(lead(tobii.as_deref())));
-    lead.set_halign(Align::Start);
-    lead.set_xalign(0.0);
-    lead.set_wrap(true);
-    lead.set_max_width_chars(58);
-    lead.add_css_class("dialog-lead");
+    pick.set_size_request(LIST_WIDTH, -1);
 
     let search = gtk::SearchEntry::new();
     search.set_widget_name(SEARCH_NAME);
@@ -2334,24 +2368,64 @@ pub fn open_with(
     list_scroll.set_child(Some(&list));
 
     let census = small("");
-    pick.append(&pick_head);
-    pick.append(&lead);
     pick.append(&search);
     pick.append(&list_scroll);
     pick.append(&census);
 
-    // ---- the nothing page
+    // ---- the detail pane, state one: nothing picked yet
+    //
+    // Zero profiles ship, so this is where every new user lands, and the pane
+    // is not empty even then: the list beside it has whatever Steam says is
+    // installed, which is what they came for.
+    //
+    // `nothing_text` fills the pane instead when Steam lists nothing at all —
+    // the modal's third page, demoted from somewhere you could never leave to a
+    // state of the pane, which is what it always was.
+    //
+    // None of these three labels is `selectable`, unlike the blocks below, and
+    // that is load-bearing rather than an oversight: this box is hidden the
+    // moment a game is picked, and `help.rs`'s measurement is that a pane
+    // folded away with the focus inside it holds its subtree for good. A label
+    // that cannot take focus cannot be holding it when the box folds. The one
+    // selectable label here is `nothing_body`, and it is only ever built on a
+    // machine with no games, where nothing is ever picked and the box never
+    // folds.
+    let empty = scan.apps.is_empty();
+    let (head, body, instruction) =
+        intro_text(tobii.as_deref(), empty, scan.steam.missing_libraries());
+    let intro = gtk::Box::new(Orientation::Vertical, 10);
+    let intro_head = Label::new(Some(head));
+    intro_head.set_halign(Align::Start);
+    intro_head.set_xalign(0.0);
+    intro_head.add_css_class("dialog-heading");
+    intro.append(&intro_head);
+    // `wrapped` when there is nothing to pick, because then this paragraph is
+    // the whole of the pane and a path in it is worth being able to copy. A
+    // plain label otherwise, so nothing in this box can hold the focus when it
+    // folds away.
+    let nothing_body = wrapped(&body);
+    if empty {
+        intro.append(&nothing_body);
+    } else {
+        let lead_label = Label::new(Some(&body));
+        lead_label.set_halign(Align::Start);
+        lead_label.set_xalign(0.0);
+        lead_label.set_wrap(true);
+        lead_label.set_max_width_chars(58);
+        lead_label.add_css_class("dialog-lead");
+        intro.append(&lead_label);
+    }
+    if let Some(line) = instruction {
+        let pick_one = Label::new(Some(line));
+        pick_one.set_halign(Align::Start);
+        pick_one.set_xalign(0.0);
+        pick_one.set_wrap(true);
+        pick_one.set_max_width_chars(58);
+        pick_one.add_css_class("section-desc");
+        intro.append(&pick_one);
+    }
 
-    let nothing = gtk::Box::new(Orientation::Vertical, 10);
-    let nothing_head = Label::new(Some("No games found"));
-    nothing_head.set_halign(Align::Start);
-    nothing_head.set_xalign(0.0);
-    nothing_head.add_css_class("dialog-heading");
-    let nothing_body = wrapped(&nothing_text(scan.steam.missing_libraries()));
-    nothing.append(&nothing_head);
-    nothing.append(&nothing_body);
-
-    // ---- the game page
+    // ---- the detail pane, state two: one game
 
     let game = gtk::Box::new(Orientation::Vertical, 14);
     let g_title = Label::new(None);
@@ -2363,10 +2437,11 @@ pub fn open_with(
     game.append(&g_title);
     game.append(&g_sub);
 
+    // No actions box, for the reason block 3 has never had one: this block
+    // reports settings it does not own. The one editor of them is the games
+    // card on the Tracker tab, and a second control here writing the same two
+    // keys is the duplication the modal was modal to survive.
     let (b1, s_body) = block(1, "These settings");
-    let s_actions = gtk::Box::new(Orientation::Horizontal, 10);
-    s_actions.set_halign(Align::Start);
-    b1.append(&s_actions);
     game.append(&b1);
     game.append(&divider());
 
@@ -2379,47 +2454,57 @@ pub fn open_with(
     game.append(&b2);
     game.append(&divider());
 
-    // No actions box, and that is the decision rather than an oversight: this
-    // program never writes a game's own configuration files, so block 3 has
-    // nothing to press. See the module docs.
+    // No actions box either, and that is the decision rather than an oversight:
+    // this program never writes a game's own configuration files, so block 3
+    // has nothing to press. See the module docs.
     let (b3, p_body) = block(3, "The game's own settings");
     let rows_box = gtk::Box::new(Orientation::Vertical, 6);
     b3.append(&rows_box);
     b3.append(&small(READ_ONLY_FOOTER));
     game.append(&b3);
 
-    let game_scroll = gtk::ScrolledWindow::new();
-    game_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-    game_scroll.set_vexpand(true);
-    game_scroll.set_child(Some(&game));
+    // Both states of the detail pane, as siblings in one box rather than as a
+    // second `Stack`: there is nothing to switch back to. `intro` is shown
+    // until a game is picked and then hidden for good, which is why the walk
+    // from `intro` to `game` below moves the focus first.
+    game.set_visible(false);
+    let detail = gtk::Box::new(Orientation::Vertical, 14);
+    detail.append(&intro);
+    detail.append(&game);
 
-    // ---- the stack and the footer
+    let detail_scroll = gtk::ScrolledWindow::new();
+    detail_scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
+    detail_scroll.set_vexpand(true);
+    detail_scroll.set_hexpand(true);
+    detail_scroll.set_size_request(DETAIL_WIDTH, -1);
+    detail_scroll.set_child(Some(&detail));
 
-    let stack = gtk::Stack::new();
-    stack.set_widget_name(STACK_NAME);
-    stack.set_hhomogeneous(false);
-    stack.set_vhomogeneous(false);
-    stack.set_vexpand(true);
-    stack.add_named(&pick, Some(PAGE_PICK));
-    stack.add_named(&game_scroll, Some(PAGE_GAME));
-    stack.add_named(&nothing, Some(PAGE_NOTHING));
+    // ---- the two panes, side by side
 
-    let back = crate::widget::button("Back");
-    let close_btn = crate::widget::button("Close");
-    crate::close_on_click(&close_btn);
-    let footer = gtk::Box::new(Orientation::Horizontal, 10);
-    footer.set_halign(Align::End);
-    footer.set_margin_top(4);
-    footer.append(&back);
-    footer.append(&close_btn);
-
-    let content = gtk::Box::new(Orientation::Vertical, 12);
-    content.set_margin_top(24);
-    content.set_margin_bottom(20);
-    content.set_margin_start(26);
-    content.set_margin_end(26);
-    content.append(&stack);
-    content.append(&footer);
+    // `vexpand`, unlike the control rack this sits beside in the hub's stack,
+    // and the difference is what each of them is made of. The rack is a fixed
+    // set of cards: it wants its natural height and any spare window below it
+    // is plain background, which is why `crate::build_hub` gives the grid
+    // `vexpand(false)` and `valign(Start)`. This tab is two scrollers over
+    // lists that have no natural length — 29 titles here, three on the next
+    // machine — so without this the list gets its own small natural height and
+    // scrolls inside a hundred pixels while four hundred sit empty underneath
+    // it.
+    //
+    // It does not grow tab 1, and the reason is not the one it looks like.
+    // Measured: `gtk_widget_compute_expand` on the hub's stack answers **true
+    // on both tabs** — a `GtkStack` takes its expand from all of its pages, not
+    // from the one that is showing — so this flag reaches the Tracker tab too.
+    // It costs nothing there for two separate reasons, both of which have to
+    // hold: `crate::build_hub` gives the control rack `vexpand(false)` and
+    // `valign(Start)`, so it stays its own height at the top of whatever it is
+    // given; and the hub's opening height comes from `root.measure`, which does
+    // not consult expand at all. Measured either side of this line: 1189 x 725
+    // both times.
+    let content = gtk::Box::new(Orientation::Horizontal, 16);
+    content.set_vexpand(true);
+    content.append(&pick);
+    content.append(&detail_scroll);
 
     // ---- the buttons, built once
     //
@@ -2427,8 +2512,6 @@ pub fn open_with(
     // handlers call: a button created by `refresh` would be held by a box that
     // `refresh` holds, and that is the cycle. Built here and only *described*
     // by `refresh`, which reaches them through `downgrade()`.
-    let settings_btn = crate::widget::button("Turn on and send to a virtual joystick");
-    s_actions.append(&settings_btn);
     let install_btn = crate::widget::button(Action::Install.caption());
     let details_btn = crate::widget::button("Details");
     details_btn.add_css_class("quiet");
@@ -2444,19 +2527,22 @@ pub fn open_with(
     // ---- the state the page draws itself from
 
     let sel: Rc<RefCell<Option<App>>> = Rc::default();
-    // All four carry the app id their answer is about, and they carry it
-    // because clearing them on a page change was not enough. A job
-    // outlives the page it was started from: select a game, press *Install the
-    // bridge*, press *Back* and pick another, and the running line and then
-    // the outcome landed on whichever game was selected when the child
-    // finished — the second game's page showing the first game's install and
-    // then its success. `row_activated` can clear what is there; it cannot
-    // clear what has not arrived yet. So the closure writes the id with the
-    // answer and the page reads only its own.
+    // All three carry the app id their answer is about, and they carry it
+    // because clearing them on a selection change was not enough. A job
+    // outlives the selection it was started from: select a game, press *Install
+    // the bridge*, pick another, and the running line and then the outcome
+    // landed on whichever game was selected when the child finished — the
+    // second game's page showing the first game's install and then its success.
+    // `row_activated` can clear what is there; it cannot clear what has not
+    // arrived yet. So the closure writes the id with the answer and the page
+    // reads only its own.
+    //
+    // The tab makes that carry matter more, not less: the poll now survives the
+    // hub being hidden to the tray, so an outcome can arrive while nothing is
+    // on screen at all and be read minutes later.
     let running: Rc<RefCell<Option<(String, String)>>> = Rc::default();
     let outcome: Rc<RefCell<Option<(String, Outcome)>>> = Rc::default();
     let report: Rc<RefCell<Option<(String, String)>>> = Rc::default();
-    let wrote: Rc<RefCell<Option<(String, String)>>> = Rc::default();
 
     // ---- refresh
     //
@@ -2465,14 +2551,19 @@ pub fn open_with(
     // if this closure held the button, or the box the button sits in, that
     // would be a cycle between two siblings, which GTK never breaks and which a
     // test that weak-refs only the window cannot see.
+    //
+    // The rule is unchanged and the stakes are higher: this tree used to die
+    // every time the modal closed, which was often, so a cycle showed up
+    // quickly. It now lives as long as the hub, and the hub closes once, at
+    // quit — which is the exact shape of the v0.3.1 bug. `tests/games_tab.rs`
+    // weak-refs the whole subtree for that reason.
     let refresh: Rc<dyn Fn()> = {
-        let (scan, sel, running, outcome, report, wrote, tobii, beside, joystick) = (
+        let (scan, sel, running, outcome, report, tobii, beside, joystick) = (
             scan.clone(),
             sel.clone(),
             running.clone(),
             outcome.clone(),
             report.clone(),
-            wrote.clone(),
             tobii.clone(),
             beside.clone(),
             joystick.clone(),
@@ -2486,9 +2577,8 @@ pub fn open_with(
             p_body.clone(),
             rows_box.clone(),
         );
-        let (s_actions, b_actions) = (s_actions.downgrade(), b_actions.downgrade());
-        let (settings_w, install_w, details_w, wine_w) = (
-            settings_btn.downgrade(),
+        let b_actions = b_actions.downgrade();
+        let (install_w, details_w, wine_w) = (
             install_btn.downgrade(),
             details_btn.downgrade(),
             wine_btn.downgrade(),
@@ -2503,7 +2593,7 @@ pub fn open_with(
             // Read before the blocks are worded, because two of them have
             // something to say about what it holds. A profile that named
             // settings, or that answered the bridge question, and was then
-            // silently ignored would be this window telling somebody nothing
+            // silently ignored would be this page telling somebody nothing
             // needs doing while something does.
             let verdict = profile_verdict(profiles::load_from(
                 &scan.profiles_dir,
@@ -2518,7 +2608,7 @@ pub fn open_with(
             // --- block 1
             let cfg = tobii_output::games::load_output_config();
             // A poisoned lock is the device thread having panicked, which this
-            // window has nothing to say about and must not panic over: the
+            // page has nothing to say about and must not panic over: the
             // answer it gives then is the default, "nobody has asked for one".
             let joy = joystick
                 .lock()
@@ -2527,30 +2617,12 @@ pub fn open_with(
             let bridge = profile
                 .map(|p| p.bridge)
                 .unwrap_or(profiles::Bridge::Unstated);
-            let (mut text, caption) = settings_block(&cfg, bridge, &joy);
+            let mut text = settings_block(&cfg, bridge, &joy);
             if let Some(note) = profile.and_then(|p| profile_settings_note(&p.settings)) {
                 text.push_str("\n\n");
                 text.push_str(&note);
             }
-            if let Some((_, w)) = wrote.borrow().as_ref().filter(|(id, _)| *id == app.appid) {
-                text.push_str("\n\n");
-                text.push_str(w);
-            }
             s_body.set_text(&text);
-            if let Some(btn) = settings_w.upgrade() {
-                match &caption {
-                    Some(c) => {
-                        crate::widget::set_button_text(&btn, c);
-                        btn.set_visible(true);
-                    }
-                    None => btn.set_visible(false),
-                }
-            }
-            if let Some(b) = s_actions.upgrade() {
-                // An insensitive ancestor makes its children insensitive, which
-                // is how this greys a button out without holding one.
-                b.set_sensitive(running.borrow().is_none());
-            }
 
             // --- block 2
             //
@@ -2642,28 +2714,14 @@ pub fn open_with(
     };
 
     // ---- the handlers
+    //
+    // There is no handler for block 1. It had one — the button that wrote
+    // `enabled` and `joystick` — and deleting it takes `games.toml` from five
+    // writers to four. Nothing in this file writes that file any more.
 
-    {
-        let (refresh, wrote, sel) = (refresh.clone(), wrote.clone(), sel.clone());
-        settings_btn.connect_clicked(move |_| {
-            let Some(app) = sel.borrow().clone() else {
-                return;
-            };
-            // Through `games::edit_config`, which re-reads the file first:
-            // three editors now share `games.toml` — this window, the hub's
-            // card, and `tobii games set` — and a held copy makes whichever
-            // was touched second clobber the other.
-            crate::games::edit_config("game-output settings", |cfg| {
-                cfg.enabled = true;
-                cfg.joystick = true;
-            });
-            *wrote.borrow_mut() = Some((app.appid, wrote_line(&tobii_output::games::games_path())));
-            refresh();
-        });
-    }
-
-    // This window's lifetime, as one flag. Every poll reads it on its first
-    // line and stops when it is false; `connect_close_request` sets it.
+    // The **hub's** lifetime, as one flag. Every poll reads it on its first
+    // line and stops when it is false; only the quit path sets it. See
+    // [`GamesTab::shutdown`] for why not `unmap`.
     let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
 
     {
@@ -2818,20 +2876,32 @@ pub fn open_with(
     }
 
     {
-        let (refresh, sel, scan, ids, wrote, outcome, report) = (
+        let (refresh, sel, scan, ids, outcome, report) = (
             refresh.clone(),
             sel.clone(),
             scan.clone(),
             ids.clone(),
-            wrote.clone(),
             outcome.clone(),
             report.clone(),
         );
-        // Weak, all three: `back` and `search` each carry handlers of their
-        // own, and `search`'s reaches this very list — so a strong reference
-        // here would close a sibling cycle that nothing ever breaks.
-        let (stack_w, back_w, game_scroll) =
-            (stack.downgrade(), back.downgrade(), game_scroll.clone());
+        // Weak, every widget: `search` carries a handler of its own that
+        // reaches this very list, and `intro` and `game` are siblings of it
+        // under a box this list is also under — so a strong reference here
+        // would close a sibling cycle that nothing ever breaks, and the tree
+        // this is in now lives as long as the hub.
+        //
+        // The three selectable bodies are here too, and they are re-cleared on
+        // every selection change rather than once when a window opened: a
+        // selectable `GtkLabel` selects all of its text the moment focus
+        // reaches it, focus can pass *through* one on its way somewhere else,
+        // and these bodies never fold away any more, so every pass has to be
+        // undone. See below for the same call at build time.
+        let (intro_w, game_w, detail_w) = (
+            intro.downgrade(),
+            game.downgrade(),
+            detail_scroll.downgrade(),
+        );
+        let (s_w, br_w, p_w) = (s_body.downgrade(), br_body.downgrade(), p_body.downgrade());
         list.connect_row_activated(move |_, row| {
             let Some(id) = ids.borrow().get(row.index().max(0) as usize).cloned() else {
                 return;
@@ -2844,95 +2914,42 @@ pub fn open_with(
             // them here is only half of that, because a job still running will
             // write its answer back after this line has run. The other half is
             // the app id each of these carries: see where they are declared.
-            *wrote.borrow_mut() = None;
             *outcome.borrow_mut() = None;
             *report.borrow_mut() = None;
             refresh();
-            if let (Some(stack), Some(back)) = (stack_w.upgrade(), back_w.upgrade()) {
-                back.set_sensitive(true);
-                // Focus leaves the outgoing page BEFORE it folds away, onto a
-                // widget that is on neither page. `help.rs` records the
-                // measurement: a pane folded away with the focus inside it
-                // permanently holds its subtree, and a stack page is a pane.
-                back.grab_focus();
-                stack.set_visible_child_name(PAGE_GAME);
-                game_scroll.grab_focus();
+            if let (Some(intro), Some(game), Some(detail)) =
+                (intro_w.upgrade(), game_w.upgrade(), detail_w.upgrade())
+            {
+                // Focus leaves the intro BEFORE it folds away, onto the
+                // scroller that holds both. `help.rs` records the measurement:
+                // a pane folded away with the focus inside it permanently holds
+                // its subtree. It only matters once — the intro never comes
+                // back — and it costs one call, so it is made rather than
+                // argued about.
+                detail.grab_focus();
+                intro.set_visible(false);
+                game.set_visible(true);
+            }
+            for body in [&s_w, &br_w, &p_w] {
+                if let Some(l) = body.upgrade() {
+                    l.select_region(0, 0);
+                }
             }
         });
     }
 
-    {
-        let (stack_w, search_w, close_w) =
-            (stack.downgrade(), search.downgrade(), close_btn.downgrade());
-        back.connect_clicked(move |b| {
-            let (Some(stack), Some(search)) = (stack_w.upgrade(), search_w.upgrade()) else {
-                return;
-            };
-            if let Some(c) = close_w.upgrade() {
-                c.grab_focus();
-            }
-            stack.set_visible_child_name(PAGE_PICK);
-            search.grab_focus();
-            b.set_sensitive(false);
-        });
-    }
-
-    // ---- the window
-
-    let win = gtk::Window::builder()
-        .application(app)
-        .transient_for(parent.as_ref())
-        .modal(true)
-        .destroy_with_parent(true)
-        .title(TITLE)
-        .default_width(620)
-        .default_height(560)
-        .resizable(true)
-        .child(&content)
-        .build();
-
-    {
-        let alive = alive.clone();
-        win.connect_close_request(move |_| {
-            // The poll's first line reads this. `connect_destroy` would be too
-            // late and is not a teardown hook — see `crate::hold_while_open`.
-            alive.set(false);
-            // And the registry, here rather than left to the weak reference
-            // going null on its own. A `WeakRef` reports the object, not the
-            // window: GTK destroys a closed window's widgetry and drops it
-            // from the application, but the GObject itself lives until the
-            // last reference goes, and any of them can outlast the close by a
-            // main-loop turn or two. Upgrading one of those and calling
-            // `present` on it gives "A window is shown after it has been
-            // destroyed", and the user gets nothing — measured, in
-            // `tests/game_setup_window.rs`, where the second open found the
-            // first window and showed a corpse.
-            OPEN.with(|c| *c.borrow_mut() = glib::WeakRef::new());
-            glib::Propagation::Proceed
-        });
-    }
-    crate::add_escape_to_close(&win);
-
-    let empty = scan.apps.is_empty();
-    stack.set_visible_child_name(if empty { PAGE_NOTHING } else { PAGE_PICK });
-    back.set_sensitive(false);
-
-    win.present();
-    if empty {
-        close_btn.grab_focus();
-    } else {
-        search.grab_focus();
-    }
-    // A selectable GtkLabel selects all of its text the moment focus reaches
+    // A selectable `GtkLabel` selects all of its text the moment focus reaches
     // it, and focus can pass through one on its way somewhere else — so the
-    // window opened with a paragraph as a solid block of highlight. Taking the
-    // focus away does not clear it; this does. The bug `help.rs` records.
+    // pane used to open with a paragraph as a solid block of highlight. Taking
+    // the focus away does not clear it; this does. The bug `help.rs` records.
     for body in [&s_body, &br_body, &p_body, &b_report, &g_sub, &nothing_body] {
         body.select_region(0, 0);
     }
 
-    OPEN.with(|c| *c.borrow_mut() = win.downgrade());
-    win
+    GamesTab {
+        root: content,
+        alive,
+    }
 }
 
 #[cfg(test)]
@@ -2987,8 +3004,133 @@ mod tests {
     /// Block 1 for a game no profile has anything to say about, with a
     /// joystick nobody has asked for yet. The two arguments the tests that do
     /// not care about them would otherwise repeat.
-    fn block1(cfg: &OutputConfig) -> (String, Option<String>) {
+    fn block1(cfg: &OutputConfig) -> String {
         settings_block(cfg, profiles::Bridge::Unstated, &JoystickStatus::Off)
+    }
+
+    // ----------------------------------------------------- the first screen
+
+    /// The pane every new user lands on, and it is a pane and not a page.
+    ///
+    /// Zero profiles ship, so nobody arrives here with something already set
+    /// up: what the Games tab is for has to be readable from a pane with
+    /// nothing selected in it. Two states, and they differ in more than their
+    /// wording — a machine with a list to pick from is told to pick, and a
+    /// machine with no list is not sent looking for one.
+    #[test]
+    fn the_pane_with_nothing_picked_says_what_to_do_and_only_when_there_is_something_to_do() {
+        let tobii = Path::new("/usr/bin/tobii");
+
+        let (head, body, next) = intro_text(Some(tobii), false, &[]);
+        assert_eq!(head, HEADING, "it says what the tab is for");
+        assert_eq!(
+            body,
+            lead(Some(tobii)),
+            "and the paragraph is the lead, verbatim: it already says what this page \
+             will do for a game and what it cannot do without a `tobii`"
+        );
+        assert_eq!(
+            next,
+            Some(PICK_ONE),
+            "a detail pane with nothing in it has to name the half that fills it, or \
+             it reads as a page that failed to load"
+        );
+
+        // Nothing installed: the old dead-end page, as a state.
+        let (head, body, next) = intro_text(Some(tobii), true, &[]);
+        assert_eq!(head, "No games found");
+        assert_eq!(body, nothing_text(&[]), "the same words, unchanged");
+        assert_eq!(
+            next, None,
+            "there is nothing on the left to pick, and telling somebody to pick from \
+             an empty list is the kind of instruction that reads as a fault in the \
+             program"
+        );
+
+        // A library that is not plugged in still gets named, in both arms.
+        let (_, absent, _) = intro_text(Some(tobii), true, &[PathBuf::from("/mnt/games2")]);
+        assert!(
+            absent.contains("/mnt/games2"),
+            "an empty list with a missing library is not the same claim as an empty \
+             list: {absent}"
+        );
+    }
+
+    // ------------------------------------------------------- the job's watch
+
+    /// What `alive` means now, asserted both ways round.
+    ///
+    /// It used to mean "the modal is open", and the modal was closed by the
+    /// hub's **unmap** handler — that is, by hiding to the tray. So hiding the
+    /// hub in the middle of a `tobii bridge install` set this flag, the poll
+    /// broke out on its next tick, and the outcome of a child process that ran
+    /// to completion was thrown away with nowhere to land. It now means "the
+    /// hub is alive" and only the quit path sets it.
+    ///
+    /// Both halves are here because either one alone can be satisfied by a poll
+    /// that does the wrong thing: a poll that never stops passes the first, a
+    /// poll that never reports passes the second.
+    ///
+    /// No widgets and no display — [`start_job`] is a channel, a thread and a
+    /// GLib timeout — so this runs in CI.
+    ///
+    /// It turns the **global default** `MainContext`, and it has to: measured,
+    /// `glib::timeout_add_local` calls `g_timeout_add_full`, which attaches to
+    /// that one and to no other, so a private context pushed as this thread's
+    /// default is never given the source and the poll never runs. This is the
+    /// only test in the crate that turns a main context, so nothing else here
+    /// is competing for it.
+    #[test]
+    fn the_job_is_watched_until_the_hub_goes_and_then_not() {
+        let ctx = glib::MainContext::default();
+        // The context is turned by hand rather than by a `MainLoop`, and the
+        // turning is bounded: a poll that never reports has to fail this test
+        // by asserting, not by hanging the suite until somebody kills it.
+        let turn = |until: &dyn Fn() -> bool, ms: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+            while !until() && std::time::Instant::now() < deadline {
+                ctx.iteration(false);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let argv = || vec![OsString::from("/bin/echo"), OsString::from("ok")];
+
+        // 1. A hub that is still there — which now includes one hidden in the
+        //    tray — gets the answer.
+        let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+        let running: Rc<RefCell<Option<(String, String)>>> = Rc::default();
+        let got: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        {
+            let got = got.clone();
+            start_job(argv(), "359320", &alive, &running, move |_| got.set(true));
+        }
+        turn(&|| got.get(), 5000);
+        assert!(
+            got.get(),
+            "the installer finished and nothing reported it, so the page would sit \
+             on 'Running now:' for ever"
+        );
+        assert!(
+            running.borrow().is_none(),
+            "and the slot is cleared, or the buttons stay greyed out"
+        );
+
+        // 2. A hub that has quit does not. The child still runs to completion —
+        //    nothing here kills it — but there is nobody left to tell.
+        let alive: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+        let running: Rc<RefCell<Option<(String, String)>>> = Rc::default();
+        let got: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        {
+            let got = got.clone();
+            start_job(argv(), "359320", &alive, &running, move |_| got.set(true));
+        }
+        alive.set(false);
+        turn(&|| false, 1500);
+        assert!(
+            !got.get(),
+            "the poll reported into a hub that has quit, which is a closure holding \
+             widgets of a window that is being torn down"
+        );
     }
 
     // ------------------------------------------------------------ the picker
@@ -3155,25 +3297,63 @@ mod tests {
     // ---------------------------------------------------------- the settings
 
     #[test]
-    fn a_config_that_needs_nothing_offers_no_button() {
-        let (body, caption) = block1(&cfg(true, true, None));
-        assert_eq!(caption, None, "there is nothing left to press: {body}");
+    fn a_config_that_needs_nothing_says_so() {
+        let body = block1(&cfg(true, true, None));
         assert!(body.contains("Nothing to change here"), "{body}");
     }
 
+    /// Block 1 has no controls, so every state of it has to end by saying where
+    /// the controls are.
+    ///
+    /// All four: the two "on" states, the "off" state, and the one with a
+    /// joystick that failed. A block of prose about settings, on a page with
+    /// nothing on it to press, reads as a page that has lost its buttons — and
+    /// this one really did lose one.
     #[test]
-    fn the_button_says_what_it_will_change() {
-        let (_, off) = block1(&cfg(false, false, None));
-        let off = off.expect("something to press");
-        assert!(off.contains("Turn on"), "the switch: {off}");
-        assert!(off.contains("virtual joystick"), "and the sink: {off}");
+    fn every_state_of_block_one_points_at_the_tab_that_owns_the_settings() {
+        let failed = JoystickStatus::Failed("/dev/uinput: Permission denied".to_string());
+        for (what, body) in [
+            ("on, with a joystick", block1(&cfg(true, true, None))),
+            ("on, without one", block1(&cfg(true, false, None))),
+            ("off", block1(&cfg(false, false, Some("127.0.0.1:4242")))),
+            (
+                "on, joystick refused",
+                settings_block(&cfg(true, true, None), profiles::Bridge::Unstated, &failed),
+            ),
+        ] {
+            assert!(
+                body.contains(TRACKER_TAB_POINTER),
+                "{what}: block 1 reports settings it cannot change and never says \
+                 where they are changed: {body}"
+            );
+        }
+    }
 
-        // Already on, sending somewhere else. Saying "turn on" here would be a
-        // caption describing something that has already happened.
-        let (_, on) = block1(&cfg(true, false, Some("127.0.0.1:4242")));
-        let on = on.expect("something to press");
-        assert!(on.contains("virtual joystick"), "{on}");
-        assert!(!on.contains("Turn on"), "the switch is already on: {on}");
+    /// The sentence that named the button it stood above.
+    ///
+    /// It said "turning it on starts all of that, not only what the button
+    /// below adds", and there is no button below any more. What has to survive
+    /// the rewording is the reason that clause existed: the switch on the other
+    /// tab starts *every* destination already in the file, not the one the
+    /// reader has in mind.
+    #[test]
+    fn the_off_state_names_the_switch_that_starts_everything_and_not_a_button() {
+        let mut c = cfg(false, false, Some("127.0.0.1:4242"));
+        c.bridge_port = Some(4243);
+        let body = block1(&c);
+        assert!(
+            body.contains("on the Tracker tab, starts all of that"),
+            "the one control that turns this on is named, and it is not here: {body}"
+        );
+        assert!(
+            !body.contains("button below"),
+            "there is no button below: {body}"
+        );
+        assert!(
+            body.contains("127.0.0.1:4242") && body.contains("4243"),
+            "and every destination the press will start is named before it is pressed: \
+             {body}"
+        );
     }
 
     /// The strength word comes from the presets, never from comparing degrees
@@ -3184,12 +3364,12 @@ mod tests {
             let mut c = cfg(true, true, None);
             c.extended_view.yaw.output_max_deg = yaw;
             c.extended_view.pitch.output_max_deg = pitch;
-            let (body, _) = block1(&c);
+            let body = block1(&c);
             assert!(body.contains(name), "{name} should be named: {body}");
         }
         let mut c = cfg(true, true, None);
         c.extended_view.yaw.output_max_deg = 33.3;
-        let (body, _) = block1(&c);
+        let body = block1(&c);
         assert!(body.contains("hand-tuned"), "{body}");
         for (name, _, _) in STRENGTHS {
             assert!(
@@ -3200,18 +3380,18 @@ mod tests {
     }
 
     /// Somebody who already set up opentrack has game output ON. Telling them
-    /// it is off would be the small untruth this whole window exists not to
+    /// it is off would be the small untruth this whole tab exists not to
     /// tell.
     #[test]
     fn game_output_on_with_another_sink_is_not_reported_as_off() {
-        let (body, _) = block1(&cfg(true, false, Some("127.0.0.1:4242")));
+        let body = block1(&cfg(true, false, Some("127.0.0.1:4242")));
         assert!(!body.contains("is off"), "{body}");
         assert!(
             body.contains("127.0.0.1:4242"),
             "it names where it is going: {body}"
         );
 
-        let (body, _) = block1(&cfg(true, false, None));
+        let body = block1(&cfg(true, false, None));
         assert!(
             body.contains("nothing is set to receive it"),
             "on with no sink is its own sentence: {body}"
@@ -4237,8 +4417,8 @@ mod tests {
         );
     }
 
-    /// The page an empty machine opens on. It has no list, no search box and
-    /// no rows, so every sentence on it has to carry itself.
+    /// What the detail pane says on an empty machine. The list beside it has no
+    /// rows, so every sentence here has to carry itself.
     #[test]
     fn the_empty_machine_page_says_why_and_names_a_library_that_is_gone() {
         let quiet = nothing_text(&[]);
@@ -4266,80 +4446,77 @@ mod tests {
     /// `games.rs` reports the joystick "from what the device thread actually
     /// did, never from the checkbox… a line that says 'sending to a virtual
     /// joystick' when none exists is exactly the support thread this row was
-    /// written to prevent". This window sits in front of that card.
+    /// written to prevent". This tab reports the same fact from the same place.
     #[test]
     fn a_joystick_that_could_not_be_created_is_not_a_destination_here_either() {
         let failed = JoystickStatus::Failed("/dev/uinput: Permission denied".to_string());
         let c = cfg(true, true, None);
 
-        let (body, caption) = settings_block(&c, profiles::Bridge::Unstated, &failed);
+        let body = settings_block(&c, profiles::Bridge::Unstated, &failed);
         assert!(
             !body.contains("sending to a virtual joystick"),
-            "the card behind this window says it could not be created: {body}"
+            "the card on the Tracker tab says it could not be created: {body}"
         );
         assert!(
             !body.contains("Nothing to change here"),
             "something is very much wrong here: {body}"
         );
         assert!(body.contains("/dev/uinput: Permission denied"), "{body}");
-        assert_eq!(
-            caption, None,
-            "and there is still no button that fixes /dev/uinput: {body}"
-        );
 
         // The same configuration with a joystick the device thread made.
-        let (ok, _) = settings_block(&c, profiles::Bridge::Unstated, &JoystickStatus::Present);
+        let ok = settings_block(&c, profiles::Bridge::Unstated, &JoystickStatus::Present);
         assert!(ok.contains("sending to a virtual joystick"), "{ok}");
         assert!(ok.contains("Nothing to change here"), "{ok}");
 
         // And `Off` is not a failure: it means nobody has asked yet, which for
-        // a window about what is *configured* is not a fault.
-        let (off, _) = settings_block(&c, profiles::Bridge::Unstated, &JoystickStatus::Off);
+        // a page about what is *configured* is not a fault.
+        let off = settings_block(&c, profiles::Bridge::Unstated, &JoystickStatus::Off);
         assert_eq!(off, ok, "not asked for yet is not could not be created");
     }
 
-    // -------------------------------------------- the button and its caption
+    // ------------------------------- what the switch on the other tab starts
 
-    /// The module's own doctrine: a button must not do more than its caption
-    /// says. This one sets `enabled`, and `enabled` is the switch every other
-    /// destination hangs off.
+    /// The doctrine that outlived the button: whoever turns game output on has
+    /// to be told what that starts, and it is not one destination.
+    ///
+    /// The button used to carry this in its caption, built from
+    /// [`destinations`] over the config the press would leave behind. The
+    /// switch that does the same thing now is on the other tab and cannot carry
+    /// a per-game caption at all — so the body has to name them, and it has to
+    /// name **every** one, which is why the list is asked of `destinations`
+    /// rather than typed out here.
     #[test]
-    fn turning_it_on_names_every_destination_the_press_will_start() {
+    fn the_off_state_names_every_destination_the_switch_will_start() {
         let mut c = cfg(false, false, Some("127.0.0.1:4242"));
         c.bridge_port = Some(4243);
+        let body = block1(&c);
 
-        let (body, caption) = block1(&c);
-        assert!(
-            body.contains("127.0.0.1:4242") && body.contains("4243"),
-            "the destinations already in the file are named before the switch is touched: \
-             {body}"
-        );
-        let caption = caption.expect("there is a switch to turn on");
-        assert!(caption.contains("virtual joystick"), "{caption}");
-        assert!(
-            caption.contains("127.0.0.1:4242"),
-            "pressing this starts opentrack too, so the caption says so: {caption}"
-        );
-        assert!(caption.contains("4243"), "and the Wine bridge: {caption}");
-
-        // What the press leaves behind, worded by the same function: the
-        // caption is that list and nothing less.
+        // What turning it on leaves behind, worded by the same function the
+        // body is worded by.
         let mut after = c.clone();
         after.enabled = true;
         after.joystick = true;
         let (sinks, _) = destinations(&after, &JoystickStatus::Off);
+        assert!(
+            sinks.len() > 1,
+            "this fixture exists to have more than one destination: {sinks:?}"
+        );
         for sink in &sinks {
+            // The joystick is the one the press adds rather than one the file
+            // already names, and block 1 off-state speaks about the file. It is
+            // named in the joystick paragraph below instead, which every
+            // non-final state carries.
+            if sink == "a virtual joystick" {
+                continue;
+            }
             assert!(
-                caption.contains(sink.as_str()),
-                "the press starts {sink} and the caption does not say so: {caption}"
+                body.contains(sink.as_str()),
+                "turning it on starts {sink} and this page does not say so: {body}"
             );
         }
-
-        // A machine with nothing else configured reads exactly as it did.
-        let (_, plain) = block1(&cfg(false, false, None));
-        assert_eq!(
-            plain.as_deref(),
-            Some("Turn on and send to a virtual joystick")
+        assert!(
+            body.contains("virtual joystick"),
+            "and the destination that needs nothing else installed: {body}"
         );
     }
 
@@ -4348,13 +4525,13 @@ mod tests {
     #[test]
     fn a_profile_that_answers_the_bridge_question_is_not_also_reported_as_unanswered() {
         let c = cfg(false, false, None);
-        let (unstated, _) = settings_block(&c, profiles::Bridge::Unstated, &JoystickStatus::Off);
+        let unstated = settings_block(&c, profiles::Bridge::Unstated, &JoystickStatus::Off);
         assert!(
             unstated.contains("not something this program knows"),
             "with nobody having said, this is the honest sentence: {unstated}"
         );
 
-        let (required, _) = settings_block(&c, profiles::Bridge::Required, &JoystickStatus::Off);
+        let required = settings_block(&c, profiles::Bridge::Required, &JoystickStatus::Off);
         assert!(
             !required.contains("not something this program knows"),
             "block 2 is about to say, from this very profile, that the joystick will not \
@@ -4368,7 +4545,7 @@ mod tests {
         let note = profile_bridge_note(profiles::Bridge::Required).expect("Required says so");
         assert!(note.contains("will not reach it"), "{note}");
 
-        let (not_needed, _) = settings_block(&c, profiles::Bridge::NotNeeded, &JoystickStatus::Off);
+        let not_needed = settings_block(&c, profiles::Bridge::NotNeeded, &JoystickStatus::Off);
         assert!(
             !not_needed.contains("not something this program knows"),
             "{not_needed}"
@@ -4874,18 +5051,34 @@ mod tests {
         );
     }
 
-    /// The lead above the game list promised the window would "do the two it
-    /// can" on a machine where block 2 has no button at all — the count was
-    /// written once and never asked whether there was a `tobii` to run.
+    /// The lead's count is a promise about buttons, and it has been wrong twice
+    /// for the same reason: it was written once and not asked again.
+    ///
+    /// First it promised "the two it can" on a machine where block 2 has no
+    /// button at all, and did not ask whether there was a `tobii` to run.
+    /// Then block 1's button was deleted with the modal and the two became one
+    /// — a lead still offering a settings button that does not exist anywhere
+    /// on the page.
+    ///
+    /// So both halves are asserted: the count is **one**, and it is never two.
     #[test]
-    fn the_lead_does_not_promise_a_button_this_machine_has_not_got() {
+    fn the_lead_promises_exactly_the_buttons_this_machine_has() {
         let with = lead(Some(Path::new("/usr/bin/tobii")));
-        assert!(with.contains("do the two it can"), "{with}");
+        assert!(
+            with.contains("do the one it can"),
+            "block 1 reports and never writes, so the bridge is the only thing this page \
+             does: {with}"
+        );
+        assert!(
+            !with.contains("do the two it can"),
+            "the second of the two was block 1's button, and it is gone: {with}"
+        );
 
         let without = lead(None);
         assert!(
-            !without.contains("do the two it can"),
-            "with no `tobii` the bridge block has no button: {without}"
+            !without.contains("do the one it can"),
+            "with no `tobii` the bridge block has no button either, so the page does \
+             none of the three: {without}"
         );
         assert!(
             without.contains("three things"),

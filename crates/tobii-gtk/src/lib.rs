@@ -647,6 +647,46 @@ pub(crate) const PREVIEW_HELP: &str = "Show a dot on screen where you're looking
 pub(crate) const EYES_HELP: &str = "If you typically squint or have poor sight in one eye, you \
                                     can make the eye tracker detect one eye only.";
 
+/// The hub's tab stack, so a display test can find it without matching on text.
+pub const HUB_STACK_NAME: &str = "hub-tabs";
+
+/// The tracker tab: calibration, the screen, the eyes, the head model, the gaze
+/// preview, and the card that says where the output goes.
+///
+/// Not "Settings", and that is not taste. The word is taken three times over —
+/// the cogwheel's tooltip is `"Settings"`, the help topic is `"Settings, behind
+/// the cogwheel"`, and the `ALWAYS ON` pill's own tooltip ends "…Turn it off
+/// under Keep the tracker awake, in Settings" — so a tab called Settings makes
+/// that sentence point at the wrong place, and the pill is the one thing in the
+/// header a confused user clicks. "Tracker" also makes the pointers on the
+/// other tab read correctly: *change that on the Tracker tab*.
+pub const TAB_TRACKER: &str = "tracker";
+/// The games tab: one installed game at a time, and what it needs set up.
+pub const TAB_GAMES: &str = "games";
+
+/// Whether the hub should be asking for the tracker right now.
+///
+/// Its own function, and not the two-term `&&` it looks like, because it is a
+/// promise this program has already broken once by accident and cannot check on
+/// a headless CI machine any other way: a window that never gets focus reports
+/// `is_active() == false` whatever tab it is showing, so a display test that
+/// watched [`device::Demand::reasons`] on the Games tab would pass on a nested
+/// compositor with the tab condition deleted. Here the condition is a value,
+/// and `the_hub_asks_for_the_tracker_only_on_the_tracker_tab` breaks it.
+///
+/// **Focus alone is not enough any more.** It was, while the only other thing
+/// in the hub that could be on screen was a modal: opening one moved the focus
+/// off the hub, `is_active()` went false, and the tracker went dark three
+/// seconds later while the user read about their game. A tab moves no focus, so
+/// the visible tab has to be part of the answer or reading the same paragraphs
+/// keeps the illuminators lit.
+///
+/// `None` — a stack with no visible child, which should not happen — is false:
+/// not knowing which tab is showing is not a reason to light the tracker.
+pub(crate) fn hub_wants_tracker(active: bool, visible_tab: Option<&str>) -> bool {
+    active && visible_tab == Some(TAB_TRACKER)
+}
+
 /// How wide a control column is.
 ///
 /// All three share it, so they read as one rack that happens to be split
@@ -1269,14 +1309,45 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // dozen pixels, and it costs a gap inside a column that visibly differs
     // from the gap between the rows.
     //
-    // Re-measured after the descriptions were shortened, two of them moved to a
-    // tooltip and the help window, and none of the controls touched: the cards
-    // are 142/142/96/194/94/204 (they were 180/161/141/213/120/204), so the
-    // columns are 300/306/314 where they were 357/370/340 and the row is 314
-    // where it was 370. The whole window: 748px natural height before, 692px
-    // after, both at its natural width of 1241px. The grouping still holds —
-    // the three columns are within 14px of each other — and the tallest column
-    // is now the games pair rather than the pair that had the most prose.
+    // THE HEIGHT NUMBERS, RE-MEASURED. The pair recorded here used to be
+    // "748px before, 692px after" the prose cut, and the 692 was stale for two
+    // commits: `237c885` added a whole button row to the games card afterwards
+    // and nobody re-measured. Do not trust a number in this comment that is not
+    // in the paragraph below.
+    //
+    // Taken end to end on the real `build_hub`, on 2026-09-28, GTK 4.22, in a
+    // nested `kwin_wayland --virtual`, by printing
+    // `hub.measure(Orientation::Horizontal, -1)` and then the window's
+    // `default_height` once the re-fit below has run — which is
+    // `root.measure(Orientation::Vertical, default_width)` and the number every
+    // user's window opens at:
+    //
+    //   main @ 69cbc2e, one tab, "Set up a game…" on the card   1189 x 776
+    //   two tabs, that row deleted                              1189 x 725
+    //
+    // **At text scale 1.0, and the test pins it there**, because this machine's
+    // saved scale is 1.2 and `load_css` applies it: the same pair measured
+    // without pinning comes out 1241 x 801 and 1241 x 749, which is where the
+    // "1241px" recorded elsewhere in this tree as a scale-1.0 number came from.
+    // It is a 1.2 number. Pin the scale or the answer is somebody's settings.
+    //
+    // Both at the same natural width, and that is the load-bearing half: the
+    // width every user opens at is `three_col_min` plus the margins, the games
+    // card's third row was placed on a row of its own precisely to protect it,
+    // and the `StackSwitcher` had to go into the header without spending any of
+    // it. It does — measured, the switcher is 42px tall against the header's
+    // existing 40px of icon buttons, so it costs the window 2px, and it costs
+    // 0px of width because the title label beside it gave up its `hexpand`.
+    //
+    // The 51px the window LOST is the games card's button row: one
+    // `widget::button` plus the `controls` spacing, out of the column that was
+    // the tallest of the three, so the whole rack row comes down with it.
+    //
+    // The grouping itself is unchanged and still holds. It was chosen from the
+    // measured cards (142/142/96/194/94/204 at `1abb857`, where the obvious
+    // grouping put both game sections together at 447 against 293), and taking
+    // a row off the games card only improves the balance it was chosen for —
+    // the column that was the tallest is now the shortest.
     let col_calib = control_column();
     col_calib.append(&section(
         "Improve my calibration",
@@ -1399,7 +1470,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     ));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
     // tracker does, not about how this program behaves.
-    let games_row = crate::games::GamesRow::build(joystick_status, recentring, demand.clone());
+    let games_row =
+        crate::games::GamesRow::build(joystick_status.clone(), recentring, demand.clone());
     col_games.append(&section(
         "Head tracking for games",
         // One line, and no instructions. Whatever this sentence said about how
@@ -1509,9 +1581,58 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     arrange(3);
     let three_col_min = split.measure(Orientation::Horizontal, -1).0;
 
+    // --- The two tabs ----------------------------------------------------
+    //
+    // A `gtk::Stack` with a `gtk::StackSwitcher`, not a `GtkNotebook`. There is
+    // no libadwaita in `Cargo.toml`, so `AdwViewSwitcher` is not available, and
+    // a Notebook's tab strip fights the flat surfaces `CSS` draws everywhere
+    // else. What the choice costs is Ctrl+Page_Up/Down, which is a Notebook
+    // feature and does not come free — so the key controller below binds both.
+    //
+    // NOT homogeneous, in either direction. A homogeneous stack measures every
+    // child and takes the largest, so the Games tab's height would set the
+    // window's and the rack would sit in a window taller than it needs. Sized
+    // to the VISIBLE child, tab 1's natural height is the window's natural
+    // height, exactly as it was before there were tabs.
+    //
+    // The header, both banners and the cogwheel stay OUTSIDE the stack, and
+    // that is a decision: an update notice and a recalibration prompt are about
+    // the program, not about a tab, and a banner that only appears on one tab
+    // is a banner a user can miss by standing still.
+    //
+    // The scan the Games tab is built from is a measured ~400 µs and 81
+    // filesystem calls, paid once here rather than on the first press of a
+    // button — see `game_setup::build`.
+    //
+    // Taken apart on the spot rather than kept as one value, and that is the
+    // point of it having two fields: `games_page` goes into the stack, which
+    // owns it, and only `games_alive` — an `Rc<Cell<bool>>`, nothing of GTK's —
+    // is ever captured by a closure. A close handler on this window that held
+    // the whole struct would be holding one of the window's own descendants,
+    // which is the sibling cycle that leaks a subtree.
+    let game_setup::GamesTab {
+        root: games_page,
+        alive: games_alive,
+    } = game_setup::build(joystick_status);
+
+    let stack = gtk::Stack::new();
+    stack.set_widget_name(HUB_STACK_NAME);
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
+    stack.add_titled(&split, Some(TAB_TRACKER), "Tracker");
+    stack.add_titled(&games_page, Some(TAB_GAMES), "Games");
+
     let header = gtk::Box::new(Orientation::Horizontal, 12);
-    title.set_hexpand(true);
     header.append(&title);
+    // The switcher takes the `hexpand` the title used to have, so the status
+    // dot, the help button and the cogwheel stay hard right and the two tabs
+    // sit beside the title where a user looks for them.
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.set_hexpand(true);
+    switcher.set_halign(Align::Start);
+    switcher.set_valign(Align::Center);
+    header.append(&switcher);
     header.append(&status_bar);
     // The help window's visible door, and the only one a touch user has: F1 is
     // not discoverable, and a pointer is not the only way people use this. It
@@ -1552,13 +1673,15 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let update_banner = update::banner();
     root.append(&update_banner);
     root.append(&banner);
-    root.append(&split);
+    root.append(&stack);
 
     // How tall the content wants to be at the width the window will open at.
     // Measured before the window exists, so the window can be built around it.
-    // Wide enough to open in the three-column layout, from what the columns
-    // measured rather than from a number. The slack above their minimum goes to
-    // the instrument, which is the only thing here that benefits from more.
+    // Wide enough to open in the three-column layout, from what the COLUMNS
+    // measured rather than from a number — `split`, not the stack, so the Games
+    // tab cannot raise the width every user opens at. The slack above their
+    // minimum goes to the instrument, which is the only thing here that
+    // benefits from more.
     let default_width = (three_col_min + PAGE_MARGIN * 2).max(1180);
     let (_, natural_height, _, _) = root.measure(Orientation::Vertical, default_width);
 
@@ -1582,7 +1705,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         .build();
     window.set_child(Some(&scroller));
 
-    // F1 opens the help window.
+    // F1 opens the help window, and Ctrl+Page_Up/Down walks the two tabs.
     //
     // A controller on THIS window rather than an application accel
     // (`app.set_accels_for_action("app.help", &["F1"])`), and that is a
@@ -1599,20 +1722,55 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // Weak, like `add_escape_to_close`: the controller belongs to this window,
     // and a strong reference here is a cycle the window never survives — see
     // `hold_while_open` for what that cost last time.
+    // The two tab keys go on this same controller rather than on one of their
+    // own: the phase, the scope and the weak reference are all already right
+    // here, and a second controller is a second thing to keep in step. They are
+    // what a `GtkNotebook` would have given for nothing and a `Stack` does not
+    // — see where the stack is built — and they are named in the "Keyboard"
+    // help topic, because a key nothing tells you about is a key nobody has.
     {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let target = window.downgrade();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key != gtk::gdk::Key::F1 {
-                return glib::Propagation::Proceed;
-            }
-            if let Some(w) = target.upgrade() {
-                if let Some(app) = w.application() {
-                    help::open(&app, &w);
+        // Weak, like the window: the controller is on the window, the stack is
+        // inside it, and a strong reference from one to the other is a cycle
+        // through the very tree this window has to be able to free.
+        let tabs = stack.downgrade();
+        keys.connect_key_pressed(move |_, key, _, mods| {
+            let ctrl = mods.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            match key {
+                gtk::gdk::Key::F1 => {
+                    if let Some(w) = target.upgrade() {
+                        if let Some(app) = w.application() {
+                            help::open(&app, &w);
+                        }
+                    }
+                    glib::Propagation::Stop
                 }
+                gtk::gdk::Key::Page_Up | gtk::gdk::Key::Page_Down if ctrl => {
+                    let Some(stack) = tabs.upgrade() else {
+                        return glib::Propagation::Proceed;
+                    };
+                    // Two tabs, so "next" and "previous" are the same move and
+                    // the name is read rather than an index counted: the order
+                    // the pages were added to the stack is the only thing that
+                    // would keep an index honest, and it is not visible here.
+                    let on_tracker = stack.visible_child_name().as_deref() == Some(TAB_TRACKER);
+                    let want = if key == gtk::gdk::Key::Page_Down {
+                        TAB_GAMES
+                    } else {
+                        TAB_TRACKER
+                    };
+                    // Already there is still handled: Ctrl+Page_Down on the last
+                    // tab must not fall through to a scroller and jump the page.
+                    if on_tracker == (want == TAB_TRACKER) {
+                        return glib::Propagation::Stop;
+                    }
+                    stack.set_visible_child_name(want);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
             }
-            glib::Propagation::Stop
         });
         window.add_controller(keys);
     }
@@ -1626,8 +1784,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // Both used to leave the window at whatever height it was born with, so
     // larger text was clipped and a banner pushed the last card out of view.
     {
-        let root = root.clone();
-        let fit_window = window.clone();
+        let root = root.downgrade();
+        let fit_window = window.downgrade();
         // The last size this closure itself set. Anything else is the user.
         //
         // The comment here used to claim it never touched "a window the user
@@ -1637,9 +1795,30 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         // `default_height` tracks the current size, so a window made smaller
         // was silently grown back to its content the next time anything
         // re-fitted.
+        let fit_tabs = stack.downgrade();
         let fit: Rc<dyn Fn()> = {
             let ours = Cell::new((0i32, 0i32));
             Rc::new(move || {
+                let (Some(fit_window), Some(root)) = (fit_window.upgrade(), root.upgrade()) else {
+                    return;
+                };
+                // Only ever the Tracker tab's height. The stack measures its
+                // VISIBLE child, so a banner arriving while the user is reading
+                // the Games tab would otherwise re-measure at that page's height
+                // and resize the window under them.
+                //
+                // And deliberately no re-fit on a tab SWITCH: a window that
+                // changes size when you click a tab is worse than a scrollbar,
+                // and the Games tab is inside the same scroller as everything
+                // else.
+                if fit_tabs
+                    .upgrade()
+                    .and_then(|s| s.visible_child_name())
+                    .as_deref()
+                    != Some(TAB_TRACKER)
+                {
+                    return;
+                }
                 // Maximised or fullscreen, the height is not ours to choose.
                 if fit_window.is_maximized() || fit_window.is_fullscreen() {
                     return;
@@ -1746,7 +1925,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
 
     // ~30 fps tick: read the device snapshot, refresh status + eye view.
     let tick_app = app.clone();
-    let tick_window = window.clone();
+    let tick_window = window.downgrade();
+    // Weak for the same reason the window is: the tick is held by a timeout the
+    // window's own map handler restarts, so a strong reference from here back
+    // into the window's tree is a cycle that tree never survives.
+    let tick_stack = stack.downgrade();
     let tick_cmd_tx = cmd_tx.clone();
     // Used twice inside the tick: to sync the hub's own focus claim, and
     // because a forced flow opens without the user clicking anything and so has
@@ -1776,10 +1959,35 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let tick_id: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let tick_body: Rc<dyn Fn() -> glib::ControlFlow> = Rc::new({
         move || {
-            // Ask for the tracker exactly while this window has focus. Polled
-            // rather than driven by `notify::is-active`: see the note below.
+            let Some(tick_window) = tick_window.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            // Ask for the tracker exactly while this window has focus AND the
+            // Tracker tab is showing. Polled rather than driven by
+            // `notify::is-active`: see the note below.
+            //
+            // The tab half is what keeps a promise the modal used to keep by
+            // accident. Opening a modal moved the focus off the hub, so
+            // `is_active()` went false and the illuminators went out three
+            // seconds later while somebody read a page of paragraphs about
+            // their game. A tab does not move the focus anywhere, so without
+            // this the same paragraphs would keep the tracker lit — which is
+            // precisely the behaviour the whole demand mechanism exists to
+            // prevent, and what `tests/games_tab.rs` asserts.
+            //
+            // `Demand`'s three-second linger absorbs tab-flipping, and that
+            // matters more here than it looks: the last drop closes the USB
+            // session, the ET5 answers a close by rebooting, and every connect
+            // has to re-apply the display area, the eye selection and the
+            // calibration. Somebody clicking between two tabs must not be
+            // cycling the device.
+            //
+            // The visible cost is that the header reads "Tracker off" while the
+            // Games tab is showing. That is what it already says whenever
+            // nothing wants the device, and it is true.
             {
-                let active = tick_window.is_active();
+                let tab = tick_stack.upgrade().and_then(|s| s.visible_child_name());
+                let active = hub_wants_tracker(tick_window.is_active(), tab.as_deref());
                 let mut h = tick_focus.borrow_mut();
                 match (active, h.is_some()) {
                     (true, false) => *h = Some(tick_demand.hold("the hub window")),
@@ -2038,11 +2246,16 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             // handler on purpose: minimising leaves this window mapped, and a
             // minimised hub is one click away, so help may stay up beside it.
             help::close();
-            // And the game-setup window, for the same reason and with one more
-            // of its own: it is modal over this window, and a modal left
-            // floating with nothing behind it to be modal over is a window a
-            // compositor has no good answer for.
-            game_setup::close();
+            // The game-setup window used to be closed here too, and it is worth
+            // saying what replaced it rather than leaving a gap. It was modal
+            // over this window, and a modal left floating with nothing behind
+            // it is a window a compositor has no good answer for — but closing
+            // it also killed the poll watching a running `tobii bridge
+            // install`, so hiding the hub in the middle of one threw the result
+            // away. The Games tab is not a window and is not closed by hiding:
+            // the poll carries on, the outcome lands in its per-appid slot, and
+            // the page shows it when the hub comes back. Only the quit path
+            // stops it — see `GamesTab::shutdown`.
         });
     }
 
@@ -2071,6 +2284,10 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         let overlay_win = overlay_win.clone();
         let tick_id = tick_id.clone();
         let quitting = really_quitting.clone();
+        // The flag, and not the tab: holding the tab's `root` here would be
+        // this window holding one of its own descendants, which is the cycle
+        // that leaks a subtree. An `Rc<Cell<bool>>` holds nothing of GTK's.
+        let games_alive = games_alive.clone();
         window.connect_close_request(move |w| {
             // PRESSING X PUTS THE PROGRAM IN THE BACKGROUND; it does not exit.
             //
@@ -2155,6 +2372,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             if let Some(id) = tick_id.borrow_mut().take() {
                 id.remove();
             }
+
+            // 3b. The Games tab's watch on whatever subprocess it started.
+            //     Here and NOT in the unmap handler, which is where the modal
+            //     this tab replaces was closed: hiding to the tray must leave a
+            //     running `tobii bridge install` being watched, so its result is
+            //     there when the user comes back. Quitting is the one moment
+            //     nobody is coming back. The child itself is never killed.
+            games_alive.set(false);
 
             // 4. The tray icon, and then the application.
             //
@@ -3059,6 +3284,58 @@ fn section<W: IsA<gtk::Widget>>(title: &str, desc: &str, control: &W) -> gtk::Bo
 
 #[cfg(test)]
 mod tests {
+    /// The hub lights the illuminators for the Tracker tab and for nothing
+    /// else.
+    ///
+    /// The modal this tab replaces kept that promise by side effect: it took
+    /// the focus, so `is_active()` went false and the claim was dropped on its
+    /// own. A tab takes no focus, so the promise is now a condition somebody
+    /// has to write down — and the failure it prevents is silent, because the
+    /// symptom is a bar of infrared LEDs glowing under a monitor while the user
+    /// reads a page of text.
+    ///
+    /// All four combinations, and the second row is the one this exists for:
+    /// delete the tab half of [`super::hub_wants_tracker`] and that row is what
+    /// goes red.
+    #[test]
+    fn the_hub_asks_for_the_tracker_only_on_the_tracker_tab() {
+        for (active, tab, want, why) in [
+            (
+                true,
+                Some(super::TAB_TRACKER),
+                true,
+                "the gaze instrument is on screen and being read",
+            ),
+            (
+                true,
+                Some(super::TAB_GAMES),
+                false,
+                "nothing on the games tab wants a frame, and lighting the illuminators \
+                 to show somebody a paragraph is what the demand mechanism exists to \
+                 prevent",
+            ),
+            (
+                false,
+                Some(super::TAB_TRACKER),
+                false,
+                "a hub behind a game is not being read, whatever tab it is showing",
+            ),
+            (false, Some(super::TAB_GAMES), false, "neither half is true"),
+            (
+                true,
+                None,
+                false,
+                "not knowing which tab is showing is not a reason to light the tracker",
+            ),
+        ] {
+            assert_eq!(
+                super::hub_wants_tracker(active, tab),
+                want,
+                "active={active} tab={tab:?}: {why}"
+            );
+        }
+    }
+
     /// The switch and the device thread must be the same bit.
     ///
     /// One round trip on purpose: it writes the way the cogwheel switch writes
