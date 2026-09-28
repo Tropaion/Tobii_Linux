@@ -83,7 +83,11 @@ window { background-color: #0d1013; color: #e8ecef; }
    of the same colour swallows the cards standing on it — so the page is a
    single step up from the window ground and the cards are a step above that.
    Three levels, and each border still reads. */
-.tab-strip { padding: 0 6px; }
+/* No left inset. The first tab's left border sits exactly on the page's, so
+   the two shapes share an edge — 6px of padding here left the Tracker tab
+   floating a little to the right of the box it stands on, which is the one
+   alignment a tab bar cannot get away with. */
+.tab-strip { padding: 0; }
 .tab-strip > button {
     background-color: transparent; border: 1px solid transparent;
     border-bottom: none; border-radius: 10px 10px 0 0;
