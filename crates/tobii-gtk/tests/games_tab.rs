@@ -288,6 +288,11 @@ fn run(app_id: &str, hold: bool) -> Seen {
                         return;
                     };
                     s.tracker_height = tracker.measure(gtk::Orientation::Vertical, w).1;
+                    // The Games page BEFORE it has ever been shown, which is
+                    // what the stack measures at this moment and is the number
+                    // the assertion below needs. It is not the height of the
+                    // tab in use: the list is filled on the first map, so this
+                    // is the page with no rows in it. Printed as such.
                     s.games_height = games.measure(gtk::Orientation::Vertical, w).1;
                     s.games_min_width = games.measure(gtk::Orientation::Horizontal, -1).0;
 
@@ -808,7 +813,7 @@ fn the_games_tab_walks_by_keyboard_takes_no_claim_and_frees_itself() {
     // the control columns. Re-take them here when either changes.
     println!(
         "GEOMETRY hub natural width {}, window {}x{}, stack {} (tracker {}, games \
-         {}), games minimum width {}",
+         {} before its first map), games minimum width {}",
         seen.hub_natural_width,
         seen.size_on_tracker.0,
         seen.size_on_tracker.1,
