@@ -2462,6 +2462,20 @@ fn profile_list(out: &mut String, dir: &std::path::Path, builtin: &[(&str, &str)
             out.push_str(&format!("  {s}\n"));
         }
     }
+    // Its own paragraph and not the one above, because it is the opposite
+    // claim: a stray is somebody else's file, and this is one of ours. Saying
+    // nothing at all about it was worse than either — `tobii uninstall
+    // --purge` deletes these, so the listing and the uninstaller disagreed
+    // about what is in the directory.
+    if !listing.leftovers.is_empty() {
+        out.push_str(
+            "\nwritten by this program and not a profile — a save that was cut short\n\
+             left it; `tobii uninstall --purge` removes it:\n",
+        );
+        for l in &listing.leftovers {
+            out.push_str(&format!("  {l}\n"));
+        }
+    }
 }
 
 /// `tobii games profile show <game>`: what this program knows, and from where.
@@ -2570,10 +2584,11 @@ fn comments_this_write_loses(
         return String::new();
     };
     // Asked of the writer that is actually about to run, not of a second guess
-    // at what it does. `to_toml_over` carries comments across; `to_toml` cannot
-    // see them. Deriving the loss independently is how this paragraph came to
-    // list, in full, six comments that were still in the file.
-    let after = p.to_toml_over(&before).unwrap_or_else(|_| p.to_toml());
+    // at what it does — [`body_over`] is the same call [`save_profile_to`]
+    // makes, on the same text, so the report and the file cannot differ.
+    // Deriving the loss independently is how this paragraph came to list, in
+    // full, six comments that were still in the file.
+    let after = body_over(p, &before).unwrap_or_else(|_| p.to_toml());
     let kept: Vec<&str> = comment_lines(&after);
     let lost: Vec<&str> = comment_lines(&before)
         .into_iter()
@@ -2610,6 +2625,109 @@ fn comment_lines(text: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|l| l.starts_with('#'))
         .collect()
+}
+
+/// The file `p` written over `before` produces, with the whole-line comments
+/// that write deliberately orphans taken out of the way first.
+///
+/// [`tobii_config::profiles::Profile::to_toml_over`] refuses a write that
+/// would leave somebody's sentence attached to nothing. That is right for
+/// `save`, which
+/// removes nothing, and it made `check remove` impossible on the only kind of
+/// check this feature is meant to produce: `check add` asks for a `#` line
+/// saying how you know, and a removal then refused over the note written about
+/// the very thing being removed. The one way out was to hand-edit the file —
+/// which is what the authoring commands exist to avoid.
+///
+/// So that comment goes, and the caller prints it back in full; see
+/// [`comments_this_write_loses`], which renders through here for exactly that
+/// reason. Only a whole comment line goes: a `#` written after a value cannot
+/// be lifted off without rewriting the value's line, and rewriting a line of
+/// somebody's file is not this function's business. That case still refuses,
+/// in the writer's own words.
+///
+/// Both decisions here are the writer's — which comment has nowhere to go, and
+/// what the file then looks like. This asks it, drops the line it names, and
+/// asks again. It works neither out for itself, because a second copy of
+/// either rule in this crate is a second answer waiting to disagree.
+fn body_over(
+    p: &tobii_config::profiles::Profile,
+    before: &str,
+) -> Result<String, tobii_config::profiles::CommentLoss> {
+    use tobii_config::profiles::CommentLoss;
+    let mut text = before.to_string();
+    // Bounded by the comment lines there are: every turn drops one, and
+    // nothing here writes one. The call after the loop is the writer's answer
+    // on the text that is left, whatever it is.
+    for _ in 0..comment_lines(before).len() {
+        let e = match p.to_toml_over(&text) {
+            Ok(body) => return Ok(body),
+            Err(e) => e,
+        };
+        // An unreadable file has nothing to locate, so nothing to drop either.
+        let line = match &e {
+            CommentLoss::Orphaned { line, .. } => *line,
+            CommentLoss::Unplaceable { .. } => return Err(e),
+        };
+        let i = line.wrapping_sub(1);
+        let whole_line = line > 0
+            && text
+                .lines()
+                .nth(i)
+                .is_some_and(|l| l.trim_start().starts_with('#'));
+        if !whole_line {
+            return Err(e);
+        }
+        let kept: Vec<&str> = text
+            .lines()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, l)| l)
+            .collect();
+        let mut next = kept.join("\n");
+        next.push('\n');
+        text = next;
+    }
+    p.to_toml_over(&text)
+}
+
+/// Write `p` as the profile for `appid`, naming the file once.
+///
+/// [`tobii_config::profiles::save_to`] is the writer this stands in for, and
+/// it stays the authority on what the file says: the body comes from
+/// [`tobii_config::profiles::Profile::to_toml_over`] by way of [`body_over`],
+/// and the bytes go down through the same [`tobii_config::write_atomic`]. What
+/// it does not do is refuse a removal over the note written about the thing
+/// removed.
+///
+/// Its refusals also read as what they are. `save_to` puts the path in front
+/// of the writer's sentence, and every caller here then prefixed "could not
+/// write <path>" — which printed the path twice and called a deliberate
+/// refusal that wrote nothing an I/O failure.
+fn save_profile_to(
+    dir: &std::path::Path,
+    appid: &str,
+    p: &tobii_config::profiles::Profile,
+) -> Result<(), String> {
+    use tobii_config::profiles;
+    // Asked before a path is built, as `save_to` asks it: `path_in` would
+    // happily make a name out of `../../anything`.
+    if !profiles::is_appid(appid) {
+        return Err(format!(
+            "{}\n{APPID_RULE}\nNothing was written.",
+            profiles::LoadError::NotAnAppId(appid.to_string())
+        ));
+    }
+    let path = profiles::path_in(dir, appid);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(before) => {
+            body_over(p, &before).map_err(|loss| format!("{}: {loss}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => p.to_toml(),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    tobii_config::write_atomic(&path, body.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 /// `tobii games profile save <game>`: capture what is honestly capturable.
@@ -2649,8 +2767,7 @@ fn profile_save(
     }
     let path = profiles::path_in(dir, &game.appid);
     let lost = comments_this_write_loses(&path, &p);
-    profiles::save_to(dir, &game.appid, &p)
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    save_profile_to(dir, &game.appid, &p)?;
     out.push_str(&format!("wrote {}\n", path.display()));
     out.push_str(&format!(
         "\ncaptured: {} settings — every setting this program has, as it stands\n  \
@@ -2701,11 +2818,18 @@ fn profile_save(
         );
     }
     if p.checks.is_empty() {
-        out.push_str(
+        // The command, not the file format. "Add [[check]] blocks by hand"
+        // sent a user to an editor in the round that gave them a command for
+        // it, and `[[check]]` is a word they have nowhere else met.
+        out.push_str(&format!(
             "\nnot captured: anything about this game's own configuration files.\n  \
              This program never writes them, and it cannot invent what they\n  \
-             should say. Add [[check]] blocks by hand.\n",
-        );
+             should say. Once you have established one, write it down:\n    \
+             tobii games profile check add {} --format <format> --path <path>\n      \
+             --setting <name> --wants <value> --tell \"<what to do about it>\"\n  \
+             `tobii games profile check` on its own says what each of those is.\n",
+            game.appid
+        ));
     }
     Ok(())
 }
@@ -3015,8 +3139,7 @@ fn profile_check_add(
     }
 
     let lost = comments_this_write_loses(&path, &p);
-    profiles::save_to(dir, &game.appid, &p)
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    save_profile_to(dir, &game.appid, &p)?;
     let n = p.checks.len();
     out.push_str(&format!("wrote {}\n", path.display()));
     if existing.is_none() {
@@ -3103,8 +3226,7 @@ fn profile_check_remove(
     }
     let gone = p.checks.remove(n - 1);
     let lost = comments_this_write_loses(&path, &p);
-    profiles::save_to(dir, &game.appid, &p)
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    save_profile_to(dir, &game.appid, &p)?;
     out.push_str(&format!("wrote {}\n", path.display()));
     out.push_str(&format!(
         "\nremoved check {n}. It said:\n  \
@@ -3228,10 +3350,37 @@ fn profile_check_where(
         }
     }
     out.push_str(
-        "\nThis did not read any of those files. It found the paths; the setting inside\n  \
-         each one is read by the hub's game-setup window, which carries the reader for\n  \
-         these formats. Nothing here will tell you what a setting says.\n",
+        "\nThis did not read any of those files. It found the paths; what a setting in\n  \
+         one of them says is read by the hub's game-setup window, which carries the\n  \
+         readers. Nothing here will tell you what a setting says.\n",
     );
+    // The promise above is only as wide as the readers this build has, and
+    // `check add` already refuses to make it for a format it does not know:
+    // *"nothing here will ever look this check up"*. Closing with the wide
+    // version told a user, minutes later, that the window reads a check the
+    // window answers `UnknownFormat` about.
+    let unknown = loaded.profile.unknown_formats();
+    if !unknown.is_empty() {
+        let n = checks.iter().filter(|c| !c.format.is_known()).count();
+        let which = if n == checks.len() && n == 1 {
+            "the one check above names".to_string()
+        } else if n == checks.len() {
+            format!("all {n} checks above name")
+        } else if n == 1 {
+            format!("1 of the {} checks above names", checks.len())
+        } else {
+            format!("{n} of the {} checks above name", checks.len())
+        };
+        out.push_str(&format!(
+            "\n  Except that {which} a format this build has no reader for: {}.\n  \
+             Nothing will ever look {} up — not this command, and not that window\n  \
+             either, which has the readers this build has and no others. A newer\n  \
+             tobii-linux may know {}.\n",
+            unknown.join(", "),
+            if n == 1 { "it" } else { "them" },
+            if unknown.len() == 1 { "it" } else { "them" },
+        ));
+    }
     Ok(())
 }
 
@@ -3259,7 +3408,14 @@ fn profile_check_cmd(
             "name a game: an app id, or part of its name.\nusage:\n  \
              tobii games profile check {v} <app id or name> …\n{CHECK_USAGE}"
         )),
-        (None, _) => Err(format!("{CHECK_SCHEMA}\n\nusage:\n{CHECK_USAGE}")),
+        // Not an error. This is the only readable description of a `[[check]]`
+        // outside a Rust doc comment, and a user who typed the words to reach
+        // it asked for it deliberately: answering on stderr, behind `error:`,
+        // and exiting 1 told them that asking was the mistake.
+        (None, _) => {
+            out.push_str(&format!("{CHECK_SCHEMA}\n\nusage:\n{CHECK_USAGE}\n"));
+            Ok(())
+        }
         (Some(other), _) => Err(format!(
             "unknown: tobii games profile check {other}\nusage:\n{CHECK_USAGE}"
         )),
@@ -5624,17 +5780,23 @@ mod tests {
     /// The one place a user can find out what a `[[check]]` is. It was
     /// documented only in a Rust module's doc comment, which made the feature
     /// unusable for the thing it exists for.
+    ///
+    /// And asking for it is not an error: it went to stderr behind `error:`
+    /// and exited 1, which tells somebody who asked for help that asking was
+    /// the mistake — and puts the schema where a pipe into a pager will not
+    /// find it.
     #[test]
     fn asking_for_check_with_no_verb_says_what_every_key_of_one_means() {
         let dir = scratch("check-schema");
         let mut out = String::new();
-        let e = profile_check_cmd(
+        profile_check_cmd(
             &mut out,
             &dir,
             &[],
             &args(&["tobii", "games", "profile", "check"]),
         )
-        .expect_err("no verb is a usage error");
+        .expect("asking what a check is is not an error");
+        let e = out;
         for needle in [
             "[[check]]",
             "format",
@@ -5648,5 +5810,226 @@ mod tests {
         ] {
             assert!(e.contains(needle), "{needle:?} is missing from:\n{e}");
         }
+    }
+
+    /// A profile with one check, a note written above it, and nothing else.
+    ///
+    /// Spelled out rather than built by `check add`, because the note is the
+    /// point and no command writes one: `add` tells the user to, and this is
+    /// the file that results.
+    const NOTED_CHECK: &str = "version = 1\n\
+         name = \"Elite Dangerous\"\n\
+         \n# measured 2026-10-01 by playing the game with the bridge running\n\
+         [[check]]\n\
+         format = \"binds-dir\"\n\
+         path = \"drive_c/users/steamuser/Options/Bindings\"\n\
+         setting = \"HeadlookMode\"\n\
+         wants = \"1\"\n\
+         tell = \"Set head look to toggle.\"\n";
+
+    /// The check this feature exists to produce is a check somebody wrote a
+    /// `#` note above — `check add` asks for one. Removing it was impossible:
+    /// the writer refuses a comment with nowhere to go, so the whole write was
+    /// refused, and the only way out was to hand-edit the file that the
+    /// authoring commands exist to save you from.
+    ///
+    /// The note goes with the thing it was about, and comes back in full on
+    /// the terminal so a copy survives.
+    #[test]
+    fn check_remove_takes_the_note_written_about_the_check_out_with_it() {
+        let dir = scratch("check-remove-noted");
+        write_profile(&dir, "359320", NOTED_CHECK);
+        let mut out = String::new();
+        profile_check_remove(&mut out, &dir, &[], &game("359320", None), Some("1"))
+            .expect("a commented check has to be removable");
+        let p = tobii_config::profiles::load_from(&dir, &[], "359320")
+            .expect("readable")
+            .expect("there")
+            .profile;
+        assert!(p.checks.is_empty(), "the check is gone");
+        assert_eq!(
+            p.name.as_deref(),
+            Some("Elite Dangerous"),
+            "the rest is not"
+        );
+        let after = std::fs::read_to_string(dir.join("359320.toml")).expect("after");
+        assert!(
+            !after.contains("measured 2026-10-01"),
+            "the note is about a check that is gone:\n{after}"
+        );
+        assert!(out.contains("NOT kept:"), "{out}");
+        assert!(
+            out.contains("# measured 2026-10-01 by playing the game with the bridge running"),
+            "the note has to come back in full:\n{out}"
+        );
+    }
+
+    /// A note above a check that stays is not the one being removed, and a
+    /// removal that took every comment with it would be the same bug wearing
+    /// the other hat.
+    #[test]
+    fn check_remove_keeps_the_note_written_about_a_check_that_stays() {
+        let dir = scratch("check-remove-noted-keep");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n\
+             \n# about the first\n[[check]]\nformat = \"binds-dir\"\n\
+             path = \"drive_c/A\"\nsetting = \"One\"\nwants = \"1\"\ntell = \"Do it.\"\n\
+             \n# about the second\n[[check]]\nformat = \"binds-dir\"\n\
+             path = \"drive_c/B\"\nsetting = \"Two\"\nwants = \"2\"\ntell = \"Do it.\"\n",
+        );
+        let mut out = String::new();
+        profile_check_remove(&mut out, &dir, &[], &game("359320", None), Some("2"))
+            .expect("remove");
+        let after = std::fs::read_to_string(dir.join("359320.toml")).expect("after");
+        assert!(after.contains("# about the first"), "{after}");
+        assert!(!after.contains("# about the second"), "{after}");
+        assert!(out.contains("# about the second"), "it comes back:\n{out}");
+    }
+
+    /// The refusal that is left — a `#` written after a value on the removed
+    /// check's own line, which cannot be lifted off without rewriting that
+    /// line — is still a refusal, and has to read as one: it wrote nothing,
+    /// and it is not an I/O failure. Both its callers used to put "could not
+    /// write <path>" in front of a sentence that already began with the path.
+    #[test]
+    fn a_write_this_still_refuses_names_the_file_once_and_is_not_called_an_io_failure() {
+        let dir = scratch("check-remove-trailing");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n\
+             \n[[check]]\nformat = \"binds-dir\" # a note about the format\n\
+             path = \"drive_c/A\"\nsetting = \"One\"\nwants = \"1\"\ntell = \"Do it.\"\n",
+        );
+        let before = std::fs::read_to_string(dir.join("359320.toml")).expect("before");
+        let mut out = String::new();
+        let e = profile_check_remove(&mut out, &dir, &[], &game("359320", None), Some("1"))
+            .expect_err("a comment on the value's own line still stops it");
+        let path = dir.join("359320.toml").display().to_string();
+        assert_eq!(e.matches(&path).count(), 1, "the path, once:\n{e}");
+        assert!(
+            !e.contains("could not write"),
+            "it wrote nothing on purpose:\n{e}"
+        );
+        // What "wrote nothing" means, asked of the file rather than of the
+        // sentence: the wording is `tobii-config`'s and this must not be the
+        // test that pins it.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("359320.toml")).expect("after"),
+            before,
+            "and the file is untouched"
+        );
+    }
+
+    /// `check add` refuses to promise anything for a format this build has no
+    /// reader for. `where` closed with the promise unconditionally, for a
+    /// check the hub's window answers `UnknownFormat` about — the two
+    /// commands contradicting each other about one check, minutes apart.
+    #[test]
+    fn check_where_does_not_promise_the_hub_reads_a_format_this_build_cannot() {
+        let home = steam_home("check-where-unknown", &[("359320", "Elite")]);
+        let dir = home.join("profiles");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n\
+             \n[[check]]\nformat = \"ini-file\"\npath = \"drive_c/x.ini\"\n\
+             setting = \"One\"\nwants = \"1\"\ntell = \"Do it.\"\n",
+        );
+        let mut out = String::new();
+        profile_check_where(&mut out, &dir, &[], &game("359320", Some("Elite")), &home)
+            .expect("where");
+        assert!(out.contains("no reader for: ini-file"), "{out}");
+        assert!(
+            out.contains("not that window"),
+            "the promise has to be taken back for this check:\n{out}"
+        );
+
+        // And it is taken back only for the check it is true of: a profile
+        // this build can read keeps the promise whole.
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n\
+             \n[[check]]\nformat = \"binds-dir\"\npath = \"drive_c/A\"\n\
+             setting = \"One\"\nwants = \"1\"\ntell = \"Do it.\"\n",
+        );
+        let mut out = String::new();
+        profile_check_where(&mut out, &dir, &[], &game("359320", Some("Elite")), &home)
+            .expect("where");
+        assert!(out.contains("which carries the"), "{out}");
+        assert!(!out.contains("no reader for"), "{out}");
+    }
+
+    /// `tobii uninstall --purge` deletes `<appid>.toml.tmp`, so a listing that
+    /// names nothing at all for it is the listing disagreeing with the
+    /// uninstaller about what is in the directory. It was printed once, as a
+    /// stray; moving it out of the strays dropped it from the report entirely.
+    #[test]
+    fn the_listing_names_the_temp_file_a_cut_short_save_left() {
+        let dir = scratch("listing-leftover");
+        std::fs::write(dir.join("359320.toml.tmp"), "half a write").expect("leftover");
+        let mut out = String::new();
+        profile_list(&mut out, &dir, &[]);
+        assert!(out.contains("359320.toml.tmp"), "{out}");
+        assert!(out.contains("--purge"), "{out}");
+        // Not as somebody else's file: that is the sentence it was moved out
+        // of the strays to stop being given.
+        assert!(!out.contains("and not a profile:\n  359320"), "{out}");
+    }
+
+    /// `save` is where somebody lands with no checks, and it sent them to an
+    /// editor in the round that gave them a command for it.
+    #[test]
+    fn save_names_the_command_that_writes_a_check_rather_than_the_file_format() {
+        let dir = scratch("save-names-add");
+        let mut out = String::new();
+        profile_save(
+            &mut out,
+            &dir,
+            &[],
+            &game("359320", Some("Elite")),
+            &tobii_output::games::OutputConfig::default(),
+        )
+        .expect("save");
+        assert!(
+            out.contains("tobii games profile check add 359320"),
+            "{out}"
+        );
+        assert!(!out.contains("by hand."), "{out}");
+    }
+
+    /// Both columns here are widths, not limits: a value wider than the column
+    /// still ends up with a space after it. A fixed `{:<28}` for the name and
+    /// a `{:<10}` an eleven-digit argument outgrew both ran the next field
+    /// straight into it.
+    #[test]
+    fn a_value_wider_than_its_column_is_still_followed_by_a_space() {
+        let dir = scratch("listing-wide");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\nname = \"Stronghold Crusader: Definitive Edition\"\n\
+             [settings]\nenabled = \"true\"\n",
+        );
+        let mut out = String::new();
+        profile_list(&mut out, &dir, &[]);
+        assert!(
+            out.contains("Stronghold Crusader: Definitive Edition 1 setting"),
+            "{out}"
+        );
+        let wide = GameRef {
+            appid: "12345678901".to_string(),
+            name: Some("Something".to_string()),
+            has_prefix: false,
+            missing_libraries: String::new(),
+        };
+        assert!(
+            wide.heading().contains("12345678901 Something"),
+            "{}",
+            wide.heading()
+        );
     }
 }
