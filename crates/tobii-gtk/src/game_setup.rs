@@ -397,9 +397,23 @@ impl RowBridge {
 /// than over a retyped copy — this tab is outside `tests/help_window.rs`'s
 /// rack walk, which is scoped to the Tracker tab's cards and always was, so
 /// this is the check that stands in for it and it runs in CI.
+/// What the button that runs `tobii bridge status` is called.
+///
+/// It was "Details", and that is the one word it must not be: beside Install
+/// and Uninstall, "Details" reads as *more of what is above* — and what is
+/// above explicitly does not read the registry. This button does, and those
+/// two values are what decide whether a game loads our DLL at all. On the
+/// machine this was written on it answers `Z:\usr\libexec\opentrack`, which
+/// is the whole diagnosis of "I installed it and nothing happened" and was
+/// sitting behind a caption that sounded optional.
+pub(crate) const DETAILS_CAPTION: &str = "Check what's registered";
+
+/// See [`ADD_GAME_CAPTION`].
 pub(crate) const DETAILS_TIP: &str =
-    "Run `tobii bridge status` for this game and show what it prints. It reads the prefix and \
-     starts nothing.";
+    "Run `tobii bridge status` for this game and show what it prints: which client DLL this \
+     prefix has registered for TrackIR and FreeTrack, and which files are in it. That \
+     registration is what decides whether a game loads ours, and the section above does not \
+     read it. It starts nothing.";
 /// See [`DETAILS_TIP`].
 pub(crate) const UNINSTALL_TIP: &str =
     "Run `tobii bridge uninstall` for this game: take the bridge's files back out of the prefix \
@@ -1328,6 +1342,30 @@ pub(crate) fn profile_bridge_note(bridge: profiles::Bridge) -> Option<String> {
     }
 }
 
+/// What this project has watched THIS title do at the signature check.
+///
+/// Block 2 carried the gate only when a profile said `bridge = required`, and
+/// nothing ships a profile — so the one page that could have told somebody
+/// their game is known to refuse our client told them nothing, on exactly the
+/// titles it has been measured on. The bar offers *Install another client…*
+/// for those titles; this is the paragraph that says why it is there.
+///
+/// `already` is whether the profile note above has said it, so the two do not
+/// print the gate twice on a game that has both a profile and a measurement.
+pub(crate) fn measured_note(m: Option<&signature::Measured>, already: bool) -> Option<String> {
+    let m = m?;
+    let mut s = format!(
+        "This program has watched this very game meet that check. {}\n\n         So installing our client into this prefix is very unlikely to give it head tracking,          however cleanly it installs. That is what the button offering somebody else's client          is for.",
+        m.clause()
+    );
+    if !already {
+        s = format!("{}\n\n{s}", signature::trackir_gate());
+        s.push_str("\n\n");
+        s.push_str(&signature::provider_note());
+    }
+    Some(s)
+}
+
 // ------------------------------------------------------- block 2: the bridge
 
 /// What a stat of the prefix found. Three cases, and the names say exactly how
@@ -1641,11 +1679,11 @@ pub(crate) fn bridge_block(
             // The same gate the button has. `refresh` hides Details when there
             // is no `tobii`, and this sentence pointing at it was appended
             // unconditionally — so on a machine with none the page said
-            // "Details below is `tobii bridge status`" and then, two
+            // the sentence pointing at the button and then, two
             // paragraphs down in `no_binary_text`, "which is why that button
             // is not on the page either". X4 fixed that for the other arm.
             if tobii.is_some() {
-                s.push_str(" Details below is `tobii bridge status`, which does.");
+                s.push_str(" The button below does — it runs `tobii bridge status`.");
             }
             s
         }
@@ -3491,7 +3529,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // `refresh` holds, and that is the cycle. Built here and only *described*
     // by `refresh`, which reaches them through `downgrade()`.
     let install_btn = crate::widget::button(Action::Install.caption());
-    let details_btn = crate::widget::button("Details");
+    let details_btn = crate::widget::button(DETAILS_CAPTION);
     details_btn.add_css_class("quiet");
     details_btn.set_tooltip_text(Some(DETAILS_TIP));
     let wine_btn = crate::widget::button("Choose the Proton build…");
@@ -3711,6 +3749,21 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // and asking for "the other prefixes this title has" of a title
             // Steam does not have is a question with no meaning rather than one
             // with an empty answer.
+            // Whether this project has watched this very title stop at the
+            // signature check. Read once, above block 2, because two things
+            // want it: the paragraph `measured_note` prints, and the button
+            // `Actions::other_client` offers — and a page whose button and
+            // whose prose disagreed about that would be offering a route with
+            // no explanation, or an explanation with no route.
+            //
+            // BOTH lookups. `MEASURED[0]` is Star Citizen, which has no app id
+            // because it is not sold on Steam, and it is the title the
+            // hand-added list exists for.
+            let measured_here = match &app.target {
+                Target::Steam(appid) => signature::measured_steam(appid),
+                Target::Prefix(_) => signature::measured_named(&app.name),
+            };
+
             let (chosen, others) = match app.appid() {
                 Some(appid) => {
                     let mut all = scan.steam.prefixes(appid);
@@ -3728,7 +3781,17 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 beside.as_deref(),
                 &app.target,
             );
-            if let Some(note) = profile.and_then(|p| profile_bridge_note(p.bridge)) {
+            let profile_said = profile.and_then(|p| profile_bridge_note(p.bridge));
+            let said_the_gate = profile_said
+                .as_deref()
+                .is_some_and(|n| n.contains("signature"));
+            if let Some(note) = &profile_said {
+                text.push_str("\n\n");
+                text.push_str(note);
+            }
+            // And what was measured about THIS title, which is the paragraph
+            // that explains the button the bar is about to show.
+            if let Some(note) = measured_note(measured_here, said_the_gate) {
                 text.push_str("\n\n");
                 text.push_str(&note);
             }
@@ -3756,7 +3819,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             };
             // Whether this project has watched this very title stop at the
             // signature check — see `Actions::other_client` for why the offer
-            // is not made to the rest.
+            // is not made to the rest, and `measured_note` for the paragraph
+            // block 2 prints from the same answer.
             //
             // BOTH lookups, and the second is not a nicety: `MEASURED[0]` is
             // Star Citizen, which has no app id because it is not sold on
@@ -3766,11 +3830,14 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // while the help topic promised it appears "for a game this project
             // has watched refuse ours at the signature check, and for no
             // other".
-            let measured = match &app.target {
-                Target::Steam(appid) => signature::measured_steam(appid).is_some(),
-                Target::Prefix(_) => signature::measured_named(&app.name).is_some(),
-            };
-            let acts = actions(&state, tobii.as_deref(), &job, reach, measured, app.group);
+            let acts = actions(
+                &state,
+                tobii.as_deref(),
+                &job,
+                reach,
+                measured_here.is_some(),
+                app.group,
+            );
             if let Some(btn) = install_w.upgrade() {
                 match acts.primary {
                     Some(a) => {
@@ -4076,10 +4143,23 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 row.set_header(None::<&gtk::Widget>);
                 return;
             }
-            let h = Label::new(Some(mine.heading()));
-            h.set_halign(Align::Start);
-            h.set_xalign(0.0);
-            h.add_css_class("eyebrow");
+            // A heading, and above every one but the first a rule. The four
+            // sections were four lines of small grey caps in an unbroken column
+            // of rows, so *set up* and *not set up* — which is the division the
+            // whole list is sorted by — were told apart by reading, not by
+            // looking. The rule is what makes the break a break.
+            let h = gtk::Box::new(Orientation::Vertical, 0);
+            if before.is_some() {
+                let rule = gtk::Box::new(Orientation::Horizontal, 0);
+                rule.add_css_class("hairline");
+                rule.set_margin_bottom(12);
+                h.append(&rule);
+            }
+            let label = Label::new(Some(mine.heading()));
+            label.set_halign(Align::Start);
+            label.set_xalign(0.0);
+            label.add_css_class("group-heading");
+            h.append(&label);
             row.set_header(Some(&h));
         });
     }
@@ -4746,6 +4826,46 @@ mod tests {
             argv.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
             vec!["/usr/bin/tobii", "bridge", "uninstall", "--steam", "359320"],
         );
+    }
+
+    /// A game this project has measured at the check is told so, with no
+    /// profile needed.
+    ///
+    /// This is the hole the button was opened over. Block 2 carried the
+    /// signature gate only when a profile said `bridge = required`, and
+    /// `profiles::BUILTIN` is empty — so on MSFS 2024, the one Steam title
+    /// measured calling that check 104 times and nothing else, the page said
+    /// nothing about it at all while the bar offered a button whose whole
+    /// reason is that measurement.
+    #[test]
+    fn a_measured_game_is_told_what_was_measured_about_it_without_a_profile() {
+        let msfs = signature::measured_steam("2537590").expect("measured");
+        let note = measured_note(Some(msfs), false).expect("a measured title gets a paragraph");
+        assert!(
+            note.contains("watched this very game"),
+            "about THIS title, not games in general: {note}"
+        );
+        assert!(note.contains("104 times"), "the measurement itself: {note}");
+        assert!(
+            note.contains(&signature::trackir_gate()),
+            "and the gate, because no profile said it: {note}"
+        );
+        assert!(
+            note.contains(&signature::provider_note()),
+            "and the second wall, which the button does not get past: {note}"
+        );
+
+        // A profile that already printed the gate does not get it twice.
+        let twice = measured_note(Some(msfs), true).expect("still a paragraph");
+        assert!(!twice.contains(&signature::trackir_gate()), "{twice}");
+        assert!(
+            twice.contains("104 times"),
+            "but still the measurement: {twice}"
+        );
+
+        // And a game nobody has put to the check gets no paragraph at all —
+        // this page does not predict what an unmeasured game will do.
+        assert_eq!(measured_note(None, false), None);
     }
 
     /// The one route measured to get past the signature check is offered to
@@ -7041,7 +7161,7 @@ mod tests {
     /// `no_binary_text`'s own doc comment names the shape and the other arm
     /// was fixed for it: `refresh` hides Details when there is no `tobii`, so
     /// a page with no `tobii` must not point at it. The `Files` arm appended
-    /// "Details below is `tobii bridge status`, which does." unconditionally,
+    /// the sentence pointing at the button unconditionally,
     /// and `no_binary_text(Reinstall, …)` — appended in that same state — says
     /// "which is why that button is not on the page either". Both paragraphs,
     /// rendered, one after the other.
@@ -7056,7 +7176,7 @@ mod tests {
             &Target::Steam("359320".to_string()),
         );
         assert!(
-            with.contains("Details below is"),
+            with.contains("The button below does"),
             "the button is on the page, so the sentence pointing at it is too: {with}"
         );
 
@@ -7085,7 +7205,7 @@ mod tests {
             "nothing to run: {without}"
         );
         assert!(
-            !without.contains("Details below is"),
+            !without.contains("The button below does"),
             "`refresh` hides Details on `tobii.is_none()`, and this very page says so a \
              paragraph later: {without}"
         );

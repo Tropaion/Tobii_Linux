@@ -117,6 +117,12 @@ window { background-color: #0d1013; color: #e8ecef; }
 .app-title { font-size: 20px; font-weight: bold; letter-spacing: 0.01em; }
 .eyebrow { font-size: 10px; font-weight: bold; letter-spacing: 0.16em;
            color: #79838d; }
+/* The Games list's section headings. `.eyebrow`'s letterforms, one step
+   brighter and with room around them: these four words are the division the
+   whole list is sorted by — set up against not — and at `.eyebrow`'s grey they
+   were four more lines of small text in a column of small text. */
+.group-heading { font-size: 10px; font-weight: bold; letter-spacing: 0.16em;
+                 color: #aab4bd; margin-bottom: 4px; }
 .section-title { font-size: 14px; font-weight: bold; }
 .section-desc { font-size: 12px; color: #8a949d; }
 /* The same muted line, under a CONTROL rather than under a title. Identical to
