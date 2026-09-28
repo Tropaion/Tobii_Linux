@@ -143,11 +143,8 @@ fn count_word(n: usize) -> &'static str {
 pub fn provider_note() -> String {
     [
         "A client that answers the check only reads the shared mapping —",
-        "something has to be filling it. Wrapping the game does that inside the",
-        "game's own session: put `tobii game -- %command%` in its Steam launch",
-        "options, and with the bridge installed in that prefix the provider is",
-        "started with the game and stops with it. The other way is",
-        "`tobii bridge run` in a terminal, which stands aside while a game is",
+        "something has to be filling it. Today that is `tobii bridge run` in a",
+        "terminal, which stands aside while a game is",
         "launching — it has to, or the game never starts — and does not restart",
         "itself, so it is started again once the game is up. Until something is",
         "filling the mapping, the game has a client answering the check and",

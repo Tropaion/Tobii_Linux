@@ -1,5 +1,30 @@
 //! Put our provider on the right side of the wineserver lock.
 //!
+//! # Nothing calls this, and the reason is measured
+//!
+//! Everything below builds a batch file and points Proton's
+//! `waitforexitandrun` at it. **Proton does not wait for a batch file.** Its
+//! `steam.exe` helper runs an `.exe` target through `CreateProcessW` and waits
+//! on it, and a `.bat` target through `ShellExecuteW`, which returns at once —
+//! confirmed on four Proton builds on the machine this was written on, against
+//! a control with an `.exe` target that waits correctly.
+//!
+//! The failure is the worst available. Proton reports success about a second
+//! in, while `cmd.exe`, the provider and the game are all still starting: Steam
+//! records the game as exited, [`crate::game`] returns and drops the tracker
+//! out from under a game that is still running, [`Once`] takes the batch file
+//! away while `cmd.exe` is reading it — so the game frequently never starts —
+//! and the next launch's `wineserver -w` blocks on whatever is still alive,
+//! which is the freeze v0.5.0 removed, reintroduced by the thing meant to make
+//! it unnecessary.
+//!
+//! What is here is kept because it is right and was measured: the plan that
+//! finds the game by Proton's own argument pair, the quoting that survives
+//! `cmd.exe`, the ordering, the reap and the exit code. What it needs is a
+//! target Proton will wait on — an `.exe` of ours that starts the provider and
+//! then the game — which is a Windows program to write, not a change here.
+//! `docs/wiki/Quality-and-Risks.md` §11.3l has the measurement.
+//!
 //! # The ordering problem, in one paragraph
 //!
 //! Steam launches a Proton title with the verb `waitforexitandrun`, and Proton
@@ -85,6 +110,9 @@
 //! the game — is reasoned from the shape of the launch and from the studied
 //! launcher working for its users. It was not measured here, and nothing on
 //! this machine could measure it.
+
+// Kept deliberately while nothing calls it — see the note above.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

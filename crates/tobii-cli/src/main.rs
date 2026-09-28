@@ -200,13 +200,26 @@ fn game(args: &[String]) -> ExitCode {
         }
     };
 
-    // The second job, and only for a Proton launch [`proton::plan`] can account
-    // for: the provider has to be inside the game's own wineserver session, so
-    // it has to be started *by* the launch rather than beside it. The file is
-    // deliberately still in scope below the wait — dropping it is what takes
-    // the batch file away.
-    let compat = std::env::var_os("STEAM_COMPAT_DATA_PATH").map(std::path::PathBuf::from);
-    let (cmd, _launch_file) = proton::arrange(cmd, compat.as_deref());
+    // The provider belongs inside the game's own wineserver session, and
+    // [`proton`] builds the batch that would put it there — but nothing calls
+    // it, because pointing Proton at a batch file does not work and the way it
+    // fails is the worst available.
+    //
+    // Measured on four Proton builds on this machine: Proton's `steam.exe`
+    // helper runs an `.exe` target through `CreateProcessW` and waits, and a
+    // `.bat` target through `ShellExecuteW`, which does not. So Proton returns
+    // 0 about a second in, while `cmd.exe`, the provider and the game are all
+    // still starting. Steam is told the game exited successfully; this wrapper
+    // returns and drops the tracker out from under a game that is still
+    // running; the batch file is deleted while `cmd.exe` is reading it, so the
+    // game often never starts at all; and the next launch's `wineserver -w`
+    // blocks on what is still alive — the freeze v0.5.0 removed, put back by
+    // the thing meant to remove the need for it.
+    //
+    // The module stays. Its plan, its quoting and its batch are measured and
+    // right, and the shape that can use them is an `.exe` of ours as the
+    // target rather than a `.bat` — which is a Windows program to build, not a
+    // line to change here. See `docs/wiki/Quality-and-Risks.md` §11.3l.
 
     let mut child = std::process::Command::new(&cmd[0]);
     child.args(&cmd[1..]);

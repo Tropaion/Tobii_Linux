@@ -1484,6 +1484,33 @@ and none of what follows was run by anybody on this project.
   doubling swallows the closing quote. A path this program cannot spell safely
   — a quote, a control character, a non-ASCII character — declines the rewrite
   and the game still launches.
+- **It does not work, and it was the shape that was wrong.** Measured after
+  the above, against real Proton rather than plain wine — four builds on this
+  machine, `proton-cachyos-11.0-slr`, Experimental, 10.0 and 9.0 (Beta), each
+  with a control. Proton's `steam.exe` helper runs an `.exe` target through
+  `CreateProcessW` and **waits**; it runs a `.bat` target through
+  `ShellExecuteW`, which **does not**. Pointing `waitforexitandrun` at our
+  batch therefore has Proton report success about a second in, on all four
+  builds, while `cmd.exe`, the provider and the game are still starting:
+  `proton_rc=0` after ~1 s where the `.exe` control returns 7 after the full
+  run. Four consequences, each measured: Steam records the game as exited
+  successfully; `tobii game` returns and drops the tracker while the game is
+  still running; the launch file is deleted while `cmd.exe` is reading it, so
+  end to end on a cold wineserver **the game never started at all**, three runs
+  of three; and the next launch's `wineserver -w` blocked at the 20 s timeout
+  on every build — the freeze §11.3i is about, reintroduced by the work meant
+  to make it unnecessary.
+- **So nothing calls it.** `crates/tobii-cli/src/proton.rs` is kept, uncalled,
+  with that written at the top of it: the plan, the quoting, the ordering, the
+  reap and the exit code are right and were measured, and what they need is a
+  target Proton waits on — an `.exe` of ours that starts the provider and then
+  the game. That is a Windows program to write, not a line to change.
+  `tobii game -- %command%` does what it did before this work: it holds the
+  tracker for the process's lifetime and rewrites nothing.
+- **The lesson is the one this register keeps writing down.** The ordering was
+  measured against plain wine, and plain wine is not the thing that runs the
+  target — Proton's own helper is, and it was never in the test. Two steps were
+  listed as unmeasured and one of them was the step that decided the outcome.
 - **What it delivered is not known.** No game has been launched through it.
   Two steps between the measured ordering and a game receiving anything are
   unwatched: that Proton accepts a batch file as its target at all (only plain
