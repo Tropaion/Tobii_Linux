@@ -330,6 +330,7 @@ impl Once {
     /// The pid is in the name so that two launches sharing a prefix cannot
     /// write over each other's file while `cmd.exe` is still reading it.
     pub(crate) fn write(dir: &Path, batch: &str) -> std::io::Result<Self> {
+        sweep(dir);
         let path = dir.join(format!("launch-{}.bat", std::process::id()));
         std::fs::write(&path, batch)?;
         Ok(Self(path))
@@ -344,6 +345,40 @@ impl Once {
 impl Drop for Once {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Remove `launch-<pid>.bat` files left by runs that are no longer running.
+///
+/// [`Once`] takes its file away on the way out, and a signal does not let it:
+/// Steam's Stop button sends `SIGTERM`, which skips every destructor, and a
+/// `SIGKILL` would skip a handler too. So rather than install one, each launch
+/// clears what earlier ones could not. Nothing here is time-based — a pid with
+/// no `/proc` entry is a process that has ended, and a file named for a live
+/// one belongs to a launch that may still be reading it.
+///
+/// A recycled pid keeps a stale file one launch longer. That costs a few
+/// hundred bytes in a directory this program owns, which is the cheaper side
+/// of the trade against deleting a batch `cmd.exe` has open.
+fn sweep(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name
+            .strip_prefix("launch-")
+            .and_then(|r| r.strip_suffix(".bat"))
+        else {
+            continue;
+        };
+        if !pid.is_empty()
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && !Path::new("/proc").join(pid).exists()
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -388,10 +423,19 @@ pub(crate) fn arrange(mut cmd: Vec<String>, compat: Option<&Path>) -> (Vec<Strin
         );
         return (cmd, None);
     };
+    // What this says is what was run, and no more. The ordering, the reap and
+    // the exit code were measured against wine's own `cmd.exe`; that Proton
+    // accepts a batch file as its target, and that the provider then shares
+    // the wineserver session the game is in, are the two steps nobody here has
+    // watched happen. Saying "will be started inside this game's Proton
+    // session" states the second of those as fact and disclaims only the
+    // outcome after it, which is the shape this project keeps having to
+    // correct.
     eprintln!(
-        "note: the bridge provider will be started inside this game's Proton session, before \
-         the game. That is the ordering; whether the game then reads tracking data from it is \
-         not checked here."
+        "note: this launch is wrapped — the provider is started first, the game runs, and the \
+         provider is stopped when it exits. Whether the game then reads tracking from it is not \
+         checked here. If the game does not start at all, take `tobii game -- ` back out of the \
+         launch options and it launches exactly as before."
     );
     point_at(&mut cmd, target, path);
     (cmd, Some(file))
@@ -747,6 +791,34 @@ mod tests {
     }
 
     // --- the file -------------------------------------------------------
+
+    /// A file a signal left behind is taken away by the next launch.
+    ///
+    /// `SIGTERM` — what Steam's Stop button sends — skips every destructor, so
+    /// [`Once`] cannot clean up after itself there and a handler would not
+    /// survive `SIGKILL` either. What must not happen is the opposite: taking
+    /// away a file belonging to a launch that is still running.
+    #[test]
+    fn a_batch_a_signal_left_behind_goes_with_the_next_launch() {
+        let scratch = Scratch::new("sweep", true);
+        let dir = scratch.dir();
+        // A pid that has ended. 2^22 is above every `pid_max` Linux allows, so
+        // no live process can wear it and the case cannot flake.
+        let dead = dir.join("launch-4194304.bat");
+        std::fs::write(&dead, "stale").expect("a stale file");
+        // One belonging to something alive, which is this test.
+        let live = dir.join(format!("launch-{}.bat", std::process::id()));
+        std::fs::write(&live, "in use").expect("a live file");
+        // And something that is not ours at all.
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, "somebody's").expect("a stranger");
+
+        sweep(&dir);
+
+        assert!(!dead.exists(), "a file from a run that ended goes");
+        assert!(live.exists(), "one from a run still going stays");
+        assert!(other.exists(), "and this only ever removes its own names");
+    }
 
     #[test]
     fn the_batch_is_written_for_one_launch_and_removed_with_it() {

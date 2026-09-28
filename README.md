@@ -677,9 +677,25 @@ client merely *reads* `FT_SharedMem` and the provider is the only thing that
 fills it. So from the moment it yields until you start it again, that client is
 reading a mapping nobody is writing and the game gets no head tracking. That is
 the whole of what v0.5.0 changed here: the launch goes through instead of
-hanging. Getting tracking out of such a title still means having the provider
-inside the game's own wineserver session, which this project does not yet do —
-see [Game-Output](docs/wiki/Game-Output.md).
+hanging.
+
+**The way not to be in that configuration** is to let the launch carry the
+provider. Put
+
+```
+tobii game -- %command%
+```
+
+in the game's Steam launch options. That wrapper already holds the tracker on
+for as long as the game runs; with the bridge installed in that game's prefix
+it also starts the provider inside the launch itself, before the game, and
+stops it when the game exits — so there is no second process for
+`wineserver -w` to wait on and nothing to restart by hand. What has been
+measured is the ordering, the reaping and the exit code, against wine's own
+`cmd.exe`. Whether a game then reads tracking from it has not been, and no
+version of this has been run against a real Proton title — see
+[Game-Output](docs/wiki/Game-Output.md) and
+[Quality-and-Risks](docs/wiki/Quality-and-Risks.md) §11.3l.
 
 **Reported, not verified here.** One user reports getting head tracking in
 Microsoft Flight Simulator 2024 by running opentrack's *Windows* build inside

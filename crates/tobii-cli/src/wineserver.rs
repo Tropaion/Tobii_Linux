@@ -238,7 +238,11 @@ pub fn yielding(pid: i32) -> String {
          \n\
          Start it again once the game is up: a client DLL picks up a mapping that\n\
          appears after it. That does not make the game accept the data — it only stops\n\
-         this command blocking the launch.\n"
+         this command blocking the launch.\n\
+         \n\
+         To not have to: put `tobii game -- %command%` in the game's Steam launch\n\
+         options instead. With the bridge installed in its prefix the provider is\n\
+         started with the game, inside the launch, and stops with it.\n"
     )
 }
 

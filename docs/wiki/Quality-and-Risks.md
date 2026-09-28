@@ -1463,10 +1463,35 @@ and none of what follows was run by anybody on this project.
 - **This entry describes a launcher we read, not code we ship.** The wrapper
   group is building this project's own sequencing in the same round as this
   entry; at the time of writing their result is not in front of me, so nothing
-  here claims anything about it. **When it lands, this section needs a line
-  saying what we built, what was run, and what it delivered** — and until that
-  line exists, this register has recorded a mechanism and no demonstration of
-  it.
+  here claims anything about it.
+- **It landed, and here is the line that entry asked for.**
+  `crates/tobii-cli/src/proton.rs`: `tobii game -- %command%` now recognises a
+  Proton launch by Proton's own argument pair — a program named `proton`
+  followed by the verb `waitforexitandrun` — and, **only** when
+  `tobii-bridge.exe` is already in that launch's
+  `$STEAM_COMPAT_DATA_PATH/pfx`, replaces Proton's target with a batch file of
+  ours: `start /b` the provider, `start /wait` the game, `taskkill` the
+  provider, return the game's saved exit code. Every other case runs the
+  command exactly as Steam wrote it.
+- **What was run.** Against real wine 11.18 with stub executables: the provider
+  starts before the game, the batch blocks for the game's lifetime, the
+  provider is reaped, and the game's exit code survives. Each of those four
+  broken in turn and watched to fail — and with the `taskkill` removed,
+  `wineserver -w` timed out at twelve seconds, which is the next launch's
+  freeze reproduced on demand. Fifteen hostile arguments and eight hostile game
+  paths arrive byte-identical through `cmd.exe`; removing the `%`-doubling
+  collapses five arguments into three, and removing the trailing-backslash
+  doubling swallows the closing quote. A path this program cannot spell safely
+  — a quote, a control character, a non-ASCII character — declines the rewrite
+  and the game still launches.
+- **What it delivered is not known.** No game has been launched through it.
+  Two steps between the measured ordering and a game receiving anything are
+  unwatched: that Proton accepts a batch file as its target at all (only plain
+  wine was tested, not the Steam Linux Runtime's container), and that the
+  provider then shares the wineserver session the game is in. The wrapper's own
+  note says what it did and not what it achieved, and this entry says the same.
+  **A demonstration is still owed**, and the shape of it is one Proton title
+  launched this way with `tobii bridge status` and a spike log either side.
 
 ### 11.4 Environmental
 
