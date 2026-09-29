@@ -417,7 +417,9 @@ pub fn topics() -> Vec<Topic> {
                  them. A button there puts it on the clipboard; this program \
                  cannot set it for you, because launch options live in Steam's \
                  own configuration, which Steam rewrites from memory when it \
-                 exits. {gate}\n\n\
+                 exits. A bridge installed before this existed cannot start a \
+                 game, and the page says so instead, naming Reinstall as the \
+                 step. {gate}\n\n\
                  {provider}\n\n\
                  Reported, and not verified by anyone here: one user reports \
                  getting head tracking working in Microsoft Flight Simulator \

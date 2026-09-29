@@ -448,9 +448,11 @@ pub(crate) const FORGET_TIP: &str =
 /// window carries the same facts.
 ///
 /// `cfg(test)` because nothing in the program reads it: the buttons each take
-/// their own const. What it is for is the LENGTH — `help::tests` asserts it, so
-/// a sixth tooltip on this tab cannot be added without that test being made to
-/// look at the new one.
+/// their own const. What it is for is the LENGTH — `help::tests` asserts this
+/// array against its own list of pairs, so a tooltip cannot be added to this tab
+/// without that test being made to look at the new one. Counting them here in
+/// prose is what drifted the first time one was added; the number lives in the
+/// type and nowhere else.
 #[cfg(test)]
 pub(crate) const TIPS: [&str; 7] = [
     DETAILS_TIP,
@@ -1738,8 +1740,34 @@ fn launch_option_line() -> String {
          That hands the launch to us, and Proton then starts the bridge's provider and \
          the game together, in one go, so the provider is inside the game's own Wine \
          session. It stops when the game does. Without it the files above are in place \
-         and nothing starts them."
+         and nothing starts them.\n\n\
+         If the game then does not start at all, `tobii` is not on the PATH Steam was \
+         launched with \u{2014} put the full path to it in front of ` game -- %command%`, \
+         or take the option back out and the launch is exactly as it was."
     )
+}
+
+/// `tobii bridge install` writes this beside the provider to say the provider
+/// understands `--launch`.
+///
+/// Spelled here as well as in `tobii-cli` for the reason `BRIDGE_FILES` is:
+/// that crate is a `[[bin]]` and this one cannot link it. The two are asserted
+/// equal in `tobii-cli`'s own tests, which can see both.
+const LAUNCH_STAMP: &str = "launch-capable.txt";
+
+/// Whether the provider in this prefix is one that can start a game.
+///
+/// The three files `bridge_state` stats do not answer this. A prefix installed
+/// before `--launch` has all of them and no stamp, `proton::plan` declines over
+/// exactly that, and the launch then runs unchanged — so a page that promised
+/// the wrap from a stat of those three would be telling every existing bridge
+/// user, on the ordinary upgrade path, that their setup is one paste from done
+/// when it is one *reinstall* from done.
+///
+/// The doc on `BRIDGE_FILES` states the rule this keeps: the wording here
+/// claims only what a stat can support, and this is the stat that supports it.
+fn launch_capable(state: &BridgeState) -> bool {
+    matches!(state, BridgeState::Files { dir, .. } if dir.join(LAUNCH_STAMP).is_file())
 }
 
 /// What goes in Steam's launch options, in the one place that spells it.
@@ -1748,6 +1776,14 @@ pub(crate) const LAUNCH_OPTION: &str = "tobii game -- %command%";
 pub(crate) const COPY_LAUNCH_CAPTION: &str = "Copy the launch option";
 /// What it says once it has, which is all it can honestly report.
 pub(crate) const COPY_LAUNCH_DONE: &str = "Copied — paste it into Steam";
+/// What block 2 says over a prefix whose bridge predates the launch wrapper.
+///
+/// Its own constant so the test can name it, and so the sentence stays the one
+/// `proton::plan` prints for the same condition.
+pub(crate) const OLDER_BRIDGE_LINE: &str =
+    "The bridge in this prefix was installed by a version that cannot start a game \
+     alongside it. Press Reinstall above and it can \u{2014} until then the launch runs \
+     as Steam wrote it, and nothing starts the provider.";
 /// See [`DETAILS_TIP`].
 pub(crate) const COPY_LAUNCH_TIP: &str =
     "Put `tobii game -- %command%` on the clipboard, for Steam's Launch Options. This \
@@ -1838,9 +1874,17 @@ pub(crate) fn bridge_block(
     // Heroic title that is an instruction to a dialogue that does not exist for
     // it. `proton::plan` agrees: it rewrites a Proton launch and nothing else,
     // so there would be nothing to start even if the option could be set.
-    if matches!(state, BridgeState::Files { .. }) && target.appid().is_some() {
-        text.push_str("\n\n");
-        text.push_str(&launch_option_line());
+    if target.appid().is_some() {
+        if launch_capable(state) {
+            text.push_str("\n\n");
+            text.push_str(&launch_option_line());
+        } else if matches!(state, BridgeState::Files { .. }) {
+            // The files are there and the provider cannot start a game. Naming
+            // the one button that fixes it, because `bridge_action` offers
+            // *Reinstall* for every `Files` state and attaches no reason to it.
+            text.push_str("\n\n");
+            text.push_str(OLDER_BRIDGE_LINE);
+        }
     }
     // Both notes hang off every state, because both are reasons the sentence
     // above them may be about the wrong place on this machine.
@@ -4082,7 +4126,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // the button cannot offer to copy something the text above did not
             // mention. Reset each time: the caption is a receipt for one press.
             if let Some(copy) = copy_launch_w.upgrade() {
-                let shown = matches!(state, BridgeState::Files { .. }) && app.appid().is_some();
+                let shown = launch_capable(&state) && app.appid().is_some();
                 copy.set_visible(shown);
                 if shown {
                     crate::widget::set_button_text(&copy, COPY_LAUNCH_CAPTION);
@@ -5830,13 +5874,46 @@ mod tests {
     /// against.
     #[test]
     fn the_page_names_the_one_step_it_has_no_button_for() {
-        let installed = bridge_block(
-            &present(),
-            &[],
-            &[],
-            Some(Path::new("/usr/bin/tobii")),
-            None,
-            &Target::Steam("2537590".to_string()),
+        // A real directory, because the claim rests on a stat of the stamp: a
+        // prefix with the three files and no stamp is the ordinary upgrade
+        // path, and it must not be told the wrap will work.
+        let dir = std::env::temp_dir().join(format!("tobii-launchline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch install dir");
+        let stamped = BridgeState::Files {
+            dir: dir.clone(),
+            prefix: dir.clone(),
+            present: BRIDGE_FILES.to_vec(),
+        };
+        let steam = Target::Steam("2537590".to_string());
+        let block = |state: &BridgeState| {
+            bridge_block(
+                state,
+                &[],
+                &[],
+                Some(Path::new("/usr/bin/tobii")),
+                None,
+                &steam,
+            )
+        };
+
+        // The files are there and the provider predates `--launch`.
+        let older = block(&stamped);
+        assert!(
+            !older.contains(LAUNCH_OPTION),
+            "a bridge that cannot start a game is told its setup is one paste from \
+             done: {older}"
+        );
+        assert!(
+            older.contains(OLDER_BRIDGE_LINE),
+            "and is not told which button fixes it: {older}"
+        );
+
+        std::fs::write(dir.join(LAUNCH_STAMP), b"0.0.0-test\n").expect("a stamp");
+        let installed = block(&stamped);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !installed.contains(OLDER_BRIDGE_LINE),
+            "and a stamped prefix is not told it is stale: {installed}"
         );
         assert!(
             installed.contains(LAUNCH_OPTION),

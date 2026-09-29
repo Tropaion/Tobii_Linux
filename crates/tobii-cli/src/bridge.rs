@@ -1871,6 +1871,11 @@ fn install(args: &[String]) -> CmdResult {
     std::fs::create_dir_all(&dest)?;
 
     let mut copied = 0;
+    // Whether THIS run put the current provider there. The stamp below is a
+    // claim about that file, and `tobii-bridge.exe` is an optional artifact —
+    // a tree built without it skips the copy and leaves whatever was in the
+    // prefix, which may be a provider from before `--launch` existed.
+    let mut provider_copied = false;
     for (name, required) in ARTIFACTS {
         let from = src.join(name);
         if !from.is_file() {
@@ -1897,12 +1902,21 @@ fn install(args: &[String]) -> CmdResult {
             return Err(format!("could not replace {}: {e}", target.display()).into());
         }
         copied += 1;
+        provider_copied |= name == PROVIDER_EXE;
         println!("  {name}");
     }
     // After the artifacts, because it is a claim about the file that was just
     // written: staged and renamed like them, so a reader never sees a stamp
     // over a half-copied provider.
-    {
+    // Only when this run copied the provider. Writing it otherwise would
+    // certify a file nobody looked at: an artifact directory without
+    // `tobii-bridge.exe` skips that copy, so the prefix keeps the provider it
+    // already had, and a v0.6.0 one carrying a v0.7.0 stamp is precisely the
+    // launch `proton::plan` would wrap and hang.
+    //
+    // An existing stamp is left alone rather than removed: it was written by a
+    // run that did copy a provider, and that provider is still there.
+    if provider_copied {
         let target = dest.join(LAUNCH_STAMP);
         let staged = dest.join(staging_name(LAUNCH_STAMP, std::process::id()));
         let body = format!(
@@ -2612,6 +2626,14 @@ struct Status {
     /// One entry per [`ARTIFACTS`] name: the name, whether it is required,
     /// whether it is there.
     artifacts: Vec<(&'static str, bool, Presence)>,
+    /// What [`LAUNCH_STAMP`] holds, when it is there.
+    ///
+    /// In the report because it decides something no other line here does:
+    /// whether `tobii game -- %command%` will wrap this game's launch or run it
+    /// unchanged. A prefix installed before the stamp existed has every file
+    /// above and no wrap, and without this line the report a user pastes into
+    /// an issue looks identical to one that works.
+    launch_stamp: Option<String>,
     /// Why [`RECORD_FILE`] could not be read, when it is there and could not
     /// be.
     ///
@@ -2805,6 +2827,19 @@ fn render_status(s: &Status) -> String {
                     "  {name:<22} {}\n",
                     artifact_line(*required, present)
                 ));
+            }
+            match &s.launch_stamp {
+                Some(v) => o.push_str(&format!(
+                    "  {:<22} yes (installed by {v}) — `tobii game -- %command%` will start\n  \
+                     {:<22} the provider alongside this game\n",
+                    LAUNCH_STAMP, ""
+                )),
+                None => o.push_str(&format!(
+                    "  {:<22} no — this bridge was installed by a version that cannot start\n  \
+                     {:<22} a game; `tobii game` runs the launch unchanged until it is\n  \
+                     {:<22} installed again\n",
+                    LAUNCH_STAMP, "", ""
+                )),
             }
             if let Some(why) = &s.record_unreadable {
                 o.push_str(&format!(
@@ -3100,6 +3135,10 @@ fn gather_status(args: &[String]) -> Result<Status, String> {
     // record": that is the right answer for a command whose next move is to
     // leave a key alone, and the wrong one for a report, which would then state
     // the consequence as a fact about somebody else's prefix.
+    let launch_stamp = std::fs::read_to_string(dir.join(LAUNCH_STAMP))
+        .ok()
+        .map(|t| t.lines().next().unwrap_or_default().trim().to_string());
+
     let (record, record_unreadable) = match std::fs::read_to_string(dir.join(RECORD_FILE)) {
         Ok(t) => (parse_record(&t), None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
@@ -3126,6 +3165,7 @@ fn gather_status(args: &[String]) -> Result<Status, String> {
         source,
         wine,
         origin,
+        launch_stamp,
         wine_given: crate::flag_value(args, "--wine").is_some(),
         wine_warning,
         server,
@@ -6040,6 +6080,49 @@ exit 0
         );
     }
 
+    /// The hub spells the stamp's name too, and the two have to be the one name.
+    ///
+    /// `tobii-gtk` cannot link this crate — it is a `[[bin]]` — so the constant
+    /// is written twice, and this is the only place that can see both. A
+    /// mismatch would have the page promise a launch wrap that `proton::plan`
+    /// then declines, which is the exact sentence the stamp exists to prevent.
+    #[test]
+    fn the_hub_and_this_crate_spell_the_stamp_the_same_way() {
+        assert_eq!(LAUNCH_STAMP, "launch-capable.txt");
+    }
+
+    /// The stamp is a claim about a file, so it is only written when that file
+    /// was written.
+    ///
+    /// `tobii-bridge.exe` is an OPTIONAL artifact: a tree built without it skips
+    /// the copy and leaves whatever the prefix already had. Stamping then would
+    /// certify a provider nobody looked at, and a v0.6.0 one carrying a v0.7.0
+    /// stamp is precisely the launch `proton::plan` wraps and hangs.
+    #[test]
+    fn a_skipped_provider_is_not_certified_as_one_that_can_launch() {
+        // `FakeWine` ships only the required DLL, so this IS the skip case.
+        let fw = FakeWine::new("stamp-without-provider");
+        install(&fw.args("install", &[])).expect("install without a provider still installs");
+        assert!(
+            fw.dest().join(REQUIRED_ARTIFACT).is_file(),
+            "the install itself still happened"
+        );
+        assert!(
+            !fw.dest().join(LAUNCH_STAMP).is_file(),
+            "a prefix whose provider this run did not write must not be stamped"
+        );
+
+        // And one that does copy a provider is stamped, or the check above
+        // passes for the wrong reason.
+        let ok = FakeWine::new("stamp-with-provider");
+        std::fs::write(ok.root.join("artifacts").join(PROVIDER_EXE), b"exe").expect("provider");
+        install(&ok.args("install", &[])).expect("install");
+        assert!(
+            ok.dest().join(LAUNCH_STAMP).is_file(),
+            "a provider this run copied is what the stamp is a claim about"
+        );
+    }
+
     /// A prefix Proton serves is not told to run a provider beside the game,
     /// because it cannot work there.
     ///
@@ -7189,6 +7272,7 @@ exit 0
             dir: prefix.join(INSTALL_SUBDIR),
             registry_file: prefix.join(tobii_config::userreg::FILE),
             prefix,
+            launch_stamp: Some("0.0.0-test".to_string()),
             source: PrefixSource::Steam(wanted.to_string()),
             wine: PathBuf::from("/games/Proton/files/bin/wine"),
             origin: WineOrigin::Prefix,

@@ -1841,6 +1841,54 @@ C stub that writes its `argv` one bracketed value per line and returns 7.
 
 ---
 
+### 11.3p The launch option the page cannot set (2026-09-29)
+
+Every part of setting a game up is a button on the Games tab except one: Steam's
+launch options. Block 2 names it once the bridge is in the prefix and a button
+copies `tobii game -- %command%`; this program does not set it, because launch
+options live in Steam's own `localconfig.vdf`, which Steam reads at start, holds
+in memory and rewrites on exit, and because writing another program's
+configuration is the rule block 3 is built on.
+
+**What is measured.** That the paragraph and the button appear together and only
+where the claim holds: the bridge's files present, a stamp saying that provider
+understands `--launch`, and a game Steam launches. Each of the three is asserted
+in both directions, and the last two were defects found by review rather than
+foresight — the first version told a Lutris title to open Steam's Properties
+dialogue, and the second told every prefix installed before v0.7.0 that its
+setup was one paste from done when `proton::plan` would decline it. A prefix
+with the files and no stamp is now told which button fixes it, which is the
+sentence the CLI already prints for the same condition.
+
+`tobii bridge status` reports the stamp too, so the output a user pastes into an
+issue distinguishes a bridge that will be wrapped from one that will not. That
+report was the third surface with the same blind spot.
+
+**What is not.**
+
+- **Nobody has pasted it into Steam and launched a game.** The wrapper's own
+  behaviour is measured against real Proton (§11.3o); that the pasted line
+  reaches `tobii game` through Steam's own environment is not. The specific
+  risk is the bare `tobii`: it is a PATH lookup in whatever environment Steam
+  was started with, and a user whose install directory is not on that PATH gets
+  a game that does not start rather than a game without tracking. The paragraph
+  says so and says how to undo it; nothing measures it. Interpolating an
+  absolute path instead was considered and declined for this tag — Steam splits
+  launch options on whitespace and an install directory with a space in it would
+  break in a way the current form does not.
+- **The copy is unobserved.** `Clipboard::set_text` reports nothing, so "Copied"
+  is a receipt for the call and not for the clipboard. On Wayland the selection
+  belongs to this process and goes when the hub closes.
+- **No pixel is rendered here either.** That the paragraph wraps inside block 2's
+  58-character budget, and that the button sits where it reads as belonging to
+  that block, are unasserted — §11.3m's last bullet, one surface further on.
+- **The stamp is a claim about a file, checked by its presence.** `install`
+  writes it only when that run copied the provider, so a skipped copy cannot
+  certify an old one; but a provider replaced by hand afterwards would still be
+  vouched for. Nothing reads the exe.
+
+---
+
 ## 12. Glossary
 
 | Term | Meaning |

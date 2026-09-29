@@ -709,11 +709,16 @@ We do not ship it. `tobii bridge install` therefore points TrackIR at an
 already-installed client DLL (opentrack's, if present); `--npclient ours`
 overrides that for a game that does not check.
 
-**That is the one configuration that still needs `tobii bridge run`.** A
-third-party client is a pure consumer of `FT_SharedMem`. Our DLLs are what
+**That is the one configuration where something else has to fill the mapping.**
+A third-party client is a pure consumer of `FT_SharedMem`. Our DLLs are what
 create and feed that mapping, and a TrackIR-only game never loads ours — so
 something has to fill it. `install` says so when it sets that up. FreeTrack
 games need nothing running.
+
+For a Steam title that something is the launch itself: `tobii game -- %command%`
+has Proton start our provider alongside the game, in the one session, and it
+ends with the game. `tobii bridge run` remains the way to fill the mapping by
+hand on a prefix Proton does not serve, and the ordering below is its rule.
 
 ### Ordering: the launch carries the provider
 
