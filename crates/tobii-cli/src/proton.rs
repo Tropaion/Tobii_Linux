@@ -257,6 +257,22 @@ pub(crate) fn plan(cmd: &[String], compat: Option<&Path>) -> Plan {
             prefix.display()
         ));
     }
+    // A provider is not enough: it has to be one that understands `--launch`.
+    //
+    // Every provider up to v0.6.0 discards an unknown flag and everything after
+    // it, then serves forever. Proton waits on an `.exe` target, so handing one
+    // of those a game to run hangs the launch and the game never starts — this
+    // mechanism causing the exact failure it exists to prevent, by the ordinary
+    // upgrade path of updating `tobii` without reinstalling into every prefix.
+    // See `crate::bridge::LAUNCH_STAMP`.
+    if !dir.join(crate::bridge::LAUNCH_STAMP).is_file() {
+        return Plan::Declined(format!(
+            "the bridge in {} was installed by an older version that cannot start a \
+             game — run `tobii bridge install` for it again to have the provider \
+             started alongside. Running this launch unchanged",
+            prefix.display()
+        ));
+    }
     // A command line is `String`s here, and a path spelled lossily names a
     // different file — so a prefix whose bytes are not UTF-8 declines rather
     // than being approximated into the launch.
@@ -458,6 +474,8 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("a scratch prefix");
             if with_provider {
                 std::fs::write(dir.join(PROVIDER), b"not really an exe").expect("a provider");
+                std::fs::write(dir.join(crate::bridge::LAUNCH_STAMP), b"0.0.0-test\n")
+                    .expect("a stamp");
             }
             Self(compat)
         }
@@ -524,6 +542,31 @@ mod tests {
                 assert_eq!(game, r"Z:\games\Über spiele\100% Orange\Thing.exe");
             }
             other => panic!("a path with a space, a percent and non-ASCII: {other:?}"),
+        }
+    }
+
+    /// A provider from before `--launch` existed is declined, and the launch
+    /// runs unchanged.
+    ///
+    /// Every provider up to v0.6.0 discards an unknown flag and everything after
+    /// it, then serves forever. Proton waits on an `.exe` target, so wrapping
+    /// one of those hangs the launch and the game never starts — this mechanism
+    /// causing the failure it exists to prevent, reached by the ordinary upgrade
+    /// path of updating `tobii` without reinstalling into every prefix. The
+    /// stamp beside the provider is what tells them apart.
+    #[test]
+    fn a_bridge_from_before_launch_existed_is_declined_rather_than_hung() {
+        let scratch = Scratch::new("old", true);
+        std::fs::remove_file(scratch.dir().join(crate::bridge::LAUNCH_STAMP)).expect("unstamp");
+        match plan(
+            &steam_command("/games/Thing/Thing.exe"),
+            Some(scratch.compat()),
+        ) {
+            Plan::Declined(why) => {
+                assert!(why.contains("older version"), "{why}");
+                assert!(why.contains("tobii bridge install"), "{why}");
+            }
+            other => panic!("an unstamped provider must never be handed a game: {other:?}"),
         }
     }
 
@@ -639,16 +682,28 @@ mod tests {
     /// nothing in it can run a test on this machine. This is the only place the
     /// mechanism can be exercised end to end.
     ///
-    /// The argument battery is the one the batch form needed rules for, plus
-    /// the two it had to refuse outright. Under `--launch` they are argv, so the
+    /// The argument battery is the one the batch form needed rules for, plus the
+    /// quote it had to refuse outright. Under `--launch` they are argv, so the
     /// expectation is that every one of them arrives unchanged.
+    ///
+    /// No non-ASCII argument, and that is the stub's limit rather than the
+    /// provider's: a C `main(argc, argv)` receives the ANSI encoding of the
+    /// command line, so an umlaut comes back as a replacement character however
+    /// faithfully it was passed. Testing it would need a stub reading
+    /// `GetCommandLineW`, and until there is one this says nothing either way
+    /// about non-ASCII paths.
     #[test]
     #[ignore = "needs wine, a built tobii-bridge.exe and a stub game (TOBII_PROTON_E2E)"]
     fn e2e_the_provider_runs_the_game_passes_its_arguments_and_ends_with_it() {
         let stubs = PathBuf::from(
             std::env::var("TOBII_PROTON_E2E").expect("TOBII_PROTON_E2E names the stub directory"),
         );
-        let provider = PathBuf::from("bridge/target/x86_64-pc-windows-gnu/release").join(PROVIDER);
+        // Anchored at the manifest, not the cwd: cargo runs a test binary from
+        // the package root, where there is no `bridge/`. Relative, this assert
+        // fired before the test ever reached wine.
+        let provider = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bridge/target/x86_64-pc-windows-gnu/release")
+            .join(PROVIDER);
         assert!(
             provider.is_file(),
             "{} is not built — run scripts/build-bridge.sh",
@@ -670,7 +725,6 @@ mod tests {
             r"C:\trailing\",
             "",
             "say \"hello\"",
-            "Über",
         ]);
 
         let status = std::process::Command::new("wine")

@@ -734,15 +734,25 @@ reading a mapping nobody is writing and the game gets no head tracking. That is
 the whole of what v0.5.0 changed here: the launch goes through instead of
 hanging.
 
-**The way out of that configuration would be to let the launch carry the
-provider** — start it inside Proton's own invocation, so there is no second
-process for `wineserver -w` to wait on and nothing to restart by hand. This
-project tried that and it does not work yet: Proton waits for an `.exe` target
-and does not wait for a batch file, so a launch wrapped that way has Proton
-report success a second in, while the game is still starting. Nothing ships it.
-`tobii game -- %command%` holds the tracker for as long as the game runs and
-rewrites nothing. [Quality-and-Risks](docs/wiki/Quality-and-Risks.md) §11.3l
-has the measurement and what a working shape would need.
+**The way out of that configuration is to let the launch carry the provider**,
+and `tobii game -- %command%` does it. When the command it is handed is a Proton
+launch *and* a bridge that understands it is already in that prefix, it points
+Proton at our provider with the game after `--launch`: one `waitforexitandrun`,
+so one `wineserver -w`, and both the provider and the game are born after the
+lock, inside the session the game is in. The provider exits with the game, so
+there is nothing to reap and nothing to restart by hand.
+
+An earlier attempt substituted a batch file and did not work — Proton waits on
+an `.exe` target and not on a `.bat`, so the launch reported success a second in
+— which is why the target is the provider itself.
+
+Every other command is run exactly as Steam wrote it. It declines, and says so,
+when the prefix has no provider, when the provider predates `--launch` (run
+`tobii bridge install` again for that game), and when `STEAM_COMPAT_DATA_PATH`
+is not set to say which prefix a launch uses.
+[Quality-and-Risks](docs/wiki/Quality-and-Risks.md) §11.3l has the measurements
+that ruled out the batch and §11.3o those for what replaced it — including what
+is still unwatched, which is whether a given title then reads the mapping.
 
 **Reported, not verified here.** One user reports getting head tracking in
 Microsoft Flight Simulator 2024 by running opentrack's *Windows* build inside

@@ -1766,12 +1766,18 @@ batch file, and `tobii game` calls `arrange`, which it never did before.
   trailing-backslash rule, the pid-named file, the sweep for files a signal left
   behind, and the three refusals. **A game under a path with a quote, a control
   character or a non-ASCII character could not be wrapped at all**; §11.3l
-  records that as a measured limit, and it is gone rather than worked around. A
-  test now asserts a path with a space, a percent and an umlaut in it is carried.
+  records that as a measured limit, and the refusal is gone rather than worked
+  around: a test asserts `plan` carries a path with a space, a percent and an
+  umlaut. Whether wine then *delivers* a non-ASCII argument intact is a separate
+  question and is in the unmeasured list below.
 
-**What is measured, and by what.** The provider's own behaviour — ordering,
-argument fidelity, exit code, reap — has an end-to-end test against real wine,
-`e2e_the_provider_runs_the_game_passes_its_arguments_and_ends_with_it`, ignored
+**What is measured, and by what.** The provider's own behaviour — argument
+fidelity, the exit code, and that nothing outlives the run — has an end-to-end
+test against real wine,
+`e2e_the_provider_runs_the_game_passes_its_arguments_and_ends_with_it` — run
+green on this machine, which the version of it first written could not have
+been: its path to the provider was relative and cargo runs a test from the
+package root, so the assert fired before it reached wine. Ignored
 and gated on `TOBII_PROTON_E2E` because it needs wine, a built
 `tobii-bridge.exe` and a stub game. Headlessly: that Proton is pointed at the
 provider and the game keeps its own arguments, that a prefix without the

@@ -123,6 +123,27 @@ const KEYS: [KeyEntry; 2] = [("ft", FT_KEY, "FreeTrack"), ("np", NP_KEY, "TrackI
 /// kept in the user's own config would outlive the prefix it describes.
 const RECORD_FILE: &str = "registered.txt";
 
+/// Written beside the provider to say that the provider beside it understands
+/// `--launch`.
+///
+/// # Why presence is the claim, and why anything needs one
+///
+/// `crates/tobii-cli/src/proton.rs` points Proton's `waitforexitandrun` at the
+/// provider, with the game after `--launch`. Every provider shipped up to and
+/// including v0.6.0 ends its argument loop with `_ => {}`: it discards the flag,
+/// the game path and the game's arguments, and falls through to an endless
+/// `recv_from`. Proton waits on an `.exe` target, so a prefix holding an old
+/// provider and a new `tobii` would hang on the launch and **never start the
+/// game** — the one failure this whole mechanism exists to avoid, caused by the
+/// mechanism itself, and reached by the ordinary upgrade path of updating the
+/// program without reinstalling into every prefix.
+///
+/// The file's presence is the capability claim and its contents are for a human
+/// reading the prefix. A provider that ever stops understanding `--launch` must
+/// stop writing this, and `proton.rs` must go on treating its absence as "run
+/// the game unwrapped" — which is what every other decline there does.
+pub(crate) const LAUNCH_STAMP: &str = "launch-capable.txt";
+
 /// Directories an installed opentrack keeps its client DLLs in.
 const OPENTRACK_DIRS: [&str; 5] = [
     "/usr/libexec/opentrack",
@@ -1625,13 +1646,18 @@ fn third_party_needs(proton: bool, prefix: &Path) -> String {
             "{head}\
              For a Steam title under Proton, `tobii bridge run` cannot be that. Started\n\
              from a terminal it is a different wineserver session: its FT_SharedMem is a\n\
-             different object and the game never sees it, which is why our own DLL\n\
-             carries the receive loop inside the game's own process instead.\n\
+             different object and the game never sees it.\n\
              \n\
-             You have just pointed the game at somebody else's DLL, so that is gone.\n\
-             This registration is worth trying only if something else in the game's own\n\
-             session fills the mapping. Whether anything does, on any particular game,\n\
-             is not something this project has watched.\n\
+             What can be, is the launch itself. Put this in the game's Steam launch\n\
+             options:\n  \
+             tobii game -- %command%\n\
+             Our provider is then started by Proton's own invocation, with the game\n\
+             after it, so both are in the one wineserver session and it fills the\n\
+             mapping that client reads. It stops when the game does.\n\
+             \n\
+             What nobody here has watched is a signature-gated title then USING the\n\
+             data: a client answering the check and a filled mapping are two\n\
+             conditions, and this project has measured them separately.\n\
              FreeTrack games need nothing running."
         );
     }
@@ -1866,6 +1892,34 @@ fn install(args: &[String]) -> CmdResult {
         copied += 1;
         println!("  {name}");
     }
+    // After the artifacts, because it is a claim about the file that was just
+    // written: staged and renamed like them, so a reader never sees a stamp
+    // over a half-copied provider.
+    {
+        let target = dest.join(LAUNCH_STAMP);
+        let staged = dest.join(staging_name(LAUNCH_STAMP, std::process::id()));
+        let body = format!(
+            "{}\nThis file says the tobii-bridge.exe beside it understands --launch.\n\
+             `tobii game -- %command%` reads it before wrapping a Proton launch; without\n\
+             it the launch is run exactly as Steam wrote it. See proton.rs.\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        if std::fs::write(&staged, body)
+            .and_then(|()| std::fs::rename(&staged, &target))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&staged);
+            // Not fatal: everything a game needs is already in place, and the
+            // only thing lost is the launch wrap, which declines safely.
+            eprintln!(
+                "note: could not write {} — the bridge is installed and works, but \
+                 `tobii game` will run this game unwrapped rather than starting the \
+                 provider alongside it.",
+                target.display()
+            );
+        }
+    }
+
     println!("copied {copied} file(s) into {}", dest.display());
     // Said at install time, not only in the docs: a 32-bit game's failure to
     // find a DLL is indistinguishable from every other "no tracking" cause.
