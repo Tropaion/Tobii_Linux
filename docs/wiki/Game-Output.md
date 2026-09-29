@@ -715,7 +715,20 @@ create and feed that mapping, and a TrackIR-only game never loads ours — so
 something has to fill it. `install` says so when it sets that up. FreeTrack
 games need nothing running.
 
-### Ordering: the game first, the bridge second
+### Ordering: the launch carries the provider
+
+**Read this first: `tobii game -- %command%` does the ordering for you**, and
+has since v0.7. When the command it is handed is a Proton launch and the prefix
+holds a bridge that understands it, it points Proton at our provider with the
+game after `--launch` — one `waitforexitandrun`, so one `wineserver -w`, and
+both are born after the lock is taken, in the session the game is in. The
+provider ends with the game. Nothing below has to be done by hand for a Steam
+title set up that way; see `crates/tobii-cli/src/proton.rs` and
+[[Quality-and-Risks]] §11.3o.
+
+The rest of this section is why that shape is the one that works, and it is
+still the whole story for `tobii bridge run` started by hand — on a prefix
+Proton does not serve, or when you want the console.
 
 `tobii bridge run` is a `wine` process on the game's prefix, and that is enough
 to stop the game from launching at all.
@@ -736,8 +749,10 @@ Measured 2026-09-26: with one wine process holding a throwaway prefix,
 `wineserver -w` timed out at 4 s (exit 124) and returned 0 the instant the
 holder died.
 
-**So the rule is: start the game, let it reach its menu, then start the
-bridge.** Late is not too late. Measured the same day: opentrack's
+**So the rule, for a provider you start by hand, is: start the game, let it
+reach its menu, then start the bridge.** (`tobii game` avoids the rule rather
+than following it — its provider is inside the launch, so there is no second
+process for `wineserver -w` to wait on.) Late is not too late. Measured the same day: opentrack's
 `NPClient64.dll`, driven through the full handshake, polled `NP_GetData` 102
 times with no `FT_SharedMem` present at all — all zeros — and then picked the
 mapping up mid-run, reporting a correct pose, when a separate process created

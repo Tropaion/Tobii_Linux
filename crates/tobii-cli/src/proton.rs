@@ -33,9 +33,10 @@
 //! `docs/wiki/Quality-and-Risks.md` §11.3l has the measurements that killed the
 //! batch, and §11.3o those for this: against real Proton, pointing
 //! `waitforexitandrun` at the provider returns the game's exit code after the
-//! full run, the game's arguments arrive byte-identical, and the provider's
-//! mapping and port come up in the host's own network namespace. What is still
-//! unwatched is a game reading the mapping — that is a title, not a mechanism.
+//! full run, ASCII arguments arrive byte-identical, and the provider's mapping
+//! and port come up in the host's own network namespace. §11.3o also carries
+//! what that run did **not** cover, which is more than the one obvious thing —
+//! see *What none of this establishes* below.
 //!
 //! # The ordering problem, in one paragraph
 //!
@@ -50,82 +51,54 @@
 //!
 //! The way out is not to win that race but never to be in it. Steam hands the
 //! wrapper the whole command it meant to run, ending in the game's `.exe`. If
-//! the thing Proton is told to run is instead a batch file that starts our
-//! provider and then the game, Proton is invoked exactly as Steam meant it to
-//! be — **one** `waitforexitandrun`, therefore **one** `wineserver -w` — and
-//! both processes are born after the lock is taken, inside the session the game
-//! itself is in. `start /wait` keeps `cmd.exe` alive for exactly as long as the
-//! game — measured, below — which is what the studied launcher relies on to
-//! leave Steam's own bookkeeping and overlay seeing a process that ends when
-//! the game does.
+//! the thing Proton is told to run is instead our provider, with the game after
+//! `--launch`, Proton is invoked exactly as Steam meant it to be — **one**
+//! `waitforexitandrun`, therefore **one** `wineserver -w` — and both processes
+//! are born after the lock is taken, inside the session the game itself is in.
+//! The reap is the provider's own exit, so there is nothing left to kill and
+//! nothing for the next launch's `wineserver -w` to block on.
 //!
 //! The shape is [markx86/opentrack-launcher]'s; the mechanism was read, and no
-//! code, binary or file of it is used here.
+//! code, binary or file of it is used here. It substitutes a `.bat`, and this
+//! module did too until that was measured — see the header.
 //!
 //! [markx86/opentrack-launcher]: https://github.com/markx86/opentrack-launcher
 //!
-//! # Why a title that already works is not disturbed
-//!
-//! The client DLLs feed themselves, so a FreeTrack title needs nothing running
-//! and now gets a provider anyway. That is safe by the feeder's own design
-//! rather than by luck: `tobii_bridge_core::feeder` cedes the port only when
-//! the mapping is openable, which is what proves the holder is in *this*
-//! wineserver session — and being in that session is precisely what this module
-//! arranges. One of the two feeds, and the other reads what it publishes.
-//!
 //! # What this module will not do
 //!
-//! Every decision here is allowed to answer "no", and answering no means the
-//! command runs exactly as Steam wrote it. That is the whole safety argument: a
+//! Rewrite a command it does not fully recognise. It is the only code in this
+//! program with a game's launch in its hands, and the asymmetry is total: a
 //! wrapper that declines costs the user the provider, and a wrapper that
 //! launches the wrong thing costs them the game.
 //!
 //! So it declines unless it can name Proton's own verb in the command, the
 //! prefix comes from the environment of *this* launch rather than being
-//! inferred, our provider is already sitting in that prefix, and every
-//! character of the game's path and arguments is one a batch file can carry.
+//! inferred, and the prefix holds a provider that understands `--launch` —
+//! which is what [`crate::bridge::LAUNCH_STAMP`] is for, because a provider
+//! from before it would take the game's path as an unknown flag, discard it,
+//! and serve forever while Proton waited.
 //!
-//! # What a batch file can carry, measured
-//!
-//! Measured 2026-09-28 against wine 11.18 on a throwaway prefix, running a
-//! generated batch whose "game" printed its own `argv` back:
-//!
-//! * A path or argument holding `%`, `^`, `&`, `(`, `)`, `!`, a space, a
-//!   trailing `\`, or nothing at all arrives intact, given [`batch_arg`]'s
-//!   quoting — `%` doubled, trailing backslashes doubled, the whole thing in
-//!   double quotes.
-//! * A **non-ASCII** path does not. `cmd.exe` reads a batch file in the
-//!   prefix's OEM codepage: the same launch worked when the file was written as
-//!   CP850 and failed as UTF-8, as UTF-8 with a BOM, as UTF-16LE with a BOM,
-//!   and with `chcp 65001` on the first line — "file not found" each time.
-//!   Which OEM codepage a given Proton prefix reads is not knowable from here,
-//!   and writing the wrong one spells a different path, so this declines
-//!   instead of guessing. (Passing the path through an environment variable and
-//!   spelling `%VAR%` in the batch *was* measured to carry non-ASCII and CJK
-//!   intact; it is not used, because it trades a limitation that declines for
-//!   one that would stop the game launching if the variable ever failed to
-//!   reach `cmd.exe`.)
-//! * The game's exit code comes back out: `start /wait`, saved to a variable
-//!   before the `taskkill` overwrites it, then `exit /b`. Measured 0, 3 and 7.
+//! Nothing is declined for the shape of the game's path any more. Under the
+//! batch a quote, a control character or anything non-ASCII could not be
+//! carried; an argv carries all three, and the path is not even rewritten —
+//! see [`point_at`].
 //!
 //! # What none of this establishes
 //!
 //! That a game then *receives* tracking. This module gets a process started in
 //! the right order; whether a given title reads `FT_SharedMem` afterwards is
 //! not something anything here can check, and no message it prints may suggest
-//! it did.
+//! it did. For a signature-gated title our own DLL is refused outright
+//! (`tobii_config::signature`), so the configuration that could work is a
+//! third-party client answering the check with our provider filling the mapping
+//! behind it — two conditions this project has measured separately and never
+//! together.
 //!
-//! Nor that a real Proton launch behaves the way the measurements above do.
-//! Every one of them ran `wine` directly on a throwaway prefix. The container's
-//! share — that Steam and Proton accept a `.bat` as the launch target, and that
-//! the `cmd.exe` running it is inside the wineserver session Proton opened for
-//! the game — is reasoned from the shape of the launch and from the studied
-//! launcher working for its users. It was not measured here, and nothing on
-//! this machine could measure it.
-
-// `arrange` is the entry point and `tobii game` calls it; the rest is reachable
-// only through it or through tests, which is what this allows.
-#![allow(dead_code)]
+//! §11.3o carries the rest of what is still unwatched: no datagram was ever
+//! sent to the bound port; Proton was invoked directly rather than through
+//! Steam, so Steam's own bookkeeping was not observed; the Steam runtime
+//! container, which a real launch enters first, was not entered; and one Proton
+//! build was tried where the batch measurement had four.
 
 use std::path::Path;
 
@@ -172,10 +145,6 @@ pub(crate) enum Plan {
         target: usize,
         /// The provider inside this game's prefix, as Proton will be given it.
         provider: String,
-        /// The game, in the Windows spelling the provider will hand to
-        /// `CreateProcess`. `cmd[target]` is a Unix path, which is right for
-        /// Proton and wrong once we are inside the prefix.
-        game: String,
     },
 }
 
@@ -284,42 +253,36 @@ pub(crate) fn plan(cmd: &[String], compat: Option<&Path>) -> Plan {
             exe.display()
         ));
     };
-    Plan::Rewrite {
-        target,
-        provider,
-        game: crate::bridge::wine_path_for(Path::new(&cmd[target])),
-    }
+    Plan::Rewrite { target, provider }
 }
 
 /// Put the provider in front of the game.
 ///
-/// The game's arguments stay exactly where they are, and that is the whole
-/// advantage of an `.exe` over a batch file: they travel as argv, so a quote, a
-/// percent sign, a trailing backslash or a non-ASCII path needs nothing done to
-/// it. The batch form had to refuse all four, and a refusal meant the provider
-/// did not start for that game at all.
+/// The game's path and arguments stay exactly where they are, and that is the
+/// whole advantage of an `.exe` over a batch file: they travel as argv, so a
+/// quote, a percent sign, a trailing backslash or a non-ASCII path needs nothing
+/// done to it. The batch form had to refuse all four, and a refusal meant the
+/// provider did not start for that game at all.
 ///
-/// The game's path is replaced with its Windows spelling, because the process
-/// reading it is inside the prefix. Proton gets the provider's Unix path, which
-/// is what it gets for a game.
-pub(crate) fn point_at(cmd: &mut Vec<String>, target: usize, provider: String, game: String) {
-    cmd[target] = game;
+/// **The game keeps Steam's own spelling of its path**, which is a Unix one,
+/// and the provider converts it. Proton's `protonfixes` layer reads the command
+/// it is handed and can rewrite a game's path for a title that needs it,
+/// matching on the spelling Steam produced; a command line converted to `Z:\…`
+/// here is one it silently does not recognise, so the fixup would be lost for
+/// every wrapped launch. See `windows_path` in `bridge/provider/src/main.rs`.
+pub(crate) fn point_at(cmd: &mut Vec<String>, target: usize, provider: String) {
     cmd.insert(target, "--launch".to_string());
     cmd.insert(target, provider);
 }
 
 pub(crate) fn arrange(mut cmd: Vec<String>, compat: Option<&Path>) -> Vec<String> {
-    let (target, provider, game) = match plan(&cmd, compat) {
+    let (target, provider) = match plan(&cmd, compat) {
         Plan::AsGiven => return cmd,
         Plan::Declined(why) => {
             eprintln!("note: {why}");
             return cmd;
         }
-        Plan::Rewrite {
-            target,
-            provider,
-            game,
-        } => (target, provider, game),
+        Plan::Rewrite { target, provider } => (target, provider),
     };
     // What this says is what was arranged, and no more. The ordering, the reap
     // and the exit code are the provider's own and are tested there; that
@@ -334,7 +297,7 @@ pub(crate) fn arrange(mut cmd: Vec<String>, compat: Option<&Path>) -> Vec<String
          the game does not start at all, take `tobii game -- ` back out of the launch options \
          and it launches exactly as before."
     );
-    point_at(&mut cmd, target, provider, game);
+    point_at(&mut cmd, target, provider);
     cmd
 }
 
@@ -447,14 +410,6 @@ mod tests {
         assert_eq!(proton_target(&upper), Some(2));
     }
 
-    // --- quoting --------------------------------------------------------
-    //
-    // Every expectation below was run through wine 11.18 on 2026-09-28: a
-    // generated batch launched a stub that wrote its own `argv` to a file, and
-    // the file held exactly the values named here.
-
-    // --- the batch ------------------------------------------------------
-
     // --- the decision ---------------------------------------------------
 
     /// A compat directory of the shape Steam names, holding a prefix that may
@@ -509,39 +464,39 @@ mod tests {
         let scratch = Scratch::new("rewrite", true);
         let cmd = steam_command("/games/common/Thing/Thing.exe");
         match plan(&cmd, Some(scratch.compat())) {
-            Plan::Rewrite {
-                target,
-                provider,
-                game,
-            } => {
+            Plan::Rewrite { target, provider } => {
                 assert_eq!(cmd[target], "/games/common/Thing/Thing.exe");
-                // Proton gets a Unix path, because that is what Proton takes.
+                // A Unix path, because that is what Proton takes — and the game
+                // keeps Steam's own spelling for `protonfixes` to match on.
                 assert_eq!(provider, scratch.dir().join(PROVIDER).to_string_lossy());
-                // The provider gets the Windows spelling, because the process
-                // that reads it is inside the prefix.
-                assert_eq!(game, r"Z:\games\common\Thing\Thing.exe");
             }
             other => panic!("{other:?}"),
         }
     }
 
-    /// A path a batch file could not carry is carried.
+    /// A path a batch file could not carry is carried, unchanged.
     ///
     /// The batch form had to refuse a quote, a control character, a `%`, a
     /// trailing backslash and anything non-ASCII, and a refusal meant the
     /// provider did not start for that game at all — on a machine whose games
     /// live under a name with an umlaut in it, for every game. An argv has no
-    /// such limits, and this is the test that says the limits are gone rather
-    /// than merely untested.
+    /// such limits, and the path is not even rewritten: it goes to the provider
+    /// in Steam's own spelling.
     #[test]
     fn a_path_no_batch_file_could_carry_is_carried() {
         let scratch = Scratch::new("awkward", true);
         let awkward = "/games/Über spiele/100% Orange/Thing.exe";
-        match plan(&steam_command(awkward), Some(scratch.compat())) {
-            Plan::Rewrite { game, .. } => {
-                assert_eq!(game, r"Z:\games\Über spiele\100% Orange\Thing.exe");
+        let mut cmd = steam_command(awkward);
+        match plan(&cmd, Some(scratch.compat())) {
+            Plan::Rewrite { target, provider } => {
+                point_at(&mut cmd, target, provider);
+                assert_eq!(
+                    cmd[target + 2],
+                    awkward,
+                    "a path with a space, a percent and non-ASCII, byte for byte: {cmd:?}"
+                );
             }
-            other => panic!("a path with a space, a percent and non-ASCII: {other:?}"),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -608,14 +563,13 @@ mod tests {
             &mut cmd,
             target,
             "/pfx/drive_c/tobii-bridge/tobii-bridge.exe".into(),
-            r"Z:\games\Thing\Thing.exe".into(),
         );
         assert_eq!(
             &cmd[target..],
             &[
                 "/pfx/drive_c/tobii-bridge/tobii-bridge.exe".to_string(),
                 "--launch".to_string(),
-                r"Z:\games\Thing\Thing.exe".to_string(),
+                "/games/Thing/Thing.exe".to_string(),
                 "-steam".to_string(),
             ],
             "the provider goes in FRONT of the game, and the game keeps its own \
@@ -644,7 +598,7 @@ mod tests {
             &[
                 provider.to_string_lossy().into_owned(),
                 "--launch".to_string(),
-                crate::bridge::wine_path_for(Path::new("/games/Thing/Thing.exe")),
+                "/games/Thing/Thing.exe".to_string(),
                 "-steam".to_string(),
             ],
             "Proton is pointed at the provider, with the game after `--launch`: {cmd:?}"
@@ -666,7 +620,7 @@ mod tests {
         }
     }
 
-    // --- the batch, actually run ----------------------------------------
+    // --- actually run ----------------------------------------------------
 
     /// The real provider, under real wine, starts a game and ends with it.
     ///
@@ -733,7 +687,9 @@ mod tests {
             .env("ARGVDUMP_OUT", crate::bridge::wine_path_for(&argv_out))
             .arg(&provider)
             .arg("--launch")
-            .arg(crate::bridge::wine_path_for(&stubs.join("game.exe")))
+            // Steam's own spelling, which is what the wrapper passes and what
+            // the provider converts — see `windows_path` in the provider.
+            .arg(stubs.join("game.exe"))
             .args(&battery)
             .status()
             .expect("wine runs");

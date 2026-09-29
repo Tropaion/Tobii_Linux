@@ -84,10 +84,15 @@ pub(crate) const INSTALL_SUBDIR: &str = "drive_c/tobii-bridge";
 
 /// The Windows spelling of the same directory.
 ///
-/// Shared with [`crate::proton`], which spells the provider's path into a batch
-/// file the game's own `cmd.exe` runs: a second copy of this string would let
-/// the two drift, and the launch would start nothing while `install` went on
-/// reporting a directory it had filled.
+/// What the two discovery keys are pointed at — `FT_KEY` always, and `NP_KEY`
+/// whenever TrackIR is pointed at our own client rather than a third party's.
+/// A second copy of this string would let the registry and the directory
+/// `install` fills drift apart, and a game would load nothing while `install`
+/// went on reporting a directory it had filled.
+///
+/// [`crate::proton`] does not read it: it takes the provider's path from the
+/// prefix it is working on, in the Unix spelling Proton needs, which this
+/// constant is not.
 pub(crate) const INSTALL_WIN_DIR: &str = r"C:\tobii-bridge";
 
 /// Registry key a TrackIR game reads to find its client DLL.
@@ -352,10 +357,12 @@ const REQUIRED_ARTIFACT: &str = "freetrackclient64.dll";
 /// The provider's file name, in the one place `ARTIFACTS` and everything that
 /// looks for it can share.
 ///
-/// `proton` stats this to decide whether to act, names it in what it starts,
-/// and names it again in what it reaps — so a rename here that did not reach
-/// there would leave a reap aimed at a program that no longer exists, which is
-/// the wineserver hang that module exists to avoid.
+/// `proton` stats this to decide whether to wrap a launch at all, and then
+/// names it as the target it points Proton at — so a rename here that did not
+/// reach there would point every wrapped launch at a file that is not in the
+/// prefix, and Proton would fail to start anything. There is no reap to get
+/// wrong: the provider ends when the game does, because it is the process
+/// Proton waits on.
 pub(crate) const PROVIDER_EXE: &str = "tobii-bridge.exe";
 
 const ARTIFACTS: [(&str, bool); 3] = [

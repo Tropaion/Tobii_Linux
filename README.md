@@ -716,9 +716,11 @@ resolves a prefix, creates a directory or writes a key: an unknown flag, `-h`,
 install /games/pfx` used to drop the path on the floor and install into
 `$WINEPREFIX` or `~/.wine` instead, saying so nowhere.
 
-**If you do need `tobii bridge run`** — the one case that still needs something
-running, where TrackIR is pointed at a third-party client DLL that only *reads*
-the shared memory ours create — **start the game first.** While it runs it is a
+**If you start `tobii bridge run` by hand** — which a Steam title set up with
+`tobii game -- %command%` does not need, because the launch carries the provider
+itself, but which is still the way to fill the mapping on a prefix Proton does
+not serve, where TrackIR is pointed at a third-party client DLL that only
+*reads* the shared memory ours create — **start the game first.** While it runs it is a
 wine process on that prefix, and Steam runs `wineserver -w` before it spawns a
 Proton game, which waits for every wine process on the prefix to exit: a bridge
 started first leaves the launch sitting there doing nothing. The command says

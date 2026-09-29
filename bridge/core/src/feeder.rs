@@ -93,7 +93,8 @@ pub enum Started {
     /// This process owns the port and is publishing.
     Feeding,
     /// Somebody in **this** wineserver session owns it, proven by their mapping
-    /// being openable — so reading theirs is right.
+    /// being openable — so reading theirs is right, for now. The port is still
+    /// watched: a holder can exit, and since `--launch` one routinely does.
     AlreadyTaken,
     /// The port is held from another session, whose mapping this one cannot
     /// see. Still retrying; the game has nothing to read until it frees up.
@@ -127,17 +128,33 @@ fn serve(port: u16, ready: mpsc::Sender<Started>) {
     // Ceding is only correct when the holder is in THIS session, and an
     // openable mapping is exactly what proves that. Otherwise the port is
     // watched until it frees up.
+    //
+    // **Ceding does not end this loop**, and that changed when the provider
+    // stopped being something a person leaves running. `--launch` makes it a
+    // child of the launch, so it exits when Proton's target does — and for a
+    // title whose target is a bootstrapper that starts the real game and
+    // returns, that is long before the game ends. This function returning on
+    // `AlreadyTaken` made the cede permanent: `START` is a `Once` and the
+    // consumer handle is cached, so the DLL would spend the rest of the session
+    // reading a mapping whose writer was dead, showing a head frozen at the
+    // last pose it published — which is the exact failure the paragraph above
+    // exists to prevent, arriving by a different road.
+    //
+    // So the holder is watched either way and the only difference is what is
+    // reported. Taking over later costs nothing: `Provider::create` reuses an
+    // existing mapping by name, so the consumer the DLL already cached goes on
+    // reading the same memory and frames simply resume.
     let socket = loop {
         match UdpSocket::bind(("127.0.0.1", port)) {
             Ok(s) => break s,
             Err(_) => {
-                if Consumer::open().is_some() {
-                    let _ = ready.send(Started::AlreadyTaken);
-                    return;
-                }
-                // A holder in another session. Keep waiting rather than
-                // leaving the game blind: when it exits, this takes over.
-                let _ = ready.send(Started::Waiting);
+                // Said once a second either way; the caller takes the first and
+                // drops the receiver, and the rest are ignored sends.
+                let _ = ready.send(if Consumer::open().is_some() {
+                    Started::AlreadyTaken
+                } else {
+                    Started::Waiting
+                });
                 std::thread::sleep(RETRY);
             }
         }

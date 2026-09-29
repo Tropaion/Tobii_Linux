@@ -261,10 +261,13 @@ fn build_provider_note() -> String {
         "What fills the mapping for our own client is our own client — both of",
         "our DLLs carry the receive loop, inside the game's process, which is",
         "the only place that is certain to be the right session. Replace the",
-        "one the game loads with somebody else's and that goes with it, unless",
-        "something else in the same session is filling the mapping. Whether",
-        "anything is, on any particular game, is not something this project has",
-        "watched.",
+        "one the game loads with somebody else's and that goes with it \u{2014}",
+        "so something else in that session has to fill the mapping, and for a",
+        "Steam title that is what `tobii game -- %command%` is for: it has",
+        "Proton start our provider alongside the game, in the one session,",
+        "and it stops when the game does. What nobody here has watched is a",
+        "signature-gated title then USING the data: a client answering the",
+        "check and a filled mapping are two conditions, measured separately.",
     ]
     .join(" ")
 }

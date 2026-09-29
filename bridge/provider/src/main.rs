@@ -161,34 +161,51 @@ fn main() {
         }
     }
 
-    // Opened before the game is started, not after: the client DLL a game
-    // loads takes the port if nothing else has it, and the ordering this
-    // program exists to fix is only fixed if the provider is up first.
-    let launching = !launch.is_empty();
-    let served = match open(port, launching) {
-        Ok(pair) => Some(pair),
-        Err(e) => {
-            eprintln!("error: {e}");
-            // Fatal when starting the provider is the whole of the job, and a
-            // warning when a game's launch is waiting behind it. See the
-            // module docs: this must never be why a game did not start.
-            if !launching {
-                std::process::exit(1);
+    // Two jobs with opposite rules about failure, so two branches rather than
+    // one with an `Option` threaded through it. Serving is the whole of the
+    // first; the second has a game's launch waiting behind it and nothing on
+    // this side may be why it does not start.
+    if let Some((game, args)) = launch.split_first() {
+        // Opened before the game is started, not after: the client DLL a game
+        // loads takes the port if nothing else has it, and the ordering this
+        // program exists to fix is only fixed if the provider is up first.
+        match open(port) {
+            Ok((provider, socket)) => {
+                println!("listening on 127.0.0.1:{port} until the game exits");
+                // Fallible, and tolerated, for the same reason everything else
+                // on this path is: `thread::spawn` panics if the OS refuses,
+                // the panic unwinds out of `main`, and the process Proton is
+                // waiting on dies before the game is ever started. See
+                // `tobii_bridge_core::feeder`, which spawns the same way.
+                if std::thread::Builder::new()
+                    .name("tobii-bridge-serve".into())
+                    .spawn(move || serve(provider, socket))
+                    .is_err()
+                {
+                    eprintln!(
+                        "warning: could not start the serving thread — starting the game \
+                         anyway, without tracking from us"
+                    );
+                }
             }
-            eprintln!("warning: starting the game anyway — it will get no tracking from us");
-            None
+            Err(e) => {
+                eprintln!("error: {e}");
+                eprintln!("warning: starting the game anyway — it will get no tracking from us");
+            }
         }
-    };
-
-    if launching {
-        if let Some((provider, socket)) = served {
-            std::thread::spawn(move || serve(provider, socket));
-        }
-        std::process::exit(run_game(&launch));
+        std::process::exit(run_game(game, args));
     }
 
-    if let Some((provider, socket)) = served {
-        serve(provider, socket);
+    match open(port) {
+        Ok((provider, socket)) => {
+            println!("listening on 127.0.0.1:{port} \u{2014} Ctrl-C to stop");
+            serve(provider, socket);
+        }
+        // Fatal here, because starting the provider is the whole of the job.
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -196,7 +213,7 @@ fn main() {
 ///
 /// Both, or neither: a provider holding the port without a mapping to publish
 /// into would take the port from a client DLL that could have served itself.
-fn open(port: u16, launching: bool) -> Result<(Provider, UdpSocket), String> {
+fn open(port: u16) -> Result<(Provider, UdpSocket), String> {
     let provider = Provider::create()?;
     println!("FT_SharedMem created");
     let socket = UdpSocket::bind(("127.0.0.1", port)).map_err(|e| {
@@ -205,15 +222,6 @@ fn open(port: u16, launching: bool) -> Result<(Provider, UdpSocket), String> {
              is another tobii-bridge already running in this prefix?"
         )
     })?;
-    // Ctrl-C is the answer when somebody started this themselves. Under
-    // `--launch` there is no console to press it in and the game's exit is what
-    // ends this process.
-    let stop = if launching {
-        "until the game exits"
-    } else {
-        "\u{2014} Ctrl-C to stop"
-    };
-    println!("listening on 127.0.0.1:{port} {stop}");
     Ok((provider, socket))
 }
 
@@ -222,18 +230,40 @@ fn open(port: u16, launching: bool) -> Result<(Provider, UdpSocket), String> {
 /// Its exit code is this process's, because Steam reads it: a wrapper that
 /// swallowed a crash would have the library show a clean exit for a game that
 /// fell over.
-fn run_game(cmd: &[String]) -> i32 {
-    let Some((exe, args)) = cmd.split_first() else {
-        eprintln!("error: --launch was given nothing to run");
-        return 1;
-    };
+///
+/// `exe` arrives in whatever spelling Proton was given, which for a Steam
+/// launch is a Unix path — see [`windows_path`] for why it is not converted
+/// before it gets here.
+fn run_game(exe: &str, args: &[String]) -> i32 {
+    let exe = windows_path(exe);
     println!("starting {exe}");
-    match Command::new(exe).args(args).status() {
+    match Command::new(&exe).args(args).status() {
         Ok(status) => status.code().unwrap_or(0),
         Err(e) => {
             eprintln!("error: could not start {exe}: {e}");
             1
         }
+    }
+}
+
+/// A path as `CreateProcess` will take it.
+///
+/// The wrapper on the Linux side hands the game over in **Steam's own
+/// spelling**, which is a Unix path, and the conversion happens here. That is
+/// deliberate: Proton's own `protonfixes` layer reads the command it is given
+/// and can rewrite the game's path for a title that needs it, and it matches on
+/// the spelling Steam produced. A command line that arrived already converted
+/// to `Z:\…` is one it silently does not recognise, so the fixup is lost for
+/// every wrapped launch.
+///
+/// Everything wine can see hangs off `Z:`, which it maps to `/`. A path that is
+/// already a Windows one — anything but a leading `/` — is passed through, so
+/// running this by hand with a `C:\` path still works.
+fn windows_path(path: &str) -> String {
+    if path.starts_with('/') {
+        format!("Z:{}", path.replace('/', "\\"))
+    } else {
+        path.to_string()
     }
 }
 

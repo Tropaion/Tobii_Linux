@@ -40,8 +40,15 @@ if [ "${1:-}" = "--spike" ]; then
     exit 0
 fi
 
+# `--locked` where it matters and not where it gets in the way: CI sets
+# CARGO_LOCKED=1 so a bridge lock file that disagrees with its manifest fails
+# there the way every other cargo invocation in this repo does, while a
+# developer adding a dependency is not made to run a separate command first.
+locked="${CARGO_LOCKED:+--locked}"
+
 echo "building the Wine bridge for $target..."
-cargo build --release --target "$target" --manifest-path "$root/bridge/Cargo.toml"
+# shellcheck disable=SC2086  # $locked is one optional flag, deliberately split
+cargo build --release $locked --target "$target" --manifest-path "$root/bridge/Cargo.toml"
 echo
 echo "built:"
 for f in tobii-bridge.exe freetrackclient64.dll NPClient64.dll; do

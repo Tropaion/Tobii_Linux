@@ -29,9 +29,11 @@ mod calibration_state;
 /// this crate, and the Wine bridge depends on `tobii-output` and cross-compiles
 /// to `x86_64-pc-windows-gnu`. Without this gate the whole bridge fails to
 /// build, which is exactly what happened between this module landing and
-/// v0.6.0 — `scripts/build-bridge.sh` is deliberately outside `cargo build` and
-/// CI does not run it, so nothing said so. Nothing on the Wine side reads a
-/// list of hand-added games; the gate costs that side nothing.
+/// v0.6.0: `scripts/build-bridge.sh` is deliberately outside `cargo build`, and
+/// at the time CI did not run it either, so nothing said so. CI builds the
+/// bridge now, which is what would catch the next one — this gate is what stops
+/// there being a next one. Nothing on the Wine side reads a list of hand-added
+/// games; it costs that side nothing.
 #[cfg(unix)]
 pub mod custom_games;
 mod edid;

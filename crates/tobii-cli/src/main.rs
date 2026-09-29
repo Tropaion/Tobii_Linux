@@ -213,7 +213,7 @@ fn game(args: &[String]) -> ExitCode {
     // It rewrites nothing unless this is a Proton launch AND our provider is
     // already in that prefix; every other command runs exactly as Steam wrote
     // it. See `proton` for what it declines and why.
-    let cmd = crate::proton::arrange(cmd.to_vec(), crate::proton::compat_data_path().as_deref());
+    let cmd = crate::proton::arrange(cmd, crate::proton::compat_data_path().as_deref());
 
     let mut child = std::process::Command::new(&cmd[0]);
     child.args(&cmd[1..]);

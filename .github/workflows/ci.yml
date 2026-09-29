@@ -123,6 +123,11 @@ jobs:
         run: rustup target add x86_64-pc-windows-gnu
 
       - name: build the Wine bridge
+        env:
+          # Every other cargo invocation here is `--locked`; this one is opt-in
+          # so a developer adding a bridge dependency is not made to run a
+          # separate command before building.
+          CARGO_LOCKED: "1"
         run: bash scripts/build-bridge.sh
 
       # The install scripts have no compiler checking them, and the root

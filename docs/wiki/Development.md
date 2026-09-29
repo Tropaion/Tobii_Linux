@@ -101,11 +101,11 @@ pinned; see [[Architecture-Decisions]] §18.
 | `tobii-gameconf` | 52 | 51 unit + `tests/writes_nothing.rs`, one test that walks a fixture tree and fails if any byte of it moves |
 | **Total** | **1509 (+18 ignored)** | |
 
-Every one of those passes as of 2026-09-28, `tobii-cli` included: the failure
+Every one of those passes as of 2026-09-29, `tobii-cli` included: the failure
 §11.3k recorded in that crate is gone, and one test there is `#[ignore]`d
 rather than failing.
 
-Counted with `cargo test -p <crate>` on 2026-09-28, not from memory: this table
+Counted with `cargo test -p <crate>` on 2026-09-29, not from memory: this table
 said "41 unit + 6 replay" for `tobii-usb` long after both numbers had moved,
 which is the failure mode of every hand-maintained count. Re-measure the whole
 column with:
