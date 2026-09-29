@@ -1722,7 +1722,9 @@ pub(crate) fn other_prefixes_note(others: &[(PathBuf, bool)]) -> Option<String> 
 /// this page until the launch wrapper shipped.
 ///
 /// Said only where the bridge is actually in the prefix, because before that it
-/// is one step of a setup that has not begun.
+/// is one step of a setup that has not begun — and only for a game Steam
+/// launches, because it names Steam's own Properties dialogue and a game added
+/// by hand does not appear there.
 ///
 /// `--steam <id>` is not part of it: the wrapper reads the launch Steam hands
 /// it, so the line is the same for every game and the app id would be a second
@@ -1830,9 +1832,13 @@ pub(crate) fn bridge_block(
             )
         }
     };
-    // Only with the files in place: before that it is one step of a setup that
-    // has not begun. See `launch_option_line`.
-    if matches!(state, BridgeState::Files { .. }) {
+    // With the files in place, and only for a game Steam launches. The
+    // paragraph tells somebody to open Steam's own Properties dialogue, and a
+    // game added by hand is one Steam has never heard of — for a Lutris or
+    // Heroic title that is an instruction to a dialogue that does not exist for
+    // it. `proton::plan` agrees: it rewrites a Proton launch and nothing else,
+    // so there would be nothing to start even if the option could be set.
+    if matches!(state, BridgeState::Files { .. }) && target.appid().is_some() {
         text.push_str("\n\n");
         text.push_str(&launch_option_line());
     }
@@ -4076,7 +4082,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // the button cannot offer to copy something the text above did not
             // mention. Reset each time: the caption is a receipt for one press.
             if let Some(copy) = copy_launch_w.upgrade() {
-                let shown = matches!(state, BridgeState::Files { .. });
+                let shown = matches!(state, BridgeState::Files { .. }) && app.appid().is_some();
                 copy.set_visible(shown);
                 if shown {
                     crate::widget::set_button_text(&copy, COPY_LAUNCH_CAPTION);
@@ -5839,6 +5845,24 @@ mod tests {
         assert!(
             installed.contains("Launch Options"),
             "and where to put it, in Steam's own words: {installed}"
+        );
+
+        // Never for a game added by hand. It names Steam's own Properties
+        // dialogue, and a Lutris or Heroic title does not appear there — so the
+        // paragraph would be telling somebody to open a window that has no row
+        // for their game. `proton::plan` agrees: it rewrites a Proton launch and
+        // nothing else.
+        let by_hand = bridge_block(
+            &present(),
+            &[],
+            &[],
+            Some(Path::new("/usr/bin/tobii")),
+            None,
+            &Target::Prefix(PathBuf::from("/games/sc/pfx")),
+        );
+        assert!(
+            !by_hand.contains(LAUNCH_OPTION),
+            "a game Steam has never heard of is told to set Steam's launch options: {by_hand}"
         );
 
         // Not before there is anything to start. Both of the other states are
