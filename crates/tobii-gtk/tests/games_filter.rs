@@ -16,8 +16,8 @@
 //! # What this is for, and why it cannot be a unit test
 //!
 //! `picker` decides what the list *should* show and is asserted against
-//! directly in `game_setup`'s own tests. What those cannot reach is the two
-//! GTK facts the rewrite rests on:
+//! directly in `game_setup`'s own tests. What those cannot reach is the three
+//! things below, each of which lives in a real widget tree:
 //!
 //! * `set_filter_func` hides a row without removing it, so `row_at_index` goes
 //!   on finding every row and only `is_child_visible` tells them apart. Every

@@ -1671,15 +1671,25 @@ manifests that does not follow the search box.
   rows the filter excludes; that the class makes a row *look* different is
   `row.not-set-up .row-name` in the stylesheet, and nothing here renders a
   pixel. This is §11.3m's last bullet again, one surface further on.
-- **Two of the eight display tests do not pass on the machine this was written
-  on, and neither is this work's doing.** `games_tab`'s fourth assertion —
-  switching tabs must not resize the window — reports the Games page wanting
-  873px against the Tracker page's 794px, deterministically; it reports exactly
-  the same pair at `fdb2361`, before any of this. `keep_awake_switch` fails
-  intermittently and also fails at `fdb2361`. Both were bisected rather than
-  assumed. They are recorded here because CI runs none of these, so nothing else
-  would notice, and because "7 of 8 pass" is the honest number for this suite
-  rather than 8.
+- **Two of the eight display tests fail intermittently on the machine this was
+  written on, and neither is this work's doing.** `games_tab`'s fourth assertion
+  — switching tabs must not resize the window — reports the Games page wanting
+  873px against the Tracker page's 794px; `keep_awake_switch` reports the CLI's
+  write never reaching the open hub's switch. Both reproduce at `fdb2361`,
+  before any of this work, which is how they were told apart from it.
+
+  Both are timing, not content. `games_tab` failed five runs in a row and was
+  written up here as deterministic; it has since passed, and the runs that pass
+  take about twice as long as the ones that fail (5.4s against 2.7s), which
+  points at a measurement taken before the layout has settled rather than at a
+  window that is genuinely the wrong size. The two rarely fail together — a run
+  that fails one usually passes the other.
+
+  Recorded because CI runs none of these, so nothing else would notice, and
+  because "6 or 7 of 8, depending on the run" is the honest description of this
+  suite on this machine rather than 8. Fixing them is its own piece of work:
+  both would need a settle-and-retry around the measurement, and neither is
+  about the Games list.
 - **`recheck` is wired and not exercised end to end.** A review found that a
   job finishing left the row it was about stale — the pane re-stats the prefix
   on every `refresh`, the rows carried what the catalogue said when the tab was
