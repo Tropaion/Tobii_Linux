@@ -452,13 +452,14 @@ pub(crate) const FORGET_TIP: &str =
 /// a sixth tooltip on this tab cannot be added without that test being made to
 /// look at the new one.
 #[cfg(test)]
-pub(crate) const TIPS: [&str; 6] = [
+pub(crate) const TIPS: [&str; 7] = [
     DETAILS_TIP,
     UNINSTALL_TIP,
     OTHER_CLIENT_TIP,
     ADD_GAME_TIP,
     FORGET_TIP,
     SET_UP_ONLY_TIP,
+    COPY_LAUNCH_TIP,
 ];
 
 /// One row of the game list.
@@ -1710,6 +1711,47 @@ pub(crate) fn other_prefixes_note(others: &[(PathBuf, bool)]) -> Option<String> 
     Some(s)
 }
 
+/// The one step of this setup no button on this page can take.
+///
+/// Everything else the Wine bridge needs is a button here: the files go in with
+/// *Install*, a third-party client with *Install another client…*, and game
+/// output is a switch on the other tab. Steam's launch options are Steam's, and
+/// without them the provider never starts — so a user can complete every
+/// control this page offers and get nothing, with nothing on screen saying why.
+/// That is the shape this window is written against, and it was the shape of
+/// this page until the launch wrapper shipped.
+///
+/// Said only where the bridge is actually in the prefix, because before that it
+/// is one step of a setup that has not begun.
+///
+/// `--steam <id>` is not part of it: the wrapper reads the launch Steam hands
+/// it, so the line is the same for every game and the app id would be a second
+/// thing to get wrong.
+fn launch_option_line() -> String {
+    format!(
+        "One thing left, and it is the only part of this that is not a button here: \
+         Steam has to be told to start the game through this program. In Steam, \
+         right-click the game \u{2192} Properties \u{2192} Launch Options, and put in:\n  \
+         {LAUNCH_OPTION}\n\
+         That hands the launch to us, and Proton then starts the bridge's provider and \
+         the game together, in one go, so the provider is inside the game's own Wine \
+         session. It stops when the game does. Without it the files above are in place \
+         and nothing starts them."
+    )
+}
+
+/// What goes in Steam's launch options, in the one place that spells it.
+pub(crate) const LAUNCH_OPTION: &str = "tobii game -- %command%";
+/// See [`ADD_GAME_CAPTION`].
+pub(crate) const COPY_LAUNCH_CAPTION: &str = "Copy the launch option";
+/// What it says once it has, which is all it can honestly report.
+pub(crate) const COPY_LAUNCH_DONE: &str = "Copied — paste it into Steam";
+/// See [`DETAILS_TIP`].
+pub(crate) const COPY_LAUNCH_TIP: &str =
+    "Put `tobii game -- %command%` on the clipboard, for Steam's Launch Options. This \
+     program cannot set it for you: launch options live in Steam's own configuration, \
+     which Steam rewrites from memory when it exits.";
+
 /// Block 2: the Wine bridge.
 ///
 /// Note the wording discipline: this window stats paths, so it claims paths.
@@ -1788,6 +1830,12 @@ pub(crate) fn bridge_block(
             )
         }
     };
+    // Only with the files in place: before that it is one step of a setup that
+    // has not begun. See `launch_option_line`.
+    if matches!(state, BridgeState::Files { .. }) {
+        text.push_str("\n\n");
+        text.push_str(&launch_option_line());
+    }
     // Both notes hang off every state, because both are reasons the sentence
     // above them may be about the wrong place on this machine.
     for note in [other_prefixes_note(others), missing_note(missing)]
@@ -3609,6 +3657,38 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // foot of the pane — see `action_bar` below for why.
     let b_report = small("");
     b2.append(&b_report);
+    // The one step of this setup that is not a button on this page, so it is at
+    // least one press to carry: the paragraph above names Steam's launch option
+    // and this puts it on the clipboard. Shown only with the bridge in the
+    // prefix, for the same reason the paragraph is — see `launch_option_line`.
+    //
+    // Setting it for the user is not on the table. Launch options live in
+    // Steam's own `localconfig.vdf`, which Steam reads at start, holds in
+    // memory and writes back on exit, so an edit made while Steam is running —
+    // which is when somebody would be doing this — does not survive. It is also
+    // another program's configuration file, holding far more than launch
+    // options, and this program not writing those is the rule block 3 is built
+    // on.
+    let copy_launch = crate::widget::button(COPY_LAUNCH_CAPTION);
+    copy_launch.add_css_class("quiet");
+    copy_launch.set_halign(Align::Start);
+    copy_launch.set_tooltip_text(Some(COPY_LAUNCH_TIP));
+    copy_launch.set_visible(false);
+    b2.append(&copy_launch);
+    {
+        // `b` is the button, not a captured clone of it: a handler holding the
+        // widget that holds the handler is a cycle GTK never breaks, and
+        // `tests/hub_lifetime.rs` caught exactly that here.
+        copy_launch.connect_clicked(move |b| {
+            // `set_text` reports nothing, so whether the clipboard took it is
+            // not observable from here; saying "copied" is the honest limit.
+            // The selection belongs to this process on Wayland, so it goes when
+            // the hub closes — which is why the caption says so rather than
+            // promising it will be there later.
+            b.display().clipboard().set_text(LAUNCH_OPTION);
+            crate::widget::set_button_text(b, COPY_LAUNCH_DONE);
+        });
+    }
     let d2 = divider();
     game.append(&b2);
     game.append(&d2);
@@ -3800,6 +3880,10 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             p_body.clone(),
             rows_box.clone(),
         );
+        // Weak, because it carries a handler: the rule this tree keeps is
+        // labels and plain boxes strongly, anything with a handler through
+        // `downgrade()`.
+        let copy_launch_w = copy_launch.downgrade();
         // The five widgets `blocks` decides the visibility of, and the one it
         // turns on. **Weak, every one of them**, and one of the five is the
         // reason: `b2` contains `b_actions`, which contains the three buttons
@@ -3988,6 +4072,16 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             );
             text.push_str(&job.text);
             br_body.set_text(&text);
+            // Beside the paragraph that names it, and on the same condition, so
+            // the button cannot offer to copy something the text above did not
+            // mention. Reset each time: the caption is a receipt for one press.
+            if let Some(copy) = copy_launch_w.upgrade() {
+                let shown = matches!(state, BridgeState::Files { .. });
+                copy.set_visible(shown);
+                if shown {
+                    crate::widget::set_button_text(&copy, COPY_LAUNCH_CAPTION);
+                }
+            }
             // The bar, from one value. `action` above is what block 2's
             // paragraph was worded from, and `acts.primary` is the same
             // function — see `bridge_action`.
@@ -5717,6 +5811,53 @@ mod tests {
             "in name order — One, Three, Two — with the bridge leading, because \
              it is what the row is drawn from"
         );
+    }
+
+    /// Block 2 names the launch option, and only where there is something for
+    /// it to start.
+    ///
+    /// Every other part of setting a game up is a button on this page. Steam's
+    /// launch options are Steam's, and without them the provider never starts —
+    /// so a user could press everything here and get nothing, with nothing on
+    /// screen saying why. That was true of this page until the launch wrapper
+    /// shipped, and it is the failure shape this whole window is written
+    /// against.
+    #[test]
+    fn the_page_names_the_one_step_it_has_no_button_for() {
+        let installed = bridge_block(
+            &present(),
+            &[],
+            &[],
+            Some(Path::new("/usr/bin/tobii")),
+            None,
+            &Target::Steam("2537590".to_string()),
+        );
+        assert!(
+            installed.contains(LAUNCH_OPTION),
+            "with the bridge in the prefix, the launch option has to be on screen: {installed}"
+        );
+        assert!(
+            installed.contains("Launch Options"),
+            "and where to put it, in Steam's own words: {installed}"
+        );
+
+        // Not before there is anything to start. Both of the other states are
+        // one step of a setup that has not begun, and a paste-me line there is
+        // an instruction to configure something that is not installed.
+        for state in [BridgeState::NoPrefix, absent()] {
+            let text = bridge_block(
+                &state,
+                &[],
+                &[],
+                Some(Path::new("/usr/bin/tobii")),
+                None,
+                &Target::Steam("2537590".to_string()),
+            );
+            assert!(
+                !text.contains(LAUNCH_OPTION),
+                "{state:?} has nothing for that option to start: {text}"
+            );
+        }
     }
 
     /// The one-word answer on a row is read off the same value block 2's

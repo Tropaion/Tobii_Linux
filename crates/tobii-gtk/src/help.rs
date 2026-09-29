@@ -409,7 +409,15 @@ pub fn topics() -> Vec<Topic> {
                  taken as relative to.\n\n\
                  The second section, the Wine bridge, is the one that can be set \
                  up correctly and still deliver nothing, which is worth knowing \
-                 before you judge it broken. {gate}\n\n\
+                 before you judge it broken. Once its files are in the prefix it \
+                 names the one step no button here can take: Steam's launch \
+                 options, `{launch}`, which is what hands the launch to this \
+                 program so Proton starts the bridge's provider and the game \
+                 together. Without it the files are in place and nothing starts \
+                 them. A button there puts it on the clipboard; this program \
+                 cannot set it for you, because launch options live in Steam's \
+                 own configuration, which Steam rewrites from memory when it \
+                 exits. {gate}\n\n\
                  {provider}\n\n\
                  Reported, and not verified by anyone here: one user reports \
                  getting head tracking working in Microsoft Flight Simulator \
@@ -444,6 +452,7 @@ pub fn topics() -> Vec<Topic> {
                 check_where = crate::game_setup::PROFILE_CHECK_WHERE,
                 pointer = crate::game_setup::TRACKER_TAB_POINTER,
                 add_btn = crate::game_setup::ADD_GAME_CAPTION,
+                launch = crate::game_setup::LAUNCH_OPTION,
                 details = crate::game_setup::DETAILS_CAPTION,
                 forget = crate::game_setup::FORGET_CAPTION,
                 other = crate::game_setup::OTHER_CLIENT_CAPTION,
@@ -1342,7 +1351,7 @@ mod tests {
             .find(|t| t.title == "Games")
             .expect("the Games topic");
         let text = games.text();
-        let pairs: [(&str, &[&str]); 6] = [
+        let pairs: [(&str, &[&str]); 7] = [
             (
                 crate::game_setup::DETAILS_TIP,
                 &["tobii bridge status", "without starting anything"][..],
@@ -1370,6 +1379,17 @@ mod tests {
             (
                 crate::game_setup::SET_UP_ONLY_TIP,
                 &["only the games that are set up", "drawn back"],
+            ),
+            // The one control whose whole point is a thing the program will not
+            // do. If the window does not carry the reason, the only place it
+            // exists is a tooltip.
+            (
+                crate::game_setup::COPY_LAUNCH_TIP,
+                &[
+                    crate::game_setup::LAUNCH_OPTION,
+                    "cannot set it for you",
+                    "rewrites from memory when it",
+                ],
             ),
         ];
         for (tip, facts) in pairs {
