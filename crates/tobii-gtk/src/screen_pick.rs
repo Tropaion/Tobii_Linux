@@ -78,7 +78,9 @@ pub enum Setup {
 /// not lost: it is in the help topic, with the consequence there was no room
 /// for on a card.
 ///
-/// Five answers, and the fifth is the reason this is not two lines of `if`. A
+/// Six answers, and *"Set up, but no monitor could be read here."* is the one
+/// that keeps this from being two lines of `if` — named rather than counted to,
+/// because the count has drifted twice already. A
 /// saved id that matches nothing is *"not connected"* only when there were
 /// monitors to compare it against; with none read at all — no `/sys/class/drm`,
 /// a container, a permission — "that monitor is not connected" is a confident

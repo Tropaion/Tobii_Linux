@@ -139,9 +139,11 @@ const HEADING: &str = "Set up a game";
 /// caller that does not exist is a promise nothing is holding.
 ///
 /// `tests/games_filter.rs` is that caller. The list's rows are hidden by a
-/// `set_filter_func` now rather than removed, and whether a hidden row is still
-/// a row, and whether a `GtkListBox` shows its placeholder for a list that the
-/// filter emptied, are two facts about GTK that no unit test can reach.
+/// `set_filter_func` now rather than removed, so whether a hidden row is still
+/// a row is a fact about GTK that no unit test can reach — and neither is
+/// whether the dim reaches the right rows, nor whether the paragraph this
+/// window puts under the list is shown when the filter is what emptied it.
+/// Each of those takes a real widget tree to drive.
 pub const SEARCH_NAME: &str = "gamesetup-search";
 /// The list of games, likewise.
 pub const LIST_NAME: &str = "gamesetup-games";
@@ -183,7 +185,6 @@ pub struct Scan {
     /// another — the disagreement this type's own doc says taking them from
     /// one value prevents.
     pub steam: Rc<tobii_steam::Steam>,
-    /// What [`tobii_steam::Steam::prefix`] answered for an app id, kept.
     /// Where the hand-added games are kept.
     ///
     /// A path and not the list, because the list is re-read every time the tab
@@ -728,11 +729,12 @@ pub(crate) struct Catalog {
     rows: Vec<(PickRow, String)>,
     /// How many titles Steam lists as installed here.
     ///
-    /// Not `rows.len()`, which it was: the third group is rows this machine
-    /// has a profile for and Steam does **not** list, so counting the list
-    /// told a user with one such profile that they had one more game
-    /// installed than they have — in a sentence whose whole subject is what
-    /// Steam's manifests on this machine say.
+    /// Not `rows.len()`: the list also holds the games somebody added by hand,
+    /// which Steam has never heard of, so counting the rows told a user with
+    /// one of those that they had a game more installed than they have — in a
+    /// sentence whose whole subject is what Steam's manifests say. The rows can
+    /// now also be filtered, which makes the distinction sharper rather than
+    /// weaker: the count is of the machine and never of what is on screen.
     installed: usize,
     /// What is in the profiles directory and is not a profile this page can
     /// use. Empty on almost every machine — see [`directory_notes`].
@@ -771,8 +773,9 @@ impl Catalog {
     /// `is_file` calls per row **that has a prefix at all** — a title never
     /// launched under Proton costs nothing, since [`bridge_state`] answers
     /// `NoPrefix` without a syscall. On this machine's 29 titles that is at
-    /// most 87 stats, once per visit to the tab, against a page whose whole
-    /// subject is what those files say.
+    /// most 87 stats, once per visit to the tab and once more after a job that
+    /// changes those files (see `recheck`), against a page whose whole subject
+    /// is what those files say.
     pub(crate) fn new(
         apps: &[App],
         listing: &profiles::Listing,

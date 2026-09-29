@@ -1645,7 +1645,8 @@ makes fails honest code. What replaced it is
 `the_bridge_is_asked_exactly_once_for_every_row`, which is the half that can
 still rot silently. The cost: unchanged prefix walks (one per Steam row, as
 before), plus three `is_file` calls per row that has a prefix at all — a title
-never launched under Proton still costs nothing — once per visit to the tab.
+never launched under Proton still costs nothing — once per visit to the tab,
+and once more after a job that changes those files.
 
 `Scan`'s prefix memo went. It had a 0% hit rate: the two closures were mutually
 exclusive, so every app id was asked once, inserted once, and cleared by
@@ -1684,6 +1685,12 @@ manifests that does not follow the search box.
   points at a measurement taken before the layout has settled rather than at a
   window that is genuinely the wrong size. The two rarely fail together — a run
   that fails one usually passes the other.
+
+  A third, `tobii-ipc`'s `listener::proc_net`, flakes about one run in two
+  hundred on its own premise assertion — a socket the test still holds open read
+  back as absent. Same shape, same cause, different crate; it predates all of
+  this too, and it is the reason a release note should say "none failing in this
+  run" rather than "none failing".
 
   Recorded because CI runs none of these, so nothing else would notice, and
   because "6 or 7 of 8, depending on the run" is the honest description of this

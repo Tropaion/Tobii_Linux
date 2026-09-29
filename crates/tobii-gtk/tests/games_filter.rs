@@ -290,7 +290,9 @@ fn the_filter_hides_rows_without_removing_them_and_an_empty_list_says_why() {
     assert_eq!(
         dimmed(&s.filtered),
         dimmed(&s.before),
-        "pressing the filter hides rows; it must not repaint the ones it keeps: {s:#?}"
+        "the toggle path must not touch a row's classes. Today it structurally \
+         cannot — the dim is applied once where rows are built — so this pins that \
+         rather than catching a change to it: {s:#?}"
     );
 
     assert_eq!(
