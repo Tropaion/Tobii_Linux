@@ -1,29 +1,36 @@
 //! Put our provider on the right side of the wineserver lock.
 //!
-//! # Nothing calls this, and the reason is measured
+//! # What Proton is pointed at, and why it is not a batch file
 //!
-//! Everything below builds a batch file and points Proton's
-//! `waitforexitandrun` at it. **Proton does not wait for a batch file.** Its
-//! `steam.exe` helper runs an `.exe` target through `CreateProcessW` and waits
-//! on it, and a `.bat` target through `ShellExecuteW`, which returns at once —
-//! confirmed on four Proton builds on the machine this was written on, against
-//! a control with an `.exe` target that waits correctly.
+//! This module used to build a batch file and point Proton's
+//! `waitforexitandrun` at it, which is the shape the studied launcher uses.
+//! **Proton does not wait for a batch file.** Its `steam.exe` helper runs an
+//! `.exe` target through `CreateProcessW` and waits on it, and a `.bat` target
+//! through `ShellExecuteW`, which returns at once — confirmed on four Proton
+//! builds on the machine this was written on, against a control with an `.exe`
+//! target that waits correctly. Proton then reports success about a second in,
+//! while `cmd.exe`, the provider and the game are all still starting: Steam
+//! records the game as exited and [`crate::game`] drops the tracker out from
+//! under a game that is still running.
 //!
-//! The failure is the worst available. Proton reports success about a second
-//! in, while `cmd.exe`, the provider and the game are all still starting: Steam
-//! records the game as exited, [`crate::game`] returns and drops the tracker
-//! out from under a game that is still running, [`Once`] takes the batch file
-//! away while `cmd.exe` is reading it — so the game frequently never starts —
-//! and the next launch's `wineserver -w` blocks on whatever is still alive,
-//! which is the freeze v0.5.0 removed, reintroduced by the thing meant to make
-//! it unnecessary.
+//! That is survivable for a launcher whose whole job is to start and reap
+//! another program, which is why the studied one ships it and works. It is not
+//! survivable here.
 //!
-//! What is here is kept because it is right and was measured: the plan that
-//! finds the game by Proton's own argument pair, the quoting that survives
-//! `cmd.exe`, the ordering, the reap and the exit code. What it needs is a
-//! target Proton will wait on — an `.exe` of ours that starts the provider and
-//! then the game — which is a Windows program to write, not a change here.
-//! `docs/wiki/Quality-and-Risks.md` §11.3l has the measurement.
+//! So Proton is pointed at **the provider**, which is an `.exe` and already in
+//! the prefix — `tobii bridge install` puts it there, and this module declines
+//! unless it is. The game follows it after `--launch`, and the provider starts
+//! itself, runs the game, waits, and exits with the game's code. See
+//! `bridge/provider/src/main.rs`, which is where the sequencing now lives.
+//!
+//! Three things fall out of the target being an `.exe` rather than a batch:
+//! Steam's bookkeeping stays correct, the reap is process exit rather than a
+//! `taskkill` that can be missed, and the game's command line travels as argv.
+//! The last one deleted the most code here — a batch file cannot carry a quote,
+//! a control character or anything non-ASCII, all measured, so a game under a
+//! path with an umlaut in it could not be wrapped at all.
+//!
+//! `docs/wiki/Quality-and-Risks.md` §11.3l has the measurements.
 //!
 //! # The ordering problem, in one paragraph
 //!
@@ -111,10 +118,11 @@
 //! launcher working for its users. It was not measured here, and nothing on
 //! this machine could measure it.
 
-// Kept deliberately while nothing calls it — see the note above.
+// `arrange` is the entry point and `tobii game` calls it; the rest is reachable
+// only through it or through tests, which is what this allows.
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Proton's verb for "run this and wait for it", the one Steam launches a title
 /// with and the only one this module treats as a game launch.
@@ -130,6 +138,16 @@ const VERB: &str = "waitforexitandrun";
 /// again here — as the directory beside it already is.
 const PROVIDER: &str = crate::bridge::PROVIDER_EXE;
 
+/// `$STEAM_COMPAT_DATA_PATH`, as this process received it.
+///
+/// Read here rather than at the call site so that the one place that knows what
+/// a Proton launch looks like is also the one place that reads Steam's word for
+/// where it is. Steam sets it for a Proton launch and for nothing else, which
+/// is why [`plan`] declines rather than guessing when it is absent.
+pub(crate) fn compat_data_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("STEAM_COMPAT_DATA_PATH").map(std::path::PathBuf::from)
+}
+
 /// What the wrapper decided to do with the command it was handed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Plan {
@@ -140,16 +158,19 @@ pub(crate) enum Plan {
     /// A Proton game launch, and a reason this one is not being rewritten. Run
     /// the command as given and say this, once.
     Declined(String),
-    /// Replace the command from `target` onwards with a batch file holding
-    /// `batch`, written into `dir`.
+    /// Put the provider in front of the game: Proton runs `provider --launch
+    /// <game> <args…>` instead of the game.
     Rewrite {
         /// Index in the command of the game executable Proton was told to run.
-        /// Everything from here on moves into the batch file.
+        /// The provider goes in front of it; the game and its arguments stay
+        /// where they are.
         target: usize,
-        /// Where the batch file goes: our own directory inside the prefix.
-        dir: PathBuf,
-        /// The batch file's whole content.
-        batch: String,
+        /// The provider inside this game's prefix, as Proton will be given it.
+        provider: String,
+        /// The game, in the Windows spelling the provider will hand to
+        /// `CreateProcess`. `cmd[target]` is a Unix path, which is right for
+        /// Proton and wrong once we are inside the prefix.
+        game: String,
     },
 }
 
@@ -198,93 +219,6 @@ fn is_exe(path: &str) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
 }
 
-/// One value, ready to appear inside a batch file, or `None` if it cannot.
-///
-/// Three characters are refused rather than escaped:
-///
-/// * `"` — `cmd.exe` toggles quoting on every one of them and has no escape a
-///   program's own `CommandLineToArgvW` would also agree with, so an embedded
-///   quote cannot mean the same thing on both sides of the line.
-/// * any ASCII control character, a newline above all: a batch file is parsed a
-///   line at a time, so a value containing one is a value that ends the command.
-/// * anything non-ASCII — see the module header for what was measured.
-///
-/// What is escaped:
-///
-/// * `%` is doubled. Inside a batch file `%FOO%` expands and a lone `%` is
-///   unpredictable; `%%` is the one spelling that means a literal one. It
-///   applies inside double quotes too, which is why quoting alone is not
-///   enough.
-/// * A run of backslashes at the very end is doubled. Quoting is for
-///   `cmd.exe`, but the program on the other side splits its own command line
-///   by the C runtime's rules, where `\"` is a literal quote — so `"C:\dir\"`
-///   would reach it as an unterminated argument beginning with `"`. Doubling
-///   only the trailing run is enough because every other backslash is followed
-///   by something that is not the closing quote.
-pub(crate) fn batch_arg(value: &str) -> Option<String> {
-    if !value.is_ascii() || value.chars().any(|c| c.is_ascii_control() || c == '"') {
-        return None;
-    }
-    let mut out = value.replace('%', "%%");
-    let trailing = out.len() - out.trim_end_matches('\\').len();
-    out.push_str(&"\\".repeat(trailing));
-    Some(format!("\"{out}\""))
-}
-
-/// The batch file that starts the provider, then the game, then reaps.
-///
-/// `target` is the game in its Windows spelling and `args` are its arguments,
-/// exactly as Proton would have passed them.
-///
-/// The order is the whole point: the provider first so that it is up by the
-/// time the game looks, the game under `start /wait` so this `cmd.exe` lives
-/// exactly as long as it does, and the reap last.
-///
-/// **`start /b`** for the provider, so it does not open a console window over a
-/// game that is about to go fullscreen, and so what it prints lands in the same
-/// output Steam already collects.
-///
-/// **`--no-register`, always**, for the reason `tobii bridge run` passes it:
-/// `install` settled both discovery keys under a read-before-write contract
-/// that the provider's own blind write knows nothing about, and in the one
-/// configuration this exists for — TrackIR pointed at a third-party client —
-/// that write replaces the registration the user came for.
-///
-/// **No `--port`.** The provider and the client DLL both take it from
-/// `TOBII_BRIDGE_PORT` in the environment, and they have to agree: naming it
-/// here would make the two disagree in exactly the case where naming it helped,
-/// an environment that did not arrive.
-///
-/// **The reap is by image name**, which the studied launcher is criticised for
-/// — and here it is the right instrument rather than a blunt one. `taskkill`
-/// reaches only this prefix's wineserver session, and the name is our own
-/// program's, so the only thing it can take besides this launch's provider is
-/// another copy of *our* provider in *this* game's prefix. That copy is
-/// precisely the wine process that would make the next launch's `wineserver -w`
-/// hang, so reaping it is the service, not the collateral.
-pub(crate) fn batch(target: &str, args: &[String]) -> Option<String> {
-    let mut game = batch_arg(target)?;
-    for a in args {
-        game.push(' ');
-        game.push_str(&batch_arg(a)?);
-    }
-    let provider = format!(r"{}\{PROVIDER}", crate::bridge::INSTALL_WIN_DIR);
-    let lines = [
-        "@echo off".to_string(),
-        "rem written by `tobii game` for one launch, and deleted after it".to_string(),
-        format!("start /b \"\" \"{provider}\" --no-register"),
-        format!("start /wait \"\" {game}"),
-        // Saved before the taskkill, which would otherwise be the exit code
-        // Steam is told the game finished with.
-        "set TOBII_GAME_RC=%ERRORLEVEL%".to_string(),
-        format!("taskkill /f /im {PROVIDER} >nul 2>&1"),
-        "exit /b %TOBII_GAME_RC%".to_string(),
-    ];
-    // CRLF: what `cmd.exe` is written for, and what every batch file it has
-    // ever been handed uses.
-    Some(lines.join("\r\n") + "\r\n")
-}
-
 /// Decide what to do with the command Steam handed the wrapper.
 ///
 /// `compat` is `$STEAM_COMPAT_DATA_PATH` as this process received it. That, and
@@ -318,160 +252,75 @@ pub(crate) fn plan(cmd: &[String], compat: Option<&Path>) -> Plan {
             prefix.display()
         ));
     }
-    let Some(batch) = batch(
-        &crate::bridge::wine_path_for(Path::new(&cmd[target])),
-        &cmd[target + 1..],
-    ) else {
-        return Plan::Declined(
-            "the game's path or one of its arguments holds a character a batch file \
-             cannot carry (a quote, a control character, or anything non-ASCII), so the \
-             bridge provider is not being started — running the game unchanged"
-                .into(),
-        );
-    };
-    Plan::Rewrite { target, dir, batch }
-}
-
-/// Point Proton at the batch file instead of at the game.
-///
-/// The game's own arguments come off the command line **with** it. They are
-/// inside the batch now, and a copy left behind would be handed to `cmd.exe` as
-/// arguments to the batch file — where `%1` and friends mean something, and
-/// where nothing would pass them to the game a second time.
-pub(crate) fn point_at(cmd: &mut Vec<String>, target: usize, batch: String) {
-    cmd.truncate(target + 1);
-    cmd[target] = batch;
-}
-
-/// A batch file that exists for one launch and is removed when it ends.
-///
-/// The studied launcher caches one per app id forever, with the executable's
-/// path and arguments baked in, so a game moved to another library goes on
-/// launching from the old path until somebody works out why. Nothing here is
-/// cached: the file is written from *this* launch's command and deleted when it
-/// returns, so there is no version of it that can be stale.
-pub(crate) struct Once(PathBuf);
-
-impl Once {
-    /// Write the batch into `dir`, named for this process.
-    ///
-    /// The pid is in the name so that two launches sharing a prefix cannot
-    /// write over each other's file while `cmd.exe` is still reading it.
-    pub(crate) fn write(dir: &Path, batch: &str) -> std::io::Result<Self> {
-        sweep(dir);
-        let path = dir.join(format!("launch-{}.bat", std::process::id()));
-        std::fs::write(&path, batch)?;
-        Ok(Self(path))
-    }
-
-    /// Where it was written, for the command line that has to name it.
-    pub(crate) fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Once {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Remove `launch-<pid>.bat` files left by runs that are no longer running.
-///
-/// [`Once`] takes its file away on the way out, and a signal does not let it:
-/// Steam's Stop button sends `SIGTERM`, which skips every destructor, and a
-/// `SIGKILL` would skip a handler too. So rather than install one, each launch
-/// clears what earlier ones could not. Nothing here is time-based — a pid with
-/// no `/proc` entry is a process that has ended, and a file named for a live
-/// one belongs to a launch that may still be reading it.
-///
-/// A recycled pid keeps a stale file one launch longer. That costs a few
-/// hundred bytes in a directory this program owns, which is the cheaper side
-/// of the trade against deleting a batch `cmd.exe` has open.
-fn sweep(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(pid) = name
-            .strip_prefix("launch-")
-            .and_then(|r| r.strip_suffix(".bat"))
-        else {
-            continue;
-        };
-        if !pid.is_empty()
-            && pid.bytes().all(|b| b.is_ascii_digit())
-            && !Path::new("/proc").join(pid).exists()
-        {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Carry out [`plan`]: the command to run, and the file that has to outlive it.
-///
-/// Every path that is not the rewrite hands the command straight back, so a
-/// caller cannot get this wrong by forgetting a branch — there is nothing to
-/// forget. The notes go to stderr from here because the reason for each one
-/// lives here; the caller has no way to say anything truer about it.
-///
-/// Hold the returned [`Once`] until the command has exited. Dropping it is what
-/// takes the batch file away, and dropping it early takes it out from under the
-/// `cmd.exe` still reading it.
-pub(crate) fn arrange(mut cmd: Vec<String>, compat: Option<&Path>) -> (Vec<String>, Option<Once>) {
-    let (target, dir, batch) = match plan(&cmd, compat) {
-        Plan::AsGiven => return (cmd, None),
-        Plan::Declined(why) => {
-            eprintln!("note: {why}");
-            return (cmd, None);
-        }
-        Plan::Rewrite { target, dir, batch } => (target, dir, batch),
-    };
-    let file = match Once::write(&dir, &batch) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "note: could not write the launch file in {} ({e}), so the bridge provider is \
-                 not being started — running the game unchanged.",
-                dir.display()
-            );
-            return (cmd, None);
-        }
-    };
     // A command line is `String`s here, and a path spelled lossily names a
     // different file — so a prefix whose bytes are not UTF-8 declines rather
     // than being approximated into the launch.
-    let Some(path) = file.path().to_str().map(str::to_owned) else {
-        eprintln!(
-            "note: {} cannot be named on a command line, so the bridge provider is not being \
-             started — running the game unchanged.",
-            file.path().display()
-        );
-        return (cmd, None);
+    let exe = dir.join(PROVIDER);
+    let Some(provider) = exe.to_str().map(str::to_owned) else {
+        return Plan::Declined(format!(
+            "{} cannot be named on a command line, so the bridge provider is not being \
+             started — running the game unchanged",
+            exe.display()
+        ));
     };
-    // What this says is what was run, and no more. The ordering, the reap and
-    // the exit code were measured against wine's own `cmd.exe`; that Proton
-    // accepts a batch file as its target, and that the provider then shares
-    // the wineserver session the game is in, are the two steps nobody here has
+    Plan::Rewrite {
+        target,
+        provider,
+        game: crate::bridge::wine_path_for(Path::new(&cmd[target])),
+    }
+}
+
+/// Put the provider in front of the game.
+///
+/// The game's arguments stay exactly where they are, and that is the whole
+/// advantage of an `.exe` over a batch file: they travel as argv, so a quote, a
+/// percent sign, a trailing backslash or a non-ASCII path needs nothing done to
+/// it. The batch form had to refuse all four, and a refusal meant the provider
+/// did not start for that game at all.
+///
+/// The game's path is replaced with its Windows spelling, because the process
+/// reading it is inside the prefix. Proton gets the provider's Unix path, which
+/// is what it gets for a game.
+pub(crate) fn point_at(cmd: &mut Vec<String>, target: usize, provider: String, game: String) {
+    cmd[target] = game;
+    cmd.insert(target, "--launch".to_string());
+    cmd.insert(target, provider);
+}
+
+pub(crate) fn arrange(mut cmd: Vec<String>, compat: Option<&Path>) -> Vec<String> {
+    let (target, provider, game) = match plan(&cmd, compat) {
+        Plan::AsGiven => return cmd,
+        Plan::Declined(why) => {
+            eprintln!("note: {why}");
+            return cmd;
+        }
+        Plan::Rewrite {
+            target,
+            provider,
+            game,
+        } => (target, provider, game),
+    };
+    // What this says is what was arranged, and no more. The ordering, the reap
+    // and the exit code are the provider's own and are tested there; that
+    // Proton runs what it is pointed at, and that the provider then shares the
+    // wineserver session the game is in, are the two steps nobody here has
     // watched happen. Saying "will be started inside this game's Proton
-    // session" states the second of those as fact and disclaims only the
-    // outcome after it, which is the shape this project keeps having to
-    // correct.
+    // session" would state the second as fact and disclaim only the outcome
+    // after it, which is the shape this project keeps having to correct.
     eprintln!(
-        "note: this launch is wrapped — the provider is started first, the game runs, and the \
-         provider is stopped when it exits. Whether the game then reads tracking from it is not \
-         checked here. If the game does not start at all, take `tobii game -- ` back out of the \
-         launch options and it launches exactly as before."
+        "note: this launch is wrapped — the provider starts first, the game runs, and both \
+         end together. Whether the game then reads tracking from it is not checked here. If \
+         the game does not start at all, take `tobii game -- ` back out of the launch options \
+         and it launches exactly as before."
     );
-    point_at(&mut cmd, target, path);
-    (cmd, Some(file))
+    point_at(&mut cmd, target, provider, game);
+    cmd
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -583,112 +432,7 @@ mod tests {
     // generated batch launched a stub that wrote its own `argv` to a file, and
     // the file held exactly the values named here.
 
-    #[test]
-    fn a_percent_is_doubled_so_cmd_does_not_expand_it() {
-        // `"100%"` in a batch file is not 100 per cent; `%%` is.
-        assert_eq!(batch_arg("100% off").as_deref(), Some(r#""100%% off""#));
-        assert_eq!(batch_arg("%PATH%").as_deref(), Some(r#""%%PATH%%""#));
-    }
-
-    /// `cmd.exe` would end the argument at the closing quote, but the program's
-    /// own `CommandLineToArgvW` reads `\"` as a literal quote and runs on.
-    #[test]
-    fn a_trailing_backslash_is_doubled_so_it_cannot_escape_the_closing_quote() {
-        assert_eq!(batch_arg(r"C:\dir\").as_deref(), Some(r#""C:\dir\\""#));
-        assert_eq!(batch_arg(r"C:\a\\").as_deref(), Some(r#""C:\a\\\\""#));
-        // Only the trailing run: an interior backslash precedes something that
-        // is not the closing quote, so it is already literal.
-        assert_eq!(batch_arg(r"C:\a\b").as_deref(), Some(r#""C:\a\b""#));
-    }
-
-    #[test]
-    fn spaces_and_shell_metacharacters_survive_inside_the_quotes() {
-        for v in ["a b", "a^b", "c&d", "(p)", "!bang!", "x|y", "a>b", ""] {
-            assert_eq!(
-                batch_arg(v).as_deref(),
-                Some(format!("\"{v}\"").as_str()),
-                "{v:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_quote_cannot_be_carried_and_stops_the_rewrite() {
-        assert_eq!(batch_arg(r#"say "hi""#), None);
-    }
-
-    #[test]
-    fn a_newline_cannot_be_carried_and_stops_the_rewrite() {
-        assert_eq!(batch_arg("a\nb"), None);
-        assert_eq!(batch_arg("a\rb"), None);
-        assert_eq!(batch_arg("a\tb"), None);
-    }
-
-    /// Measured: the identical launch worked from a CP850 batch and failed from
-    /// UTF-8, UTF-8 with a BOM, UTF-16LE and `chcp 65001`. Which codepage a
-    /// given prefix reads is not knowable here, so this declines.
-    #[test]
-    fn a_non_ascii_path_cannot_be_carried_and_stops_the_rewrite() {
-        assert_eq!(batch_arg("/games/Wéird/game.exe"), None);
-        assert_eq!(batch_arg("日本語"), None);
-    }
-
     // --- the batch ------------------------------------------------------
-
-    #[test]
-    fn the_provider_starts_before_the_game_and_is_reaped_after_it() {
-        let text = batch(r"Z:\games\Thing\Thing.exe", &args(&["-steam"])).expect("a batch");
-        let at = |needle: &str| {
-            text.find(needle)
-                .unwrap_or_else(|| panic!("{needle:?} is absent"))
-        };
-        assert!(at("start /b") < at("start /wait"), "{text}");
-        assert!(at("start /wait") < at("taskkill"), "{text}");
-        assert!(
-            text.contains(r#"start /b "" "C:\tobii-bridge\tobii-bridge.exe""#),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn the_provider_is_started_with_no_register() {
-        let text = batch(r"Z:\g\g.exe", &[]).expect("a batch");
-        let line = text
-            .lines()
-            .find(|l| l.contains("tobii-bridge.exe") && l.starts_with("start"))
-            .expect("the provider line");
-        assert!(line.contains("--no-register"), "{line}");
-    }
-
-    /// Without saving it first, the exit code Steam is told the game finished
-    /// with is `taskkill`'s.
-    #[test]
-    fn the_games_exit_code_is_saved_before_the_reap_and_returned_after_it() {
-        let text = batch(r"Z:\g\g.exe", &[]).expect("a batch");
-        let lines: Vec<&str> = text.lines().collect();
-        let save = lines
-            .iter()
-            .position(|l| l.starts_with("set TOBII_GAME_RC="))
-            .expect("the exit code is saved");
-        let kill = lines
-            .iter()
-            .position(|l| l.starts_with("taskkill"))
-            .expect("the reap");
-        assert!(save < kill, "{text}");
-        assert_eq!(lines.last().copied(), Some("exit /b %TOBII_GAME_RC%"));
-    }
-
-    #[test]
-    fn the_batch_uses_the_line_endings_cmd_is_written_for() {
-        let text = batch(r"Z:\g\g.exe", &[]).expect("a batch");
-        assert!(text.ends_with("\r\n"));
-        assert!(!text.contains("\n\n"), "no bare LF between lines");
-    }
-
-    #[test]
-    fn one_uncarryable_argument_stops_the_whole_batch() {
-        assert_eq!(batch(r"Z:\g\g.exe", &args(&["-ok", "a\"b"])), None);
-    }
 
     // --- the decision ---------------------------------------------------
 
@@ -718,7 +462,7 @@ mod tests {
             &self.0
         }
 
-        /// Where the batch file goes.
+        /// Where the bridge's files go, and so where the provider is.
         fn dir(&self) -> PathBuf {
             self.0.join("pfx").join(crate::bridge::INSTALL_SUBDIR)
         }
@@ -742,18 +486,39 @@ mod tests {
         let scratch = Scratch::new("rewrite", true);
         let cmd = steam_command("/games/common/Thing/Thing.exe");
         match plan(&cmd, Some(scratch.compat())) {
-            Plan::Rewrite { target, dir, batch } => {
+            Plan::Rewrite {
+                target,
+                provider,
+                game,
+            } => {
                 assert_eq!(cmd[target], "/games/common/Thing/Thing.exe");
-                assert_eq!(dir, scratch.dir());
-                assert!(
-                    batch.contains(r"Z:\games\common\Thing\Thing.exe"),
-                    "{batch}"
-                );
-                // The game's own arguments move into the batch, because they
-                // come off Proton's command line with it.
-                assert!(batch.contains("\"-steam\""), "{batch}");
+                // Proton gets a Unix path, because that is what Proton takes.
+                assert_eq!(provider, scratch.dir().join(PROVIDER).to_string_lossy());
+                // The provider gets the Windows spelling, because the process
+                // that reads it is inside the prefix.
+                assert_eq!(game, r"Z:\games\common\Thing\Thing.exe");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// A path a batch file could not carry is carried.
+    ///
+    /// The batch form had to refuse a quote, a control character, a `%`, a
+    /// trailing backslash and anything non-ASCII, and a refusal meant the
+    /// provider did not start for that game at all — on a machine whose games
+    /// live under a name with an umlaut in it, for every game. An argv has no
+    /// such limits, and this is the test that says the limits are gone rather
+    /// than merely untested.
+    #[test]
+    fn a_path_no_batch_file_could_carry_is_carried() {
+        let scratch = Scratch::new("awkward", true);
+        let awkward = "/games/Über spiele/100% Orange/Thing.exe";
+        match plan(&steam_command(awkward), Some(scratch.compat())) {
+            Plan::Rewrite { game, .. } => {
+                assert_eq!(game, r"Z:\games\Über spiele\100% Orange\Thing.exe");
+            }
+            other => panic!("a path with a space, a percent and non-ASCII: {other:?}"),
         }
     }
 
@@ -788,107 +553,59 @@ mod tests {
     }
 
     #[test]
-    fn a_game_path_a_batch_cannot_spell_is_declined_rather_than_mangled() {
-        let scratch = Scratch::new("unicode", true);
-        match plan(
-            &steam_command("/games/Wéird/Thing.exe"),
-            Some(scratch.compat()),
-        ) {
-            Plan::Declined(why) => assert!(why.contains("non-ASCII"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_games_arguments_come_off_the_command_line_with_the_game() {
+    fn the_games_arguments_stay_on_the_command_line_after_the_game() {
         let mut cmd = steam_command("/games/Thing/Thing.exe");
         let target = proton_target(&cmd).expect("a target");
         point_at(
             &mut cmd,
             target,
-            "/pfx/drive_c/tobii-bridge/launch-1.bat".into(),
+            "/pfx/drive_c/tobii-bridge/tobii-bridge.exe".into(),
+            r"Z:\games\Thing\Thing.exe".into(),
         );
         assert_eq!(
-            cmd.last().map(String::as_str),
-            Some("/pfx/drive_c/tobii-bridge/launch-1.bat")
+            &cmd[target..],
+            &[
+                "/pfx/drive_c/tobii-bridge/tobii-bridge.exe".to_string(),
+                "--launch".to_string(),
+                r"Z:\games\Thing\Thing.exe".to_string(),
+                "-steam".to_string(),
+            ],
+            "the provider goes in FRONT of the game, and the game keeps its own \
+             arguments — under the batch they had to come off with it: {cmd:?}"
         );
-        // `-steam` went into the batch; a copy here would be an argument to the
-        // batch file instead.
-        assert!(!cmd.iter().any(|a| a == "-steam"), "{cmd:?}");
+        // Exactly one `-steam`: under the batch the game's arguments had to come
+        // off the command line, because a copy left behind would have been
+        // handed to `cmd.exe` as arguments to the batch file. They stay now, and
+        // a second copy would reach the game twice.
+        assert_eq!(cmd.iter().filter(|a| *a == "-steam").count(), 1, "{cmd:?}");
         assert_eq!(cmd[target - 1], VERB);
-    }
-
-    // --- the file -------------------------------------------------------
-
-    /// A file a signal left behind is taken away by the next launch.
-    ///
-    /// `SIGTERM` — what Steam's Stop button sends — skips every destructor, so
-    /// [`Once`] cannot clean up after itself there and a handler would not
-    /// survive `SIGKILL` either. What must not happen is the opposite: taking
-    /// away a file belonging to a launch that is still running.
-    #[test]
-    fn a_batch_a_signal_left_behind_goes_with_the_next_launch() {
-        let scratch = Scratch::new("sweep", true);
-        let dir = scratch.dir();
-        // A pid that has ended. 2^22 is above every `pid_max` Linux allows, so
-        // no live process can wear it and the case cannot flake.
-        let dead = dir.join("launch-4194304.bat");
-        std::fs::write(&dead, "stale").expect("a stale file");
-        // One belonging to something alive, which is this test.
-        let live = dir.join(format!("launch-{}.bat", std::process::id()));
-        std::fs::write(&live, "in use").expect("a live file");
-        // And something that is not ours at all.
-        let other = dir.join("notes.txt");
-        std::fs::write(&other, "somebody's").expect("a stranger");
-
-        sweep(&dir);
-
-        assert!(!dead.exists(), "a file from a run that ended goes");
-        assert!(live.exists(), "one from a run still going stays");
-        assert!(other.exists(), "and this only ever removes its own names");
-    }
-
-    #[test]
-    fn the_batch_is_written_for_one_launch_and_removed_with_it() {
-        let scratch = Scratch::new("once", false);
-        let path = {
-            let once = Once::write(&scratch.dir(), "@echo off\r\n").expect("written");
-            let written = std::fs::read_to_string(once.path()).expect("the batch is on disk");
-            assert_eq!(written, "@echo off\r\n");
-            once.path().to_path_buf()
-        };
-        assert!(!path.exists(), "{} outlived the launch", path.display());
     }
 
     // --- arranging it ---------------------------------------------------
 
     #[test]
-    fn arranging_a_proton_launch_points_it_at_the_batch_and_keeps_the_file_alive() {
+    fn arranging_a_proton_launch_points_it_at_the_provider() {
         let scratch = Scratch::new("arrange", true);
-        let (cmd, file) = arrange(
+        let cmd = arrange(
             steam_command("/games/Thing/Thing.exe"),
             Some(scratch.compat()),
         );
-        let file = file.expect("the batch file is handed back to be held");
-        assert_eq!(cmd.last().map(PathBuf::from).as_deref(), Some(file.path()));
-        assert!(file.path().is_file(), "it must exist while the game runs");
-    }
-
-    /// The disk can refuse, and the answer to that is the launch Steam asked
-    /// for — not a command line pointing at a file that was never written.
-    #[test]
-    fn a_batch_that_cannot_be_written_leaves_the_launch_exactly_as_it_was() {
-        let scratch = Scratch::new("unwritable", true);
-        // A directory where the file goes: `write` fails with `EISDIR` for
-        // root as much as for anybody, which a permission bit would not.
-        let blocked = scratch
-            .dir()
-            .join(format!("launch-{}.bat", std::process::id()));
-        std::fs::create_dir_all(&blocked).expect("something in the file's way");
-        let original = steam_command("/games/Thing/Thing.exe");
-        let (cmd, file) = arrange(original.clone(), Some(scratch.compat()));
-        assert_eq!(cmd, original);
-        assert!(file.is_none());
+        let provider = scratch.dir().join(PROVIDER);
+        assert_eq!(
+            &cmd[cmd.len() - 4..],
+            &[
+                provider.to_string_lossy().into_owned(),
+                "--launch".to_string(),
+                crate::bridge::wine_path_for(Path::new("/games/Thing/Thing.exe")),
+                "-steam".to_string(),
+            ],
+            "Proton is pointed at the provider, with the game after `--launch`: {cmd:?}"
+        );
+        assert!(
+            provider.is_file(),
+            "and at a provider that is actually there — nothing is written for the launch, \
+             which is why there is no file to clean up"
+        );
     }
 
     #[test]
@@ -897,42 +614,47 @@ mod tests {
             args(&["./MyGame.x86_64", "-w"]),
             steam_command("/games/Thing/Thing.exe"),
         ] {
-            let (cmd, file) = arrange(command.clone(), None);
-            assert_eq!(cmd, command);
-            assert!(file.is_none());
+            assert_eq!(arrange(command.clone(), None), command);
         }
     }
 
     // --- the batch, actually run ----------------------------------------
 
-    /// Everything above asserts about a string. This runs it.
+    /// The real provider, under real wine, starts a game and ends with it.
     ///
-    /// Ignored because it needs `wine` and two Windows executables this crate
-    /// cannot build (CI has neither). `$TOBII_PROTON_E2E` names a directory
-    /// holding both:
+    /// Ignored and gated because it needs three things this repository does not
+    /// ship: `wine`, a built `tobii-bridge.exe` (`scripts/build-bridge.sh`), and
+    /// a stub `game.exe` that writes its own `argv` one bracketed value per line
+    /// to `%ARGVDUMP_OUT%` and exits 7. Point `TOBII_PROTON_E2E` at the
+    /// directory holding the stub.
     ///
-    /// * `tobii-bridge.exe` — writes the file `%HELPER_OUT%` names, then runs
-    ///   until something kills it.
-    /// * `game.exe` — writes one `[argument]` per line to the file
-    ///   `%ARGVDUMP_OUT%` names, then exits with code 7.
+    /// What it is for: the sequencing moved out of this crate and into the
+    /// provider when Proton's target became an `.exe` rather than a batch file,
+    /// and `bridge/` is a separate workspace that cross-compiles to Windows —
+    /// nothing in it can run a test on this machine. This is the only place the
+    /// mechanism can be exercised end to end.
     ///
-    /// Run it with
-    /// `TOBII_PROTON_E2E=<dir> cargo test -p tobii-cli -- --ignored e2e`.
+    /// The argument battery is the one the batch form needed rules for, plus
+    /// the two it had to refuse outright. Under `--launch` they are argv, so the
+    /// expectation is that every one of them arrives unchanged.
     #[test]
-    #[ignore = "needs wine and two Windows stubs (TOBII_PROTON_E2E)"]
-    fn e2e_the_generated_batch_starts_the_provider_runs_the_game_and_reaps_it() {
+    #[ignore = "needs wine, a built tobii-bridge.exe and a stub game (TOBII_PROTON_E2E)"]
+    fn e2e_the_provider_runs_the_game_passes_its_arguments_and_ends_with_it() {
         let stubs = PathBuf::from(
             std::env::var("TOBII_PROTON_E2E").expect("TOBII_PROTON_E2E names the stub directory"),
         );
+        let provider = PathBuf::from("bridge/target/x86_64-pc-windows-gnu/release").join(PROVIDER);
+        assert!(
+            provider.is_file(),
+            "{} is not built — run scripts/build-bridge.sh",
+            provider.display()
+        );
         let scratch = Scratch::new("e2e", false);
         let prefix = scratch.compat().join("pfx");
-        let dir = scratch.dir();
-        std::fs::copy(stubs.join(PROVIDER), dir.join(PROVIDER)).expect("the provider stub");
-
-        let helper_out = scratch.compat().join("helper.txt");
         let argv_out = scratch.compat().join("argv.txt");
-        // The battery from the module header, each one a character `cmd.exe`
-        // would otherwise act on.
+
+        // Every one of these had a rule in the batch form, and the last three
+        // could not be carried at all: a quote, a non-ASCII path and a newline.
         let battery = args(&[
             "-w indowed",
             "100%",
@@ -942,25 +664,22 @@ mod tests {
             "!bang!",
             r"C:\trailing\",
             "",
+            "say \"hello\"",
+            "Über",
         ]);
-        let batch = batch(
-            &crate::bridge::wine_path_for(&stubs.join("game.exe")),
-            &battery,
-        )
-        .expect("the battery is carryable");
-        let file = Once::write(&dir, &batch).expect("the batch is written");
 
         let status = std::process::Command::new("wine")
             .env("WINEPREFIX", &prefix)
             .env("WINEDEBUG", "-all")
-            .env("HELPER_OUT", crate::bridge::wine_path_for(&helper_out))
             .env("ARGVDUMP_OUT", crate::bridge::wine_path_for(&argv_out))
-            .arg(file.path())
+            .arg(&provider)
+            .arg("--launch")
+            .arg(crate::bridge::wine_path_for(&stubs.join("game.exe")))
+            .args(&battery)
             .status()
             .expect("wine runs");
 
         let argv = std::fs::read_to_string(&argv_out).unwrap_or_default();
-        let helper = helper_out.is_file();
         // `wineserver -w` is what the next Steam launch does, and it returns
         // only once every wine process on this prefix is gone: if the provider
         // outlived the game, this is the launch that would hang.
@@ -983,7 +702,6 @@ mod tests {
                 }
             }
         };
-        drop(file);
         // Before the tree goes: a wineserver still serving a directory being
         // deleted is how a scratch prefix outlives its test.
         let _ = std::process::Command::new("wineserver")
@@ -991,20 +709,21 @@ mod tests {
             .arg("-k")
             .status();
 
-        assert!(helper, "the provider never started");
         assert_eq!(
             argv.lines().collect::<Vec<_>>(),
             battery.iter().map(|a| format!("[{a}]")).collect::<Vec<_>>(),
-            "the game did not receive its arguments intact"
+            "the game did not receive its arguments intact — the last three are the ones a \
+             batch file could not carry at all"
         );
         assert_eq!(
             status.code(),
             Some(7),
-            "the game's exit code did not come back"
+            "the game's exit code did not come back through the provider"
         );
         assert!(
             reaped,
-            "the provider outlived the game and still holds the prefix"
+            "the provider outlived the game and still holds the prefix — the next launch's \
+             `wineserver -w` is what would block"
         );
     }
 }

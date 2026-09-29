@@ -199,26 +199,21 @@ fn game(args: &[String]) -> ExitCode {
         }
     };
 
-    // The provider belongs inside the game's own wineserver session, and
-    // [`proton`] builds the batch that would put it there — but nothing calls
-    // it, because pointing Proton at a batch file does not work and the way it
-    // fails is the worst available.
+    // The provider belongs inside the game's own wineserver session, and this
+    // is where it is put there.
     //
-    // Measured on four Proton builds on this machine: Proton's `steam.exe`
-    // helper runs an `.exe` target through `CreateProcessW` and waits, and a
-    // `.bat` target through `ShellExecuteW`, which does not. So Proton returns
-    // 0 about a second in, while `cmd.exe`, the provider and the game are all
-    // still starting. Steam is told the game exited successfully; this wrapper
-    // returns and drops the tracker out from under a game that is still
-    // running; the batch file is deleted while `cmd.exe` is reading it, so the
-    // game often never starts at all; and the next launch's `wineserver -w`
-    // blocks on what is still alive — the freeze v0.5.0 removed, put back by
-    // the thing meant to remove the need for it.
+    // Steam runs a Proton title through `waitforexitandrun`, and Proton runs
+    // `wineserver -w` — a wait for every wine process on the prefix — before it
+    // spawns the game, so anything of ours started beforehand does not delay
+    // that launch, it prevents it. `arrange` answers by not being in the race:
+    // it points Proton at our provider with the game after `--launch`, so one
+    // `waitforexitandrun` starts both, after the lock, in the session the game
+    // is in.
     //
-    // The module stays. Its plan, its quoting and its batch are measured and
-    // right, and the shape that can use them is an `.exe` of ours as the
-    // target rather than a `.bat` — which is a Windows program to build, not a
-    // line to change here. See `docs/wiki/Quality-and-Risks.md` §11.3l.
+    // It rewrites nothing unless this is a Proton launch AND our provider is
+    // already in that prefix; every other command runs exactly as Steam wrote
+    // it. See `proton` for what it declines and why.
+    let cmd = crate::proton::arrange(cmd.to_vec(), crate::proton::compat_data_path().as_deref());
 
     let mut child = std::process::Command::new(&cmd[0]);
     child.args(&cmd[1..]);

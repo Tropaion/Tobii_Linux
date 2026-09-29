@@ -1506,7 +1506,9 @@ and none of what follows was run by anybody on this project.
   of three; and the next launch's `wineserver -w` blocked at the 20 s timeout
   on every build — the freeze §11.3i is about, reintroduced by the work meant
   to make it unnecessary.
-- **So nothing calls it.** `crates/tobii-cli/src/proton.rs` is kept, uncalled,
+- **So nothing called it — until §11.3o, which is the answer to this.** What
+  follows describes the state this section was written in.
+  `crates/tobii-cli/src/proton.rs` was kept, uncalled,
   with that written at the top of it: the plan, the quoting, the ordering, the
   reap and the exit code are right and were measured, and what they need is a
   target Proton waits on — an `.exe` of ours that starts the provider and then
@@ -1731,6 +1733,72 @@ manifests that does not follow the search box.
   list instead. GTK's own placeholder may well have worked; nothing here could
   check it, and a window that prints a paragraph explaining why it looks empty
   should not rest on a claim about a toolkit that no test can make.
+
+---
+
+### 11.3o The target Proton waits on (2026-09-29)
+
+§11.3l ends with *"what they need is a target Proton waits on — an `.exe` of
+ours that starts the provider and then the game. That is a Windows program to
+write, not a line to change."* It was already written. `bridge/provider` is a
+`[[bin]]` that cross-compiles to `x86_64-pc-windows-gnu`, and
+`tobii-bridge.exe` is one of the three files `tobii bridge install` puts in a
+prefix — so the missing piece was a flag on it, not a new program.
+
+`tobii-bridge.exe --launch <game.exe> <args…>` opens the mapping, binds the
+port, spawns the game on the main thread, serves on another, and exits with the
+game's code. `proton.rs` points `waitforexitandrun` at that instead of at a
+batch file, and `tobii game` calls `arrange`, which it never did before.
+
+**What this buys over the batch, and it is not only that Proton waits.**
+
+- Steam's bookkeeping stays correct. Playtime, the Stop button and the overlay
+  see a process that ends when the game does. The studied launcher accepts the
+  early return; its users accept a wrong playtime because opentrack keeps
+  running and the game keeps running. `tobii game` cannot: it releases the
+  tracker when it returns.
+- The reap is process exit. The batch needed `taskkill /IM`, which a signal can
+  skip, and a surviving helper is exactly the wine process that makes the next
+  launch's `wineserver -w` block. The provider is a thread of the process Proton
+  is waiting on and cannot outlive it.
+- The game's command line is argv. This deleted `batch_arg`, `batch`, `Once`
+  and `sweep` — about 170 lines — along with the `%`-doubling, the
+  trailing-backslash rule, the pid-named file, the sweep for files a signal left
+  behind, and the three refusals. **A game under a path with a quote, a control
+  character or a non-ASCII character could not be wrapped at all**; §11.3l
+  records that as a measured limit, and it is gone rather than worked around. A
+  test now asserts a path with a space, a percent and an umlaut in it is carried.
+
+**What is measured, and by what.** The provider's own behaviour — ordering,
+argument fidelity, exit code, reap — has an end-to-end test against real wine,
+`e2e_the_provider_runs_the_game_passes_its_arguments_and_ends_with_it`, ignored
+and gated on `TOBII_PROTON_E2E` because it needs wine, a built
+`tobii-bridge.exe` and a stub game. Headlessly: that Proton is pointed at the
+provider and the game keeps its own arguments, that a prefix without the
+provider declines and says where it looked, that a launch with no
+`STEAM_COMPAT_DATA_PATH` declines rather than guessing, and that anything which
+is not a Proton launch is handed straight back.
+
+**What is not measured, and it is the same gap §11.3l named.**
+
+- **Nobody here has run this against real Proton.** §11.3l's own lesson is that
+  the ordering was measured against plain wine and plain wine is not what runs
+  the game. That lesson applies to this in full. What is different is that the
+  specific thing which broke the batch — `ShellExecuteW` not waiting — cannot
+  apply to an `.exe` target, and that *was* measured on four Proton builds, with
+  an `.exe` control that returned the game's exit code after the full run. The
+  control is the evidence; the configuration itself is untested.
+- **That a game then receives tracking.** An answering client and a filled
+  mapping are two conditions and this project has measured neither together.
+  For a signature-gated title our own DLL is refused (§11.3j), so the
+  configuration that could work is a third-party client answering the check with
+  our provider filling the mapping behind it — which is the reading §11.3l gives
+  for the one user report of MSFS 2024 working, with their tracker rather than
+  ours. Nothing here has watched it.
+- **That `FT_SharedMem` crosses the boundary.** The mechanism says one
+  `waitforexitandrun`, therefore one wineserver, therefore one namespace.
+  Nothing on this machine can watch the mapping opened by the provider being
+  read by a client DLL in the same launch.
 
 ---
 
