@@ -1697,6 +1697,15 @@ manifests that does not follow the search box.
   suite on this machine rather than 8. Fixing them is its own piece of work:
   both would need a settle-and-retry around the measurement, and neither is
   about the Games list.
+- **The census had no guard at all until after the tag.** `census_line` is pure
+  and its wording is asserted headlessly, but which count `rebuild` hands it is
+  a choice — `cat.installed` is what Steam lists, `cat.rows.len()` is that plus
+  the games added by hand, and both compile. Nothing in the tree would have
+  failed on the wrong one: the unit tests called `census_line` themselves, so
+  they were testing the function and not the window. `tests/games_filter.rs`
+  reads the label now, over a fixture built so the two numbers differ, and the
+  substitution was mutation-tested — it reports "3 titles installed" and the
+  test fails. Landed after v0.6.0, so v0.6.0 itself shipped without it.
 - **`recheck` is wired and not exercised end to end.** A review found that a
   job finishing left the row it was about stale — the pane re-stats the prefix
   on every `refresh`, the rows carried what the catalogue said when the tab was

@@ -109,6 +109,7 @@ struct Seen {
     placeholder_when_some_show: Option<bool>,
     placeholder_when_none_show: Option<bool>,
     placeholder_text: String,
+    census: String,
     troubles: Vec<String>,
 }
 
@@ -186,6 +187,9 @@ fn the_filter_hides_rows_without_removing_them_and_an_empty_list_says_why() {
                         return;
                     };
                     s.before = rows(&list);
+                    s.census = named::<gtk::Label>(r.upcast_ref(), game_setup::CENSUS_NAME)
+                        .map(|l| l.text().to_string())
+                        .unwrap_or_default();
                     // Down it goes, which is all a user does.
                     toggle.set_active(true);
                     s.filtered = rows(&list);
@@ -293,6 +297,20 @@ fn the_filter_hides_rows_without_removing_them_and_an_empty_list_says_why() {
         "the toggle path must not touch a row's classes. Today it structurally \
          cannot — the dim is applied once where rows are built — so this pins that \
          rather than catching a change to it: {s:#?}"
+    );
+
+    // The census counts what Steam lists, and this fixture is built so that
+    // the two plausible numbers differ: Steam names two titles and the list
+    // holds three rows, the third being the game added by hand. `census_line`
+    // is pure and its wording is asserted headlessly; which count `rebuild`
+    // hands it is a choice only a widget can be asked about, and until this
+    // assertion existed nothing in the tree would have failed if that choice
+    // had been `cat.rows.len()`.
+    assert!(
+        s.census.starts_with("2 titles installed"),
+        "the census is of Steam's manifests, not of the rows on screen — three rows, \
+         two installed titles: {:?}",
+        s.census
     );
 
     assert_eq!(

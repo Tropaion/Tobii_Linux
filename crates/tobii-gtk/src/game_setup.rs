@@ -147,9 +147,18 @@ const HEADING: &str = "Set up a game";
 pub const SEARCH_NAME: &str = "gamesetup-search";
 /// The list of games, likewise.
 pub const LIST_NAME: &str = "gamesetup-games";
-/// The paragraph that stands where the rows would be, likewise — and the one
-/// the display test is really about. See [`nothing_showing`].
+/// The paragraph that stands where the rows would be, likewise. See
+/// [`nothing_showing`].
 pub const PLACEHOLDER_NAME: &str = "gamesetup-nothing-showing";
+/// The line under the list, likewise — and the only place the number `rebuild`
+/// hands [`census_line`] can be checked at all.
+///
+/// `census_line` is pure and its wording is asserted headlessly, but which
+/// count it is given is `rebuild`'s choice: `cat.installed` says what Steam
+/// lists, `cat.rows.len()` would say that plus the games somebody added by
+/// hand, and both compile. Nothing could tell them apart until a test read the
+/// label.
+pub const CENSUS_NAME: &str = "gamesetup-census";
 
 /// How wide the list of games asks to be, and how wide the detail pane does.
 ///
@@ -1005,9 +1014,11 @@ fn nothing_showing(query: &str, only_set_up: bool, missing: &[PathBuf]) -> Strin
 ///
 /// It carried the census and the directory notes too, until the window stopped
 /// reading them from here: `rebuild` asks [`census_line`] and [`Catalog::notes`]
-/// directly, because neither follows the query. Four tests went on asserting
-/// over the copies, which meant four tests guarding a field nothing shipped —
-/// so they ask `census_line` now, which is what the window calls.
+/// directly, because neither follows the query. The tests went on asserting
+/// over the copies, which meant tests guarding a field nothing shipped — so
+/// they ask `census_line` now, which is what the window calls, and
+/// `tests/games_filter.rs` reads the label itself, which is the only place the
+/// number `rebuild` chooses can be checked.
 pub(crate) fn picker(
     catalog: &Catalog,
     missing: &[PathBuf],
@@ -3472,6 +3483,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     list_scroll.set_child(Some(&list_and_empty));
 
     let census = small("");
+    census.set_widget_name(CENSUS_NAME);
     // Under the census and usually not there at all: what is in the profiles
     // directory and is not a profile. Hidden rather than empty, so it takes no
     // height on the machines — almost all of them — with nothing to say.
@@ -4720,10 +4732,6 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // Safe for the lifetime: `recheck` reaches every handler-carrying widget
     // through `downgrade()`, so nothing under `content` holds `content` back.
     {
-        // The same four lines `recheck` is, and they were written out twice —
-        // which is the shape of the defect `recheck` was added to fix, one
-        // level up. A re-read that lives in two places is a re-read somebody
-        // adds a step to in one of them.
         let recheck = recheck.clone();
         content.connect_map(move |_| recheck());
     }
@@ -7232,15 +7240,19 @@ mod tests {
         );
         assert!(!quiet_warn, "{quiet}");
 
-        // The rows can be narrowed to one — by a query or by the filter — and
-        // the census is still of two, because it is not built from them.
+        // The rows narrow — by a query, and by the filter — while the census
+        // takes no query at all and structurally cannot follow them.
+        //
+        // This used to end in `assert_eq!(census_line(c.installed, &[]).0,
+        // quiet)` under the heading "the census is of the machine, not of the
+        // search", which is `f(x) == f(x)` for a pure function over a value
+        // nothing mutated: it could not fail, and the sentence it carried was
+        // not being checked by anything. What `census_line`'s signature does
+        // guarantee is that the search box cannot reach it. What it does NOT
+        // guarantee is that `rebuild` hands it the right number, and no unit
+        // test can — see `tests/games_filter.rs`, which reads the label.
         assert_eq!(picker(&c, &[], "One", false).rows.len(), 1);
         assert_eq!(picker(&c, &[], "", true).rows.len(), 0);
-        assert_eq!(
-            census_line(c.installed, &[]).0,
-            quiet,
-            "the census is of the machine, not of the search"
-        );
 
         let one = catalog(&apps[..1], &nothing_set_up);
         assert!(
