@@ -596,10 +596,17 @@ impl Picked {
 /// This used to suppress two more, for the rows of the *Set up, not installed
 /// here* section — a game on a drive that is not plugged in has no prefix and
 /// nothing to send tracking to. Those rows are no longer listed, so the arm
-/// that hid the first two blocks had no row left to hide them for. It was
-/// deleted rather than left compiling and unentered, which is what the type
-/// would otherwise have become: a struct with three fields of which two were
-/// constant.
+/// that hid the first two blocks had no row left to hide them for, and was
+/// deleted rather than left compiling and unentered.
+///
+/// **Which does leave a struct of three fields of which two are constant**, and
+/// that is worth stating rather than letting a reader discover it and assume it
+/// was missed. It is kept as a type because it is the named, tested seam for
+/// "which blocks does a row of this kind get", and the answer stopped being
+/// constant once before. A third origin is not far-fetched — the hand-added
+/// path exists for games Steam never sold, and a Lutris or Heroic row would
+/// arrive the same way — and this is where that decision belongs. Collapsing it
+/// to a bool at the call site saves two fields and costs the seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Blocks {
     pub settings: bool,
@@ -621,11 +628,6 @@ pub(crate) fn blocks(origin: Origin) -> Blocks {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Picker {
     pub rows: Vec<PickRow>,
-    /// The line under the list, always present: what this list is a list of.
-    pub census: String,
-    /// Whether the census is a warning rather than a statement — true exactly
-    /// when a library Steam names is not on this machine.
-    pub census_warn: bool,
     /// What to show instead of rows when the query matched nothing.
     ///
     /// [`None`] when there are rows. It repeats the missing-library sentence
@@ -633,14 +635,6 @@ pub(crate) struct Picker {
     /// own and got nothing back, which is the exact moment a silent list
     /// becomes a lie.
     pub no_match: Option<String>,
-    /// [`directory_notes`], carried through unchanged. One line each, under
-    /// the census, and usually none at all.
-    ///
-    /// Not filtered by the query, and that is deliberate: a file in the
-    /// profiles directory that could not be read is not a search result, and a
-    /// warning that disappeared when somebody typed would be a warning about
-    /// their typing.
-    pub notes: Vec<String>,
 }
 
 /// What is in the profiles directory and is not a profile this page can use.
@@ -1008,6 +1002,12 @@ fn nothing_showing(query: &str, only_set_up: bool, missing: &[PathBuf]) -> Strin
 /// read and narrowed by [`keeps`] through `set_filter_func` — but the model
 /// does, and it is what the tests assert over. `rows` is what is showing,
 /// `no_match` is what stands where they would be when nothing is.
+///
+/// It carried the census and the directory notes too, until the window stopped
+/// reading them from here: `rebuild` asks [`census_line`] and [`Catalog::notes`]
+/// directly, because neither follows the query. Four tests went on asserting
+/// over the copies, which meant four tests guarding a field nothing shipped —
+/// so they ask `census_line` now, which is what the window calls.
 pub(crate) fn picker(
     catalog: &Catalog,
     missing: &[PathBuf],
@@ -1021,17 +1021,10 @@ pub(crate) fn picker(
         .filter(|(row, lower)| keeps(row, lower, &q, only_set_up))
         .map(|(row, _)| row.clone())
         .collect();
-    let (census, census_warn) = census_line(catalog.installed, missing);
     let no_match = rows
         .is_empty()
         .then(|| nothing_showing(query, only_set_up, missing));
-    Picker {
-        rows,
-        census,
-        census_warn,
-        no_match,
-        notes: catalog.notes.clone(),
-    }
+    Picker { rows, no_match }
 }
 
 /// A first name for a prefix somebody has just picked.
@@ -4278,9 +4271,10 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // game on this machine has the bridge installed yet", six inches from a pane
     // reporting the bridge it had installed thirty seconds earlier.
     //
-    // It is the tab-switch read, paid at the one other moment the answer can
-    // change. Not on the report button, which starts nothing and changes
-    // nothing.
+    // It is one function and not two because the tab-switch hook below calls
+    // it as well — a re-read written out in two places is a re-read somebody
+    // adds a step to in one of them, which is this very defect one level up.
+    // Not on the report button, which starts nothing and changes nothing.
     let recheck: Rc<dyn Fn()> = {
         let (catalog, scan, rebuild, refresh) = (
             catalog.clone(),
@@ -4723,22 +4717,15 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     // The query is taken from the search box rather than reset, so coming back
     // to a filtered list finds it as it was left.
     //
-    // Safe for the lifetime: both closures reach every handler-carrying widget
+    // Safe for the lifetime: `recheck` reaches every handler-carrying widget
     // through `downgrade()`, so nothing under `content` holds `content` back.
     {
-        let (refresh, rebuild, catalog, scan) = (
-            refresh.clone(),
-            rebuild.clone(),
-            catalog.clone(),
-            scan.clone(),
-        );
-        let search_w = search.downgrade();
-        content.connect_map(move |_| {
-            *catalog.borrow_mut() = read_catalog(&scan);
-            let q = search_w.upgrade().map(|e| e.text().to_string());
-            rebuild(q.as_deref().unwrap_or(""));
-            refresh();
-        });
+        // The same four lines `recheck` is, and they were written out twice —
+        // which is the shape of the defect `recheck` was added to fix, one
+        // level up. A re-read that lives in two places is a re-read somebody
+        // adds a step to in one of them.
+        let recheck = recheck.clone();
+        content.connect_map(move |_| recheck());
     }
 
     GamesTab {
@@ -5557,16 +5544,20 @@ mod tests {
         // Three rows — two from Steam and one added by hand — and a profile
         // for a title that is in none of them.
         assert_eq!(picker(&c, &[], "", false).rows.len(), 3);
+        // Asked of `census_line`, which is what `rebuild` calls — the census
+        // is not on `Picker` any more, precisely so that a test cannot pass by
+        // reading a copy the window never shows.
         for (query, only, why) in [
             ("", false, "nothing typed"),
             ("alpha", false, "a query that narrows to one"),
             ("", true, "a filter that hides every row"),
         ] {
-            let p = picker(&c, &[], query, only);
+            let showing = picker(&c, &[], query, only).rows.len();
+            let (census, _) = census_line(c.installed, &[]);
             assert!(
-                p.census.starts_with("2 titles installed"),
-                "{why}: the census follows the search box, and it must not: {}",
-                p.census
+                census.starts_with("2 titles installed"),
+                "{why} (showing {showing}): the census follows the search box, and it \
+                 must not: {census}"
             );
         }
     }
@@ -5940,7 +5931,7 @@ mod tests {
         assert!(!text.contains("cannot rule out"), "{text}");
         assert!(!text.contains("not on this machine"), "{text}");
         assert!(
-            !p.census_warn,
+            !census_line(1, &[]).1,
             "no library is missing, so nothing to warn about"
         );
     }
@@ -7233,47 +7224,39 @@ mod tests {
     #[test]
     fn the_census_counts_the_titles_and_warns_only_when_a_library_is_gone() {
         let apps = [app("1", "One"), app("2", "Two")];
-        let quiet = picker(&catalog(&apps, &nothing_set_up), &[], "", false);
+        let c = catalog(&apps, &nothing_set_up);
+        let (quiet, quiet_warn) = census_line(c.installed, &[]);
         assert!(
-            quiet.census.starts_with("2 titles"),
-            "it counts every installed title, not the filtered rows: {}",
-            quiet.census
+            quiet.starts_with("2 titles"),
+            "it counts every installed title: {quiet}"
         );
-        assert!(!quiet.census_warn, "{}", quiet.census);
+        assert!(!quiet_warn, "{quiet}");
 
-        // Filtered down to one row, and still a census of two.
-        let filtered = picker(&catalog(&apps, &nothing_set_up), &[], "One", false);
-        assert_eq!(filtered.rows.len(), 1);
+        // The rows can be narrowed to one — by a query or by the filter — and
+        // the census is still of two, because it is not built from them.
+        assert_eq!(picker(&c, &[], "One", false).rows.len(), 1);
+        assert_eq!(picker(&c, &[], "", true).rows.len(), 0);
         assert_eq!(
-            filtered.census, quiet.census,
+            census_line(c.installed, &[]).0,
+            quiet,
             "the census is of the machine, not of the search"
         );
 
-        let one = picker(&catalog(&apps[..1], &nothing_set_up), &[], "", false);
+        let one = catalog(&apps[..1], &nothing_set_up);
         assert!(
-            one.census.starts_with("1 title"),
+            census_line(one.installed, &[]).0.starts_with("1 title"),
             "singular: {}",
-            one.census
+            census_line(one.installed, &[]).0
         );
 
-        let warned = picker(
-            &catalog(&apps, &nothing_set_up),
-            &[PathBuf::from("/mnt/games2")],
-            "",
-            false,
-        );
+        let (warned, warned_warn) = census_line(c.installed, &[PathBuf::from("/mnt/games2")]);
         assert!(
-            warned.census_warn,
+            warned_warn,
             "a library Steam names and this machine does not have is what the warning is \
-             for: {}",
-            warned.census
+             for: {warned}"
         );
-        assert!(warned.census.contains("/mnt/games2"), "{}", warned.census);
-        assert!(
-            warned.census.contains("2 titles"),
-            "and it still counts: {}",
-            warned.census
-        );
+        assert!(warned.contains("/mnt/games2"), "{warned}");
+        assert!(warned.contains("2 titles"), "and it still counts: {warned}");
     }
 
     /// What the detail pane says on an empty machine. The list beside it has no
