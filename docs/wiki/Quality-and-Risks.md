@@ -1779,26 +1779,59 @@ provider declines and says where it looked, that a launch with no
 `STEAM_COMPAT_DATA_PATH` declines rather than guessing, and that anything which
 is not a Proton launch is handed straight back.
 
-**What is not measured, and it is the same gap §11.3l named.**
+**Measured against real Proton (2026-09-29).** §11.3l's lesson is that the
+ordering was measured against plain wine and plain wine is not what runs the
+game, so this was measured against Proton itself:
+`proton-cachyos-slr` from `/usr/share/steam/compatibilitytools.d`, invoked
+directly with `waitforexitandrun`, a scratch `STEAM_COMPAT_DATA_PATH` and a
+`STEAM_COMPAT_CLIENT_INSTALL_PATH` pointing at an empty directory of the test's
+own. No Steam install, real prefix or game was touched. The "game" is a 12-line
+C stub that writes its `argv` one bracketed value per line and returns 7.
 
-- **Nobody here has run this against real Proton.** §11.3l's own lesson is that
-  the ordering was measured against plain wine and plain wine is not what runs
-  the game. That lesson applies to this in full. What is different is that the
-  specific thing which broke the batch — `ShellExecuteW` not waiting — cannot
-  apply to an `.exe` target, and that *was* measured on four Proton builds, with
-  an `.exe` control that returned the game's exit code after the full run. The
-  control is the evidence; the configuration itself is untested.
-- **That a game then receives tracking.** An answering client and a filled
-  mapping are two conditions and this project has measured neither together.
-  For a signature-gated title our own DLL is refused (§11.3j), so the
-  configuration that could work is a third-party client answering the check with
-  our provider filling the mapping behind it — which is the reading §11.3l gives
-  for the one user report of MSFS 2024 working, with their tracker rather than
-  ours. Nothing here has watched it.
-- **That `FT_SharedMem` crosses the boundary.** The mechanism says one
-  `waitforexitandrun`, therefore one wineserver, therefore one namespace.
-  Nothing on this machine can watch the mapping opened by the provider being
-  read by a client DLL in the same launch.
+- **A control first**, the same one §11.3l used: a plain `.exe` target returns
+  the game's exit code after the full run. `proton_rc=7`.
+- **`tobii-bridge.exe --launch <game.exe> <args…>` as Proton's target returns 7
+  as well.** The game's exit code travels through the provider, through Proton,
+  to the shell. This is the thing pointing Proton at a `.bat` could not do, and
+  the reason `tobii game` could not use the batch: it returns when Proton
+  returns, and it releases the tracker when it returns.
+- **The game's arguments arrive intact**: `-w indowed`, `100%` and
+  `say "hello"` came back bracketed and byte-identical. Under the batch the
+  first two needed rules and the third could not be carried at all.
+- **The provider opens the mapping and binds the port, in the host's own
+  network namespace.** `127.0.0.1:4243` was `UNCONN` and held by our `main` and
+  the prefix's `wineserver`, visible to `ss` on the Linux side, and
+  `/proc/<pid>/ns/net` was `net:[4026531833]` for the provider and for the host
+  shell alike. That is the step the register called reasoned rather than
+  watched: a provider started this way is where a datagram from Linux can reach
+  it. (An earlier sweep saw nothing and was wrong about why — a cold Proton
+  prefix takes some twenty seconds to build before the target runs at all.)
+- **Both end together.** No wine process outlived the run; the port was free
+  afterwards.
+
+**Still not measured, and the list is shorter but not empty.**
+
+- **That a game reads `FT_SharedMem`.** The stub does not look. An answering
+  client and a filled mapping remain two conditions this project has never
+  measured together, and for a signature-gated title our own DLL is refused
+  (§11.3j) — so the configuration that could work is a third-party client
+  answering the check with our provider behind it, which is the reading §11.3l
+  gives for the one user report of MSFS 2024 working.
+- **That a datagram sent from Linux is received and published.** The socket is
+  bound and reachable in principle; nothing sent one.
+- **Steam's own bookkeeping.** Proton was invoked directly, not through Steam,
+  so playtime, the Stop button and the overlay were not observed. That Proton
+  waits is what they depend on, and that is measured; that they then behave is
+  not.
+- **Steam's runtime container.** A real launch enters it through
+  `_v2-entry-point` before Proton runs. This did not, so the namespace result
+  above is Proton's own and not the container's.
+- **One build, one machine.** `proton-cachyos-slr` only, against §11.3l's four
+  builds for the `.bat` measurement.
+- **Non-ASCII arguments are untested either way.** A path with an umlaut came
+  back mangled, and the stub is the likely cause — it reads ANSI `argv` rather
+  than `GetCommandLineW` — but that was not run down, so nothing here claims
+  the round trip works.
 
 ---
 

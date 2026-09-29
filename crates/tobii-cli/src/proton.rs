@@ -30,7 +30,12 @@
 //! a control character or anything non-ASCII, all measured, so a game under a
 //! path with an umlaut in it could not be wrapped at all.
 //!
-//! `docs/wiki/Quality-and-Risks.md` §11.3l has the measurements.
+//! `docs/wiki/Quality-and-Risks.md` §11.3l has the measurements that killed the
+//! batch, and §11.3o those for this: against real Proton, pointing
+//! `waitforexitandrun` at the provider returns the game's exit code after the
+//! full run, the game's arguments arrive byte-identical, and the provider's
+//! mapping and port come up in the host's own network namespace. What is still
+//! unwatched is a game reading the mapping — that is a title, not a mechanism.
 //!
 //! # The ordering problem, in one paragraph
 //!
