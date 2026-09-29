@@ -53,7 +53,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential ca-certificates curl git pkg-config \
             libgtk-4-dev libgtk4-layer-shell-dev libusb-1.0-0-dev \
-            python3-yaml
+            python3-yaml gcc-mingw-w64-x86-64
 
       - uses: actions/checkout@v5
 
@@ -89,6 +89,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            bridge/target
           key: cargo-${{ runner.os }}-trixie-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-trixie-
 
@@ -104,6 +105,25 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+      # The Wine bridge is a separate workspace that cross-compiles to
+      # x86_64-pc-windows-gnu, deliberately outside `cargo build` and
+      # `cargo clippy --workspace` so that anyone without the mingw toolchain
+      # can still build everything else. The cost of that is that nothing above
+      # this line compiles it, and between v0.5.0 and v0.6.0 it stopped
+      # compiling at all: `tobii-config` grew a module using
+      # `std::os::unix::ffi::OsStrExt`, `tobii-output` depends on that crate and
+      # the bridge depends on `tobii-output`, so the whole Wine side failed to
+      # build from a clean checkout and every check here stayed green.
+      #
+      # A full build rather than `cargo check`, because the bridge is three
+      # cdylib/bin targets and a link error is the other half of what can go
+      # wrong when a Linux-only path reaches Windows code.
+      - name: Install the Windows target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: build the Wine bridge
+        run: bash scripts/build-bridge.sh
 
       # The install scripts have no compiler checking them, and the root
       # refusal, the manifest and the autostart repair are exactly the things

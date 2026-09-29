@@ -17,6 +17,22 @@
 pub mod autostart;
 mod calibration_state;
 /// Games this machine has that Steam does not list: a name and a Wine prefix.
+///
+/// Linux-only, and that is load-bearing rather than tidy. This module writes
+/// and reads prefix paths **byte for byte**, through
+/// `std::os::unix::ffi::OsStrExt`, so a path this program cannot decode
+/// survives a round trip through the hub. Windows has no byte view of an
+/// `OsStr` — its paths are UTF-16 — so the guarantee cannot be kept there and
+/// the code does not compile there either.
+///
+/// That matters because of who else is downstream: `tobii-output` depends on
+/// this crate, and the Wine bridge depends on `tobii-output` and cross-compiles
+/// to `x86_64-pc-windows-gnu`. Without this gate the whole bridge fails to
+/// build, which is exactly what happened between this module landing and
+/// v0.6.0 — `scripts/build-bridge.sh` is deliberately outside `cargo build` and
+/// CI does not run it, so nothing said so. Nothing on the Wine side reads a
+/// list of hand-added games; the gate costs that side nothing.
+#[cfg(unix)]
 pub mod custom_games;
 mod edid;
 /// Every name this program writes, and the XDG directories they go in.
