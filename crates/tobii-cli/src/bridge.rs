@@ -1483,8 +1483,14 @@ fn shell_quoted(p: &Path) -> String {
 /// words having been silently dropped as positionals. The one line in the
 /// report whose entire job is to survive a round trip through the clipboard has
 /// to survive a title with a space in it, and Steam titles have spaces.
+///
+/// Borrowed rather than written, for the reason `tobii-gtk` borrowed it: this
+/// crate already reaches `shell_word` in `uninstall.rs`, under the alias
+/// `sh_quote`, and the two copies disagreed — a path needing no quotes came out
+/// `'/opt/x'` here and `/opt/x` there, in two commands a reader is meant to
+/// compare.
 fn quoted(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+    tobii_update::install::shell_word(s)
 }
 
 /// One key install will not write into, and everything the refusal is allowed
@@ -3644,7 +3650,7 @@ mod tests {
         assert!(err.contains("--wine"), "and the way past it: {err}");
         assert!(err.contains("--force"), "and the other one: {err}");
         assert!(
-            err.contains("'8888'"),
+            err.contains("8888"),
             "spelled with this run's own title: {err}"
         );
 
@@ -6829,9 +6835,9 @@ exit 0
         let mut s = steam_status("2537590");
         s.dir_present = Presence::Yes;
         let out = render_status(&s);
-        assert!(out.contains("Steam, from `--steam '2537590'`"), "{out}");
+        assert!(out.contains("Steam, from `--steam 2537590`"), "{out}");
         assert!(
-            out.contains("tobii bridge uninstall --steam '2537590'"),
+            out.contains("tobii bridge uninstall --steam 2537590"),
             "{out}"
         );
         assert!(
@@ -6894,7 +6900,7 @@ exit 0
     fn an_empty_prefix_is_handed_the_command_that_fills_it() {
         let out = render_status(&steam_status("2537590"));
         let fills = out
-            .find("tobii bridge install --steam '2537590'")
+            .find("tobii bridge install --steam 2537590")
             .unwrap_or_else(|| panic!("no install line in {out}"));
         assert!(
             out.find("tobii bridge uninstall --steam")

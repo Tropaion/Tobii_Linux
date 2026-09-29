@@ -114,8 +114,8 @@ column with:
 cargo test --workspace --offline --locked 2>&1 | grep -E 'Running|test result'
 ```
 
-The ignored 17 are 7 in `tobii-headpose` (they need the 13 MB model), 1 in
-`tobii-output`, 1 in `tobii-cli`, and 8 in `tobii-gtk` (they need a display).
+The ignored 18 are 7 in `tobii-headpose` (they need the 13 MB model), 1 in
+`tobii-output`, 1 in `tobii-cli`, and 9 in `tobii-gtk` (they need a display).
 CI runs as root with no display, which is why the display tests are
 `#[ignore]`d rather than skipped at runtime. Run them with:
 
@@ -125,7 +125,7 @@ scripts/display-tests.sh games_tab  # one
 ```
 
 That starts a nested `kwin_wayland --virtual` with a socket of its own and
-runs the seven files against it. **Never the session's compositor**: they
+runs the eight files against it. **Never the session's compositor**: they
 present windows, take focus and drive keys. A socket per run matters —
 `keep_awake_switch` failed for a week against a shared one and passes against
 a fresh one.

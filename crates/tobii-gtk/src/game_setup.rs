@@ -285,7 +285,7 @@ fn missing_note(missing: &[PathBuf]) -> Option<String> {
 /// games which were found on the pc" — and the fact they carried is not lost:
 /// [`orphan_profiles_note`] says how many there are and names the command that
 /// reads them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Origin {
     /// Steam lists the title as installed on this machine.
     Steam,
@@ -344,7 +344,7 @@ impl RowBridge {
     /// list draws at full strength.
     ///
     /// The one place the three states fold to two, so the list, the filter and
-    /// the toggle's own caption cannot disagree about what "set up" means.
+    /// the toggle's own tooltip cannot disagree about what "set up" means.
     pub(crate) fn set_up(self) -> bool {
         matches!(self, RowBridge::Installed)
     }
@@ -879,7 +879,7 @@ pub(crate) fn orphan_profiles_note(apps: &[App], listing: &profiles::Listing) ->
     (n > 0).then(|| {
         format!(
             "{n} {thing} here {is} for {games} Steam does not list on this machine. The \
-             profile is not lost: it applies again the moment Steam lists the game. \
+             profiles are not lost: each applies again the moment Steam lists its game. \
              `tobii games profile show` names every profile here.",
             thing = plural(n, "profile", "profiles"),
             is = if n == 1 { "is" } else { "are" },
@@ -3574,9 +3574,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
     game.append(&g_title);
     game.append(&g_sub);
 
-    // What stands in for the first two blocks when Steam does not list the
-    // title here — a whole group of the list, and the one case where those two
-    // block has no true answer. See `added_by_hand_text`.
+    // What stands in for block 3 on a game added by hand — the one block with
+    // no true answer for a row that has no app id. See `added_by_hand_text`.
     //
     // A box of its own, with its own divider, so that showing it is one
     // `set_visible` and hiding it is one more: three widgets toggled instead of
