@@ -96,6 +96,39 @@ const RECENTRE_MIN_POSES: usize = 10;
 /// refused for moving, never for being off-axis.
 const RECENTRE_MAX_SPREAD_DEG: f64 = tobii_headpose::MOVED_SPREAD_DEG;
 
+/// How far the head may sit from the neutral position, in millimetres, and
+/// still have auto-centre pull the neutral toward it.
+///
+/// The translation counterpart of `AutoCentre::window_deg`. A lean further than
+/// this is a lean the user means — peering at an instrument, ducking under a
+/// canopy bow — and adapting toward it would slowly erase the movement they are
+/// making. 80 mm is past the few centimetres a seated posture wanders over a
+/// session and well short of a deliberate lean.
+const AUTO_CENTRE_WINDOW_MM: f64 = 80.0;
+
+/// The part of the screen, as a fraction of its width and height either side
+/// of the middle, that auto-centre counts as "looking at the centre".
+///
+/// ±20% is the middle 40% of the screen each way: where the eyes rest when the
+/// user is looking straight ahead at the game, not at a minimap or a gauge.
+const AUTO_CENTRE_GAZE_BOX: f64 = 0.2;
+
+/// The longest gap between two frames that auto-centre will integrate over,
+/// in seconds. A stall is not a second of the user sitting still.
+const AUTO_CENTRE_MAX_DT_S: f64 = 0.2;
+
+/// How far from the middle of the screen, as a fraction of its width and
+/// height either side, a recentre's gaze may sit and still be adopted as the
+/// Extended View centre.
+///
+/// ±30% is the middle 60% each way. Inside it, the user was looking at the
+/// middle and the tracker placed it a little off — gaze calibration error on a
+/// wide panel is easily a fifth of its width — and that error is exactly what
+/// should be zeroed. Outside it, they pressed the key while glancing at a side
+/// window or a gauge, and adopting that glance as "straight ahead" would bake
+/// it in until the next recentre; the gaze reference is then left as it was.
+const RECENTRE_GAZE_BOX: f64 = 0.3;
+
 /// What a rotation recentre did, for whoever asked for it to report.
 ///
 /// Both refusals name what went wrong rather than the user simply seeing
@@ -106,6 +139,7 @@ pub enum RecentreOutcome {
     /// The reference moved. The angles are what now reads as straight ahead.
     Applied {
         yaw_deg: f64,
+        pitch_deg: f64,
         roll_deg: f64,
         spread_deg: f64,
     },
@@ -135,11 +169,14 @@ impl std::fmt::Display for RecentreOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecentreOutcome::Applied {
-                yaw_deg, roll_deg, ..
+                yaw_deg,
+                pitch_deg,
+                roll_deg,
+                ..
             } => write!(
                 f,
-                "recentred — {yaw_deg:+.1}° of yaw and {roll_deg:+.1}° of roll now read as \
-                 straight ahead"
+                "recentred — {yaw_deg:+.1}° yaw, {pitch_deg:+.1}° pitch, {roll_deg:+.1}° roll \
+                 and your current position now read as zero"
             ),
             RecentreOutcome::Moved { spread_deg } => write!(
                 f,
@@ -193,7 +230,18 @@ pub struct SuppliedPose {
 struct RecentreRun {
     started: Instant,
     yaw_deg: Vec<f64>,
+    pitch_deg: Vec<f64>,
     roll_deg: Vec<f64>,
+    /// Head position relative to the current neutral, x/y/z in mm. Collected
+    /// on every frame with a finite position, rotation held or not: a held
+    /// rotation still comes with freshly measured eye origins.
+    pos_mm: [Vec<f64>; 3],
+    /// Raw gaze angles (yaw, pitch) relative to the screen centre, before the
+    /// Extended View curve — where the user was looking while they held still.
+    gaze_deg: [Vec<f64>; 2],
+    /// The normalised gaze points behind `gaze_deg`, for the
+    /// [`RECENTRE_GAZE_BOX`] check.
+    gaze_xy: [Vec<f64>; 2],
 }
 
 /// The state carried between frames.
@@ -287,6 +335,28 @@ pub struct FramePipeline {
     ///   the geometric path has no pitch to reference in any case.
     /// * **Not taken from the composed pose.** See the module docs.
     rot_ref: Option<[f64; 2]>,
+    /// The pitch that reads as level, set by a recentre alongside
+    /// [`rot_ref`](Self::rot_ref).
+    ///
+    /// Separate from `rot_ref` so that auto-centre, which deliberately leaves
+    /// pitch alone, cannot move it. It sits on top of the measured zero from
+    /// `tobii headpose --calibrate-pitch` rather than replacing it: that one
+    /// corrects how the tracker is mounted, this one is where the user wants
+    /// "level" to be right now — and a recentre that left pitch off-centre
+    /// was, in use, a recentre that did not work.
+    pitch_ref: Option<f64>,
+    /// The gaze direction that reads as "looking straight ahead" for Extended
+    /// View: raw yaw and pitch, in degrees from the screen centre, set by a
+    /// recentre.
+    ///
+    /// Without it a recentre zeroed the head and left the gaze term alone, so
+    /// the joystick's yaw stayed off-centre whenever the tracker's idea of
+    /// "the middle of the screen" differed from where the user was actually
+    /// looking — a few degrees of gaze calibration error on a wide panel is
+    /// tens of degrees of Extended View. Subtracted from the raw angle, before
+    /// the deadzone and curve, so the response keeps its full shape around the
+    /// new centre rather than being shifted up or down it.
+    gaze_ref: Option<(f64, f64)>,
     /// The stamp on the last [`SuppliedPose`] this pipeline was handed.
     ///
     /// Compared, not aged: the caller has already decided how stale a held
@@ -298,6 +368,15 @@ pub struct FramePipeline {
     recentre: Option<RecentreRun>,
     /// The last finished recentre, until somebody takes it.
     last_recentre: Option<RecentreOutcome>,
+    /// When the last pose went into the filter: the adaptive filter turns a
+    /// change into a speed with it, and auto-centre integrates over it.
+    last_frame_at: Option<Instant>,
+    /// The last pose that went out, for the output slew limit
+    /// ([`OutputConfig::filter_max_rot_speed_deg_s`]).
+    last_out: Option<HeadPose>,
+    /// The last smoothed pose before the curves shaped it, for a curve editor
+    /// to mark where the head is on each curve.
+    last_curve_input: Option<HeadPose>,
 }
 
 /// What the one-eye fallback has done this session.
@@ -328,7 +407,7 @@ impl FramePipeline {
     /// A pipeline smoothing at the configured strength.
     pub fn new(cfg: &OutputConfig) -> Self {
         FramePipeline {
-            filter: PoseFilter::with_max_step_mm(cfg.filter_alpha, cfg.filter_max_step_mm),
+            filter: PoseFilter::with_smoothing(cfg.smoothing(), cfg.filter_max_step_mm),
             last_ev: None,
             gaze_lost_since: None,
             last_tracked: None,
@@ -336,9 +415,14 @@ impl FramePipeline {
             pair: PairOffset::new(),
             stats: FallbackStats::default(),
             rot_ref: None,
+            pitch_ref: None,
+            gaze_ref: None,
             last_rotation_at: None,
             recentre: None,
             last_recentre: None,
+            last_frame_at: None,
+            last_out: None,
+            last_curve_input: None,
         }
     }
 
@@ -353,7 +437,11 @@ impl FramePipeline {
         self.recentre = Some(RecentreRun {
             started: now,
             yaw_deg: Vec::new(),
+            pitch_deg: Vec::new(),
             roll_deg: Vec::new(),
+            pos_mm: [Vec::new(), Vec::new(), Vec::new()],
+            gaze_deg: [Vec::new(), Vec::new()],
+            gaze_xy: [Vec::new(), Vec::new()],
         });
     }
 
@@ -414,9 +502,19 @@ impl FramePipeline {
             // for it, and a median taken over one is not a median. Dropping
             // either kind also costs the run those frames, so a window full of
             // them is refused for having too few poses — which is the truth.
-            if !rotation_held && head.yaw_deg.is_finite() && head.roll_deg.is_finite() {
+            if !rotation_held
+                && head.yaw_deg.is_finite()
+                && head.pitch_deg.is_finite()
+                && head.roll_deg.is_finite()
+            {
                 run.yaw_deg.push(head.yaw_deg);
+                run.pitch_deg.push(head.pitch_deg);
                 run.roll_deg.push(head.roll_deg);
+            }
+            for (v, x) in run.pos_mm.iter_mut().zip([head.x_mm, head.y_mm, head.z_mm]) {
+                if x.is_finite() {
+                    v.push(x);
+                }
             }
             // The window-close check sits outside that gate on purpose: a run
             // whose second runs out during an outage must still be able to
@@ -426,11 +524,17 @@ impl FramePipeline {
                 self.last_recentre = Some(self.settle(run));
             }
         }
-        match self.rot_ref {
+        let head = match self.rot_ref {
             Some([yaw, roll]) => HeadPose {
                 yaw_deg: head.yaw_deg - yaw,
                 roll_deg: head.roll_deg - roll,
-                // Pitch is untouched, deliberately. See `rot_ref`.
+                ..head
+            },
+            None => head,
+        };
+        match self.pitch_ref {
+            Some(pitch) => HeadPose {
+                pitch_deg: head.pitch_deg - pitch,
                 ..head
             },
             None => head,
@@ -461,11 +565,122 @@ impl FramePipeline {
             return RecentreOutcome::Moved { spread_deg };
         }
         self.rot_ref = Some([yaw_deg, roll_deg]);
+        let (pitch_deg, _) = median_and_spread(&mut run.pitch_deg);
+        self.pitch_ref = Some(pitch_deg);
+        // Position: re-take the neutral at the median of the window, so
+        // translation reads zero too. The samples are relative to the neutral
+        // in use, so the median is the correction to it.
+        // Gaze: only when the window saw enough of it. Without gaze (no display
+        // geometry, eyes not tracked) the previous gaze reference stands.
+        let near_middle = run.gaze_xy.iter_mut().all(|v| {
+            v.len() >= RECENTRE_MIN_POSES
+                && (median_and_spread(v).0 - 0.5).abs() <= RECENTRE_GAZE_BOX
+        });
+        if near_middle && run.gaze_deg.iter().all(|v| v.len() >= RECENTRE_MIN_POSES) {
+            let gy = median_and_spread(&mut run.gaze_deg[0]).0;
+            let gp = median_and_spread(&mut run.gaze_deg[1]).0;
+            self.gaze_ref = Some((gy, gp));
+        }
+        if let Some(n) = self.neutral.as_mut() {
+            for (axis, v) in n.iter_mut().zip(run.pos_mm.iter_mut()) {
+                if v.len() >= RECENTRE_MIN_POSES {
+                    *axis += median_and_spread(v).0;
+                }
+            }
+        }
         RecentreOutcome::Applied {
             yaw_deg,
+            pitch_deg,
             roll_deg,
             spread_deg,
         }
+    }
+
+    /// Automatic recentring: nudge the neutral and the rotation reference a
+    /// little toward the pose the user is holding right now.
+    ///
+    /// # When it adapts
+    ///
+    /// Only when all of these hold, because each one is a sign the user is
+    /// sitting the way they mean to sit rather than looking somewhere on
+    /// purpose:
+    ///
+    /// * the user is **looking near the middle of the screen**
+    ///   ([`AUTO_CENTRE_GAZE_BOX`]) — the moment of play where "straight ahead"
+    ///   is unambiguous, and the reason a deliberate glance at a side window
+    ///   does not get absorbed;
+    /// * the head's yaw and roll, measured against the current reference, are
+    ///   **inside `window_deg`** — a big turn is a turn;
+    /// * the head's position is inside [`AUTO_CENTRE_WINDOW_MM`] of the
+    ///   neutral — a big lean is a lean;
+    /// * **no manual recentre is measuring**, whose result would otherwise be
+    ///   mixed with this one.
+    ///
+    /// # How much
+    ///
+    /// A first-order pull with time constant `time_s`: each frame closes
+    /// `1 - e^(-dt/time_s)` of the gap. At the default eight seconds a 10°
+    /// offset is down to under 4° after eight seconds of looking at the middle
+    /// of the screen and under 1.5° after sixteen — slow enough not to be felt
+    /// as motion, fast enough to undo a posture change within a minute.
+    ///
+    /// Rotation adapts only on frames that **measured** it (not a held model
+    /// rotation, not a one-eye reconstruction), for the same reason the manual
+    /// settle window refuses them. Pitch is left alone, as with the manual
+    /// reference: it has its own measured zero.
+    ///
+    /// `head` is the head term after the neutral is subtracted and before the
+    /// rotation reference is, which is the quantity both references are
+    /// measured in.
+    fn auto_centre(
+        &mut self,
+        cfg: &OutputConfig,
+        head: HeadPose,
+        gaze: Option<[f64; 2]>,
+        rotation_held: bool,
+        dt_s: f64,
+    ) {
+        let ac = &cfg.auto_centre;
+        if !ac.enabled || self.recentre.is_some() || !ac.time_s.is_finite() || ac.time_s <= 0.0 {
+            return;
+        }
+        let Some([gx, gy]) = gaze else { return };
+        if (gx - 0.5).abs() > AUTO_CENTRE_GAZE_BOX || (gy - 0.5).abs() > AUTO_CENTRE_GAZE_BOX {
+            return;
+        }
+        let [ref_yaw, ref_roll] = self.rot_ref.unwrap_or([0.0, 0.0]);
+        let (d_yaw, d_roll) = (head.yaw_deg - ref_yaw, head.roll_deg - ref_roll);
+        let offset_mm =
+            (head.x_mm * head.x_mm + head.y_mm * head.y_mm + head.z_mm * head.z_mm).sqrt();
+        if !(d_yaw.abs() <= ac.window_deg && d_roll.abs() <= ac.window_deg)
+            || offset_mm.is_nan()
+            || offset_mm > AUTO_CENTRE_WINDOW_MM
+        {
+            return;
+        }
+        let dt = dt_s.clamp(0.0, AUTO_CENTRE_MAX_DT_S);
+        let k = 1.0 - (-dt / ac.time_s).exp();
+        if !rotation_held {
+            self.rot_ref = Some([ref_yaw + k * d_yaw, ref_roll + k * d_roll]);
+        }
+        let t_pos = if ac.translation_time_s.is_finite() && ac.translation_time_s > 0.0 {
+            ac.translation_time_s
+        } else {
+            ac.time_s
+        };
+        let k_pos = 1.0 - (-dt / t_pos).exp();
+        if let Some(n) = self.neutral.as_mut() {
+            n[0] += k_pos * head.x_mm;
+            n[1] += k_pos * head.y_mm;
+            n[2] += k_pos * head.z_mm;
+        }
+    }
+
+    /// The pose the head curves were last applied to: smoothed, recentred,
+    /// Extended View composed in, not yet shaped. `None` before the first
+    /// tracked frame and after a tracking loss.
+    pub fn curve_input(&self) -> Option<HeadPose> {
+        self.last_curve_input
     }
 
     /// How many of this session's frames the one-eye fallback carried.
@@ -490,7 +705,7 @@ impl FramePipeline {
     /// `filter_max_step_mm`), and a setter that named only one of them would
     /// quietly reset the other to its default every time the strength changed.
     pub fn set_filter(&mut self, cfg: &OutputConfig) {
-        self.filter = PoseFilter::with_max_step_mm(cfg.filter_alpha, cfg.filter_max_step_mm);
+        self.filter = PoseFilter::with_smoothing(cfg.smoothing(), cfg.filter_max_step_mm);
     }
 
     /// Compose one frame.
@@ -568,12 +783,22 @@ impl FramePipeline {
         let pose = incoming.map(|raw| {
             let (ev_yaw, ev_pitch) = match (cfg.extended_view.enabled, corners, gaze) {
                 (true, Some(c), Some(g)) => {
-                    let ev = fusion::extended_view(
-                        &cfg.extended_view,
-                        &c,
-                        [raw.x_mm, raw.y_mm, raw.z_mm],
-                        g,
-                    );
+                    let eye = [raw.x_mm, raw.y_mm, raw.z_mm];
+                    let angles = fusion::gaze_angles_deg(&c, eye, g);
+                    if let (Some((gy, gp)), Some(run)) = (angles, self.recentre.as_mut()) {
+                        run.gaze_deg[0].push(gy);
+                        run.gaze_deg[1].push(gp);
+                        run.gaze_xy[0].push(g[0]);
+                        run.gaze_xy[1].push(g[1]);
+                    }
+                    let (ry, rp) = self.gaze_ref.unwrap_or((0.0, 0.0));
+                    let ev = match angles {
+                        Some((gy, gp)) => (
+                            cfg.extended_view.yaw.shape(gy - ry),
+                            cfg.extended_view.pitch.shape(gp - rp),
+                        ),
+                        None => (0.0, 0.0),
+                    };
                     self.last_ev = Some(ev);
                     self.gaze_lost_since = None;
                     ev
@@ -611,11 +836,31 @@ impl FramePipeline {
                 z_mm: raw.z_mm - neutral[2],
                 ..raw
             };
+            let dt_s = self
+                .last_frame_at
+                .map_or(tobii_headpose::filter::NOMINAL_DT_S, |t| {
+                    now.saturating_duration_since(t).as_secs_f64()
+                });
+            self.last_frame_at = Some(now);
+            let head = centred;
             let centred = self.rereference(centred, rotation_held, now);
+            // After this frame's reference has been applied, so a change shows
+            // from the next frame on and never as a step inside this one.
+            self.auto_centre(cfg, head, gaze, rotation_held, dt_s);
             // Compose first, then filter once: smoothing head and gaze
             // separately would leave the two contributions out of phase.
-            self.filter
-                .update(fusion::compose(centred, ev_yaw, ev_pitch))
+            let smoothed = self
+                .filter
+                .update_dt(fusion::compose(centred, ev_yaw, ev_pitch), dt_s);
+            // Curves next: they shape what the user sees, so their deadzone is
+            // measured from the centre the user sees, after the noise is gone.
+            self.last_curve_input = Some(smoothed);
+            let shaped = cfg.head_curves.apply(smoothed);
+            // And the slew limit last, on exactly what goes out, so a gain in
+            // the curves cannot multiply a step back past it.
+            let out = slew_limit(self.last_out, shaped, cfg, dt_s);
+            self.last_out = Some(out);
+            out
         });
 
         if pose.is_some() {
@@ -624,6 +869,9 @@ impl FramePipeline {
             let lost_for = self.last_tracked.map(|t| now.saturating_duration_since(t));
             if lost_for.is_none_or(|d| d >= TRACKING_LOSS_RESET) {
                 self.filter.reset();
+                self.last_frame_at = None;
+                self.last_out = None;
+                self.last_curve_input = None;
                 self.last_tracked = None;
                 self.last_ev = None;
                 // Dropped with the rest of the state: whoever comes back is
@@ -662,6 +910,39 @@ impl FramePipeline {
             gaze,
             presence,
         }
+    }
+}
+
+/// Move `prev` toward `next` by no more than the configured speed limits allow
+/// in `dt_s`, axis by axis.
+///
+/// The first pose after a reset passes straight through: there is nothing to
+/// limit against, and ramping in from zero would sweep the view on every
+/// sit-down.
+fn slew_limit(prev: Option<HeadPose>, next: HeadPose, cfg: &OutputConfig, dt_s: f64) -> HeadPose {
+    let Some(prev) = prev else { return next };
+    // A stall is not time the head had to travel in.
+    let dt = if dt_s.is_finite() {
+        dt_s.clamp(0.0, 0.2)
+    } else {
+        tobii_headpose::filter::NOMINAL_DT_S
+    };
+    let step = |old: f64, new: f64, speed: f64| {
+        if !(speed.is_finite() && speed > 0.0) {
+            return new;
+        }
+        let max = speed * dt;
+        old + (new - old).clamp(-max, max)
+    };
+    let r = cfg.filter_max_rot_speed_deg_s;
+    let t = cfg.filter_max_move_speed_mm_s;
+    HeadPose {
+        yaw_deg: step(prev.yaw_deg, next.yaw_deg, r),
+        pitch_deg: step(prev.pitch_deg, next.pitch_deg, r),
+        roll_deg: step(prev.roll_deg, next.roll_deg, r),
+        x_mm: step(prev.x_mm, next.x_mm, t),
+        y_mm: step(prev.y_mm, next.y_mm, t),
+        z_mm: step(prev.z_mm, next.z_mm, t),
     }
 }
 
@@ -738,10 +1019,20 @@ mod tests {
         })
     }
 
+    /// The composition under test, without the two output-stage effects that
+    /// have tests of their own: the slew limit and the mirrored x axis. With
+    /// them on, every test here that steps a pose would be measuring the
+    /// limiter, and every sign check on x the mirror.
     fn cfg(ev: bool) -> OutputConfig {
         OutputConfig {
             extended_view: ExtendedView {
                 enabled: ev,
+                ..Default::default()
+            },
+            filter_max_rot_speed_deg_s: f64::INFINITY,
+            filter_max_move_speed_mm_s: f64::INFINITY,
+            head_curves: crate::curves::HeadCurves {
+                invert: [false; 6],
                 ..Default::default()
             },
             ..Default::default()
@@ -1285,10 +1576,11 @@ mod tests {
         at
     }
 
-    /// Frames in a settle window, plus enough after it for the exponential
-    /// average to have followed the step the new reference makes (0.75^40 ≈
-    /// 1e-5 of it left at the default alpha).
-    const WINDOW_FRAMES: usize = 40;
+    /// Frames in a settle window, plus enough after it for the filter to have
+    /// followed the step the new reference makes. Sized for the adaptive
+    /// filter at its default rest cutoff, the slower of the two smoothers: the
+    /// step opens it, and it then closes in on the target at ~0.07 a frame.
+    const WINDOW_FRAMES: usize = 60;
 
     /// The point of the whole thing. A user sitting off the tracker's axis has
     /// a permanent in-game bias, and before this there was no control that
@@ -1318,6 +1610,7 @@ mod tests {
                 yaw_deg,
                 roll_deg,
                 spread_deg,
+                ..
             }) => {
                 assert!((yaw_deg - OFF_AXIS_YAW_DEG).abs() < 0.01, "yaw {yaw_deg}");
                 assert!((roll_deg + 3.0).abs() < 0.01, "roll {roll_deg}");
@@ -1518,10 +1811,47 @@ mod tests {
         );
     }
 
-    /// Pitch has a measured zero of its own, saved on disk and applied inside
-    /// the model. A second reference for the same angle would fight it.
+    /// And position: somebody who shifted 40 mm to the side since tracking
+    /// started reads zero on X after a recentre, not the 40 mm they moved.
     #[test]
-    fn a_recentre_never_touches_pitch() {
+    fn a_recentre_zeroes_position_too() {
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let start = Instant::now();
+        // Neutral taken here.
+        p.offer(&head_at(0.0, 0.0), None, &c, None, start);
+        let mut moved = head_at(0.0, 0.0);
+        moved.eye_origin_l_mm[0] += 40.0;
+        moved.eye_origin_r_mm[0] += 40.0;
+        let mut at = start + CADENCE;
+        // Let the filter settle on the move, then recentre.
+        for _ in 0..200 {
+            p.offer(&moved, None, &c, None, at);
+            at += CADENCE;
+        }
+        let before = p.offer(&moved, None, &c, None, at).pose.expect("a pose");
+        assert!((before.x_mm - 40.0).abs() < 1.0, "premise: {before:?}");
+        p.begin_recentre(at);
+        for _ in 0..WINDOW_FRAMES * 2 {
+            at += CADENCE;
+            p.offer(&moved, None, &c, None, at);
+        }
+        assert!(matches!(
+            p.take_recentre(),
+            Some(RecentreOutcome::Applied { .. })
+        ));
+        for _ in 0..200 {
+            at += CADENCE;
+            p.offer(&moved, None, &c, None, at);
+        }
+        let after = p.offer(&moved, None, &c, None, at).pose.expect("a pose");
+        assert!(after.x_mm.abs() < 0.5, "X should read zero: {after:?}");
+    }
+
+    /// A recentre zeroes pitch too: a recentre that left any head axis
+    /// off-centre read, in use, as a recentre that did not work.
+    #[test]
+    fn a_recentre_zeroes_pitch_too() {
         let c = cfg(false);
         let mut p = FramePipeline::new(&c);
         let sample = head_at(OFF_AXIS_YAW_DEG, 0.0);
@@ -1548,8 +1878,8 @@ mod tests {
             .pose
             .expect("a pose");
         assert!(
-            (after.pitch_deg - 12.0).abs() < 0.01,
-            "pitch must keep its own zero: {after:?}"
+            after.pitch_deg.abs() < 0.01,
+            "pitch was referenced: {after:?}"
         );
         assert!(after.yaw_deg.abs() < 0.01, "yaw was referenced: {after:?}");
     }
@@ -1948,5 +2278,179 @@ mod tests {
             held.z_mm.abs() < 0.01,
             "the jump limit was lost when the strength changed: {held:?}"
         );
+    }
+
+    /// Run `secs` of frames with the head held at `yaw` (a fresh measurement
+    /// every frame) and gaze at `gaze`, and return the last output yaw.
+    fn hold_yaw(
+        p: &mut FramePipeline,
+        c: &OutputConfig,
+        start: Instant,
+        yaw: f64,
+        gaze: [f64; 2],
+        secs: f64,
+    ) -> f64 {
+        let frames = (secs / 0.030).round() as u32;
+        let mut out = f64::NAN;
+        for i in 0..frames {
+            let at = start + Duration::from_millis(30 * i as u64);
+            let head = HeadPose {
+                yaw_deg: yaw,
+                z_mm: 680.0,
+                ..Default::default()
+            };
+            out = p
+                .offer(&tracked_sample(Some(gaze)), supplied(head, at), c, None, at)
+                .pose
+                .expect("a pose")
+                .yaw_deg;
+        }
+        out
+    }
+
+    fn auto(on: bool) -> OutputConfig {
+        let mut c = cfg(false);
+        c.auto_centre.enabled = on;
+        c
+    }
+
+    /// The point of auto-centre: somebody sat 10° off the tracker's axis,
+    /// looking at the middle of their screen, drifts back to centre on their
+    /// own — and with it off, they do not.
+    #[test]
+    fn auto_centre_pulls_a_constant_offset_back_to_centre() {
+        let start = Instant::now();
+        let mut off = FramePipeline::new(&auto(false));
+        let stuck = hold_yaw(&mut off, &auto(false), start, 10.0, [0.5, 0.5], 30.0);
+        assert!(
+            (stuck - 10.0).abs() < 0.1,
+            "premise: without it the offset stays, got {stuck}"
+        );
+
+        let mut on = FramePipeline::new(&auto(true));
+        let after = hold_yaw(&mut on, &auto(true), start, 10.0, [0.5, 0.5], 30.0);
+        assert!(
+            after.abs() < 1.0,
+            "30 s at an 8 s time constant should leave <1°, got {after}"
+        );
+        let r = on.rotation_reference().expect("a reference was built");
+        assert!((r[0] - 10.0).abs() < 1.0, "{r:?}");
+    }
+
+    /// Looking at the edge of the screen is a look, not a posture.
+    #[test]
+    fn auto_centre_leaves_alone_a_user_looking_off_centre() {
+        let start = Instant::now();
+        let mut p = FramePipeline::new(&auto(true));
+        let out = hold_yaw(&mut p, &auto(true), start, 10.0, [0.9, 0.5], 30.0);
+        assert!((out - 10.0).abs() < 0.1, "got {out}");
+    }
+
+    /// And a big turn is a turn, wherever the eyes are.
+    #[test]
+    fn auto_centre_leaves_alone_a_turn_past_its_window() {
+        let start = Instant::now();
+        let c = auto(true);
+        let mut p = FramePipeline::new(&c);
+        let turn = c.auto_centre.window_deg + 10.0;
+        let out = hold_yaw(&mut p, &c, start, turn, [0.5, 0.5], 30.0);
+        assert!((out - turn).abs() < 0.1, "got {out}");
+    }
+
+    /// Curves reach the outgoing frame: a yaw deadzone wider than the head's
+    /// turn sends exactly zero.
+    #[test]
+    fn head_curves_shape_the_outgoing_pose() {
+        let start = Instant::now();
+        let mut c = cfg(false);
+        c.head_curves.axis_mut("yaw").unwrap().deadzone_deg = 5.0;
+        let mut p = FramePipeline::new(&c);
+        assert_eq!(hold_yaw(&mut p, &c, start, 4.0, [0.5, 0.5], 1.0), 0.0);
+        let mut q = FramePipeline::new(&cfg(false));
+        assert!(
+            hold_yaw(&mut q, &cfg(false), start, 4.0, [0.5, 0.5], 1.0) > 3.9,
+            "premise"
+        );
+    }
+
+    /// A step in the pose leaves as a sweep at the configured speed, not a cut.
+    #[test]
+    fn the_output_never_moves_faster_than_its_speed_limit() {
+        let c = OutputConfig {
+            filter_max_rot_speed_deg_s: 60.0,
+            ..cfg(false)
+        };
+        let step = Duration::from_millis(30);
+        let prev = HeadPose::default();
+        let next = HeadPose {
+            yaw_deg: 40.0,
+            x_mm: -1.0,
+            ..HeadPose::default()
+        };
+        let out = slew_limit(Some(prev), next, &c, step.as_secs_f64());
+        assert!((out.yaw_deg - 1.8).abs() < 1e-9, "{out:?}");
+        assert_eq!(out.x_mm, -1.0, "a small move is not held back");
+        assert_eq!(slew_limit(None, next, &c, 0.03), next, "first pose passes");
+    }
+
+    /// The whole output reads zero after a recentre, Extended View included:
+    /// a user whose gaze the tracker places 15° left of the screen centre while
+    /// they look at it gets a yaw of zero, not 15° of Extended View on top.
+    #[test]
+    fn a_recentre_zeroes_the_gaze_term_too() {
+        let c = cfg(true);
+        let mut p = FramePipeline::new(&c);
+        let start = Instant::now();
+        // Gaze reported well left of the middle while the head is square.
+        let mut s = head_at(0.0, 0.0);
+        s.gaze_point_2d = [0.25, 0.5];
+        let mut at = start;
+        for _ in 0..100 {
+            p.offer(&s, None, &c, Some(corners()), at);
+            at += CADENCE;
+        }
+        let before = p
+            .offer(&s, None, &c, Some(corners()), at)
+            .pose
+            .expect("a pose");
+        assert!(
+            before.yaw_deg < -5.0,
+            "premise: Extended View pulls yaw: {before:?}"
+        );
+        p.begin_recentre(at);
+        for _ in 0..WINDOW_FRAMES * 2 {
+            at += CADENCE;
+            p.offer(&s, None, &c, Some(corners()), at);
+        }
+        assert!(matches!(
+            p.take_recentre(),
+            Some(RecentreOutcome::Applied { .. })
+        ));
+        for _ in 0..200 {
+            at += CADENCE;
+            p.offer(&s, None, &c, Some(corners()), at);
+        }
+        let after = p
+            .offer(&s, None, &c, Some(corners()), at)
+            .pose
+            .expect("a pose");
+        assert!(after.yaw_deg.abs() < 0.5, "yaw should read zero: {after:?}");
+        assert!(
+            after.pitch_deg.abs() < 0.5,
+            "pitch should read zero: {after:?}"
+        );
+
+        // And looking away from that new centre still swings the view.
+        let mut right = s.clone();
+        right.gaze_point_2d = [0.6, 0.5];
+        for _ in 0..200 {
+            at += CADENCE;
+            p.offer(&right, None, &c, Some(corners()), at);
+        }
+        let look = p
+            .offer(&right, None, &c, Some(corners()), at)
+            .pose
+            .expect("a pose");
+        assert!(look.yaw_deg > 5.0, "Extended View still responds: {look:?}");
     }
 }

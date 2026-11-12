@@ -4614,7 +4614,10 @@ mod tests {
                 "bridge_port" => "4243",
                 "ev_hold_ms" => "150",
                 "filter_alpha" => "0.3",
+                "filter_mode" => "ema",
+                "auto_centre" => "true",
                 k if k.ends_with("_curve") => "linear",
+                k if k.ends_with("_invert") => "true",
                 _ => "3",
             };
             assert!(

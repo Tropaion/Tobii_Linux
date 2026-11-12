@@ -273,6 +273,31 @@ pub(crate) const RECENTRE_TOOLTIP: &str =
      still for a second while it measures. Games with their own centring key \
      still have it; this fixes a tracker that is not quite square to you.";
 
+/// What the Auto-centre checkbox does, on the checkbox and its row.
+pub(crate) const AUTO_CENTRE_TOOLTIP: &str =
+    "Slowly pull \u{201c}straight ahead\u{201d} toward the way you are actually sitting, \
+     so the view stops creeping off to one side over a session. It only adapts while \
+     you look near the middle of the screen with your head close to straight, so a \
+     deliberate look or lean is never absorbed. Its pace and range are in the Tuning \
+     window.";
+
+/// The recentre-key row, on COSMIC.
+pub(crate) const SHORTCUT_TOOLTIP: &str =
+    "A COSMIC keyboard shortcut that recentres the view, even while a game has \
+     focus. It appears in COSMIC Settings › Keyboard › Custom shortcuts, where it \
+     can also be changed.";
+
+/// The recentre-key row, everywhere else.
+pub(crate) const SHORTCUT_ELSEWHERE_TOOLTIP: &str =
+    "The hub can only set this key for you on COSMIC. On other desktops, add a \
+     custom keyboard shortcut that runs `tobii recentre`.";
+
+/// The Tuning… button.
+pub(crate) const TUNING_TOOLTIP: &str =
+    "Opens the tuning window: a response-curve editor for each of the six axes, with \
+     a live dot showing where your head is on the curve, the smoothing and speed \
+     limits, auto-centre's pace, and whether gaze steers the camera.";
+
 /// What the virtual joystick is, on the control and not only on the box that
 /// lays it out.
 ///
@@ -349,6 +374,143 @@ fn check_row(text: &str) -> (CheckButton, gtk::Box) {
     (cb, row)
 }
 
+/// The recentre shortcut row: what is bound, and the buttons to change it.
+///
+/// See [`crate::shortcut`] for why this writes a COSMIC custom shortcut rather
+/// than grabbing a key, and why it cannot be offered elsewhere.
+fn shortcut_row(recentring: Recentring) -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Horizontal, 8);
+    let name = Label::new(Some("Recentre key"));
+    name.set_valign(Align::Center);
+    let value = Label::new(None);
+    value.add_css_class("readout-value");
+    value.set_valign(Align::Center);
+    value.set_hexpand(true);
+    value.set_halign(Align::Start);
+    row.append(&name);
+    row.append(&value);
+
+    if !crate::shortcut::is_cosmic() {
+        value.set_text("bind `tobii recentre` in your desktop's keyboard settings");
+        value.set_wrap(true);
+        row.set_tooltip_text(Some(SHORTCUT_ELSEWHERE_TOOLTIP));
+        return row;
+    }
+
+    let show = {
+        let value = value.clone();
+        move || {
+            value.set_text(
+                &crate::shortcut::current()
+                    .map(|b| b.display())
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+        }
+    };
+    show();
+    row.set_tooltip_text(Some(SHORTCUT_TOOLTIP));
+
+    let set = crate::widget::button("Set key…");
+    let clear = crate::widget::button("Clear");
+    {
+        let show = show.clone();
+        let recentring = recentring.clone();
+        clear.connect_clicked(move |_| {
+            let msg = match crate::shortcut::set(None) {
+                Ok(()) => "recentre key removed".to_string(),
+                Err(e) => e,
+            };
+            recentring.report(msg, Instant::now());
+            show();
+        });
+    }
+    set.connect_clicked(move |b| {
+        capture_key(b, show.clone(), recentring.clone());
+    });
+    row.append(&set);
+    row.append(&clear);
+    row
+}
+
+/// A small window that takes the next key combination pressed and binds it.
+fn capture_key(anchor: &gtk::Button, show: impl Fn() + Clone + 'static, recentring: Recentring) {
+    let win = gtk::Window::new();
+    win.set_title(Some("Recentre key"));
+    win.set_modal(true);
+    win.set_resizable(false);
+    if let Some(root) = anchor.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
+        win.set_transient_for(Some(&root));
+    }
+    let msg = Label::new(Some(
+        "Press the key combination that should recentre the view.\n\
+         Esc cancels.",
+    ));
+    msg.set_wrap(true);
+    msg.set_max_width_chars(40);
+    msg.set_justify(gtk::Justification::Center);
+    msg.set_margin_top(24);
+    msg.set_margin_bottom(24);
+    msg.set_margin_start(24);
+    msg.set_margin_end(24);
+    win.set_child(Some(&msg));
+
+    let keys = gtk::EventControllerKey::new();
+    {
+        let win = win.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            use gtk::gdk::{Key, ModifierType};
+            let name = key
+                .to_lower()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            // A modifier on its own is the start of a combination, not one.
+            if name.is_empty()
+                || name.starts_with("Shift_")
+                || name.starts_with("Control_")
+                || name.starts_with("Alt_")
+                || name.starts_with("Super_")
+                || name.starts_with("Meta_")
+                || name.starts_with("ISO_Level3")
+            {
+                return glib::Propagation::Stop;
+            }
+            let mut mods = Vec::new();
+            if state.contains(ModifierType::SUPER_MASK) {
+                mods.push("Super");
+            }
+            if state.contains(ModifierType::CONTROL_MASK) {
+                mods.push("Ctrl");
+            }
+            if state.contains(ModifierType::ALT_MASK) {
+                mods.push("Alt");
+            }
+            if state.contains(ModifierType::SHIFT_MASK) {
+                mods.push("Shift");
+            }
+            if key == Key::Escape && mods.is_empty() {
+                win.close();
+                return glib::Propagation::Stop;
+            }
+            let binding = crate::shortcut::Binding::new(&mods, &name);
+            match crate::shortcut::set(Some(&binding)) {
+                Ok(()) => {
+                    recentring.report(
+                        format!("recentre key set to {}", binding.display()),
+                        Instant::now(),
+                    );
+                    show();
+                    win.close();
+                }
+                Err(e) => msg.set_text(&format!("{e}.\n\nTry another, or press Esc.")),
+            }
+            glib::Propagation::Stop
+        });
+    }
+    win.add_controller(keys);
+    win.present();
+}
+
 /// Read the settings, change them, write them back.
 ///
 /// Every write re-reads the file first. Three controls edit the same config —
@@ -377,6 +539,7 @@ pub struct GamesRow {
     /// ends up contradicting the sentence directly beneath it.
     enabled: Switch,
     joy: CheckButton,
+    auto_centre: CheckButton,
     strength: Vec<CheckButton>,
     joystick: Arc<Mutex<JoystickStatus>>,
     /// The recentre button, so [`GamesRow::refresh`] can make it insensitive
@@ -416,6 +579,7 @@ impl GamesRow {
         joystick: Arc<Mutex<JoystickStatus>>,
         recentring: Recentring,
         demand: Demand,
+        live: crate::tuning::Live,
     ) -> GamesRow {
         let cfg = load_output_config();
 
@@ -511,6 +675,22 @@ impl GamesRow {
             });
         }
 
+        // On a row of its own rather than beside the joystick checkbox and the
+        // recentre button: that row is already as wide as this column may get
+        // without widening the whole hub (see the note further down).
+        let (auto_centre, auto_row) = check_row("Auto-centre");
+        auto_centre.set_active(cfg.auto_centre.enabled);
+        auto_centre.set_tooltip_text(Some(AUTO_CENTRE_TOOLTIP));
+        auto_row.set_tooltip_text(Some(AUTO_CENTRE_TOOLTIP));
+        {
+            let refresh = refresh.clone();
+            auto_centre.connect_toggled(move |c| {
+                let on = c.is_active();
+                edit_config("auto-centre setting", |cfg| cfg.auto_centre.enabled = on);
+                refresh();
+            });
+        }
+
         // A button, not a setting: it acts on the pose being sent right now,
         // and it is the only control in this window that does.
         let tracker_on = Rc::new(Cell::new(false));
@@ -586,6 +766,16 @@ impl GamesRow {
         second.append(&joy_row);
         second.append(&recentre);
         controls.append(&second);
+        // The tuning window: gaze, smoothing and the curve editor. On the
+        // recentre-key row, which is already button-tall: on the auto-centre
+        // row it cost the card 18px of height.
+        let tune = crate::widget::button("Tuning…");
+        tune.set_tooltip_text(Some(TUNING_TOOLTIP));
+        tune.connect_clicked(move |b| crate::tuning::open(b, live.clone()));
+        controls.append(&auto_row);
+        let keys = shortcut_row(recentring.clone());
+        keys.append(&tune);
+        controls.append(&keys);
         controls.append(&status);
 
         let row = GamesRow {
@@ -593,6 +783,7 @@ impl GamesRow {
             status,
             enabled: sw,
             joy,
+            auto_centre,
             strength: buttons,
             joystick,
             recentre,
@@ -624,6 +815,9 @@ impl GamesRow {
         }
         if self.joy.is_active() != cfg.joystick {
             self.joy.set_active(cfg.joystick);
+        }
+        if self.auto_centre.is_active() != cfg.auto_centre.enabled {
+            self.auto_centre.set_active(cfg.auto_centre.enabled);
         }
         if let Some(i) = strength_index(&cfg) {
             if let Some(b) = self.strength.get(i) {
@@ -995,6 +1189,7 @@ mod tests {
     fn an_outcome_reads_as_a_sentence_without_being_reworded() {
         let applied = tobii_output::pipeline::RecentreOutcome::Applied {
             yaw_deg: 17.4,
+            pitch_deg: 3.0,
             roll_deg: -0.2,
             spread_deg: 0.3,
         }

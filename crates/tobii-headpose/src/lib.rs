@@ -73,7 +73,7 @@ pub mod preprocess;
 /// too. Kept here so `tobii_headpose::sha256` still resolves.
 pub use tobii_config::sha256;
 
-pub use filter::PoseFilter;
+pub use filter::{PoseFilter, Smoothing};
 pub use model::{ModelConfig, ModelKind, PoseModel};
 pub use opentrack::to_opentrack_datagram;
 

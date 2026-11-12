@@ -13,6 +13,7 @@
 //! Everything here is `std`-only and free of device access, so the whole
 //! routing layer is unit-testable with literal numbers and no hardware.
 
+pub mod curves;
 pub mod frame;
 pub mod freetrack;
 pub mod fusion;
@@ -22,6 +23,7 @@ pub mod pipeline;
 pub mod sinks;
 pub mod trackir;
 
+pub use curves::HeadCurves;
 pub use frame::TrackingFrame;
 pub use fusion::{AxisResponse, Curve, ExtendedView};
 

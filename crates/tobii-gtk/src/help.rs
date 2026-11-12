@@ -302,6 +302,9 @@ pub fn topics() -> Vec<Topic> {
                  Strength — {strength}.\n\n\
                  Virtual joystick — {joystick}\n\n\
                  Recentre view — {recentre}\n\n\
+                 Auto-centre — {auto_centre}\n\n\
+                 Recentre key — {shortcut} {shortcut_elsewhere}\n\n\
+                 Tuning — {tuning}\n\n\
                  It is greyed out when it cannot be taken, and the row's tooltip \
                  says why. A reason reads like one of these:\n{refusals}\n\n\
                  More than one thing can be holding the tracker at once, and then \
@@ -315,6 +318,10 @@ pub fn topics() -> Vec<Topic> {
                 strength = crate::games::STRENGTH_TOOLTIP,
                 joystick = crate::games::JOYSTICK_TOOLTIP,
                 recentre = crate::games::RECENTRE_TOOLTIP,
+                auto_centre = crate::games::AUTO_CENTRE_TOOLTIP,
+                shortcut = crate::games::SHORTCUT_TOOLTIP,
+                shortcut_elsewhere = crate::games::SHORTCUT_ELSEWHERE_TOOLTIP,
+                tuning = crate::games::TUNING_TOOLTIP,
                 refusals = refusals,
             ),
         ),
@@ -1244,6 +1251,10 @@ mod tests {
             crate::games::STRENGTH_TOOLTIP.to_string(),
             crate::games::JOYSTICK_TOOLTIP.to_string(),
             crate::games::RECENTRE_TOOLTIP.to_string(),
+            crate::games::AUTO_CENTRE_TOOLTIP.to_string(),
+            crate::games::SHORTCUT_TOOLTIP.to_string(),
+            crate::games::SHORTCUT_ELSEWHERE_TOOLTIP.to_string(),
+            crate::games::TUNING_TOOLTIP.to_string(),
         ];
         // And the reasons the Recentre button greys itself out, which the
         // pointer user reads in the row's tooltip and nobody else could.

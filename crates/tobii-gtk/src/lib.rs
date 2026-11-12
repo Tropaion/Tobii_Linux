@@ -22,7 +22,9 @@ pub mod overlay;
 pub mod particles;
 pub mod screen_pick;
 pub mod setup_flow;
+pub mod shortcut;
 pub mod tray;
+pub mod tuning;
 pub mod update;
 pub mod widget;
 
@@ -1283,6 +1285,37 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let spacer = Label::new(Some(" "));
     readout.attach(&spacer, 2, 0, 1, 1);
 
+    // What the virtual joystick is sending, under the head pose it is made
+    // from: the two side by side are how somebody tuning curves and gains sees
+    // what their settings do, without a game open. Rows 4-7, under a heading
+    // on row 3, in the same two columns as the groups above.
+    let joy_heading = Label::new(Some("JOYSTICK OUTPUT"));
+    joy_heading.add_css_class("readout-name");
+    joy_heading.set_halign(Align::Start);
+    joy_heading.set_margin_top(8);
+    readout.attach(&joy_heading, 0, 3, 5, 1);
+    let joystick_cells: Vec<Vec<(Label, Label)>> = [(0i32, 12), (3, 9)]
+        .iter()
+        .map(|&(col, chars)| {
+            (0..4)
+                .map(|row| {
+                    let name = Label::new(None);
+                    name.add_css_class("readout-name");
+                    name.set_halign(Align::Start);
+                    name.set_xalign(0.0);
+                    let value = Label::new(None);
+                    value.add_css_class("readout-value");
+                    value.set_halign(Align::End);
+                    value.set_xalign(1.0);
+                    value.set_width_chars(chars);
+                    readout.attach(&name, col, 4 + row, 1, 1);
+                    readout.attach(&value, col + 1, 4 + row, 1, 1);
+                    (name, value)
+                })
+                .collect()
+        })
+        .collect();
+
     // --- Live data, as one card: the two views SIDE BY SIDE. ---
     //
     // Stacked, these two made the instrument twice as tall as any control
@@ -1775,8 +1808,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     ));
     // Beside "Head tracking" rather than in the cogwheel: it is about what the
     // tracker does, not about how this program behaves.
+    let curve_live: crate::tuning::Live = {
+        let state = state.clone();
+        Rc::new(move || state.lock().unwrap().curve_input)
+    };
     let games_row =
-        crate::games::GamesRow::build(joystick_status.clone(), recentring, demand.clone());
+        crate::games::GamesRow::build(joystick_status.clone(), recentring, demand.clone(), curve_live);
     col_games.append(&section(
         "Head tracking for games",
         // One line, and no instructions. Whatever this sentence said about how
@@ -2576,6 +2613,15 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
                             v.remove_css_class("readout-alert");
                         }
                     }
+                }
+            }
+            for (cells, rows) in joystick_cells
+                .iter()
+                .zip(widget::joystick_rows(snap.joystick_axes.filter(|_| conn)))
+            {
+                for ((n, v), r) in cells.iter().zip(rows) {
+                    n.set_text(r.label);
+                    v.set_text(&r.value);
                 }
             }
             // Camera preview: keep the last frame between device frames; update on a

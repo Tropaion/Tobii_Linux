@@ -536,9 +536,24 @@ pub struct GameOutput {
     /// is left. Cloned into every rebuild of this struct, so a request cannot
     /// be lost by the settings changing underneath it.
     recentring: Recentring,
+    /// The joystick, also held outside the router so the hub can show what it
+    /// last sent.
+    joystick: Option<JoystickHandle>,
 }
 
 impl GameOutput {
+    /// What the virtual joystick last reported, if it is attached and has
+    /// reported — see [`JoystickHandle::last_report`].
+    pub fn joystick_axes(&self) -> Option<[i32; 8]> {
+        self.joystick.as_ref().and_then(JoystickHandle::last_report)
+    }
+
+    /// The pose the head curves were last applied to — see
+    /// [`FramePipeline::curve_input`](tobii_output::pipeline::FramePipeline::curve_input).
+    pub fn curve_input(&self) -> Option<tobii_headpose::HeadPose> {
+        self.pipeline.curve_input()
+    }
+
     /// The output for this session, or `None` if game output is switched off.
     ///
     /// Off is the default, deliberately: a hub that started steering games the
@@ -592,7 +607,7 @@ impl GameOutput {
         }
         // Handed in, never created here: the device outlives any one session.
         // See `JoystickHandle`.
-        if let Some(js) = joystick {
+        if let Some(js) = joystick.clone() {
             router.add(Box::new(js));
         }
         if router.sink_count() == 0 {
@@ -611,6 +626,7 @@ impl GameOutput {
             cfg,
             router,
             recentring,
+            joystick,
         })
     }
 
@@ -636,14 +652,13 @@ impl GameOutput {
         // Both of the filter's settings, because rebuilding it from one of them
         // resets the other: `set_filter` takes the whole config for exactly
         // that reason. The pipeline is otherwise kept — see the doc above.
-        if (fresh.cfg.filter_alpha - self.cfg.filter_alpha).abs() > f64::EPSILON
-            || (fresh.cfg.filter_max_step_mm - self.cfg.filter_max_step_mm).abs() > f64::EPSILON
-        {
+        if fresh.cfg.filter_differs(&self.cfg) {
             self.pipeline.set_filter(&fresh.cfg);
         }
         self.cfg = fresh.cfg;
         self.router = fresh.router;
         self.corners = fresh.corners;
+        self.joystick = fresh.joystick;
         true
     }
 
