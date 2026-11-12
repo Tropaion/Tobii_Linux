@@ -70,6 +70,7 @@ fn main() -> ExitCode {
         (Some("cal-points"), _) => cal_points(),
         (Some("enabled-eye"), arg) => enabled_eye_cmd(arg),
         (Some("games"), sub) => games_cmd(sub, &args),
+        (Some("recentre" | "recenter"), _) => recentre_cmd(),
         _ => {
             eprintln!(
                 "usage:\n  \
@@ -78,6 +79,7 @@ fn main() -> ExitCode {
                  tobii stream [--json] [--eyes]\n  \
                  tobii game -- <command> [args...]\n  \
                  tobii games [set KEY VALUE]\n  \
+                 tobii recentre\n  \
                  tobii games profile show|save|apply|forget [<app id or name>]\n  \
                  tobii games profile check where|add|remove <app id or name>\n  \
                  tobii bridge install --prefix PATH\n  \
@@ -2011,6 +2013,46 @@ fn games_set(
         "{key} = {value:?} was not accepted.\nvalid keys: {}",
         tobii_output::games::OutputConfig::keys().join(", ")
     ))
+}
+
+/// Ask the running hub to recentre the head-tracking view.
+///
+/// The hub's socket has always accepted this request — the hub's own button
+/// and its tests use it — but nothing on the command line sent it, so there
+/// was no way to put a recentre on a key. This is that way: bind
+/// `tobii recentre` to a keyboard shortcut in the desktop's settings, which
+/// works under Wayland where a program cannot grab a global hotkey itself.
+///
+/// Connects with no subscriptions, so asking does not by itself switch the
+/// tracker on: a recentre only means something while a game is already
+/// receiving a pose, and the hub refuses it, saying why, when none is.
+///
+/// `ok` means the hub took the request, not that the reference moved: the
+/// one-second settle window has yet to run and can still refuse a head that
+/// does not hold still. That outcome appears on the hub's card and in its log.
+fn recentre_cmd() -> CmdResult {
+    use tobii_ipc::Msg;
+    let mut client = tobii_ipc::Client::connect(0, "tobii recentre").map_err(|e| {
+        format!("could not reach the hub ({e}) — is it running? A recentre acts on the hub's game output")
+    })?;
+    client.send(&Msg::Recentre)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match client.recv_timeout(left) {
+            Some(Msg::RecentreReply { ok: true, .. }) => {
+                println!(
+                    "recentring — hold still and look at the middle of the screen for a second"
+                );
+                return Ok(());
+            }
+            Some(Msg::RecentreReply { ok: false, text }) => {
+                return Err(format!("not recentred: {text}").into());
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    Err("the hub did not answer the recentre request".into())
 }
 
 /// `tobii games` — show the game-output settings; `tobii games set K V` — change one.
