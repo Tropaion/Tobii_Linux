@@ -21,6 +21,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use crate::curves::DEFAULT_INVERT;
+use crate::curves::{HeadCurves, AXIS_NAMES};
 use crate::fusion::{AxisResponse, Curve, ExtendedView};
 
 /// Default opentrack endpoint — its "UDP over network" input's usual address.
@@ -35,6 +38,74 @@ pub const DEFAULT_BRIDGE_PORT: u16 = 4243;
 
 /// Default frames per second put on the wire.
 pub const DEFAULT_RATE_HZ: f64 = 60.0;
+
+/// Default [`OutputConfig::filter_max_rot_speed_deg_s`]: quick enough for a
+/// glance over the shoulder to arrive in a third of a second, slow enough that
+/// a gaze jump reads as a turn rather than a cut.
+pub const DEFAULT_MAX_ROT_SPEED_DEG_S: f64 = 240.0;
+
+/// Default [`OutputConfig::filter_max_move_speed_mm_s`].
+pub const DEFAULT_MAX_MOVE_SPEED_MM_S: f64 = 400.0;
+
+/// Which smoother the pose filter runs. See [`tobii_headpose::Smoothing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Speed-adaptive One-Euro filter: calm at rest, quick on a turn.
+    Adaptive,
+    /// Fixed exponential moving average, driven by `filter_alpha`.
+    Ema,
+}
+
+impl FilterMode {
+    fn parse(s: &str) -> Option<FilterMode> {
+        match s {
+            "adaptive" => Some(FilterMode::Adaptive),
+            "ema" => Some(FilterMode::Ema),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            FilterMode::Adaptive => "adaptive",
+            FilterMode::Ema => "ema",
+        }
+    }
+}
+
+/// Automatic recentring: slowly pulling "straight ahead" toward the posture
+/// the user actually holds while they look at the middle of the screen.
+///
+/// See `FramePipeline::auto_centre` for the conditions it adapts under and why.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoCentre {
+    /// Whether it runs at all. Off by default: it changes what the existing
+    /// manual reference means, so it is something to opt into.
+    pub enabled: bool,
+    /// Time constant in seconds: how long a constant offset takes to shrink to
+    /// about a third (1/e). Larger is slower and less noticeable.
+    pub time_s: f64,
+    /// The same for the head's **position**: the neutral it measures leans
+    /// from. Shorter than `time_s`, because a seated posture wanders in
+    /// position far more than it does in angle, and an offset left standing
+    /// there is a camera that never quite comes back to centre.
+    pub translation_time_s: f64,
+    /// How far, in degrees of yaw or roll from the current centre, the head may
+    /// be turned and still be adapted toward. Beyond it the user is looking
+    /// somewhere on purpose and nothing moves.
+    pub window_deg: f64,
+}
+
+impl Default for AutoCentre {
+    fn default() -> Self {
+        AutoCentre {
+            enabled: false,
+            time_s: 8.0,
+            translation_time_s: 3.0,
+            window_deg: 12.0,
+        }
+    }
+}
 
 /// Everything that decides what game output does.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,8 +158,16 @@ pub struct OutputConfig {
     /// Frames per second delivered to sinks. Sampling and smoothing still run
     /// at the device's full rate; this throttles only the wire.
     pub rate_hz: f64,
-    /// Smoothing strength, `0.0`–`1.0`; higher follows the head more closely.
+    /// Which smoother runs: adaptive (default) or the fixed EMA.
+    pub filter_mode: FilterMode,
+    /// EMA smoothing strength, `0.0`–`1.0`; higher follows the head more
+    /// closely. Only read when [`filter_mode`](Self::filter_mode) is `ema`.
     pub filter_alpha: f64,
+    /// Adaptive filter: cutoff at rest in hertz. Lower is steadier.
+    pub filter_min_cutoff_hz: f64,
+    /// Adaptive filter: how quickly it opens up with speed. Higher is snappier
+    /// on fast movements.
+    pub filter_beta: f64,
     /// How far the head's position may move between two frames and still be
     /// believed, in millimetres.
     ///
@@ -103,6 +182,16 @@ pub struct OutputConfig {
     /// off with (a very large value) or tighten it with. See that constant for
     /// what the 150 mm default is derived from.
     pub filter_max_step_mm: f64,
+    /// The fastest the outgoing rotation may change, in degrees per second.
+    ///
+    /// A slew limit on what the game sees, applied last. A saccade reaches the
+    /// output through Extended View as a step of tens of degrees in one frame,
+    /// and the adaptive filter, seeing a fast signal, lets it straight through;
+    /// this turns that step into a quick sweep instead. A very large value
+    /// switches it off.
+    pub filter_max_rot_speed_deg_s: f64,
+    /// The same for position, in millimetres per second.
+    pub filter_max_move_speed_mm_s: f64,
     /// opentrack endpoint, or `None` to not send there.
     pub opentrack: Option<String>,
     /// Whether a program bound to [`opentrack`](Self::opentrack) is itself a
@@ -192,6 +281,10 @@ pub struct OutputConfig {
     pub wake_for_joystick: bool,
     /// Gaze-driven camera offset.
     pub extended_view: ExtendedView,
+    /// Automatic recentring.
+    pub auto_centre: AutoCentre,
+    /// Per-axis response curves applied to the finished pose.
+    pub head_curves: HeadCurves,
 }
 
 impl Default for OutputConfig {
@@ -200,8 +293,13 @@ impl Default for OutputConfig {
             enabled: false,
             keep_awake: false,
             rate_hz: DEFAULT_RATE_HZ,
+            filter_mode: FilterMode::Adaptive,
             filter_alpha: tobii_headpose::filter::DEFAULT_ALPHA,
+            filter_min_cutoff_hz: tobii_headpose::filter::DEFAULT_MIN_CUTOFF_HZ,
+            filter_beta: tobii_headpose::filter::DEFAULT_BETA,
             filter_max_step_mm: tobii_headpose::filter::DEFAULT_MAX_STEP_MM,
+            filter_max_rot_speed_deg_s: DEFAULT_MAX_ROT_SPEED_DEG_S,
+            filter_max_move_speed_mm_s: DEFAULT_MAX_MOVE_SPEED_MM_S,
             opentrack: Some(DEFAULT_OPENTRACK_ADDR.to_string()),
             wake_for_opentrack: true,
             bridge_port: Some(DEFAULT_BRIDGE_PORT),
@@ -209,6 +307,8 @@ impl Default for OutputConfig {
             joystick: true,
             wake_for_joystick: true,
             extended_view: ExtendedView::default(),
+            auto_centre: AutoCentre::default(),
+            head_curves: HeadCurves::default(),
         }
     }
 }
@@ -229,6 +329,23 @@ fn axis_to_toml(prefix: &str, a: &AxisResponse) -> String {
     )
 }
 
+/// Emit one head axis's four keys with a `prefix` such as `head_yaw`.
+///
+/// No clamp key: unlike Extended View's, a head curve's ceiling is its
+/// `output_max`, since the mapping saturates there.
+fn head_axis_to_toml(prefix: &str, a: &AxisResponse) -> String {
+    format!(
+        "{prefix}_deadzone = {}\n\
+         {prefix}_input_max = {}\n\
+         {prefix}_output_max = {}\n\
+         {prefix}_curve = \"{}\"\n",
+        a.deadzone_deg,
+        a.input_max_deg,
+        a.output_max_deg,
+        a.curve.to_config_string(),
+    )
+}
+
 /// Strip surrounding double quotes, if present.
 fn unquote(s: &str) -> &str {
     s.strip_prefix('"')
@@ -237,6 +354,26 @@ fn unquote(s: &str) -> &str {
 }
 
 impl OutputConfig {
+    /// The smoother these settings ask for.
+    pub fn smoothing(&self) -> tobii_headpose::Smoothing {
+        match self.filter_mode {
+            FilterMode::Ema => tobii_headpose::Smoothing::Ema {
+                alpha: self.filter_alpha,
+            },
+            FilterMode::Adaptive => tobii_headpose::Smoothing::Adaptive {
+                min_cutoff_hz: self.filter_min_cutoff_hz,
+                beta: self.filter_beta,
+            },
+        }
+    }
+
+    /// Whether `other` would build a different filter — what a live
+    /// reconfigure has to check before rebuilding it, since rebuilding drops
+    /// the smoothing state.
+    pub fn filter_differs(&self, other: &OutputConfig) -> bool {
+        self.smoothing() != other.smoothing() || self.filter_max_step_mm != other.filter_max_step_mm
+    }
+
     /// Serialize to a `[games]` TOML document.
     pub fn to_toml(&self) -> String {
         let mut s = String::from(
@@ -253,15 +390,44 @@ impl OutputConfig {
              # wake_for_joystick = false stops the virtual joystick from doing the\n\
              #                 same. With it off, a game reading those axes sees\n\
              #                 them frozen at centre once the hub loses focus.\n\
+             # filter_mode = \"adaptive\" (calm at rest, quick on a turn) or \"ema\"\n\
+             #                 (fixed, uses filter_alpha). Adaptive tuning:\n\
+             #                 lower filter_min_cutoff_hz = steadier at rest,\n\
+             #                 higher filter_beta = less lag on fast moves.\n\
+             # auto_centre = true slowly pulls centre toward how you sit while\n\
+             #                 you look at the middle of the screen.\n\
+             # head_<axis>_* shapes yaw/pitch/roll (degrees) and x/y/z (mm):\n\
+             #                 input_max maps to output_max, curve is \"linear\",\n\
+             #                 \"smoothstep\" or \"power:N\" (N > 1 = gentle centre);\n\
+             #                 head_<axis>_invert = true mirrors that axis.\n\
+             # filter_max_rot_speed_deg_s / filter_max_move_speed_mm_s cap how\n\
+             #                 fast the output may move: lower = no jumps.\n\
              [games]\n",
         );
         s.push_str(&format!("enabled = {}\n", self.enabled));
         s.push_str(&format!("keep_awake = {}\n", self.keep_awake));
         s.push_str(&format!("rate_hz = {}\n", self.rate_hz));
+        s.push_str(&format!(
+            "filter_mode = \"{}\"\n",
+            self.filter_mode.as_str()
+        ));
         s.push_str(&format!("filter_alpha = {}\n", self.filter_alpha));
+        s.push_str(&format!(
+            "filter_min_cutoff_hz = {}\n",
+            self.filter_min_cutoff_hz
+        ));
+        s.push_str(&format!("filter_beta = {}\n", self.filter_beta));
         s.push_str(&format!(
             "filter_max_step_mm = {}\n",
             self.filter_max_step_mm
+        ));
+        s.push_str(&format!(
+            "filter_max_rot_speed_deg_s = {}\n",
+            self.filter_max_rot_speed_deg_s
+        ));
+        s.push_str(&format!(
+            "filter_max_move_speed_mm_s = {}\n",
+            self.filter_max_move_speed_mm_s
         ));
         s.push_str(&format!(
             "opentrack = \"{}\"\n",
@@ -293,6 +459,29 @@ impl OutputConfig {
         s.push_str(&format!("ev_hold_ms = {}\n", self.extended_view.hold_ms));
         s.push_str(&axis_to_toml("ev_yaw", &self.extended_view.yaw));
         s.push_str(&axis_to_toml("ev_pitch", &self.extended_view.pitch));
+        s.push_str(&format!("auto_centre = {}\n", self.auto_centre.enabled));
+        s.push_str(&format!(
+            "auto_centre_time_s = {}\n",
+            self.auto_centre.time_s
+        ));
+        s.push_str(&format!(
+            "auto_centre_translation_time_s = {}\n",
+            self.auto_centre.translation_time_s
+        ));
+        s.push_str(&format!(
+            "auto_centre_window_deg = {}\n",
+            self.auto_centre.window_deg
+        ));
+        for (i, name) in AXIS_NAMES.iter().enumerate() {
+            s.push_str(&head_axis_to_toml(
+                &format!("head_{name}"),
+                &self.head_curves.axes[i],
+            ));
+            s.push_str(&format!(
+                "head_{name}_invert = {}\n",
+                self.head_curves.invert[i]
+            ));
+        }
         s
     }
 
@@ -353,8 +542,44 @@ impl OutputConfig {
                 Some(v) => self.rate_hz = v,
                 None => return false,
             },
+            "filter_mode" => match FilterMode::parse(value) {
+                Some(m) => self.filter_mode = m,
+                None => return false,
+            },
             "filter_alpha" => match f(value).filter(|v| (0.0..=1.0).contains(v)) {
                 Some(v) => self.filter_alpha = v,
+                None => return false,
+            },
+            "filter_min_cutoff_hz" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.filter_min_cutoff_hz = v,
+                None => return false,
+            },
+            "filter_beta" => match f(value).filter(|v| *v >= 0.0) {
+                Some(v) => self.filter_beta = v,
+                None => return false,
+            },
+            "auto_centre" => match value.parse::<bool>() {
+                Ok(b) => self.auto_centre.enabled = b,
+                Err(_) => return false,
+            },
+            "auto_centre_time_s" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.auto_centre.time_s = v,
+                None => return false,
+            },
+            "auto_centre_translation_time_s" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.auto_centre.translation_time_s = v,
+                None => return false,
+            },
+            "filter_max_rot_speed_deg_s" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.filter_max_rot_speed_deg_s = v,
+                None => return false,
+            },
+            "filter_max_move_speed_mm_s" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.filter_max_move_speed_mm_s = v,
+                None => return false,
+            },
+            "auto_centre_window_deg" => match f(value).filter(|v| *v > 0.0) {
+                Some(v) => self.auto_centre.window_deg = v,
                 None => return false,
             },
             // Positive and finite is the whole rule, and there is deliberately
@@ -425,6 +650,45 @@ impl OutputConfig {
                 Ok(v) => self.extended_view.hold_ms = v,
                 Err(_) => return false,
             },
+            _ if key.starts_with("head_") => {
+                let Some((name, rest)) = key["head_".len()..].split_once('_') else {
+                    return false;
+                };
+                if rest == "invert" {
+                    let Some(flag) = self.head_curves.invert_mut(name) else {
+                        return false;
+                    };
+                    match value.parse::<bool>() {
+                        Ok(b) => *flag = b,
+                        Err(_) => return false,
+                    }
+                    return true;
+                }
+                let Some(axis) = self.head_curves.axis_mut(name) else {
+                    return false;
+                };
+                match rest {
+                    "deadzone" => match f(value).filter(|v| *v >= 0.0) {
+                        Some(v) => axis.deadzone_deg = v,
+                        None => return false,
+                    },
+                    "input_max" => match f(value).filter(|v| *v > 0.0) {
+                        Some(v) => axis.input_max_deg = v,
+                        None => return false,
+                    },
+                    // Negative would invert the axis, which is a game's job and
+                    // a trap here; zero would kill it silently.
+                    "output_max" => match f(value).filter(|v| *v > 0.0) {
+                        Some(v) => axis.output_max_deg = v,
+                        None => return false,
+                    },
+                    "curve" => match Curve::parse(value) {
+                        Some(c) => axis.curve = c,
+                        None => return false,
+                    },
+                    _ => return false,
+                }
+            }
             _ => {
                 let (axis, rest) = if let Some(r) = key.strip_prefix("ev_yaw_") {
                     (&mut self.extended_view.yaw, r)
@@ -474,8 +738,13 @@ impl OutputConfig {
             "enabled",
             "keep_awake",
             "rate_hz",
+            "filter_mode",
             "filter_alpha",
+            "filter_min_cutoff_hz",
+            "filter_beta",
             "filter_max_step_mm",
+            "filter_max_rot_speed_deg_s",
+            "filter_max_move_speed_mm_s",
             "opentrack",
             "wake_for_opentrack",
             "bridge_port",
@@ -496,6 +765,40 @@ impl OutputConfig {
             "ev_pitch_output_max_deg",
             "ev_pitch_curve",
             "ev_pitch_clamp_deg",
+            "auto_centre",
+            "auto_centre_time_s",
+            "auto_centre_translation_time_s",
+            "auto_centre_window_deg",
+            "head_yaw_deadzone",
+            "head_yaw_input_max",
+            "head_yaw_output_max",
+            "head_yaw_curve",
+            "head_yaw_invert",
+            "head_pitch_deadzone",
+            "head_pitch_input_max",
+            "head_pitch_output_max",
+            "head_pitch_curve",
+            "head_pitch_invert",
+            "head_roll_deadzone",
+            "head_roll_input_max",
+            "head_roll_output_max",
+            "head_roll_curve",
+            "head_roll_invert",
+            "head_x_deadzone",
+            "head_x_input_max",
+            "head_x_output_max",
+            "head_x_curve",
+            "head_x_invert",
+            "head_y_deadzone",
+            "head_y_input_max",
+            "head_y_output_max",
+            "head_y_curve",
+            "head_y_invert",
+            "head_z_deadzone",
+            "head_z_input_max",
+            "head_z_output_max",
+            "head_z_curve",
+            "head_z_invert",
         ]
     }
 }
@@ -545,8 +848,13 @@ mod tests {
             // On, because the default is off — see the note above `joystick`.
             keep_awake: true,
             rate_hz: 120.0,
+            filter_mode: FilterMode::Ema,
             filter_alpha: 0.4,
+            filter_min_cutoff_hz: 1.1,
+            filter_beta: 0.07,
             filter_max_step_mm: 220.0,
+            filter_max_rot_speed_deg_s: 90.0,
+            filter_max_move_speed_mm_s: 150.0,
             opentrack: Some("192.168.1.7:4242".to_string()),
             // Off, because the default is on — see the note above `joystick`.
             wake_for_opentrack: false,
@@ -569,6 +877,23 @@ mod tests {
                     ..base.pitch
                 },
                 ..base
+            },
+            auto_centre: AutoCentre {
+                enabled: true,
+                time_s: 4.5,
+                translation_time_s: 1.5,
+                window_deg: 20.0,
+            },
+            head_curves: {
+                let mut h = HeadCurves::default();
+                for (i, axis) in h.axes.iter_mut().enumerate() {
+                    axis.deadzone_deg = 0.5 + i as f64;
+                    axis.input_max_deg = 30.0 + i as f64;
+                    axis.output_max_deg = 60.0 + i as f64;
+                    axis.curve = Curve::Power(1.5 + i as f64 / 10.0);
+                }
+                h.invert = DEFAULT_INVERT.map(|b| !b);
+                h
             },
         };
         // Touch nothing else: the round-trip tests below are only meaningful if
@@ -830,7 +1155,10 @@ mod tests {
                 // be legitimately out of range.
                 "filter_alpha" => "0.3",
                 "filter_max_step_mm" => "200",
+                "filter_mode" => "ema",
+                "auto_centre" => "true",
                 k if k.ends_with("_curve") => "linear",
+                k if k.ends_with("_invert") => "true",
                 _ => "3",
             };
             assert!(

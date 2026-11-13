@@ -538,6 +538,24 @@ mod tests {
     /// Side by side, the taller group sets the height. Five values stacked was
     /// what made the panel too long.
     #[test]
+    fn the_joystick_rows_show_signed_deflection_and_say_off_when_absent() {
+        use tobii_output::sinks::uinput_joystick::{AXIS_CENTRE, AXIS_MAX};
+        let [left, right] = joystick_rows(None);
+        assert!(left.iter().chain(&right).all(|r| r.value == "off"));
+
+        let mut a = [AXIS_CENTRE; 8];
+        a[3] = AXIS_MAX; // yaw full right
+        a[0] = 0; // x full left
+        a[4] = AXIS_CENTRE + AXIS_CENTRE / 2; // pitch half up
+        let [left, right] = joystick_rows(Some(a));
+        assert_eq!(left[0].value, "-100%");
+        assert_eq!(left[1].value, "+0%");
+        assert_eq!(right[0].label, "RX yaw");
+        assert_eq!(right[0].value, "+100%");
+        assert_eq!(right[1].value, "+50%");
+    }
+
+    #[test]
     fn the_readout_is_three_rows_tall_not_five() {
         let [placement, facing] = readout_groups(&EyeView::none(), None, true);
         assert_eq!(placement.len().max(facing.len()), 3);
@@ -895,6 +913,41 @@ pub fn readout_groups(
     ];
 
     [placement, facing]
+}
+
+/// The virtual joystick's output, as two groups for the readout beneath the
+/// head pose: translation and gaze on the left, rotation on the right.
+///
+/// Each value is the axis's deflection from centre as a signed percentage of
+/// its half-range — what a game binding that axis actually reads, after the
+/// pipeline's smoothing, recentring and curves and the joystick's own
+/// `joystick_*_full_deg` gain. `None` is game output or the joystick being off,
+/// and every row says so rather than showing a centred stick that is not there.
+pub fn joystick_rows(axes: Option<[i32; 8]>) -> [Vec<ReadoutRow>; 2] {
+    use tobii_output::sinks::uinput_joystick::AXIS_CENTRE;
+    let value = |i: usize| match axes {
+        Some(a) => {
+            let pct = (a[i] - AXIS_CENTRE) as f64 / AXIS_CENTRE as f64 * 100.0;
+            format!("{pct:+.0}%")
+        }
+        None => "off".to_string(),
+    };
+    let row = |label, i| ReadoutRow {
+        label,
+        value: value(i),
+        alert: false,
+    };
+    // Report order is X, Y, Z, RX, RY, RZ, throttle, rudder — see
+    // `uinput_joystick::AXES`.
+    [
+        vec![row("X", 0), row("Y", 1), row("Z", 2), row("Thr gaze", 6)],
+        vec![
+            row("RX yaw", 3),
+            row("RY pitch", 4),
+            row("RZ roll", 5),
+            row("Rud gaze", 7),
+        ],
+    ]
 }
 
 /// Draw the head those eyes belong to, onto the eye-position box.

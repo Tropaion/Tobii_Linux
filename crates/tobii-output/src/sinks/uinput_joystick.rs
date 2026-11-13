@@ -436,6 +436,9 @@ pub struct UinputJoystick {
     /// blink; holding the last value makes a blink invisible, which is what the
     /// Extended View path already does for the same reason.
     last_gaze: [i32; 2],
+    /// The last values written to the device, in [`AXES`] order — for a front
+    /// end to show what a game is reading. `None` until the first report.
+    last_report: Option<[i32; 8]>,
 }
 
 /// Turn `errno` into an `io::Error`, tagging the failing operation.
@@ -557,6 +560,7 @@ impl UinputJoystick {
             fd,
             response: Response::default(),
             last_gaze: [AXIS_CENTRE; 2],
+            last_report: None,
         })
     }
 
@@ -621,7 +625,9 @@ impl Sink for UinputJoystick {
             return Ok(());
         };
         self.last_gaze = hold_gaze(self.last_gaze, frame.gaze);
-        self.report(axis_values(&pose, self.last_gaze, &self.response))?;
+        let values = axis_values(&pose, self.last_gaze, &self.response);
+        self.report(values)?;
+        self.last_report = Some(values);
         Ok(())
     }
 }
@@ -694,6 +700,14 @@ impl JoystickHandle {
     /// Re-tune the shared device — see [`UinputJoystick::set_response`].
     pub fn set_response(&self, response: Response) {
         self.0.borrow_mut().set_response(response);
+    }
+
+    /// The axis values most recently written to the device, in report order:
+    /// X, Y, Z, RX (yaw), RY (pitch), RZ (roll), throttle and rudder (gaze).
+    /// Each is `0..=AXIS_MAX` with [`AXIS_CENTRE`] at rest. `None` until the
+    /// device has been written to.
+    pub fn last_report(&self) -> Option<[i32; 8]> {
+        self.0.borrow().last_report
     }
 }
 

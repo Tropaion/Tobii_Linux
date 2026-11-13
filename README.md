@@ -473,6 +473,47 @@ comes from `--calibrate-pitch`. The hub greys the button out wherever it would
 refuse anyway — no tracker running, a calibration or display setup holding the
 device, or nothing switched on for the recentre to act on.
 
+To recentre from a key, bind `tobii recentre` (or `tobii recenter`) to a
+keyboard shortcut in your desktop's settings. It asks the running hub to do
+exactly what the button does, and prints why if the hub refuses.
+
+**Auto-centre** (the checkbox on the same card, or `tobii games set auto_centre
+true`) keeps the view from creeping away over a session. While you look near the
+middle of the screen with your head within `auto_centre_window_deg` (default
+12°) of straight, it slowly pulls "straight ahead" and the neutral position
+toward how you are actually sitting, with a time constant of
+`auto_centre_time_s` (default 8 s). It does nothing during a deliberate look,
+turn, or lean of more than 80 mm.
+
+### Smoothing and response curves
+
+The pose is smoothed by an **adaptive (One-Euro) filter**. It smooths hard while
+your head is still and opens up as you move, so you get less jitter without
+extra lag on real turns. To tune it:
+
+```sh
+tobii games set filter_min_cutoff_hz 0.4   # lower = steadier at rest (default 0.6)
+tobii games set filter_beta 0.05           # higher = less lag on fast moves (default 0.03)
+tobii games set filter_mode ema            # the old fixed filter, driven by filter_alpha
+```
+
+Every output axis (`yaw`, `pitch`, `roll` in degrees; `x`, `y`, `z` in mm)
+has a **response curve**, applied after smoothing and before any game sees the
+pose. The default is a pass-through. Each axis has four keys, which work like
+Extended View's `ev_*` keys:
+
+```sh
+tobii games set head_yaw_deadzone 1.5      # ignore the first 1.5° around centre
+tobii games set head_yaw_input_max 30      # 30° of head turn ...
+tobii games set head_yaw_output_max 90     # ... gives 90° in game
+tobii games set head_yaw_curve power:1.6   # gentle near centre, steeper toward the edge
+```
+
+`curve` is `linear`, `smoothstep` or `power:N`. With N above 1, small
+movements stay small, which also hides tremor. Movement past `input_max`
+saturates at `output_max`. The hub picks up these changes within a second, with
+no restart.
+
 ### What lights the tracker
 
 The hub keeps the infrared illuminators dark unless something is asking for the

@@ -382,6 +382,13 @@ impl CalPhase {
 #[derive(Debug, Clone, Default)]
 pub struct DeviceState {
     pub status: ConnStatus,
+    /// What the virtual joystick last sent, axis by axis (see
+    /// `JoystickHandle::last_report`), or `None` while game output or the
+    /// joystick is off — for the hub's readout.
+    pub joystick_axes: Option<[i32; 8]>,
+    /// The pose the head curves were last applied to, for the curve editor's
+    /// live marker. `None` while game output is off or nothing is tracked.
+    pub curve_input: Option<tobii_headpose::HeadPose>,
     pub latest_gaze: Option<GazeSample>,
     /// Most recent decoded eye-camera frame (`CAMERA_STREAM`), for the hub
     /// preview. `None` until the camera stream is subscribed and a frame arrives.
@@ -823,8 +830,17 @@ pub fn device_tick<T: Transport>(
                     // than from a timer re-reading the state mutex: a poll
                     // re-samples a ~30 Hz source at its own cadence and turns
                     // every frame into a decision about which one it missed.
-                    if let Some(out) = games.as_deref_mut() {
-                        out.offer(&g, for_games, now);
+                    let (axes, curve_input) = games
+                        .as_deref_mut()
+                        .map(|out| {
+                            out.offer(&g, for_games, now);
+                            (out.joystick_axes(), out.curve_input())
+                        })
+                        .unwrap_or((None, None));
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.joystick_axes = axes;
+                        s.curve_input = curve_input;
                     }
                 }
                 got = true;

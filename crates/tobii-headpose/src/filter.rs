@@ -1,9 +1,18 @@
 //! Smoothing for the derived head pose.
 //!
 //! Raw eye origins are noisy at the millimetre level, and that noise turns into
-//! visible jitter once it is amplified into an in-game camera angle. A plain
-//! exponential moving average is enough for a first cut; deliberately *not* a
-//! one-euro filter or anything adaptive.
+//! visible jitter once it is amplified into an in-game camera angle. Two
+//! smoothers are offered, chosen by [`Smoothing`]:
+//!
+//! * **Adaptive** (the default) — a One-Euro filter (Casiez, Roussel & Vogel,
+//!   CHI 2012). Its cutoff frequency rises with the speed of the signal, so a
+//!   head held still is smoothed hard while a deliberate turn passes with
+//!   little lag. A fixed EMA cannot do both: an alpha low enough to calm the
+//!   camera at rest makes every turn feel late, and one high enough to follow a
+//!   turn lets the millimetre noise and gaze micro-saccades straight through.
+//! * **EMA** — the plain exponential moving average this module started as.
+//!   Kept for anyone who preferred its feel, and because its arithmetic is
+//!   simple enough for tests elsewhere to reason about exactly.
 //!
 //! In front of the average sits one plausibility gate: a sample whose *position*
 //! has moved further in a single frame than a head can move is held rather than
@@ -17,6 +26,106 @@ use crate::HeadPose;
 /// Default smoothing factor: a reasonable compromise between jitter and lag at
 /// the ET5's frame rate. Tune upwards for a snappier, noisier feel.
 pub const DEFAULT_ALPHA: f64 = 0.25;
+
+/// Default One-Euro cutoff at rest, in hertz.
+///
+/// The cutoff the adaptive filter uses when the head is still. 0.4 Hz is a time
+/// constant of about 400 ms — at the ~33 Hz the tracker delivers, a per-frame
+/// blend weight of roughly 0.07, more than three times calmer than
+/// [`DEFAULT_ALPHA`]. Lower is steadier and slower to settle; higher lets more
+/// tremor through. Down from 0.6, which in play still let a visible shimmer
+/// through once the output curves added gain.
+pub const DEFAULT_MIN_CUTOFF_HZ: f64 = 0.4;
+
+/// Default One-Euro speed coefficient: how much the cutoff rises per unit of
+/// speed (degrees or millimetres per second).
+///
+/// At 0.02 a 60°/s head turn lifts the cutoff to ~1.6 Hz (blend weight ~0.23).
+/// Frame-to-frame noise in the eye origins reads as tens of degrees per second
+/// of yaw, so a larger beta let the noise open the filter on its own; 0.03 did,
+/// in play. A gaze jump still opens it — the output slew limit is what keeps
+/// that from arriving as a cut. Raise it if fast movements feel late; lower it
+/// if slow movements still shimmer.
+pub const DEFAULT_BETA: f64 = 0.02;
+
+/// The cutoff applied to the speed estimate itself, in hertz. The value the
+/// One-Euro paper recommends and every implementation ships; not exposed,
+/// because nothing a user would describe maps onto it.
+const DERIVATIVE_CUTOFF_HZ: f64 = 1.0;
+
+/// The frame interval assumed when a caller does not supply one: the 30.208 ms
+/// median measured from `session.tobiicap` (see [`DEFAULT_MAX_STEP_MM`]).
+pub const NOMINAL_DT_S: f64 = 0.030_208;
+
+/// The longest interval one update may claim. A gap longer than this is a
+/// stall, not motion, and dividing a position change by it would read as a
+/// standstill; capping it keeps a resumed stream from being smoothed as though
+/// a full second of stillness had passed.
+const MAX_DT_S: f64 = 0.2;
+
+/// Which smoother [`PoseFilter`] runs after its plausibility gate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Smoothing {
+    /// Fixed-weight exponential moving average.
+    Ema {
+        /// Blend weight of each new sample, `0`–`1`.
+        alpha: f64,
+    },
+    /// Speed-adaptive One-Euro filter.
+    Adaptive {
+        /// Cutoff at rest, in hertz.
+        min_cutoff_hz: f64,
+        /// Cutoff gain per unit of speed.
+        beta: f64,
+    },
+}
+
+impl Default for Smoothing {
+    fn default() -> Self {
+        Smoothing::Adaptive {
+            min_cutoff_hz: DEFAULT_MIN_CUTOFF_HZ,
+            beta: DEFAULT_BETA,
+        }
+    }
+}
+
+impl Smoothing {
+    /// Replace anything non-finite or out of range with the default for that
+    /// parameter, so a bad config value degrades rather than poisons.
+    fn sanitised(self) -> Smoothing {
+        match self {
+            Smoothing::Ema { alpha } => Smoothing::Ema {
+                alpha: if alpha.is_finite() {
+                    alpha.clamp(0.0, 1.0)
+                } else {
+                    DEFAULT_ALPHA
+                },
+            },
+            Smoothing::Adaptive {
+                min_cutoff_hz,
+                beta,
+            } => Smoothing::Adaptive {
+                min_cutoff_hz: if min_cutoff_hz.is_finite() && min_cutoff_hz > 0.0 {
+                    min_cutoff_hz
+                } else {
+                    DEFAULT_MIN_CUTOFF_HZ
+                },
+                beta: if beta.is_finite() && beta >= 0.0 {
+                    beta
+                } else {
+                    DEFAULT_BETA
+                },
+            },
+        }
+    }
+}
+
+/// The blend weight a first-order low-pass with `cutoff_hz` gives a sample
+/// `dt_s` after the previous one.
+fn lowpass_alpha(cutoff_hz: f64, dt_s: f64) -> f64 {
+    let tau = 1.0 / (2.0 * std::f64::consts::PI * cutoff_hz);
+    1.0 / (1.0 + tau / dt_s)
+}
 
 /// The largest per-frame step in head **position** treated as real, in
 /// millimetres of straight-line distance between consecutive accepted samples.
@@ -96,11 +205,15 @@ fn step_mm(a: HeadPose, b: HeadPose) -> f64 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-/// An exponential moving average over [`HeadPose`].
+/// A smoothing filter over [`HeadPose`]: a plausibility gate, then the
+/// [`Smoothing`] chosen at construction.
 ///
 /// Each update blends the new sample into the running state with weight
-/// `alpha`: `out = alpha * new + (1 - alpha) * previous`. `alpha == 1.0` is a
-/// pass-through, and smaller values smooth harder at the cost of lag.
+/// `alpha`: `out = alpha * new + (1 - alpha) * previous`. For the EMA `alpha`
+/// is fixed — `1.0` is a pass-through, and smaller values smooth harder at the
+/// cost of lag. For the adaptive filter it is recomputed per channel on every
+/// update from that channel's smoothed speed, which is what lets it be calm and
+/// quick at once.
 ///
 /// The filter never emits a non-finite value: a non-finite input is discarded
 /// (the previous output is repeated) so one bad sample cannot poison the state.
@@ -119,7 +232,7 @@ fn step_mm(a: HeadPose, b: HeadPose) -> f64 {
 /// it would need revisiting if these angles were ever sourced from elsewhere.
 #[derive(Debug, Clone)]
 pub struct PoseFilter {
-    alpha: f64,
+    smoothing: Smoothing,
     max_step_mm: f64,
     /// The last accepted sample and what it produced, or `None` before the
     /// first one.
@@ -143,6 +256,9 @@ struct Accepted {
     /// What the blend produced from it, and what the gate repeats while it
     /// holds.
     out: HeadPose,
+    /// The adaptive filter's smoothed speed per channel (x, y, z, yaw, pitch,
+    /// roll), in units per second. Unused by the EMA.
+    speed: [f64; 6],
 }
 
 impl Default for PoseFilter {
@@ -165,27 +281,40 @@ impl PoseFilter {
     /// positive would refuse everything, so it falls back to
     /// [`DEFAULT_MAX_STEP_MM`] the same way a bad `alpha` does.
     pub fn with_max_step_mm(alpha: f64, max_step_mm: f64) -> Self {
-        let alpha = if alpha.is_finite() {
-            alpha.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_ALPHA
-        };
+        Self::with_smoothing(Smoothing::Ema { alpha }, max_step_mm)
+    }
+
+    /// A filter running `smoothing` behind the plausibility gate.
+    ///
+    /// Out-of-range parameters fall back to their defaults one by one, the same
+    /// way [`with_max_step_mm`](Self::with_max_step_mm) treats a bad `alpha`.
+    pub fn with_smoothing(smoothing: Smoothing, max_step_mm: f64) -> Self {
         let max_step_mm = if max_step_mm > 0.0 {
             max_step_mm
         } else {
             DEFAULT_MAX_STEP_MM
         };
         Self {
-            alpha,
+            smoothing: smoothing.sanitised(),
             max_step_mm,
             last: None,
             held: 0,
         }
     }
 
-    /// The smoothing factor actually in use (after clamping).
+    /// The smoother actually in use (after sanitising).
+    pub fn smoothing(&self) -> Smoothing {
+        self.smoothing
+    }
+
+    /// The EMA's smoothing factor actually in use (after clamping). For the
+    /// adaptive filter this is the blend weight it applies at rest, at the
+    /// nominal frame interval — the number comparable to an EMA's alpha.
     pub fn alpha(&self) -> f64 {
-        self.alpha
+        match self.smoothing {
+            Smoothing::Ema { alpha } => alpha,
+            Smoothing::Adaptive { min_cutoff_hz, .. } => lowpass_alpha(min_cutoff_hz, NOMINAL_DT_S),
+        }
     }
 
     /// The per-frame position limit actually in use.
@@ -222,7 +351,25 @@ impl PoseFilter {
     /// The first update after construction or [`reset`](Self::reset) adopts `p`
     /// outright rather than ramping up from zero, which would otherwise fling
     /// the pose in from the tracker's origin over the first second.
+    ///
+    /// Assumes the nominal frame interval; [`update_dt`](Self::update_dt) is the
+    /// form for callers that know the real one, which the adaptive filter uses
+    /// to turn a change into a speed.
     pub fn update(&mut self, p: HeadPose) -> HeadPose {
+        self.update_dt(p, NOMINAL_DT_S)
+    }
+
+    /// As [`update`](Self::update), `dt_s` seconds after the previous sample.
+    ///
+    /// The interval is clamped to a sane range: a zero or negative one (two
+    /// samples stamped alike) would divide by zero, and a long one is a stall
+    /// rather than a slow movement — see `MAX_DT_S`.
+    pub fn update_dt(&mut self, p: HeadPose, dt_s: f64) -> HeadPose {
+        let dt = if dt_s.is_finite() {
+            dt_s.clamp(0.001, MAX_DT_S)
+        } else {
+            NOMINAL_DT_S
+        };
         if !p.is_finite() {
             // Repeat the last good output; if there is none yet, stay neutral.
             // Deliberately ahead of the gate and deliberately not counted as a
@@ -231,31 +378,62 @@ impl PoseFilter {
             // gate for whatever arrived next.
             return self.last.map_or_else(HeadPose::default, |a| a.out);
         }
-        let out = match self.last {
+        let (out, speed) = match self.last {
             // There is nothing to measure against before the first accepted
             // sample, so it seeds the filter unconditionally.
-            None => p,
+            None => (p, [0.0; 6]),
             Some(last) => {
                 // The gate.
                 if step_mm(p, last.raw) > self.max_step_mm && self.held < MAX_HELD_FRAMES {
                     self.held += 1;
                     return last.out;
                 }
-                let a = self.alpha;
-                let mix = |new: f64, old: f64| a * new + (1.0 - a) * old;
-                HeadPose {
-                    x_mm: mix(p.x_mm, last.out.x_mm),
-                    y_mm: mix(p.y_mm, last.out.y_mm),
-                    z_mm: mix(p.z_mm, last.out.z_mm),
-                    yaw_deg: mix(p.yaw_deg, last.out.yaw_deg),
-                    pitch_deg: mix(p.pitch_deg, last.out.pitch_deg),
-                    roll_deg: mix(p.roll_deg, last.out.roll_deg),
+                let new = channels(p);
+                let old = channels(last.out);
+                let mut out = [0.0; 6];
+                let mut speed = last.speed;
+                match self.smoothing {
+                    Smoothing::Ema { alpha: a } => {
+                        for i in 0..6 {
+                            out[i] = a * new[i] + (1.0 - a) * old[i];
+                        }
+                    }
+                    Smoothing::Adaptive {
+                        min_cutoff_hz,
+                        beta,
+                    } => {
+                        let a_d = lowpass_alpha(DERIVATIVE_CUTOFF_HZ, dt);
+                        for i in 0..6 {
+                            let raw_speed = (new[i] - old[i]) / dt;
+                            speed[i] = a_d * raw_speed + (1.0 - a_d) * last.speed[i];
+                            let cutoff = min_cutoff_hz + beta * speed[i].abs();
+                            let a = lowpass_alpha(cutoff, dt);
+                            out[i] = a * new[i] + (1.0 - a) * old[i];
+                        }
+                    }
                 }
+                (from_channels(out), speed)
             }
         };
         self.held = 0;
-        self.last = Some(Accepted { raw: p, out });
+        self.last = Some(Accepted { raw: p, out, speed });
         out
+    }
+}
+
+/// The six channels in a fixed order, so both smoothers can loop over them.
+fn channels(p: HeadPose) -> [f64; 6] {
+    [p.x_mm, p.y_mm, p.z_mm, p.yaw_deg, p.pitch_deg, p.roll_deg]
+}
+
+fn from_channels(c: [f64; 6]) -> HeadPose {
+    HeadPose {
+        x_mm: c[0],
+        y_mm: c[1],
+        z_mm: c[2],
+        yaw_deg: c[3],
+        pitch_deg: c[4],
+        roll_deg: c[5],
     }
 }
 
@@ -597,5 +775,93 @@ mod tests {
             f64::INFINITY,
             "infinity is how a caller asks for a plain EMA"
         );
+    }
+
+    fn adaptive() -> PoseFilter {
+        PoseFilter::with_smoothing(Smoothing::default(), DEFAULT_MAX_STEP_MM)
+    }
+
+    /// A deterministic ±amp alternating wobble: the worst case for jitter,
+    /// since every frame reverses direction.
+    fn wobble(i: usize, amp: f64) -> f64 {
+        if i.is_multiple_of(2) {
+            amp
+        } else {
+            -amp
+        }
+    }
+
+    /// The reason the adaptive filter is the default: holding still, it lets
+    /// through markedly less tremor than the old fixed EMA did.
+    #[test]
+    fn the_adaptive_filter_is_calmer_than_the_ema_at_rest() {
+        let mut ema = PoseFilter::new(DEFAULT_ALPHA);
+        let mut ad = adaptive();
+        let (mut ema_peak, mut ad_peak) = (0.0_f64, 0.0_f64);
+        for i in 0..200 {
+            let p = pose(wobble(i, 2.0), wobble(i, 1.0));
+            let e = ema.update(p);
+            let a = ad.update(p);
+            if i > 50 {
+                ema_peak = ema_peak.max(e.yaw_deg.abs());
+                ad_peak = ad_peak.max(a.yaw_deg.abs());
+            }
+        }
+        assert!(
+            ad_peak < ema_peak * 0.6,
+            "adaptive residual jitter {ad_peak:.3}° should be well under the EMA's {ema_peak:.3}°"
+        );
+    }
+
+    /// And the other half of the trade: a real turn is followed with less lag
+    /// than the EMA gives, not more.
+    #[test]
+    fn the_adaptive_filter_follows_a_turn_faster_than_the_ema() {
+        let mut ema = PoseFilter::new(DEFAULT_ALPHA);
+        let mut ad = adaptive();
+        ema.update(pose(0.0, 0.0));
+        ad.update(pose(0.0, 0.0));
+        // 90°/s for half a second.
+        let (mut e, mut a) = (0.0, 0.0);
+        for i in 1..=16 {
+            let p = pose(0.0, i as f64 * 90.0 * NOMINAL_DT_S);
+            e = ema.update(p).yaw_deg;
+            a = ad.update(p).yaw_deg;
+        }
+        let target = 16.0 * 90.0 * NOMINAL_DT_S;
+        assert!(
+            target - a < target - e,
+            "adaptive lag {:.2}° should be smaller than the EMA's {:.2}°",
+            target - a,
+            target - e
+        );
+    }
+
+    #[test]
+    fn the_adaptive_filter_settles_on_a_step_without_overshoot() {
+        let mut f = adaptive();
+        f.update(pose(0.0, 0.0));
+        let mut out = pose(0.0, 0.0);
+        for _ in 0..300 {
+            out = f.update(pose(50.0, 20.0));
+            assert!(out.x_mm <= 50.0 + 1e-9 && out.yaw_deg <= 20.0 + 1e-9);
+        }
+        assert!((out.x_mm - 50.0).abs() < 0.01 && (out.yaw_deg - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_adaptive_filter_tolerates_hostile_intervals_and_parameters() {
+        let mut f = PoseFilter::with_smoothing(
+            Smoothing::Adaptive {
+                min_cutoff_hz: f64::NAN,
+                beta: -1.0,
+            },
+            DEFAULT_MAX_STEP_MM,
+        );
+        assert_eq!(f.smoothing(), Smoothing::default());
+        f.update_dt(pose(0.0, 0.0), 0.0);
+        for dt in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e9] {
+            assert!(f.update_dt(pose(10.0, 5.0), dt).is_finite(), "dt={dt}");
+        }
     }
 }
