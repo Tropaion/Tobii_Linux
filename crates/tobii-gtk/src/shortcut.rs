@@ -81,9 +81,9 @@ impl Binding {
         )
     }
 
-    /// Whether a key alone, with no modifier, would take a key away from
-    /// typing. Function keys, Pause, Scroll Lock, Print and media keys are
-    /// fine bare; everything else is not.
+    /// Whether binding this, with no modifier or with Shift alone, would take
+    /// a key away from typing. Function keys, Pause, Scroll Lock, Print and
+    /// media keys are fine that way; everything else is not.
     ///
     /// A list of the keys that are fine, not of the ones that type, because
     /// the second list has no end: GDK names most typing keys with more than
@@ -91,6 +91,9 @@ impl Binding {
     /// AltGr is not one of the modifiers recorded, so AltGr+Q arrives here as
     /// a bare `at`. A deny-list missed every one of those, and bound globally
     /// each stops that character typing anywhere on the desktop.
+    ///
+    /// Shift counts as no modifier because it changes which character a key
+    /// types, not whether it types: Shift+ö is Ö, and Shift+a is A.
     pub fn steals_typing(&self) -> bool {
         let k = self.key.as_str();
         let function_key = k
@@ -99,7 +102,7 @@ impl Binding {
         let fine_bare = function_key
             || k.starts_with("XF86")
             || matches!(k, "Pause" | "Break" | "Scroll_Lock" | "Print" | "Sys_Req");
-        self.modifiers.is_empty() && !fine_bare
+        self.modifiers.iter().all(|m| *m == "Shift") && !fine_bare
     }
 }
 
@@ -155,17 +158,80 @@ pub fn recentre_command() -> String {
 fn split_entries(text: &str) -> Option<Vec<&str>> {
     let body = text.trim();
     let body = body.strip_prefix('{')?.strip_suffix('}')?;
+    let (kinds, closed) = lex(body);
+    if !closed {
+        return None;
+    }
     let mut entries = Vec::new();
     let (mut depth, mut start) = (0i32, 0usize);
-    let (mut in_str, mut escaped, mut in_comment) = (false, false, false);
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_comment {
-            if c == b'\n' {
-                in_comment = false;
+    for (i, (&c, &kind)) in body.as_bytes().iter().zip(&kinds).enumerate() {
+        if kind != Lex::Code {
+            continue;
+        }
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                entries.push(body[start..i].trim());
+                start = i + 1;
             }
+            _ => {}
+        }
+        if depth < 0 {
+            return None;
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    entries.push(body[start..].trim());
+    Some(entries.into_iter().filter(|e| !e.is_empty()).collect())
+}
+
+/// What one byte of a RON text is part of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lex {
+    Code,
+    /// A string, its quotes included.
+    Str,
+    /// A `//` or `/* */` comment, its delimiters included.
+    Comment,
+}
+
+/// Every byte of `text`, classified, and whether the text ended outside any
+/// string or block comment.
+///
+/// One scanner for both readers in this file ([`split_entries`] and
+/// [`value_span`]), so they cannot disagree about where a comment is. They
+/// did: `value_span` knew only `//`, took the one inside `/* see https://x.org
+/// */` for a line comment, and put the separating comma inside the block
+/// comment. Block comments nest, as in Rust; a file that only parses if they
+/// do not is left unclosed here, and so refused rather than misread.
+fn lex(text: &str) -> (Vec<Lex>, bool) {
+    let b = text.as_bytes();
+    let mut kinds = Vec::with_capacity(b.len());
+    let (mut in_str, mut escaped, mut line) = (false, false, false);
+    let mut block = 0u32;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let pair = |second: u8| b.get(i + 1) == Some(&second);
+        if line {
+            line = c != b'\n';
+            kinds.push(Lex::Comment);
+        } else if block > 0 || (!in_str && c == b'/' && pair(b'*')) {
+            if c == b'/' && pair(b'*') {
+                block += 1;
+            } else if c == b'*' && pair(b'/') {
+                block -= 1;
+            } else {
+                kinds.push(Lex::Comment);
+                i += 1;
+                continue;
+            }
+            kinds.extend([Lex::Comment; 2]);
+            i += 2;
+            continue;
         } else if in_str {
             if escaped {
                 escaped = false;
@@ -174,29 +240,19 @@ fn split_entries(text: &str) -> Option<Vec<&str>> {
             } else if c == b'"' {
                 in_str = false;
             }
+            kinds.push(Lex::Str);
+        } else if c == b'/' && pair(b'/') {
+            line = true;
+            kinds.push(Lex::Comment);
+        } else if c == b'"' {
+            in_str = true;
+            kinds.push(Lex::Str);
         } else {
-            match c {
-                b'"' => in_str = true,
-                b'/' if bytes.get(i + 1) == Some(&b'/') => in_comment = true,
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                b',' if depth == 0 => {
-                    entries.push(body[start..i].trim());
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-        if depth < 0 {
-            return None;
+            kinds.push(Lex::Code);
         }
         i += 1;
     }
-    if depth != 0 || in_str {
-        return None;
-    }
-    entries.push(body[start..].trim());
-    Some(entries.into_iter().filter(|e| !e.is_empty()).collect())
+    (kinds, !in_str && block == 0)
 }
 
 /// The binding written in one entry's key, if it can be read.
@@ -291,8 +347,8 @@ pub fn with_binding(
 }
 
 /// Where the value in `entry` starts and ends: its first character outside a
-/// `//` comment, and just past its last one. `None` for an entry that is
-/// nothing but comments.
+/// comment, and just past its last one. `None` for an entry that is nothing
+/// but comments.
 ///
 /// The separating comma goes at the end. Appended to the end of the entry
 /// instead, it lands inside a trailing comment — `Spawn("cosmic-term") //
@@ -301,35 +357,19 @@ pub fn with_binding(
 /// whenever no comma follows the value, which in a hand-edited file is the
 /// last entry.
 fn value_span(entry: &str) -> Option<(usize, usize)> {
-    let bytes = entry.as_bytes();
-    let (mut in_str, mut escaped, mut in_comment) = (false, false, false);
-    let mut start = None;
-    let mut end = None;
-    for (i, &c) in bytes.iter().enumerate() {
-        if in_comment {
-            in_comment = c != b'\n';
-        } else if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-            end = Some(i + 1);
-        } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            in_comment = true;
-        } else {
-            if c == b'"' {
-                in_str = true;
-            }
-            if !c.is_ascii_whitespace() {
-                start.get_or_insert(i);
-                end = Some(i + 1);
-            }
+    let (kinds, _) = lex(entry);
+    let mut span: Option<(usize, usize)> = None;
+    for (i, (&c, &kind)) in entry.as_bytes().iter().zip(&kinds).enumerate() {
+        let part_of_value = match kind {
+            Lex::Str => true,
+            Lex::Code => !c.is_ascii_whitespace(),
+            Lex::Comment => false,
+        };
+        if part_of_value {
+            span = Some((span.map_or(i, |(start, _)| start), i + 1));
         }
     }
-    start.zip(end)
+    span
 }
 
 /// Whether COSMIC already uses `b` for one of its own actions.
@@ -360,8 +400,8 @@ pub fn set(binding: Option<&Binding>) -> Result<(), String> {
     if let Some(b) = binding {
         if b.steals_typing() {
             return Err(format!(
-                "{} on its own would stop that key typing anywhere — add Ctrl, Alt, \
-                 Shift or Super, or use a key like F9 or Pause",
+                "{} would stop that key typing anywhere — add Ctrl, Alt or Super, \
+                 or use a key like F9 or Pause",
                 b.display()
             ));
         }
@@ -494,15 +534,23 @@ mod tests {
             "KP_5",
             "dead_acute",
             "Up",
-            "F",
+            "a",
         ] {
             assert!(
                 Binding::new(&[], key).steals_typing(),
                 "{key} alone types, so a global binding must be refused"
             );
             assert!(
+                Binding::new(&["Shift"], key).steals_typing(),
+                "Shift+{key} types too (the capital), so Shift alone is no modifier"
+            );
+            assert!(
                 !Binding::new(&["Ctrl"], key).steals_typing(),
                 "with a modifier, {key} is fine"
+            );
+            assert!(
+                !Binding::new(&["Shift", "Ctrl"], key).steals_typing(),
+                "Shift beside a real modifier is fine"
             );
         }
         for key in [
@@ -514,6 +562,10 @@ mod tests {
             "Print",
             "XF86AudioPlay",
         ] {
+            assert!(
+                !Binding::new(&["Shift"], key).steals_typing(),
+                "Shift+{key} types nothing either"
+            );
             assert!(
                 !Binding::new(&[], key).steals_typing(),
                 "{key} types nothing, so it is fine on its own"
@@ -562,6 +614,39 @@ mod tests {
             "{out}"
         );
         assert_eq!(split_entries(&out).map(|e| e.len()), Some(2), "{out}");
+    }
+
+    /// Block comments, which the comma placement did not know: the `//` inside
+    /// `/* see https://x.org */` was taken for a line comment and the comma
+    /// went in after `https:`, inside the block comment, leaving the new entry
+    /// unseparated. A comma or bracket inside one is not structure either.
+    #[test]
+    fn block_comments_are_comments_to_both_readers() {
+        let theirs = "{\n    (modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\") /* see https://x.org */\n}";
+        let out = with_binding(theirs, Some(&ctrl_shift_r()), "tobii recentre").unwrap();
+        assert!(
+            out.contains("Spawn(\"cosmic-term\"), /* see https://x.org */"),
+            "the comma goes before the comment, which is kept whole: {out}"
+        );
+        let es = split_entries(&out).expect("still a map");
+        assert_eq!(es.len(), 2, "two entries, separately: {out}");
+        assert_eq!(current_in(&out), Some(ctrl_shift_r()), "{out}");
+
+        // A comma and brackets inside a block comment split nothing.
+        let noted = "{\n    /* mine, (all) of [these] */ (modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\"),\n}";
+        let es = split_entries(noted).expect("a map with a comment in it");
+        assert_eq!(es.len(), 1, "{es:?}");
+        assert_eq!(entry_binding(es[0]), Some(Binding::new(&["Super"], "t")));
+
+        // And one in front of ours is kept when ours goes, like a `//` one.
+        let out = with_binding(noted, Some(&ctrl_shift_r()), "tobii recentre").unwrap();
+        let ours_noted = out.replacen("(modifiers: [Ctrl", "/* recentre */ (modifiers: [Ctrl", 1);
+        let back = with_binding(&ours_noted, None, "tobii recentre").unwrap();
+        assert!(back.contains("/* recentre */"), "{back}");
+        assert_eq!(current_in(&back), None, "{back}");
+
+        // Unclosed: not a format this can edit, so it is refused, not guessed.
+        assert_eq!(split_entries("{ /* never closed }"), None);
     }
 
     #[test]

@@ -556,8 +556,8 @@ impl GameOutput {
 
     /// The head-pose source was rebuilt — see
     /// [`FramePipeline::forget_pitch_reference`](tobii_output::pipeline::FramePipeline::forget_pitch_reference).
-    pub fn forget_pitch_reference(&mut self) {
-        self.pipeline.forget_pitch_reference();
+    pub fn forget_pitch_reference(&mut self, now: Instant) {
+        self.pipeline.forget_pitch_reference(now);
     }
 
     /// The output for this session, or `None` if game output is switched off.

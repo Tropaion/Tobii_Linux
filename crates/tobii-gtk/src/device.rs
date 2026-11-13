@@ -1689,7 +1689,7 @@ fn device_session(
                         // pipeline there was built for this connection and has
                         // not recentred yet.
                         if let Some(g) = games.as_mut() {
-                            g.forget_pitch_reference();
+                            g.forget_pitch_reference(Instant::now());
                         }
                     }
                     let calibrating = thread_state.lock().unwrap().calibration.active;

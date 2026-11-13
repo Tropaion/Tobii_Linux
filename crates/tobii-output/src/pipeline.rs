@@ -475,8 +475,17 @@ impl FramePipeline {
     /// +22°, then a calibration that saves that 22° as the zero, sent a level
     /// head out as −22° until the next recentre. Yaw, roll, position and gaze
     /// stay as they were; nothing about them moved.
-    pub fn forget_pitch_reference(&mut self) {
+    ///
+    /// A recentre still measuring is measuring against the old zero too, and
+    /// would install exactly that stale number when its window closes. So it
+    /// starts over from `now`: the user is holding still for it either way, and
+    /// a fresh window measures what they asked for, which an "interrupted"
+    /// refusal blaming the tracker would not.
+    pub fn forget_pitch_reference(&mut self, now: Instant) {
         self.pitch_ref = None;
+        if self.recentre.is_some() {
+            self.begin_recentre(now);
+        }
     }
 
     /// Feed one head term to a running settle window, then apply the reference.
@@ -648,8 +657,9 @@ impl FramePipeline {
     ///
     /// Rotation adapts only on frames that **measured** it (not a held model
     /// rotation, not a one-eye reconstruction), for the same reason the manual
-    /// settle window refuses them. Pitch is left alone, as with the manual
-    /// reference: it has its own measured zero.
+    /// settle window refuses them. Pitch is left alone: it has its own measured
+    /// zero, and the manual recentre's [`pitch_ref`](Self::pitch_ref) is out of
+    /// reach here on purpose.
     ///
     /// `head` is the head term after the neutral is subtracted and before the
     /// rotation reference is, which is the quantity both references are
@@ -1981,7 +1991,7 @@ mod tests {
             "premise: the reference was taken"
         );
 
-        p.forget_pitch_reference();
+        p.forget_pitch_reference(at);
         let calibrated = HeadPose {
             pitch_deg: 0.0,
             ..uncalibrated
@@ -2003,6 +2013,46 @@ mod tests {
             "yaw and roll are not the pitch zero's to drop"
         );
         assert!(after.yaw_deg.abs() < 0.5, "yaw still referenced: {after:?}");
+    }
+
+    /// The zero changes while a recentre is still measuring. The window has
+    /// almost a second of the old zero's 22° in it and would close on a few
+    /// frames of the new zero's 0°: `Applied` at 22°, the exact stale number
+    /// forgetting was for. It starts over instead and measures the new zero.
+    #[test]
+    fn forgetting_restarts_a_recentre_that_is_still_measuring() {
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let sample = head_at(OFF_AXIS_YAW_DEG, 0.0);
+        let uncalibrated = HeadPose {
+            yaw_deg: OFF_AXIS_YAW_DEG,
+            pitch_deg: 22.0,
+            ..Default::default()
+        };
+        let calibrated = HeadPose {
+            pitch_deg: 0.0,
+            ..uncalibrated
+        };
+        let mut at = Instant::now();
+        p.begin_recentre(at);
+        for _ in 0..32 {
+            p.offer(&sample, supplied(uncalibrated, at), &c, None, at);
+            at += CADENCE;
+        }
+        assert!(p.recentring(), "premise: the window is still open");
+
+        p.forget_pitch_reference(at);
+        for _ in 0..WINDOW_FRAMES * 2 {
+            p.offer(&sample, supplied(calibrated, at), &c, None, at);
+            at += CADENCE;
+        }
+        match p.take_recentre() {
+            Some(RecentreOutcome::Applied { pitch_deg, .. }) => assert!(
+                pitch_deg.abs() < 0.5,
+                "the window kept the old zero's samples: {pitch_deg}"
+            ),
+            other => panic!("a fresh window of a still head applies, got {other:?}"),
+        }
     }
 
     /// A reference captured mid-turn is worse than none — and worse than the
@@ -2530,20 +2580,45 @@ mod tests {
     /// what notices if a default config stops doing either.
     #[test]
     fn the_shipped_defaults_mirror_x_and_limit_speed() {
-        let c = OutputConfig::default();
-        let lean = HeadPose {
-            x_mm: 40.0,
-            ..HeadPose::default()
+        // Through `offer`, so it is the output path being tested and not the
+        // helpers it calls. Only the smoothing is taken out of the way (an EMA
+        // that passes every sample whole), which leaves the curves and the
+        // speed limit as the only things between the pose and what goes out.
+        let c = OutputConfig {
+            filter_mode: crate::games::FilterMode::Ema,
+            filter_alpha: 1.0,
+            ..OutputConfig::default()
         };
-        assert_eq!(c.head_curves.apply(lean).x_mm, -40.0, "x is mirrored");
-        let turn = HeadPose {
+        let mut p = FramePipeline::new(&c);
+        let sample = head_at(0.0, 0.0);
+        let rest = HeadPose::default();
+        let mut at = Instant::now();
+        for _ in 0..5 {
+            p.offer(&sample, supplied(rest, at), &c, None, at);
+            at += CADENCE;
+        }
+        // One frame later: turned 90° and leaned 40 mm to the right.
+        let jump = HeadPose {
             yaw_deg: 90.0,
-            ..HeadPose::default()
+            x_mm: 40.0,
+            ..rest
         };
-        let out = slew_limit(Some(HeadPose::default()), turn, &c, 0.03);
-        assert!(out.yaw_deg < 10.0, "a 90° cut is limited: {out:?}");
-        let out = slew_limit(Some(HeadPose::default()), lean, &c, 0.03);
-        assert!(out.x_mm < 40.0, "so is a 40 mm one in 30 ms: {out:?}");
+        let out = p
+            .offer(&sample, supplied(jump, at), &c, None, at)
+            .pose
+            .expect("a pose");
+        let dt = CADENCE.as_secs_f64();
+        let max_turn = crate::games::DEFAULT_MAX_ROT_SPEED_DEG_S * dt;
+        let max_move = crate::games::DEFAULT_MAX_MOVE_SPEED_MM_S * dt;
+        assert!(
+            out.yaw_deg > 0.0 && out.yaw_deg <= max_turn + 1e-9,
+            "a 90° cut leaves limited to {max_turn}°: {out:?}"
+        );
+        assert!(out.x_mm < 0.0, "x leaves mirrored: {out:?}");
+        assert!(
+            out.x_mm >= -max_move - 1e-9,
+            "and limited to {max_move} mm: {out:?}"
+        );
     }
 
     /// The whole output reads zero after a recentre, Extended View included:
