@@ -2497,8 +2497,11 @@ mod tests {
     /// A step in the pose leaves as a sweep at the configured speed, not a cut.
     #[test]
     fn the_output_never_moves_faster_than_its_speed_limit() {
+        // Both limits set here: `cfg` switches them off, and with the movement
+        // limit at infinity "a small move is not held back" held for any move.
         let c = OutputConfig {
             filter_max_rot_speed_deg_s: 60.0,
+            filter_max_move_speed_mm_s: 400.0,
             ..cfg(false)
         };
         let step = Duration::from_millis(30);
@@ -2511,7 +2514,36 @@ mod tests {
         let out = slew_limit(Some(prev), next, &c, step.as_secs_f64());
         assert!((out.yaw_deg - 1.8).abs() < 1e-9, "{out:?}");
         assert_eq!(out.x_mm, -1.0, "a small move is not held back");
+        // 400 mm/s for 30 ms is 12 mm.
+        let lean = HeadPose {
+            x_mm: -40.0,
+            ..HeadPose::default()
+        };
+        let out = slew_limit(Some(prev), lean, &c, step.as_secs_f64());
+        assert!((out.x_mm + 12.0).abs() < 1e-9, "a large one is: {out:?}");
         assert_eq!(slew_limit(None, next, &c, 0.03), next, "first pose passes");
+    }
+
+    /// The shipped defaults, which every other test here switches off (see
+    /// `cfg`): x leaves mirrored and a fast move leaves speed-limited. Both
+    /// were kept as the default for everyone when PR #3 was merged; this is
+    /// what notices if a default config stops doing either.
+    #[test]
+    fn the_shipped_defaults_mirror_x_and_limit_speed() {
+        let c = OutputConfig::default();
+        let lean = HeadPose {
+            x_mm: 40.0,
+            ..HeadPose::default()
+        };
+        assert_eq!(c.head_curves.apply(lean).x_mm, -40.0, "x is mirrored");
+        let turn = HeadPose {
+            yaw_deg: 90.0,
+            ..HeadPose::default()
+        };
+        let out = slew_limit(Some(HeadPose::default()), turn, &c, 0.03);
+        assert!(out.yaw_deg < 10.0, "a 90° cut is limited: {out:?}");
+        let out = slew_limit(Some(HeadPose::default()), lean, &c, 0.03);
+        assert!(out.x_mm < 40.0, "so is a 40 mm one in 30 ms: {out:?}");
     }
 
     /// The whole output reads zero after a recentre, Extended View included:
