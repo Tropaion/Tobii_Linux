@@ -82,15 +82,24 @@ impl Binding {
     }
 
     /// Whether a key alone, with no modifier, would take a key away from
-    /// typing. Function keys, Pause, Scroll Lock and the like are fine bare;
-    /// a letter, digit or punctuation key is not.
+    /// typing. Function keys, Pause, Scroll Lock, Print and media keys are
+    /// fine bare; everything else is not.
+    ///
+    /// A list of the keys that are fine, not of the ones that type, because
+    /// the second list has no end: GDK names most typing keys with more than
+    /// one character — `minus`, `odiaeresis` (ö), `ssharp` (ß), `KP_5` — and
+    /// AltGr is not one of the modifiers recorded, so AltGr+Q arrives here as
+    /// a bare `at`. A deny-list missed every one of those, and bound globally
+    /// each stops that character typing anywhere on the desktop.
     pub fn steals_typing(&self) -> bool {
-        self.modifiers.is_empty()
-            && (self.key.chars().count() == 1
-                || matches!(
-                    self.key.as_str(),
-                    "space" | "Return" | "Tab" | "BackSpace" | "Escape" | "Delete"
-                ))
+        let k = self.key.as_str();
+        let function_key = k
+            .strip_prefix('F')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let fine_bare = function_key
+            || k.starts_with("XF86")
+            || matches!(k, "Pause" | "Break" | "Scroll_Lock" | "Print" | "Sys_Req");
+        self.modifiers.is_empty() && !fine_bare
     }
 }
 
@@ -237,6 +246,16 @@ pub fn with_binding(
     let mut out: Vec<String> = Vec::new();
     for e in entries {
         if is_ours(e) {
+            // Ours goes; the user's comments in front of it stay. A comment
+            // after the previous entry's comma is split off with this entry,
+            // and writing ours behind a trailing comment puts one exactly
+            // there (see `value_span`).
+            if let Some((start, _)) = value_span(e) {
+                let lead = e[..start].trim();
+                if !lead.is_empty() {
+                    out.push(lead.to_string());
+                }
+            }
             continue;
         }
         if let (Some(b), Some(theirs)) = (binding, entry_binding(e)) {
@@ -256,11 +275,61 @@ pub fn with_binding(
     let mut s = String::from("{\n");
     for e in out {
         s.push_str("    ");
-        s.push_str(&e);
-        s.push_str(",\n");
+        match value_span(&e) {
+            Some((_, end)) => {
+                s.push_str(&e[..end]);
+                s.push(',');
+                s.push_str(&e[end..]);
+            }
+            // Only comments: there is no value to separate.
+            None => s.push_str(&e),
+        }
+        s.push('\n');
     }
     s.push('}');
     Ok(s)
+}
+
+/// Where the value in `entry` starts and ends: its first character outside a
+/// `//` comment, and just past its last one. `None` for an entry that is
+/// nothing but comments.
+///
+/// The separating comma goes at the end. Appended to the end of the entry
+/// instead, it lands inside a trailing comment — `Spawn("cosmic-term") //
+/// mine,` — and two entries are left with no separator between them, which is
+/// not RON. [`split_entries`] keeps such a comment with the entry before it
+/// whenever no comma follows the value, which in a hand-edited file is the
+/// last entry.
+fn value_span(entry: &str) -> Option<(usize, usize)> {
+    let bytes = entry.as_bytes();
+    let (mut in_str, mut escaped, mut in_comment) = (false, false, false);
+    let mut start = None;
+    let mut end = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        if in_comment {
+            in_comment = c != b'\n';
+        } else if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            end = Some(i + 1);
+        } else if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            in_comment = true;
+        } else {
+            if c == b'"' {
+                in_str = true;
+            }
+            if !c.is_ascii_whitespace() {
+                start.get_or_insert(i);
+                end = Some(i + 1);
+            }
+        }
+    }
+    start.zip(end)
 }
 
 /// Whether COSMIC already uses `b` for one of its own actions.
@@ -405,6 +474,94 @@ mod tests {
         assert!(Binding::new(&[], "space").steals_typing());
         assert!(!Binding::new(&[], "F9").steals_typing());
         assert!(!ctrl_shift_r().steals_typing());
+    }
+
+    /// GDK's names for the typing keys of a German layout, the keypad, and
+    /// AltGr+Q (AltGr is not a recorded modifier, so it arrives bare). Each
+    /// one types; a deny-list of single characters let all of them through.
+    #[test]
+    fn bare_keys_with_long_names_that_type_are_flagged_too() {
+        for key in [
+            "odiaeresis",
+            "adiaeresis",
+            "udiaeresis",
+            "ssharp",
+            "minus",
+            "comma",
+            "period",
+            "numbersign",
+            "at",
+            "KP_5",
+            "dead_acute",
+            "Up",
+            "F",
+        ] {
+            assert!(
+                Binding::new(&[], key).steals_typing(),
+                "{key} alone types, so a global binding must be refused"
+            );
+            assert!(
+                !Binding::new(&["Ctrl"], key).steals_typing(),
+                "with a modifier, {key} is fine"
+            );
+        }
+        for key in [
+            "F1",
+            "F12",
+            "F24",
+            "Pause",
+            "Scroll_Lock",
+            "Print",
+            "XF86AudioPlay",
+        ] {
+            assert!(
+                !Binding::new(&[], key).steals_typing(),
+                "{key} types nothing, so it is fine on its own"
+            );
+        }
+    }
+
+    /// A hand-edited file whose last entry ends in a `//` comment. The comma
+    /// after it used to be written after the comment, so inside it, and the
+    /// new entry followed with no separator — not RON, and one entry where
+    /// there were two.
+    #[test]
+    fn a_trailing_comment_keeps_its_entry_separated() {
+        let theirs =
+            "{\n    (modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\") // my terminal\n}";
+        let out = with_binding(theirs, Some(&ctrl_shift_r()), "tobii recentre").unwrap();
+        let es = split_entries(&out).expect("still a map");
+        assert_eq!(es.len(), 2, "two entries, separately: {out}");
+        assert_eq!(entry_binding(es[0]), Some(Binding::new(&["Super"], "t")));
+        assert_eq!(current_in(&out), Some(ctrl_shift_r()), "{out}");
+        assert!(
+            out.contains("Spawn(\"cosmic-term\"), // my terminal\n"),
+            "the comma goes before the comment, which is kept: {out}"
+        );
+
+        // Removing ours again leaves theirs, comment and all, still readable:
+        // the comment now sits in front of ours, and must not go with it.
+        let back = with_binding(&out, None, "tobii recentre").unwrap();
+        let es = split_entries(&back).expect("still a map");
+        let bound: Vec<Binding> = es.iter().filter_map(|e| entry_binding(e)).collect();
+        assert_eq!(bound, vec![Binding::new(&["Super"], "t")], "{back}");
+        assert!(back.contains("// my terminal"), "{back}");
+        let again = with_binding(&back, Some(&ctrl_shift_r()), "tobii recentre").unwrap();
+        assert!(
+            again.contains("// my terminal"),
+            "a re-bind keeps it too: {again}"
+        );
+        assert_eq!(current_in(&again), Some(ctrl_shift_r()), "{again}");
+
+        // A trailing note with nothing after it gets no comma of its own.
+        let note =
+            "{\n    (modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\"),\n    // a note\n}";
+        let out = with_binding(note, None, "tobii recentre").unwrap();
+        assert!(
+            !out.contains("// a note,") && !out.contains(", // a note"),
+            "{out}"
+        );
+        assert_eq!(split_entries(&out).map(|e| e.len()), Some(2), "{out}");
     }
 
     #[test]
