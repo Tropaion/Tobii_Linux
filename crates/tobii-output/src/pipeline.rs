@@ -322,17 +322,17 @@ pub struct FramePipeline {
     ///
     /// # Three things it deliberately is not
     ///
-    /// * **Not automatic.** The neutral is taken from the first pose because
-    ///   the moment the tracker picks you up is, by construction, a moment you
-    ///   are sitting normally — that is not true of *where you are looking*,
-    ///   which is what rotation measures. So this moves only when asked
+    /// * **Not automatic, unless the user turns auto-centre on.** The neutral
+    ///   is taken from the first pose because the moment the tracker picks you
+    ///   up is, by construction, a moment you are sitting normally — that is
+    ///   not true of *where you are looking*, which is what rotation measures.
+    ///   So by default this moves only when asked
     ///   ([`FramePipeline::begin_recentre`]) and, unlike the neutral, survives
     ///   a tracking loss: a reference the user set is not something an absence
-    ///   should quietly undo.
-    /// * **Not pitch.** Pitch already has a measured zero of its own from
-    ///   `tobii headpose --calibrate-pitch`, saved to disk and applied inside
-    ///   the model. A second reference for the same angle would fight it — and
-    ///   the geometric path has no pitch to reference in any case.
+    ///   should quietly undo. Auto-centre (`auto_centre`, off by default) is
+    ///   the opt-in exception: see [`FramePipeline::auto_centre`].
+    /// * **Not pitch.** A recentre takes pitch too, but into
+    ///   [`pitch_ref`](Self::pitch_ref), which auto-centre cannot reach.
     /// * **Not taken from the composed pose.** See the module docs.
     rot_ref: Option<[f64; 2]>,
     /// The pitch that reads as level, set by a recentre alongside
@@ -344,6 +344,10 @@ pub struct FramePipeline {
     /// corrects how the tracker is mounted, this one is where the user wants
     /// "level" to be right now — and a recentre that left pitch off-centre
     /// was, in use, a recentre that did not work.
+    ///
+    /// Because it is measured against that zero, it is dropped whenever the
+    /// zero changes: see [`FramePipeline::forget_pitch_reference`]. The
+    /// geometric path measures no pitch, so a recentre there takes 0.
     pitch_ref: Option<f64>,
     /// The gaze direction that reads as "looking straight ahead" for Extended
     /// View: raw yaw and pitch, in degrees from the screen centre, set by a
@@ -461,6 +465,20 @@ impl FramePipeline {
         self.rot_ref
     }
 
+    /// Drop the pitch a recentre took as level, because the pitch it was
+    /// measured against has changed under it.
+    ///
+    /// For a front end to call whenever the head-pose source is rebuilt: a new
+    /// pitch zero from `--calibrate-pitch`, a model installed or removed. The
+    /// reference is a number in the old source's frame, so carrying it across
+    /// subtracts the calibration a second time: a recentre at an uncalibrated
+    /// +22°, then a calibration that saves that 22° as the zero, sent a level
+    /// head out as −22° until the next recentre. Yaw, roll, position and gaze
+    /// stay as they were; nothing about them moved.
+    pub fn forget_pitch_reference(&mut self) {
+        self.pitch_ref = None;
+    }
+
     /// Feed one head term to a running settle window, then apply the reference.
     ///
     /// The order inside matters: a window that completes on this frame is
@@ -556,16 +574,20 @@ impl FramePipeline {
         }
         let (yaw_deg, yaw_spread) = median_and_spread(&mut run.yaw_deg);
         let (roll_deg, roll_spread) = median_and_spread(&mut run.roll_deg);
-        // The worse of the two axes, not their average: a head that held its
-        // yaw while swinging in roll was still moving.
-        let spread_deg = yaw_spread.max(roll_spread);
+        let (pitch_deg, pitch_spread) = median_and_spread(&mut run.pitch_deg);
+        // The worst of the three axes, not their average: a head that held its
+        // yaw while swinging in roll was still moving. Pitch is in it because
+        // pitch is adopted below — left out, a nod during the window became
+        // the new level, and a level head then read as tilted by however far
+        // the nod went. The geometric path measures no pitch, so its samples
+        // are all zero and add no spread.
+        let spread_deg = yaw_spread.max(roll_spread).max(pitch_spread);
         if spread_deg > RECENTRE_MAX_SPREAD_DEG {
             // The old reference stands. A reference captured mid-turn is worse
             // than none, and worse still than the one already in use.
             return RecentreOutcome::Moved { spread_deg };
         }
         self.rot_ref = Some([yaw_deg, roll_deg]);
-        let (pitch_deg, _) = median_and_spread(&mut run.pitch_deg);
         self.pitch_ref = Some(pitch_deg);
         // Position: re-take the neutral at the median of the window, so
         // translation reads zero too. The samples are relative to the neutral
@@ -827,8 +849,8 @@ impl FramePipeline {
             // Rotation is recentred the other way round — before `compose`,
             // not after — and only when the user has asked for a reference.
             // See `rot_ref`, and the module docs for why the two orderings are
-            // opposite. Pitch is in neither: it has its own measured zero
-            // (`tobii headpose --calibrate-pitch`).
+            // opposite. Pitch is referenced with rotation, by `pitch_ref`, on
+            // top of its measured zero from `tobii headpose --calibrate-pitch`.
             let neutral = *self.neutral.get_or_insert([raw.x_mm, raw.y_mm, raw.z_mm]);
             let centred = HeadPose {
                 x_mm: raw.x_mm - neutral[0],
@@ -1882,6 +1904,105 @@ mod tests {
             "pitch was referenced: {after:?}"
         );
         assert!(after.yaw_deg.abs() < 0.01, "yaw was referenced: {after:?}");
+    }
+
+    /// Pitch is adopted, so pitch must be still too. Yaw held perfectly while
+    /// the head nods through 40°: the stillness bar used to look at yaw and
+    /// roll only, so this was `Applied` with a spread of 0 and the nod's middle
+    /// (+15°) became level — a level head then read −15° for the rest of the
+    /// session.
+    #[test]
+    fn a_nod_during_the_window_is_refused_not_adopted_as_level() {
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let sample = head_at(OFF_AXIS_YAW_DEG, 0.0);
+        let start = Instant::now();
+        let mut at = start;
+        p.begin_recentre(at);
+        for i in 0..WINDOW_FRAMES * 2 {
+            let nod = HeadPose {
+                yaw_deg: OFF_AXIS_YAW_DEG,
+                pitch_deg: 15.0 + 20.0 * (i as f64 * 0.3).sin(),
+                ..Default::default()
+            };
+            p.offer(&sample, supplied(nod, at), &c, None, at);
+            at += CADENCE;
+        }
+        match p.take_recentre() {
+            Some(RecentreOutcome::Moved { spread_deg }) => assert!(
+                spread_deg > RECENTRE_MAX_SPREAD_DEG,
+                "refused for a spread inside the bar: {spread_deg}"
+            ),
+            other => panic!("a nodding head must be refused, got {other:?}"),
+        }
+        assert_eq!(p.rotation_reference(), None, "nothing was adopted");
+
+        // And the pitch reference was not adopted on the side: level reads level.
+        let level = HeadPose {
+            yaw_deg: OFF_AXIS_YAW_DEG,
+            ..Default::default()
+        };
+        let mut after = None;
+        for _ in 0..200 {
+            at += CADENCE;
+            after = p.offer(&sample, supplied(level, at), &c, None, at).pose;
+        }
+        let after = after.expect("a pose");
+        assert!(
+            after.pitch_deg.abs() < 0.5,
+            "level must read level: {after:?}"
+        );
+    }
+
+    /// A recentre's pitch is a number in the frame of the pitch zero it was
+    /// measured against, so it has to go when that zero changes. A recentre at
+    /// an uncalibrated +22°, then a calibration that saves those 22° as the
+    /// zero: the source now reads 0 for a level head, and a pitch reference
+    /// still in place would send that out as −22°.
+    #[test]
+    fn forgetting_the_pitch_reference_stops_it_subtracting_a_new_zero() {
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let sample = head_at(OFF_AXIS_YAW_DEG, 0.0);
+        let uncalibrated = HeadPose {
+            yaw_deg: OFF_AXIS_YAW_DEG,
+            pitch_deg: 22.0,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut at = start;
+        p.begin_recentre(at);
+        for _ in 0..WINDOW_FRAMES * 2 {
+            p.offer(&sample, supplied(uncalibrated, at), &c, None, at);
+            at += CADENCE;
+        }
+        assert!(
+            matches!(p.take_recentre(), Some(RecentreOutcome::Applied { .. })),
+            "premise: the reference was taken"
+        );
+
+        p.forget_pitch_reference();
+        let calibrated = HeadPose {
+            pitch_deg: 0.0,
+            ..uncalibrated
+        };
+        let mut after = None;
+        for _ in 0..200 {
+            at += CADENCE;
+            after = p
+                .offer(&sample, supplied(calibrated, at), &c, None, at)
+                .pose;
+        }
+        let after = after.expect("a pose");
+        assert!(
+            after.pitch_deg.abs() < 0.5,
+            "the old pitch reference was subtracted from the new zero: {after:?}"
+        );
+        assert!(
+            p.rotation_reference().is_some(),
+            "yaw and roll are not the pitch zero's to drop"
+        );
+        assert!(after.yaw_deg.abs() < 0.5, "yaw still referenced: {after:?}");
     }
 
     /// A reference captured mid-turn is worse than none — and worse than the

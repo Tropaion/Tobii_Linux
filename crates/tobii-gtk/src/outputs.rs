@@ -554,6 +554,12 @@ impl GameOutput {
         self.pipeline.curve_input()
     }
 
+    /// The head-pose source was rebuilt — see
+    /// [`FramePipeline::forget_pitch_reference`](tobii_output::pipeline::FramePipeline::forget_pitch_reference).
+    pub fn forget_pitch_reference(&mut self) {
+        self.pipeline.forget_pitch_reference();
+    }
+
     /// The output for this session, or `None` if game output is switched off.
     ///
     /// Off is the default, deliberately: a hub that started steering games the

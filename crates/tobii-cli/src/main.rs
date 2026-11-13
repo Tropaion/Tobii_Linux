@@ -3829,8 +3829,8 @@ fn headpose(args: &[String]) -> CmdResult {
     if recentre {
         eprintln!(
             "recentring: sit the way you play, look at the centre of the screen and hold \
-             still for a second — the head angle you are holding becomes straight ahead. \
-             Pitch is not part of it; it has its own zero from `--calibrate-pitch`."
+             still for a second — the head angle you are holding, pitch included, becomes \
+             straight ahead and level. `--calibrate-pitch` still sets the zero underneath it."
         );
     }
 

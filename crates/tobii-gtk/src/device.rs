@@ -1681,6 +1681,16 @@ fn device_session(
                         // Dropping the old worker closes its channel, so its
                         // thread ends after the frame it is on.
                         head = HeadWorker::spawn(thread_state.clone());
+                        // Every change to the pitch zero arrives this way (a
+                        // saved calibration, a model installed or removed), and
+                        // a recentre's pitch was measured against the old one.
+                        // The pipeline outlives this reload, so it has to be
+                        // told. The drain above needs no such call: the
+                        // pipeline there was built for this connection and has
+                        // not recentred yet.
+                        if let Some(g) = games.as_mut() {
+                            g.forget_pitch_reference();
+                        }
                     }
                     let calibrating = thread_state.lock().unwrap().calibration.active;
                     if tick.published || calibrating {
