@@ -152,8 +152,23 @@ between tracking that feels right and tracking that feels broken:
   (`--recenter`, the hub's button, `Msg::Recentre`) is taken before, because
   after `compose` the angle also carries the gaze-driven Extended View term — and
   a reference caught during a glance at a screen edge would be permanent, since
-  nothing decays it. Pitch is in neither: it has its own measured zero from
-  `tobii headpose --calibrate-pitch`.
+  nothing decays it. A recentre takes pitch with rotation, into a reference of
+  its own (`pitch_ref`) that sits on top of the measured zero from
+  `tobii headpose --calibrate-pitch` and is dropped whenever that zero changes
+  (the hub's head-model reload). With Extended View on, it also takes the gaze
+  direction as the Extended View centre, if the gaze was near the middle of the
+  screen.
+* **Auto-centre moves the rotation reference, never pitch.** Opt-in
+  (`auto_centre`). While the gaze is near the screen centre and the head within
+  `auto_centre_window_deg`, it pulls `rot_ref` and the neutral position toward
+  the current pose with time constants `auto_centre_time_s` and
+  `auto_centre_translation_time_s`. It pauses during a manual recentre.
+* **Curves after the filter, the speed limit last.** The `head_*` response
+  curves are applied to the smoothed, composed pose, so their deadzone is
+  measured from the centre the user sees once the noise is gone. The speed limit
+  (`filter_max_rot_speed_deg_s`, `filter_max_move_speed_mm_s`) comes after them,
+  on exactly what goes out, so a curve's gain cannot multiply a step back past
+  it.
 
 Tracking loss longer than a second discards the smoothing state entirely:
 resuming from a second-old pose swings the camera across the room.
@@ -239,6 +254,15 @@ their profiles. The Wine bridge stands in for the TrackIR software, which is
 what shapes the signal before a game sees it, so it arguably wants this too; it
 is deliberately left raw until a real game has consumed that path, rather than
 changing its feel and bringing it up at the same time.
+
+The user's own `head_*` response curves (the hub's Tuning window) are the
+exception to that rule, and a deliberate one: they are applied once, before the
+router, so they reach **every** output, opentrack and the bridge included. By
+default they pass every axis through unchanged except x, which is mirrored
+(`head_x_invert = true`); both were kept as the default for everyone when PR #3
+was merged. A curve set to suit the joystick therefore also changes what
+opentrack receives, and on the joystick it sits in series with the
+`joystick_*_full_deg` scale above.
 
 Translation full scale is deliberately the same ±500 mm the TrackIR encoder
 saturates at, so a movement of a given size means the same thing on every output

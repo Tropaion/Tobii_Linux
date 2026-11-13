@@ -466,10 +466,15 @@ were confirmed on hardware.
 Hold the posture that should count as straight ahead and take a rotation
 reference: `tobii headpose --recenter` (`--recentre` works too), or **Recentre
 view** on the hub's *Head tracking for games* card. It measures for a second,
-takes the median of the yaw and roll it saw, and refuses — keeping whatever
-reference you had, and saying why — if your head moved more than 8° across that
-second, or if the tracker saw too little of it. Pitch is untouched: that zero
-comes from `--calibrate-pitch`. The hub greys the button out wherever it would
+takes the median of the yaw, pitch and roll it saw, re-takes the neutral
+position, and refuses — keeping whatever reference you had, and saying why — if
+your head moved more than 8° on any of the three across that second, or if the
+tracker saw too little of it. With Extended View on, the direction you were
+looking also becomes the centre, but only if that was near the middle of the
+screen. Pitch is levelled on top of the zero from `--calibrate-pitch`, which
+stays underneath as the correction for how the tracker is mounted; a new pitch
+calibration, or installing or removing the model, drops the recentre's pitch
+until you recentre again. The hub greys the button out wherever it would
 refuse anyway — no tracker running, a calibration or display setup holding the
 device, or nothing switched on for the recentre to act on.
 
@@ -480,10 +485,14 @@ exactly what the button does, and prints why if the hub refuses.
 **Auto-centre** (the checkbox on the same card, or `tobii games set auto_centre
 true`) keeps the view from creeping away over a session. While you look near the
 middle of the screen with your head within `auto_centre_window_deg` (default
-12°) of straight, it slowly pulls "straight ahead" and the neutral position
-toward how you are actually sitting, with a time constant of
-`auto_centre_time_s` (default 8 s). It does nothing during a deliberate look,
-turn, or lean of more than 80 mm.
+12°) of straight, it slowly pulls "straight ahead" toward how you are actually
+sitting, with a time constant of `auto_centre_time_s` (default 8 s), and the
+neutral position the same way with `auto_centre_translation_time_s` (default
+3 s). It leaves pitch alone, and stops while you look away from the middle,
+turn further than the window, or lean more than 80 mm. A smaller turn that you
+hold while still looking at the middle of the screen, which is what turning
+your head toward something does, looks to it exactly like sitting crooked and is
+drawn back as well. That is why it is off by default.
 
 ### Smoothing and response curves
 
@@ -492,27 +501,45 @@ your head is still and opens up as you move, so you get less jitter without
 extra lag on real turns. To tune it:
 
 ```sh
-tobii games set filter_min_cutoff_hz 0.4   # lower = steadier at rest (default 0.6)
-tobii games set filter_beta 0.05           # higher = less lag on fast moves (default 0.03)
+tobii games set filter_min_cutoff_hz 0.3   # lower = steadier at rest (default 0.4)
+tobii games set filter_beta 0.05           # higher = less lag on fast moves (default 0.02)
 tobii games set filter_mode ema            # the old fixed filter, driven by filter_alpha
 ```
 
+`filter_alpha` is read only in `ema` mode, so an alpha tuned for the old filter
+takes effect again only with `filter_mode ema`.
+
+What goes out is also **speed-limited**, so a sudden jump in the measurement
+arrives in game as a fast sweep rather than a cut: `filter_max_rot_speed_deg_s`
+(default 240°/s) and `filter_max_move_speed_mm_s` (default 400 mm/s). The limit
+applies after the response curves below, so a curve with a lot of gain reaches
+it on slower head movements. To effectively switch it off, set a very large
+value such as 100000.
+
 Every output axis (`yaw`, `pitch`, `roll` in degrees; `x`, `y`, `z` in mm)
 has a **response curve**, applied after smoothing and before any game sees the
-pose. The default is a pass-through. Each axis has four keys, which work like
-Extended View's `ev_*` keys:
+pose. Each axis has five keys; the first four work like Extended View's `ev_*`
+keys:
 
 ```sh
 tobii games set head_yaw_deadzone 1.5      # ignore the first 1.5° around centre
 tobii games set head_yaw_input_max 30      # 30° of head turn ...
 tobii games set head_yaw_output_max 90     # ... gives 90° in game
 tobii games set head_yaw_curve power:1.6   # gentle near centre, steeper toward the edge
+tobii games set head_yaw_invert true       # mirror the axis
 ```
 
 `curve` is `linear`, `smoothstep` or `power:N`. With N above 1, small
 movements stay small, which also hides tremor. Movement past `input_max`
-saturates at `output_max`. The hub picks up these changes within a second, with
-no restart.
+saturates at `output_max`. The curves apply to every output (opentrack, the
+Wine bridge and the virtual joystick alike) and to the Extended View term as
+well as the head's own. The defaults pass every axis through unchanged **except
+x, which is mirrored** (`head_x_invert` is `true`), so that a lean to the right
+moves the in-game head to the right rather than the left. If x comes out
+backwards in your game, or your opentrack profile already mirrors it, set
+`head_x_invert false`. The hub picks up these changes within a
+second, with no restart. Its **Tuning** window draws each curve, lets you drag
+it, and shows where your head currently sits on it.
 
 ### What lights the tracker
 

@@ -57,7 +57,9 @@
 //! hardware or against opentrack**, and neither has the assumed handedness of
 //! the tracker's x axis on which they rest. If in-game head movement comes out
 //! mirrored, the fix is to negate the offending angle in [`pose_from_eyes`] —
-//! that is the only place either sign is decided. See also
+//! that is the only place either sign is decided. (Downstream, `tobii-output`'s
+//! `head_*_invert` keys can mirror any output axis; by default they mirror x
+//! only.) See also
 //! [`opentrack::TRANSLATION_SCALE`] for the matching unit caveat on position.
 
 pub mod filter;

@@ -216,9 +216,11 @@ screen edge would write that glance in permanently — and unlike the neutral,
 nothing decays it. A window that completes on a frame is applied to *that* frame,
 so the recentre takes effect on the first frame it possibly can.
 
-**Pitch is untouched**, as this item asked: it already has a measured zero from
+**Pitch was left untouched**, as this item asked: it already has a measured zero from
 `tobii headpose --calibrate-pitch`, saved to disk and applied inside the model,
-and the geometric path has no pitch to reference at all. The reference also
+and the geometric path has no pitch to reference at all. (Superseded by PR #3:
+a recentre now levels pitch too, through a reference of its own on top of that
+zero, dropped whenever the zero changes. See [[Game-Output]].) The reference also
 **survives a tracking loss**, unlike the neutral beside it — walking away is not
 a request to undo something the user asked for — though a settle window *in
 flight* when the head is gone for a second is abandoned and reported as
