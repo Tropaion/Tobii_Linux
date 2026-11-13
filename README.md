@@ -480,7 +480,8 @@ device, or nothing switched on for the recentre to act on.
 
 To recentre from a key, bind `tobii recentre` (or `tobii recenter`) to a
 keyboard shortcut in your desktop's settings. It asks the running hub to do
-exactly what the button does, and prints why if the hub refuses.
+exactly what the button does, and prints why if the hub refuses to start. How
+the measurement itself went shows on the hub's card, not in the terminal.
 
 **Auto-centre** (the checkbox on the same card, or `tobii games set auto_centre
 true`) keeps the view from creeping away over a session. While you look near the

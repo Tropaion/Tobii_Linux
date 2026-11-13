@@ -278,8 +278,9 @@ pub(crate) const AUTO_CENTRE_TOOLTIP: &str =
     "Slowly pull \u{201c}straight ahead\u{201d} toward the way you are actually sitting, \
      so the view stops creeping off to one side over a session. It only adapts while \
      you look near the middle of the screen with your head close to straight, so a \
-     deliberate look or lean is never absorbed. Its pace and range are in the Tuning \
-     window.";
+     look away or a big turn or lean is left alone \u{2014} but a small turn you hold \
+     while still looking at the middle is drawn back too, just like sitting crooked. \
+     Its pace and range are in the Tuning window.";
 
 /// The recentre-key row, on COSMIC.
 pub(crate) const SHORTCUT_TOOLTIP: &str =
