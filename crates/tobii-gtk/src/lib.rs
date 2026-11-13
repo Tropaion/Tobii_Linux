@@ -1812,8 +1812,12 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         let state = state.clone();
         Rc::new(move || state.lock().unwrap().curve_input)
     };
-    let games_row =
-        crate::games::GamesRow::build(joystick_status.clone(), recentring, demand.clone(), curve_live);
+    let games_row = crate::games::GamesRow::build(
+        joystick_status.clone(),
+        recentring,
+        demand.clone(),
+        curve_live,
+    );
     col_games.append(&section(
         "Head tracking for games",
         // One line, and no instructions. Whatever this sentence said about how

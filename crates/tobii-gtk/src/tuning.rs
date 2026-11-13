@@ -61,12 +61,54 @@ struct AxisInfo {
 }
 
 static AXES: [AxisInfo; 6] = [
-    AxisInfo { title: "Yaw", unit: "°", deadzone_max: 20.0, input_max: 180.0, output_max: 180.0, plot_x: 45.0 },
-    AxisInfo { title: "Pitch", unit: "°", deadzone_max: 20.0, input_max: 90.0, output_max: 180.0, plot_x: 30.0 },
-    AxisInfo { title: "Roll", unit: "°", deadzone_max: 20.0, input_max: 180.0, output_max: 180.0, plot_x: 30.0 },
-    AxisInfo { title: "X (sideways)", unit: "mm", deadzone_max: 100.0, input_max: 500.0, output_max: 1000.0, plot_x: 150.0 },
-    AxisInfo { title: "Y (up/down)", unit: "mm", deadzone_max: 100.0, input_max: 500.0, output_max: 1000.0, plot_x: 120.0 },
-    AxisInfo { title: "Z (forward/back)", unit: "mm", deadzone_max: 100.0, input_max: 500.0, output_max: 1000.0, plot_x: 150.0 },
+    AxisInfo {
+        title: "Yaw",
+        unit: "°",
+        deadzone_max: 20.0,
+        input_max: 180.0,
+        output_max: 180.0,
+        plot_x: 45.0,
+    },
+    AxisInfo {
+        title: "Pitch",
+        unit: "°",
+        deadzone_max: 20.0,
+        input_max: 90.0,
+        output_max: 180.0,
+        plot_x: 30.0,
+    },
+    AxisInfo {
+        title: "Roll",
+        unit: "°",
+        deadzone_max: 20.0,
+        input_max: 180.0,
+        output_max: 180.0,
+        plot_x: 30.0,
+    },
+    AxisInfo {
+        title: "X (sideways)",
+        unit: "mm",
+        deadzone_max: 100.0,
+        input_max: 500.0,
+        output_max: 1000.0,
+        plot_x: 150.0,
+    },
+    AxisInfo {
+        title: "Y (up/down)",
+        unit: "mm",
+        deadzone_max: 100.0,
+        input_max: 500.0,
+        output_max: 1000.0,
+        plot_x: 120.0,
+    },
+    AxisInfo {
+        title: "Z (forward/back)",
+        unit: "mm",
+        deadzone_max: 100.0,
+        input_max: 500.0,
+        output_max: 1000.0,
+        plot_x: 150.0,
+    },
 ];
 
 /// The value of axis `i` in `p`, in the order of [`AXIS_NAMES`].
@@ -158,7 +200,11 @@ fn slider(
     u.set_halign(Align::Start);
     u.set_width_chars(5);
     u.add_css_class("section-desc");
-    for w in [l.upcast_ref::<gtk::Widget>(), scale.upcast_ref(), spin.upcast_ref()] {
+    for w in [
+        l.upcast_ref::<gtk::Widget>(),
+        scale.upcast_ref(),
+        spin.upcast_ref(),
+    ] {
         w.set_tooltip_text(Some(tooltip));
     }
     grid.attach(&l, 0, row, 1, 1);
@@ -183,7 +229,14 @@ fn bound(
     what: &'static str,
     write: impl Fn(&mut OutputConfig, f64) + 'static,
 ) -> Adjustment {
-    let adj = Adjustment::new(value.clamp(lower, upper), lower, upper, step, step * 10.0, 0.0);
+    let adj = Adjustment::new(
+        value.clamp(lower, upper),
+        lower,
+        upper,
+        step,
+        step * 10.0,
+        0.0,
+    );
     adj.connect_value_changed(move |a| {
         let v = a.value();
         edit_config(what, |c| write(c, v));
@@ -205,14 +258,40 @@ fn gaze_section(cfg: &OutputConfig) -> gtk::Box {
     b.append(&on);
 
     let g = grid();
-    let yaw = bound(cfg.extended_view.yaw.output_max_deg, 0.0, 90.0, 1.0, "gaze yaw", |c, v| {
-        c.extended_view.yaw.output_max_deg = v
-    });
-    let pitch = bound(cfg.extended_view.pitch.output_max_deg, 0.0, 60.0, 1.0, "gaze pitch", |c, v| {
-        c.extended_view.pitch.output_max_deg = v
-    });
-    slider(&g, 0, "Sideways reach", &yaw, 0, "°", "How far the view turns when you look at the left or right edge");
-    slider(&g, 1, "Vertical reach", &pitch, 0, "°", "How far the view tilts when you look at the top or bottom edge");
+    let yaw = bound(
+        cfg.extended_view.yaw.output_max_deg,
+        0.0,
+        90.0,
+        1.0,
+        "gaze yaw",
+        |c, v| c.extended_view.yaw.output_max_deg = v,
+    );
+    let pitch = bound(
+        cfg.extended_view.pitch.output_max_deg,
+        0.0,
+        60.0,
+        1.0,
+        "gaze pitch",
+        |c, v| c.extended_view.pitch.output_max_deg = v,
+    );
+    slider(
+        &g,
+        0,
+        "Sideways reach",
+        &yaw,
+        0,
+        "°",
+        "How far the view turns when you look at the left or right edge",
+    );
+    slider(
+        &g,
+        1,
+        "Vertical reach",
+        &pitch,
+        0,
+        "°",
+        "How far the view tilts when you look at the top or bottom edge",
+    );
     g.set_sensitive(cfg.extended_view.enabled);
     b.append(&g);
     on.connect_toggled(move |c| {
@@ -244,25 +323,61 @@ fn smoothing_section(cfg: &OutputConfig) -> gtk::Box {
     b.append(&mode_row);
 
     let adaptive = grid();
-    let cutoff = bound(cfg.filter_min_cutoff_hz, 0.05, 3.0, 0.05, "filter cutoff", |c, v| {
-        c.filter_min_cutoff_hz = v
-    });
-    let beta = bound(cfg.filter_beta, 0.0, 0.2, 0.001, "filter speed response", |c, v| {
-        c.filter_beta = v
-    });
-    slider(&adaptive, 0, "Steadiness at rest", &cutoff, 2, "Hz",
-        "Cutoff while the head is still. Lower = steadier, but slower to settle");
-    slider(&adaptive, 1, "Speed response", &beta, 3, "",
+    let cutoff = bound(
+        cfg.filter_min_cutoff_hz,
+        0.05,
+        3.0,
+        0.05,
+        "filter cutoff",
+        |c, v| c.filter_min_cutoff_hz = v,
+    );
+    let beta = bound(
+        cfg.filter_beta,
+        0.0,
+        0.2,
+        0.001,
+        "filter speed response",
+        |c, v| c.filter_beta = v,
+    );
+    slider(
+        &adaptive,
+        0,
+        "Steadiness at rest",
+        &cutoff,
+        2,
+        "Hz",
+        "Cutoff while the head is still. Lower = steadier, but slower to settle",
+    );
+    slider(
+        &adaptive,
+        1,
+        "Speed response",
+        &beta,
+        3,
+        "",
         "How quickly the filter opens up as you move. Higher = less lag on fast turns, \
-         but noise can open it too");
+         but noise can open it too",
+    );
     b.append(&adaptive);
 
     let ema = grid();
-    let alpha = bound(cfg.filter_alpha, 0.02, 1.0, 0.01, "filter strength", |c, v| {
-        c.filter_alpha = v
-    });
-    slider(&ema, 0, "Follow strength", &alpha, 2, "",
-        "Weight of each new sample. Lower = smoother and laggier; 1 = no smoothing");
+    let alpha = bound(
+        cfg.filter_alpha,
+        0.02,
+        1.0,
+        0.01,
+        "filter strength",
+        |c, v| c.filter_alpha = v,
+    );
+    slider(
+        &ema,
+        0,
+        "Follow strength",
+        &alpha,
+        2,
+        "",
+        "Weight of each new sample. Lower = smoother and laggier; 1 = no smoothing",
+    );
     b.append(&ema);
 
     let sel = |m: u32, a: &gtk::Grid, e: &gtk::Grid| {
@@ -273,26 +388,67 @@ fn smoothing_section(cfg: &OutputConfig) -> gtk::Box {
     mode.connect_selected_notify(move |d| {
         let m = d.selected();
         edit_config("filter mode", |c| {
-            c.filter_mode = if m == 1 { FilterMode::Ema } else { FilterMode::Adaptive }
+            c.filter_mode = if m == 1 {
+                FilterMode::Ema
+            } else {
+                FilterMode::Adaptive
+            }
         });
         sel(m, &adaptive, &ema);
     });
 
     let limits = grid();
-    let rot = bound(cfg.filter_max_rot_speed_deg_s, 20.0, 2000.0, 10.0, "rotation speed limit", |c, v| {
-        c.filter_max_rot_speed_deg_s = v
-    });
-    let mov = bound(cfg.filter_max_move_speed_mm_s, 20.0, 3000.0, 10.0, "movement speed limit", |c, v| {
-        c.filter_max_move_speed_mm_s = v
-    });
-    let jump = bound(cfg.filter_max_step_mm, 20.0, 1000.0, 5.0, "jump limit", |c, v| {
-        c.filter_max_step_mm = v
-    });
-    slider(&limits, 0, "Max turn speed", &rot, 0, "°/s",
-        "The fastest the output may rotate. Lower turns jumps into sweeps; too low feels sluggish");
-    slider(&limits, 1, "Max move speed", &mov, 0, "mm/s", "The fastest the output may translate");
-    slider(&limits, 2, "Glitch gate", &jump, 0, "mm",
-        "A position step larger than this in one frame is treated as a tracking glitch and held");
+    let rot = bound(
+        cfg.filter_max_rot_speed_deg_s,
+        20.0,
+        2000.0,
+        10.0,
+        "rotation speed limit",
+        |c, v| c.filter_max_rot_speed_deg_s = v,
+    );
+    let mov = bound(
+        cfg.filter_max_move_speed_mm_s,
+        20.0,
+        3000.0,
+        10.0,
+        "movement speed limit",
+        |c, v| c.filter_max_move_speed_mm_s = v,
+    );
+    let jump = bound(
+        cfg.filter_max_step_mm,
+        20.0,
+        1000.0,
+        5.0,
+        "jump limit",
+        |c, v| c.filter_max_step_mm = v,
+    );
+    slider(
+        &limits,
+        0,
+        "Max turn speed",
+        &rot,
+        0,
+        "°/s",
+        "The fastest the output may rotate. Lower turns jumps into sweeps; too low feels sluggish",
+    );
+    slider(
+        &limits,
+        1,
+        "Max move speed",
+        &mov,
+        0,
+        "mm/s",
+        "The fastest the output may translate",
+    );
+    slider(
+        &limits,
+        2,
+        "Glitch gate",
+        &jump,
+        0,
+        "mm",
+        "A position step larger than this in one frame is treated as a tracking glitch and held",
+    );
     b.append(&limits);
 
     let ac = gtk::CheckButton::with_label("Auto-centre");
@@ -300,18 +456,57 @@ fn smoothing_section(cfg: &OutputConfig) -> gtk::Box {
     ac.set_tooltip_text(Some(crate::games::AUTO_CENTRE_TOOLTIP));
     b.append(&ac);
     let acg = grid();
-    let t_rot = bound(cfg.auto_centre.time_s, 0.5, 60.0, 0.5, "auto-centre time", |c, v| {
-        c.auto_centre.time_s = v
-    });
-    let t_pos = bound(cfg.auto_centre.translation_time_s, 0.5, 60.0, 0.5, "auto-centre position time", |c, v| {
-        c.auto_centre.translation_time_s = v
-    });
-    let win = bound(cfg.auto_centre.window_deg, 2.0, 45.0, 1.0, "auto-centre window", |c, v| {
-        c.auto_centre.window_deg = v
-    });
-    slider(&acg, 0, "Rotation pace", &t_rot, 1, "s", "How long rotation takes to drift back to centre. Lower = stronger pull");
-    slider(&acg, 1, "Position pace", &t_pos, 1, "s", "The same for leaning. Lower = stronger pull back to centre");
-    slider(&acg, 2, "Ignore turns past", &win, 0, "°", "A turn bigger than this is deliberate and is not pulled back");
+    let t_rot = bound(
+        cfg.auto_centre.time_s,
+        0.5,
+        60.0,
+        0.5,
+        "auto-centre time",
+        |c, v| c.auto_centre.time_s = v,
+    );
+    let t_pos = bound(
+        cfg.auto_centre.translation_time_s,
+        0.5,
+        60.0,
+        0.5,
+        "auto-centre position time",
+        |c, v| c.auto_centre.translation_time_s = v,
+    );
+    let win = bound(
+        cfg.auto_centre.window_deg,
+        2.0,
+        45.0,
+        1.0,
+        "auto-centre window",
+        |c, v| c.auto_centre.window_deg = v,
+    );
+    slider(
+        &acg,
+        0,
+        "Rotation pace",
+        &t_rot,
+        1,
+        "s",
+        "How long rotation takes to drift back to centre. Lower = stronger pull",
+    );
+    slider(
+        &acg,
+        1,
+        "Position pace",
+        &t_pos,
+        1,
+        "s",
+        "The same for leaning. Lower = stronger pull back to centre",
+    );
+    slider(
+        &acg,
+        2,
+        "Ignore turns past",
+        &win,
+        0,
+        "°",
+        "A turn bigger than this is deliberate and is not pulled back",
+    );
     acg.set_sensitive(cfg.auto_centre.enabled);
     b.append(&acg);
     ac.connect_toggled(move |c| {
@@ -486,10 +681,33 @@ fn curves_section(cfg: &OutputConfig, live: Live) -> gtk::Box {
     let input = Adjustment::new(30.0, 1.0, 180.0, 1.0, 10.0, 0.0);
     let output = Adjustment::new(30.0, 1.0, 180.0, 1.0, 10.0, 0.0);
     let exponent = Adjustment::new(1.0, 0.3, 4.0, 0.05, 0.5, 0.0);
-    slider(&g, 0, "Deadzone", &deadzone, 1, "", "Movement from centre that does nothing at all");
-    slider(&g, 1, "Head movement for full output", &input, 0, "",
-        "How far you move your head to reach the full output below");
-    slider(&g, 2, "Full output", &output, 0, "", "What the game receives at that head movement");
+    slider(
+        &g,
+        0,
+        "Deadzone",
+        &deadzone,
+        1,
+        "",
+        "Movement from centre that does nothing at all",
+    );
+    slider(
+        &g,
+        1,
+        "Head movement for full output",
+        &input,
+        0,
+        "",
+        "How far you move your head to reach the full output below",
+    );
+    slider(
+        &g,
+        2,
+        "Full output",
+        &output,
+        0,
+        "",
+        "What the game receives at that head movement",
+    );
     let shape_row = gtk::Box::new(Orientation::Horizontal, 10);
     shape_row.append(&Label::new(Some("Shape")));
     let shape = gtk::DropDown::from_strings(&["Linear", "Smoothstep (S-curve)", "Power"]);
@@ -499,8 +717,15 @@ fn curves_section(cfg: &OutputConfig, live: Live) -> gtk::Box {
     invert.set_halign(Align::End);
     shape_row.append(&invert);
     g.attach(&shape_row, 0, 3, 4, 1);
-    slider(&g, 4, "Power exponent", &exponent, 2, "",
-        "Above 1: gentle near centre, steep at the edge. Below 1: the opposite");
+    slider(
+        &g,
+        4,
+        "Power exponent",
+        &exponent,
+        2,
+        "",
+        "Above 1: gentle near centre, steep at the edge. Below 1: the opposite",
+    );
     b.append(&g);
 
     let reset = crate::widget::button("Reset this axis");
@@ -510,7 +735,14 @@ fn curves_section(cfg: &OutputConfig, live: Live) -> gtk::Box {
     buttons.append(&reset);
     b.append(&buttons);
 
-    let ctl = Rc::new(Controls { deadzone, input, output, shape, exponent, invert });
+    let ctl = Rc::new(Controls {
+        deadzone,
+        input,
+        output,
+        shape,
+        exponent,
+        invert,
+    });
     ctl.show(&ed);
 
     // Units in the slider rows follow the axis.
@@ -662,8 +894,12 @@ fn curves_section(cfg: &OutputConfig, live: Live) -> gtk::Box {
         let ctl = ctl.clone();
         let area = area.clone();
         drag.connect_drag_update(move |g, dx, dy| {
-            let Some(handle) = ed.dragging.get() else { return };
-            let Some((sx, sy)) = g.start_point() else { return };
+            let Some(handle) = ed.dragging.get() else {
+                return;
+            };
+            let Some((sx, sy)) = g.start_point() else {
+                return;
+            };
             let geo = Geometry::new(area.width() as f64, area.height() as f64, ed.extent.get());
             let (vx, vy) = geo.value(sx + dx, sy + dy);
             let info = ed.info();
@@ -742,10 +978,16 @@ impl Geometry {
         }
     }
     fn pt(&self, x: f64, y: f64) -> (f64, f64) {
-        (self.x0 + x / self.xmax * self.w, self.y0 - y / self.ymax * self.h)
+        (
+            self.x0 + x / self.xmax * self.w,
+            self.y0 - y / self.ymax * self.h,
+        )
     }
     fn value(&self, px: f64, py: f64) -> (f64, f64) {
-        ((px - self.x0) / self.w * self.xmax, (self.y0 - py) / self.h * self.ymax)
+        (
+            (px - self.x0) / self.w * self.xmax,
+            (self.y0 - py) / self.h * self.ymax,
+        )
     }
 }
 
@@ -847,7 +1089,13 @@ fn draw_curve(cr: &cairo::Context, w: f64, h: f64, ed: &Editor) {
 
     // Handles.
     let handle = |(x, y): (f64, f64), active: bool| {
-        cr.arc(x, y, if active { 8.0 } else { 6.5 }, 0.0, std::f64::consts::TAU);
+        cr.arc(
+            x,
+            y,
+            if active { 8.0 } else { 6.5 },
+            0.0,
+            std::f64::consts::TAU,
+        );
         cr.set_source_rgb(0.95, 0.95, 0.97);
         let _ = cr.fill_preserve();
         cr.set_source_rgb(0.35, 0.70, 1.0);
@@ -855,7 +1103,10 @@ fn draw_curve(cr: &cairo::Context, w: f64, h: f64, ed: &Editor) {
         let _ = cr.stroke();
     };
     let d = ed.dragging.get();
-    handle(geo.pt(r.input_max_deg, r.output_max_deg), d == Some(Handle::End));
+    handle(
+        geo.pt(r.input_max_deg, r.output_max_deg),
+        d == Some(Handle::End),
+    );
     handle(geo.pt(r.deadzone_deg, 0.0), d == Some(Handle::Deadzone));
     handle(bend_point(&geo, &r), d == Some(Handle::Bend));
 
@@ -873,7 +1124,11 @@ fn draw_curve(cr: &cairo::Context, w: f64, h: f64, ed: &Editor) {
         cr.set_source_rgb(0.4, 0.9, 0.5);
         cr.arc(px, py, 5.0, 0.0, std::f64::consts::TAU);
         let _ = cr.fill();
-        let sign = if ed.invert.get() { -v.signum() } else { v.signum() };
+        let sign = if ed.invert.get() {
+            -v.signum()
+        } else {
+            v.signum()
+        };
         cr.move_to(geo.x0 + geo.w - 230.0, geo.y0 - geo.h + 14.0);
         let _ = cr.show_text(&format!(
             "now: {v:+.1}{u} -> {:+.1}{u}",

@@ -21,9 +21,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::curves::{HeadCurves, AXIS_NAMES};
 #[cfg(test)]
 use crate::curves::DEFAULT_INVERT;
+use crate::curves::{HeadCurves, AXIS_NAMES};
 use crate::fusion::{AxisResponse, Curve, ExtendedView};
 
 /// Default opentrack endpoint — its "UDP over network" input's usual address.
