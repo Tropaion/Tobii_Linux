@@ -435,6 +435,12 @@ pub struct DeviceState {
     /// What became of the head-pose model the last time this program tried to
     /// load it. See [`HeadModel`].
     pub head_model: HeadModel,
+    /// Goes up every time [`DeviceState::head_model`] is answered afresh — the
+    /// worker built, or the card asking for a new look — so the hub's card can
+    /// redraw on it. The answer alone is no signal: a worker rebuilt for a
+    /// saved pitch zero is `Running` before and after, and a fresh look asked
+    /// for while nothing has answered yet is `Unasked` before and after.
+    pub head_answers: u64,
     /// Most recent head pose, as the opentrack stream would see it: position
     /// from the eye origins, rotation from the model. `None` until a model is
     /// installed AND a frame it was confident about has arrived.
@@ -501,7 +507,9 @@ pub enum DeviceCommand {
     /// save it. Runs inline on the device thread, publishing progress into
     /// [`DeviceState::pitch_cal`]; the hub is briefly not updating gaze while it
     /// does, which is the correct trade for a measurement the user is holding
-    /// still for anyway.
+    /// still for anyway. A saved zero rebuilds the head-pose worker by itself,
+    /// as [`DeviceCommand::ReloadHeadModel`] would: the running model holds the
+    /// offset it was built with.
     PitchCalibrate {
         secs: u64,
         token: u64,
@@ -511,8 +519,8 @@ pub enum DeviceCommand {
     ///
     /// The worker resolves both once, when it is created, and a connection can
     /// live for hours. Without this, a model fetched from the hub did nothing
-    /// until a restart, and a pitch zero measured in the hub was written to disk
-    /// and then ignored by the very model that had just been used to measure it.
+    /// until a restart. A saved pitch measurement rebuilds it the same way,
+    /// without this command (see [`DeviceCommand::PitchCalibrate`]).
     ReloadHeadModel,
     /// Compute and apply the model from the points collected so far, without
     /// ending the session.
@@ -565,7 +573,7 @@ fn apply_command<T: Transport>(
             let _ = conn.set_display_area(&c);
         }
         DeviceCommand::PitchCalibrate { secs, token } => {
-            calibrate_pitch(conn, state, secs, token);
+            reload_head = calibrate_pitch(conn, state, secs, token);
         }
         DeviceCommand::ReloadHeadModel => reload_head = true,
         DeviceCommand::SetEnabledEye(e) => {
@@ -926,13 +934,18 @@ impl HeadWorker {
     /// time the connection was re-established.
     fn spawn(state: Arc<Mutex<DeviceState>>) -> Option<HeadWorker> {
         use tobii_headpose::onnx::{fuse, OnnxPose, RotationSource};
+        let answer = |a: HeadModel| {
+            let mut s = state.lock().unwrap();
+            s.head_model = a;
+            s.head_answers += 1;
+        };
         let mut model = match OnnxPose::from_store() {
             Ok(m) => {
-                state.lock().unwrap().head_model = HeadModel::Running;
+                answer(HeadModel::Running);
                 m
             }
             Err(tobii_headpose::onnx::OnnxError::ModelMissing(_)) => {
-                state.lock().unwrap().head_model = HeadModel::Missing;
+                answer(HeadModel::Missing);
                 return None;
             }
             // Published as well as logged, and that is the whole point of the
@@ -941,7 +954,7 @@ impl HeadWorker {
             Err(e) => {
                 let why = e.to_string();
                 tobii_diagnostics::log::warn(&format!("head pose: {why}"));
-                state.lock().unwrap().head_model = HeadModel::Refused(why);
+                answer(HeadModel::Refused(why));
                 return None;
             }
         };
@@ -1004,18 +1017,22 @@ impl HeadWorker {
 /// acceptable precisely because the user is sitting still for it — and the
 /// alternative, holding a 13 MB model and 12 ms of inference inside the state
 /// mutex the UI redraws from, is not.
+///
+/// Returns whether a new zero was saved, which is when the head-pose worker
+/// has to be rebuilt. Decided here, where the file is written, because the
+/// result cannot say it: a run that saved but saw the head move reports `Err`.
 fn calibrate_pitch<T: Transport>(
     conn: &mut Connection<T>,
     state: &Mutex<DeviceState>,
     secs: u64,
     token: u64,
-) {
+) -> bool {
     // The UI put `active` and `token` in place before sending the command. If
     // either has changed, this run was cancelled or superseded while it sat in
     // the queue, and going ahead would spend 13 s measuring a user who has
     // walked away and then save it over their good calibration.
     if !current(state, token) {
-        return;
+        return false;
     }
     let finish = |r: Result<f64, String>| {
         let mut s = state.lock().unwrap();
@@ -1033,7 +1050,10 @@ fn calibrate_pitch<T: Transport>(
 
     let mut model = match tobii_headpose::onnx::OnnxPose::from_store() {
         Ok(m) => m,
-        Err(e) => return finish(Err(e.to_string())),
+        Err(e) => {
+            finish(Err(e.to_string()));
+            return false;
+        }
     };
     // Measure the model's RAW pitch. Applying the saved offset while measuring a
     // new one would make each run a correction of the last, not a measurement.
@@ -1070,31 +1090,32 @@ fn calibrate_pitch<T: Transport>(
         }
         let mut s = state.lock().unwrap();
         if s.pitch_cal.token != token || !s.pitch_cal.active {
-            return; // cancelled from the UI, or superseded by a newer run
+            return false; // cancelled from the UI, or superseded by a newer run
         }
         s.pitch_cal.secs_left = deadline.saturating_duration_since(Instant::now()).as_secs();
         s.pitch_cal.samples = samples.len();
     }
 
-    match tobii_headpose::pitch_offset_from(&mut samples) {
-        Some((offset, spread)) => match tobii_config::save_pitch_offset(offset) {
-            Ok(()) => {
-                if spread > 8.0 {
-                    finish(Err(format!(
-                        "saved, but your head moved during the measurement \
-                         ({spread:.1}° of spread) — run it again if pitch looks off"
-                    )));
-                } else {
-                    finish(Ok(offset));
-                }
-            }
-            Err(e) => finish(Err(format!("could not save: {e}"))),
-        },
-        None => finish(Err(format!(
+    let Some((offset, spread)) = tobii_headpose::pitch_offset_from(&mut samples) else {
+        finish(Err(format!(
             "only {} usable frames — was your face in view? Nothing was saved.",
             samples.len()
-        ))),
+        )));
+        return false;
+    };
+    if let Err(e) = tobii_config::save_pitch_offset(offset) {
+        finish(Err(format!("could not save: {e}")));
+        return false;
     }
+    finish(if spread > 8.0 {
+        Err(format!(
+            "saved, but your head moved during the measurement \
+             ({spread:.1}° of spread) — run it again if pitch looks off"
+        ))
+    } else {
+        Ok(offset)
+    });
+    true
 }
 
 /// Whether `token` still owns the pitch-calibration state.
@@ -1112,8 +1133,9 @@ fn current(state: &Mutex<DeviceState>, token: u64) -> bool {
 pub struct Tick {
     pub published: bool,
     pub saw_traffic: bool,
-    /// A [`DeviceCommand::ReloadHeadModel`] arrived; the loop owns the worker,
-    /// so it does the rebuilding.
+    /// A [`DeviceCommand::ReloadHeadModel`] arrived, or a
+    /// [`DeviceCommand::PitchCalibrate`] saved a zero; the loop owns the
+    /// worker, so it does the rebuilding.
     pub reload_head: bool,
 }
 
@@ -1175,6 +1197,10 @@ pub fn spawn() -> Session {
                     if !matches!(st.status, ConnStatus::Idle) {
                         *st = DeviceState {
                             status: ConnStatus::Idle,
+                            // Counted on, not reset: the answer goes back to
+                            // `Unasked`, and a count back at a value the hub
+                            // already saw would hide a change from its card.
+                            head_answers: st.head_answers + 1,
                             ..DeviceState::default()
                         };
                     }

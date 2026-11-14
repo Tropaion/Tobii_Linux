@@ -3,6 +3,24 @@
 //! A styled hub window (status + live eye-position view) over the device
 //! thread, from which the guided display-setup and calibration flows, the
 //! gaze-preview overlay, and the select-eyes control are driven.
+//!
+//! # Lifetimes
+//!
+//! GTK4 emits `destroy` only on finalisation, so a leaked widget is invisible
+//! until something weak-references it and looks (`tests/hub_lifetime.rs`,
+//! `tests/head_model_dialogs.rs`). Two shapes leak, and the rule that avoids
+//! both is: labels and plain boxes strongly, every widget that carries a
+//! handler through `downgrade()`, and no widget — nor anything holding one —
+//! strongly in a GLib source's closure.
+//!
+//! * **A handler holding its own window**, or any widget holding the handler,
+//!   is a cycle GTK never breaks. Take the window from the widget at the time
+//!   instead — [`close_on_click`], [`add_escape_to_close`].
+//! * **A source still pending when the program quits** never runs again and
+//!   never drops its closure, so whatever it holds strongly outlives the
+//!   program. A poll holds its widgets weakly and stops when they are gone.
+//!   A window the hub's quit does not close is a third way in: a dialog is
+//!   made one of the application's windows ([`dialog_of`]) so that it is.
 
 pub mod accuracy;
 pub mod align;
@@ -1017,6 +1035,21 @@ pub(crate) fn add_escape_to_close(win: &impl IsA<gtk::Window>) {
     win.add_controller(keys);
 }
 
+/// Make `win` a dialog of `parent`: kept above it, and one of the
+/// application's windows, so that the hub's quit closes it — running its close
+/// handler — along with every other window (see the quit path's step 2b). A
+/// window that is only transient for the hub is left open by that, with its
+/// handlers unrun and everything in it alive past the end of the program.
+pub(crate) fn dialog_of(win: &gtk::Window, parent: Option<&gtk::Window>) {
+    let Some(parent) = parent else {
+        return;
+    };
+    win.set_transient_for(Some(parent));
+    if let Some(app) = parent.application() {
+        win.set_application(Some(&app));
+    }
+}
+
 /// Make `btn` close the window it is in.
 ///
 /// Found from the button at click time, never captured: the button lives inside
@@ -1804,8 +1837,9 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
         &eyes_box,
     ));
     // Taken apart on the spot, the way the Games tab is and for the same
-    // reason: the tick holds `refresh`, which holds no widget strongly, and
-    // never the card, which is one of this window's own descendants.
+    // reason: the tick holds `refresh`, which holds only the card's labels
+    // strongly, and never the card, which is one of this window's own
+    // descendants.
     let head_model::HeadCard {
         root: head_root,
         refresh: head_refresh,
@@ -2388,7 +2422,7 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     let eye_applied = Rc::new(Cell::new(0u64));
     // What the head-model card was last told, so the tick only redraws it when
     // the device thread's answer has actually changed.
-    let last_head_model: Rc<RefCell<Option<device::HeadModel>>> = Rc::default();
+    let last_head_answers: Rc<Cell<Option<u64>>> = Rc::default();
     // The hub's claim on the tracker, synced from `window.is_active()` on every
     // tick. Declared here because the tick below owns it.
     let focus_hold: Rc<RefCell<Option<device::DemandGuard>>> = Rc::new(RefCell::new(None));
@@ -2620,8 +2654,8 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
             // program. Compared before calling because this runs every 33 ms
             // and the refresh reads the profile directory's neighbour on disk;
             // the value changes at most a handful of times in a session.
-            if last_head_model.borrow().as_ref() != Some(&snap.head_model) {
-                *last_head_model.borrow_mut() = Some(snap.head_model.clone());
+            // On the count of answers and not the answer: see `head_answers`.
+            if last_head_answers.replace(Some(snap.head_answers)) != Some(snap.head_answers) {
                 head_refresh();
             }
 
@@ -3379,11 +3413,15 @@ fn diagnostics_row() -> gtk::Box {
             status.set_visible(true);
             let mine = generation.get().wrapping_add(1);
             generation.set(mine);
-            let status = status.clone();
+            // Weakly: this is pending for six seconds after any message, quit
+            // included (see the crate docs, *Lifetimes*).
+            let status = status.downgrade();
             let generation = generation.clone();
             glib::timeout_add_local_once(Duration::from_secs(6), move || {
                 if generation.get() == mine {
-                    status.set_visible(false);
+                    if let Some(status) = status.upgrade() {
+                        status.set_visible(false);
+                    }
                 }
             });
         }

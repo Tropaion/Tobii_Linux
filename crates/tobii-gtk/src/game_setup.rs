@@ -3285,13 +3285,33 @@ fn pretty(argv: &[OsString]) -> String {
         .join(" ")
 }
 
+/// What a finished job does: put what it found in `slot`, keyed by the game it
+/// was for, then call `then` to redraw.
+///
+/// `then` is held weakly, because the closure this returns lives in
+/// [`start_job`]'s poll and `then` reaches the page's widgets (see the crate
+/// docs, *Lifetimes*).
+fn land<T: 'static>(
+    slot: &Rc<RefCell<Option<(String, T)>>>,
+    id: String,
+    then: &Rc<dyn Fn()>,
+) -> impl Fn(T) + 'static {
+    let (slot, then) = (slot.clone(), Rc::downgrade(then));
+    move |found| {
+        *slot.borrow_mut() = Some((id.clone(), found));
+        if let Some(then) = then.upgrade() {
+            then();
+        }
+    }
+}
+
 /// Run one subprocess on a worker thread and poll for its result.
 ///
 /// The poll is `glib::timeout_add_local` at 150 ms, which is
-/// `head_model::start_download`'s shape, with the `alive` guard from
-/// `head_model::pitch_dialog` — whose comment records the measurement: without
-/// it a cancelled run "left a 5 Hz timeout running for the life of the process,
-/// holding every widget in this window alive with it".
+/// `head_model::start_download`'s shape, stopped by the `alive` guard below.
+///
+/// **`done` runs from that poll, so it holds no widget strongly**: the poll
+/// is pending at quit whenever a job is. [`land`] builds one that does not.
 ///
 /// **Nothing here kills the child, ever.** `bridge.rs`'s install stages each
 /// DLL beside its target and renames it, exactly so a half-finished copy cannot
@@ -4477,11 +4497,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             };
             *outcome.borrow_mut() = None;
             let argv = install_argv(t, &app.target, &InstallWith::default());
-            let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
-            start_job(argv, &app.key(), &alive, &running, move |o| {
-                *outcome2.borrow_mut() = Some((id.clone(), o));
-                recheck2();
-            });
+            let done = land(&outcome, app.key(), &recheck);
+            start_job(argv, &app.key(), &alive, &running, done);
             refresh();
         });
     }
@@ -4506,11 +4523,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
             // user has moved on lands on the right game or nowhere.
             *outcome.borrow_mut() = None;
             let argv = uninstall_argv(t, &app.target);
-            let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
-            start_job(argv, &app.key(), &alive, &running, move |o| {
-                *outcome2.borrow_mut() = Some((id.clone(), o));
-                recheck2();
-            });
+            let done = land(&outcome, app.key(), &recheck);
+            start_job(argv, &app.key(), &alive, &running, done);
             refresh();
         });
     }
@@ -4529,8 +4543,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 return;
             };
             let argv = status_argv(t, &app.target);
-            let (refresh2, report2, id, t2) =
-                (refresh.clone(), report.clone(), app.key(), t.clone());
+            let (done, t2) = (land(&report, app.key(), &refresh), t.clone());
             start_job(argv, &app.key(), &alive, &running, move |o| {
                 let mut s = String::new();
                 // A `tobii` with no `bridge status` answers with its usage and
@@ -4548,8 +4561,7 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                     }
                     s.push_str(o.stderr.trim_end());
                 }
-                *report2.borrow_mut() = Some((id.clone(), s));
-                refresh2();
+                done(s);
             });
             refresh();
         });
@@ -4597,11 +4609,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                         ..InstallWith::default()
                     },
                 );
-                let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
-                start_job(argv, &app.key(), &alive, &running, move |o| {
-                    *outcome2.borrow_mut() = Some((id.clone(), o));
-                    recheck2();
-                });
+                let done = land(&outcome, app.key(), &recheck);
+                start_job(argv, &app.key(), &alive, &running, done);
                 refresh();
             });
         });
@@ -4645,11 +4654,8 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                         ..InstallWith::default()
                     },
                 );
-                let (recheck2, outcome2, id) = (recheck.clone(), outcome.clone(), app.key());
-                start_job(argv, &app.key(), &alive, &running, move |o| {
-                    *outcome2.borrow_mut() = Some((id.clone(), o));
-                    recheck2();
-                });
+                let done = land(&outcome, app.key(), &recheck);
+                start_job(argv, &app.key(), &alive, &running, done);
                 refresh();
             });
         });

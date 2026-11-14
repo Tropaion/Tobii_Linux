@@ -205,6 +205,7 @@ pub fn control(
             // *Get the model…* button hidden, for the rest of the session.
             if let Ok(mut s) = state.lock() {
                 s.head_model = crate::device::HeadModel::Unasked;
+                s.head_answers += 1;
             }
             let _ = cmd_tx.send(crate::device::DeviceCommand::ReloadHeadModel);
         }
@@ -317,33 +318,23 @@ pub fn control(
 
     // --- get the model ---
     {
-        let (status, refresh) = (status.clone(), refresh.clone());
+        let status = status.clone();
         let reload = reload.clone();
         get.connect_clicked(move |btn| {
-            let (status, refresh, btn) = (status.clone(), refresh.clone(), btn.clone());
+            let (status, btn) = (status.clone(), btn.clone());
             let reload = reload.clone();
             let parent = btn.root().and_downcast::<gtk::Window>();
-            let reload = reload.clone();
             terms_dialog(parent.as_ref(), move || {
-                start_download(&btn, &status, refresh.clone(), reload.clone())
+                start_download(&btn, &status, reload.clone())
             });
         });
     }
 
     // --- measure the pitch zero ---
-    {
-        let (pitch_label, refresh) = (pitch.clone(), refresh.clone());
-        set_pitch.connect_clicked(move |btn| {
-            let parent = btn.root().and_downcast::<gtk::Window>();
-            pitch_dialog(
-                parent.as_ref(),
-                state.clone(),
-                cmd_tx.clone(),
-                pitch_label.clone(),
-                refresh.clone(),
-            );
-        });
-    }
+    set_pitch.connect_clicked(move |btn| {
+        let parent = btn.root().and_downcast::<gtk::Window>();
+        pitch_dialog(parent.as_ref(), state.clone(), cmd_tx.clone());
+    });
 
     // --- is there a newer model upstream? ---
     {
@@ -357,8 +348,12 @@ pub fn control(
             std::thread::spawn(move || {
                 let _ = tx.send(model_store::check_update(SRC));
             });
-            let (btn, status) = (btn.clone(), status.clone());
+            // Weakly (see the crate docs, *Lifetimes*).
+            let (btn, status) = (btn.downgrade(), status.downgrade());
             glib::timeout_add_local(Duration::from_millis(150), move || {
+                let (Some(btn), Some(status)) = (btn.upgrade(), status.upgrade()) else {
+                    return glib::ControlFlow::Break;
+                };
                 match rx.try_recv() {
                     Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Ok(u) => {
@@ -390,7 +385,7 @@ pub fn control(
 
     // --- remove it ---
     {
-        let (status, refresh) = (status.clone(), refresh.clone());
+        let status = status.clone();
         let reload = reload.clone();
         remove.connect_clicked(move |btn| {
             let dlg = gtk::AlertDialog::builder()
@@ -404,21 +399,17 @@ pub fn control(
                 .cancel_button(0)
                 .default_button(0)
                 .build();
-            let (status, refresh) = (status.clone(), refresh.clone());
+            let status = status.clone();
             let reload = reload.clone();
             let parent = btn.root().and_downcast::<gtk::Window>();
             dlg.choose(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
                 if res.unwrap_or(0) != 1 {
                     return;
                 }
+                // `reload` clears the stale published answer, and the hub's
+                // tick redraws the card on that.
                 match std::fs::remove_file(model_store::path_of(SRC)) {
-                    Ok(()) => {
-                        // `reload` before `refresh`, and that order is the fix:
-                        // `reload` clears the stale published answer and
-                        // `refresh` is what reads it.
-                        reload();
-                        refresh();
-                    }
+                    Ok(()) => reload(),
                     Err(e) => status.set_text(&format!("Could not remove it: {e}")),
                 }
             });
@@ -431,9 +422,9 @@ pub fn control(
 /// The head-model card, and the one thing the hub has to be able to do to it.
 ///
 /// Two fields taken apart on the spot by the caller, for [`crate::game_setup::GamesTab`]'s
-/// reason: `root` goes into the rack, which owns it, and `refresh` holds no
-/// widget strongly, so the hub's tick can keep a handle on it without holding
-/// a subtree of its own window.
+/// reason: `root` goes into the rack, which owns it, and `refresh` holds only
+/// the card's two labels strongly, so the hub's tick can keep a handle on it
+/// without holding a subtree of its own window.
 pub struct HeadCard {
     /// The widget the rack gets.
     pub root: gtk::Box,
@@ -448,12 +439,18 @@ pub struct HeadCard {
 }
 
 /// The guided pitch-zero measurement: instructions, a live countdown, a result.
-fn pitch_dialog(
+///
+/// The card's own pitch line is not this dialog's to update: a saved zero
+/// rebuilds the device thread's worker, which publishes the zero it was built
+/// with, and the hub's tick refreshes the card on that — whether or not this
+/// dialog is still open to see the result.
+///
+/// Public so a test can open it without a hub or a tracker; the hub only
+/// reaches it through the button in [`control`].
+pub fn pitch_dialog(
     parent: Option<&gtk::Window>,
     state: std::sync::Arc<std::sync::Mutex<crate::device::DeviceState>>,
     cmd_tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>,
-    pitch_label: Label,
-    refresh: Rc<dyn Fn()>,
 ) {
     const SECS: u64 = 10;
 
@@ -508,39 +505,27 @@ fn pitch_dialog(
         .default_width(520)
         .child(&content)
         .build();
-    if let Some(p) = parent {
-        win.set_transient_for(Some(p));
-    }
+    crate::dialog_of(&win, parent);
 
+    // Cancel (later Stop, then Done) and Esc only close the window; closing it,
+    // by them or by the compositor, is what stops a running measurement.
+    crate::close_on_click(&close);
+    crate::add_escape_to_close(&win);
     {
-        let w = win.clone();
         let state = state.clone();
-        close.connect_clicked(move |_| {
+        win.connect_close_request(move |_| {
             // Tell a running measurement to stop; the device thread checks this
             // flag each loop and returns without saving.
-            state.lock().unwrap().pitch_cal.active = false;
-            w.close();
-        });
-    }
-    // The dialog's lifetime, so the poll below can stop when it closes. Without
-    // it a cancelled run left a 5 Hz timeout running for the life of the
-    // process, holding every widget in this window alive with it.
-    let alive = std::rc::Rc::new(std::cell::Cell::new(true));
-    {
-        let (alive, state) = (alive.clone(), state.clone());
-        win.connect_close_request(move |_| {
-            alive.set(false);
             state.lock().unwrap().pitch_cal.active = false;
             glib::Propagation::Proceed
         });
     }
     {
-        let (progress, close, pitch_label) = (progress.clone(), close.clone(), pitch_label.clone());
-        let refresh = refresh.clone();
-        let state = state.clone();
-        let cmd_tx = cmd_tx.clone();
-        let alive = alive.clone();
+        let close = close.downgrade();
         go.connect_clicked(move |go| {
+            let Some(close) = close.upgrade() else {
+                return;
+            };
             go.set_sensitive(false);
             crate::widget::set_button_text(&close, "Stop");
             progress.set_text("Get comfortable — starting in 3 seconds…");
@@ -561,29 +546,26 @@ fn pitch_dialog(
             };
             let _ = cmd_tx.send(crate::device::DeviceCommand::PitchCalibrate { secs: SECS, token });
 
-            let (state, progress, go, close) =
-                (state.clone(), progress.clone(), go.clone(), close.clone());
-            let (pitch_label, refresh, alive) =
-                (pitch_label.clone(), refresh.clone(), alive.clone());
-            let cmd_tx = cmd_tx.clone();
+            // Weakly (see the crate docs, *Lifetimes*): closing the dialog
+            // frees these, and that is what stops this poll.
+            //
+            // Nothing to send or refresh when a run ends: the device thread
+            // rebuilds the model itself once it has saved a zero (see
+            // `calibrate_pitch`), and the hub's tick redraws the card on that.
+            let state = state.clone();
+            let (progress, go, close) = (progress.downgrade(), go.downgrade(), close.downgrade());
             glib::timeout_add_local(Duration::from_millis(200), move || {
-                if !alive.get() {
+                let (Some(progress), Some(go), Some(close)) =
+                    (progress.upgrade(), go.upgrade(), close.upgrade())
+                else {
                     return glib::ControlFlow::Break; // the dialog is gone
-                }
+                };
                 let cal = state.lock().unwrap().pitch_cal.clone();
                 if cal.token != token {
                     return glib::ControlFlow::Break; // a newer run owns it
                 }
                 if let Some(result) = &cal.result {
                     progress.set_text(&pitch_outcome(result));
-                    if result.is_ok() {
-                        // The running model holds the offset it was built with,
-                        // so the number just measured means nothing until it is
-                        // rebuilt — including to the very model that measured it.
-                        let _ = cmd_tx.send(crate::device::DeviceCommand::ReloadHeadModel);
-                    }
-                    pitch_label.set_text(&pitch_line(model_store::pitch_offset()));
-                    refresh();
                     go.set_sensitive(true);
                     crate::widget::set_button_text(&close, "Done");
                     return glib::ControlFlow::Break;
@@ -602,19 +584,6 @@ fn pitch_dialog(
         });
     }
 
-    let keys = gtk::EventControllerKey::new();
-    let w = win.clone();
-    let state_for_esc = state.clone();
-    keys.connect_key_pressed(move |_, key, _, _| {
-        if key == gtk::gdk::Key::Escape {
-            state_for_esc.lock().unwrap().pitch_cal.active = false;
-            w.close();
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    win.add_controller(keys);
     win.present();
     close.grab_focus();
 }
@@ -708,17 +677,13 @@ pub fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F
         .default_width(560)
         .child(&content)
         .build();
-    if let Some(p) = parent {
-        win.set_transient_for(Some(p));
-    }
+    crate::dialog_of(&win, parent);
 
-    let w = win.clone();
-    cancel.connect_clicked(move |_| w.close());
-    let w = win.clone();
-    agree.connect_clicked(move |_| {
-        w.close();
-        on_agree();
-    });
+    // Handlers run in the order they were connected, so agreeing closes the
+    // window before the download starts.
+    crate::close_on_click(&cancel);
+    crate::close_on_click(&agree);
+    agree.connect_clicked(move |_| on_agree());
     // Escape is a "no", like every other refusal path here.
     crate::add_escape_to_close(&win);
     win.present();
@@ -728,12 +693,11 @@ pub fn terms_dialog<F: Fn() + 'static>(parent: Option<&gtk::Window>, on_agree: F
 }
 
 /// Fetch on a worker thread, reporting progress from the part-file's size.
-fn start_download<R: Fn() + Clone + 'static>(
-    btn: &Button,
-    status: &Label,
-    refresh: Rc<dyn Fn()>,
-    reload: R,
-) {
+///
+/// The card redraws itself once it is done: `reload` clears the device
+/// thread's answer about the old file, and the hub's tick refreshes the card
+/// when that answer changes.
+fn start_download<R: Fn() + 'static>(btn: &Button, status: &Label, reload: R) {
     btn.set_sensitive(false);
     btn.set_visible(true);
     status.set_text(&progress_line(0, SRC.bytes));
@@ -743,36 +707,38 @@ fn start_download<R: Fn() + Clone + 'static>(
     std::thread::spawn(move || {
         let _ = tx.send(model_store::fetch(SRC));
     });
-    let btn = btn.clone();
-    let status = status.clone();
-    glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
-        Err(std::sync::mpsc::TryRecvError::Empty) => {
-            // The fetcher is a child process (curl/wget), so the only progress
-            // signal available is the part-file growing on disk.
-            let so_far = std::fs::metadata(model_store::download_path(SRC))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            status.set_text(&progress_line(so_far, SRC.bytes));
-            glib::ControlFlow::Continue
-        }
-        Ok(Ok(_)) => {
-            btn.set_sensitive(true);
-            // `reload` first: it clears the published answer that `refresh`
-            // reads, and that answer is about the file this download replaced.
+    // The widgets weakly (see the crate docs, *Lifetimes*), and the poll goes
+    // on without them: a finished download is loaded whether or not the card
+    // is there to say so.
+    let (btn, status) = (btn.downgrade(), status.downgrade());
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        let done = match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // The fetcher is a child process (curl/wget), so the only
+                // progress signal available is the part-file growing on disk.
+                if let Some(status) = status.upgrade() {
+                    let so_far = std::fs::metadata(model_store::download_path(SRC))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    status.set_text(&progress_line(so_far, SRC.bytes));
+                }
+                return glib::ControlFlow::Continue;
+            }
+            Ok(r) => r.map(drop).map_err(|e| e.to_string()),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("the download stopped unexpectedly.".to_string())
+            }
+        };
+        if done.is_ok() {
             reload();
-            refresh();
-            glib::ControlFlow::Break
         }
-        Ok(Err(e)) => {
+        if let Some(btn) = btn.upgrade() {
             btn.set_sensitive(true);
+        }
+        if let (Err(e), Some(status)) = (done, status.upgrade()) {
             status.set_text(&format!("Download failed: {e}"));
-            glib::ControlFlow::Break
         }
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            btn.set_sensitive(true);
-            status.set_text("Download failed: the download stopped unexpectedly.");
-            glib::ControlFlow::Break
-        }
+        glib::ControlFlow::Break
     });
 }
 

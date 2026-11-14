@@ -1576,7 +1576,9 @@ the quit and letting go afterwards, because a freeing that only happens when
 nobody else took a reference is not one anybody can rely on.
 `tests/games_tab_refreshes.rs` rewrites `games.toml` between tab switches and
 asserts the page re-reads it. `tests/hub_lifetime.rs` censuses the hub's
-*whole* tree the same way. Headlessly, `hub_wants_tracker` pins the claim
+*whole* tree the same way, and `tests/head_model_dialogs.rs` the head-model
+card's two dialogs after every way out of each, the last of them a quit with a
+pitch measurement running. Headlessly, `hub_wants_tracker` pins the claim
 condition, because a window in a nested compositor may never be active and a
 display test watching the reason list would pass with the tab condition
 deleted.
@@ -1584,12 +1586,12 @@ deleted.
 **What is not:**
 
 - **None of it runs in CI.** `ci.yml`, `release.yml` and `scripts/package.sh`
-  all run `cargo test --workspace --locked`, which compiles the nine ignored
+  all run `cargo test --workspace --locked`, which compiles the ten ignored
   tests and skips every one. `clippy --all-targets` keeps them from rotting
   syntactically, so nobody gets a warning; they simply never run.
   `scripts/display-tests.sh` is the one command that does run them, and it is
   run by a person. This is the same gap §11.3h recorded for the help window,
-  now carrying eight files instead of one.
+  now carrying nine files instead of one.
 - **The tab strip's appearance is unasserted.** That the selected tab merges
   into the page it stands on is CSS — a negative bottom margin landing on a
   border — and the tests assert the *structure* it depends on (the strip and

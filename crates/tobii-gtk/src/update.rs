@@ -992,9 +992,7 @@ fn changelog_dialog(parent: Option<&gtk::Window>, release: &Release) {
         .default_height(480)
         .child(&content)
         .build();
-    if let Some(p) = parent {
-        win.set_transient_for(Some(p));
-    }
+    crate::dialog_of(&win, parent);
     crate::close_on_click(&close);
     crate::add_escape_to_close(&win);
     win.present();

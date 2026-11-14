@@ -1030,26 +1030,29 @@ pub fn launch(
     add_escape_to_close(&win);
 
     // Closing the window — by button, Esc, or the compositor (Alt+F4) — aborts
-    // any open session and retires the tick. Without the flag the tick would
-    // keep firing forever against a dead window, and could still fire CalFinish
-    // and persist a calibration after the flow was gone.
-    let closed = Rc::new(Cell::new(false));
+    // any open session and removes the tick. Without that the tick would keep
+    // firing against a dead window, and could still fire CalFinish and persist
+    // a calibration after the flow was gone. Removed on the spot rather than
+    // flagged for it to read: at quit it never runs again, so a flag left it
+    // holding every widget of the flow past the end of the program (see the
+    // crate docs, *Lifetimes*).
+    let tick: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
     {
-        let closed = closed.clone();
+        let tick = tick.clone();
         let cmd_tx = cmd_tx.clone();
         win.connect_close_request(move |_| {
-            closed.set(true);
+            if let Some(id) = tick.borrow_mut().take() {
+                id.remove();
+            }
             let _ = cmd_tx.send(DeviceCommand::CalAbort);
             glib::Propagation::Proceed
         });
     }
 
     // ~30 fps state machine: read the device's CalPhase, advance the UI phase.
+    // It never stops itself; the close handler above removes it.
     let tick_cmd = cmd_tx.clone();
-    glib::timeout_add_local(Duration::from_millis(33), move || {
-        if closed.get() {
-            return glib::ControlFlow::Break;
-        }
+    let id = glib::timeout_add_local(Duration::from_millis(33), move || {
         let cal: CalPhase = state.lock().unwrap().calibration.clone();
         // Age out any still-animating burst every tick, independent of phase —
         // this keeps the last point's explosion finishing on its own even once
@@ -1682,6 +1685,7 @@ pub fn launch(
         area.queue_draw();
         glib::ControlFlow::Continue
     });
+    *tick.borrow_mut() = Some(id);
 
     win.present();
     win

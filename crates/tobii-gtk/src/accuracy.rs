@@ -687,8 +687,13 @@ pub fn launch(
             per_eye.clone(),
             results.clone(),
         );
-        let (win, area, targets) = (win.clone(), area.clone(), targets.clone());
+        // Weakly, and the window's going is what stops this: Esc closes it
+        // without telling the tick (see the crate docs, *Lifetimes*).
+        let (win, area, targets) = (win.downgrade(), area.downgrade(), targets.clone());
         move || {
+            let (Some(win), Some(area)) = (win.upgrade(), area.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
             let i = index.get();
             let Some(&target) = targets.get(i) else {
                 return glib::ControlFlow::Break;
@@ -771,7 +776,7 @@ pub fn launch(
                 ticks.set(0);
                 index.set(i + 1);
                 if i + 1 >= targets.len() {
-                    finish(&results.borrow(), band, width_mm, offset_x_mm, eye_mode);
+                    // The close handler reports.
                     win.close();
                     return glib::ControlFlow::Break;
                 }
@@ -782,21 +787,14 @@ pub fn launch(
     };
     glib::timeout_add_local(std::time::Duration::from_millis(33), tick);
 
-    let esc = gtk::EventControllerKey::new();
-    {
-        let (win, results) = (win.clone(), results.clone());
-        esc.connect_key_pressed(move |_, key, _, _| {
-            if key == gtk::gdk::Key::Escape {
-                // Report whatever was gathered — a half-finished sweep of the
-                // middle is still worth more than nothing.
-                finish(&results.borrow(), band, width_mm, offset_x_mm, eye_mode);
-                win.close();
-                return glib::Propagation::Stop;
-            }
-            glib::Propagation::Proceed
-        });
-    }
-    win.add_controller(esc);
+    // Every way out reports, once, from here: the end of the sweep, Esc and
+    // the compositor (Alt+F4) all close the window. Whatever was gathered — a
+    // half-finished sweep of the middle is still worth more than nothing.
+    crate::add_escape_to_close(&win);
+    win.connect_close_request(move |_| {
+        finish(&results.borrow(), band, width_mm, offset_x_mm, eye_mode);
+        glib::Propagation::Proceed
+    });
 
     win.present();
     win

@@ -473,10 +473,7 @@ fn capture_key(anchor: &gtk::Button, recentring: Recentring) {
     win.set_title(Some("Recentre key"));
     win.set_modal(true);
     win.set_resizable(false);
-    if let Some(root) = anchor.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
-        win.set_transient_for(Some(&root));
-        win.set_destroy_with_parent(true);
-    }
+    crate::dialog_of(&win, anchor.root().and_downcast::<gtk::Window>().as_ref());
     let msg = Label::new(Some(
         "Press the key combination that should recentre the view.\n\
          Esc cancels; Backspace removes the key.",
