@@ -1893,6 +1893,91 @@ report was the third surface with the same blind spot.
   certify an old one; but a provider replaced by hand afterwards would still be
   vouched for. Nothing reads the exe.
 
+### 11.3q Smoothing, response curves, auto-centre, the recentre key and the Tuning window (new in v0.8.0)
+
+PR #3 (an outside contribution) added the One-Euro filter as the default, a
+response curve per output axis, an output speed limit, opt-in auto-centre, a
+recentre that also levels pitch, `tobii recentre` with a key for it, and the
+Tuning window. Four of those change what an existing user gets without touching
+anything (x mirrored, the adaptive filter, the speed limit, pitch in the
+recentre), and the maintainer chose to keep them as defaults. The release notes
+list each, and how to undo the three that can be undone.
+
+**What is measured.**
+
+- The curves, the filter and the speed limit are unit-tested in
+  `tobii-output` and `tobii-headpose`. The movement speed-limit test that came
+  with the PR could not fail, and was replaced by one that can.
+- The recentre has tests for refusing a nod, and for
+  `forget_pitch_reference` dropping the pitch reference. Since 4167196 they
+  also cover a head model that drops out: the reference applies only to
+  measured pitch, and a window keeps to one source.
+- The COSMIC writer is tested against COSMIC's file format, including the
+  comments a person might add. Removing nothing writes nothing, and a
+  commented-out copy of our entry is not mistaken for it.
+- A per-user `tobii uninstall` decides about the entry by the same rule as
+  the menu entry, and keeps an entry it cannot read, with the reason.
+- `tobii games set` and `tobii games profile apply` refuse a deadzone at or
+  past `input_max` and an exponent outside 0.1 to 10. They refuse only
+  problems the edit creates: a file that already has one still loads and
+  saves.
+- Settings writes go through a symlink and keep the target's mode. A target
+  that cannot be written through is replaced, made writable by its owner.
+  That replacement is asserted only when the test does not run as root, and
+  CI runs as root.
+- Three display tests, run by hand like every other (§11.3m):
+  - `tuning_window` asserts what the window writes and when, what it reads
+    back, and that every tooltip in it is in the help window.
+  - `recentre_key` asserts that the COSMIC button follows the file when
+    something else changes it.
+  - `head_model_dialogs` asserts that the card's dialogs are freed after
+    every way out, a quit included.
+
+  Each was seen to fail on the code before its fix.
+
+**What is not.**
+
+- **Nothing here measures the new defaults against a game.** Nothing in the
+  repository backs the filter's 0.4 Hz cutoff and 0.02 beta, or the 240°/s and
+  400 mm/s limits, with a measurement of how they feel in play. They are the
+  PR's choices.
+- **The x mirror rests on one observation.** `DEFAULT_INVERT` records that a
+  lean to the right moved the in-game head left, seen in play by the
+  contributor. No measurement of it is recorded here. A user whose opentrack
+  profile already mirrors x gets a double flip, and nothing can detect that
+  from this side.
+- **Nothing tests that the hub drops the pitch reference.** The hub calls
+  `forget_pitch_reference` on every change of the pitch zero
+  (`device.rs`, on the head-model reload), and no test covers that call.
+- **The recentre's gaze box is a guess.** The Extended View centre is taken
+  only when the gaze median is within 0.3 of the middle on both axes
+  (`RECENTRE_GAZE_BOX`, the middle 60% of the screen). No measurement chose
+  that number.
+- **Auto-centre cannot tell a held turn from sitting crooked.** A turn
+  inside its window, held while looking at the middle of the screen, is drawn
+  back. That is documented, and one reason the feature is off by default.
+- **No COSMIC session was part of this release's testing.** It was tested on
+  KDE. Off COSMIC the row is a Copy button: the hub does not use the
+  GlobalShortcuts portal that KDE and GNOME offer.
+- **A `--system` uninstall leaves the shortcut.** `sudo tobii uninstall
+  --system` does not consider it, as it does not consider start-at-login, and
+  a per-user uninstall keeps it because the `tobii` it runs is not going. So
+  after a system install is removed, a COSMIC key still runs a `tobii` that is
+  gone. The release notes tell the user to remove it in COSMIC Settings.
+- **The Tuning window's writes can lose a race.** Edits are written 300 ms
+  after the first one, on focus-out and on close, so clicking the hub normally
+  writes the queue first. An edit made while the window is unfocused (with the
+  scroll wheel, say) and followed within 300 ms by a hub click on the same
+  setting can overwrite that click.
+- **The Tuning window does not follow a moved link.** It watches
+  `games.toml`, and the file a symlink points to. If the link is pointed
+  somewhere else while the window is open, the new target is not watched;
+  focus-in still reloads.
+- **Two `tobii uninstall` paths have no test:** re-checking along a chain of
+  links, and an entry whose removal fails.
+- **The readout is taller.** The JOYSTICK OUTPUT block makes it eight rows
+  for everyone, whether or not the joystick is in use.
+
 ---
 
 ## 12. Glossary

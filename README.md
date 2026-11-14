@@ -1038,7 +1038,8 @@ If that `tobii` is gone already, the release archive runs its own copy for you:
 
 It also takes the recentre key out of COSMIC's custom shortcuts, if the hub set
 one there and the `tobii` it runs is going; your own shortcuts in that file
-stay. `--purge` also removes
+stay. `--system` leaves that file alone, so after removing a system install,
+remove the key in COSMIC Settings. `--purge` also removes
 settings and calibration, `--udev` the device rule, and
 `sudo tobii uninstall --system` a `--system` install. **A copy your package
 manager owns is not touched** — it prints the manager's own command instead:
