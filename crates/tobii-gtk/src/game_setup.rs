@@ -1325,7 +1325,7 @@ fn join_and(items: &[String]) -> String {
 /// [`None`] when the profile asks for none, which is every profile today —
 /// there are none. Saying nothing is the right answer there; inventing a
 /// heading over an empty list is not.
-pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<String> {
+pub(crate) fn profile_settings_note(settings: &[(String, String)], appid: &str) -> Option<String> {
     if settings.is_empty() {
         return None;
     }
@@ -1336,8 +1336,8 @@ pub(crate) fn profile_settings_note(settings: &[(String, String)]) -> Option<Str
         .join(", ");
     Some(format!(
         "The profile for this game also asks for {n} of this program's own settings: {pairs}. \
-         This window has not applied {them} — `tobii games set <key> <value>` in a terminal \
-         does.",
+         This window has not applied {them} — `tobii games profile apply {appid}` in a \
+         terminal does, all of them or none if one cannot be used.",
         n = settings.len(),
         them = plural(settings.len(), "it", "them"),
     ))
@@ -4062,7 +4062,10 @@ pub fn build_with(scanned: Scan, joystick: Arc<Mutex<JoystickStatus>>) -> GamesT
                 .map(|p| p.bridge)
                 .unwrap_or(profiles::Bridge::Unstated);
             let mut text = settings_block(&cfg, bridge, &joy);
-            if let Some(note) = profile.and_then(|p| profile_settings_note(&p.settings)) {
+            let note = profile
+                .zip(app.appid())
+                .and_then(|(p, appid)| profile_settings_note(&p.settings, appid));
+            if let Some(note) = note {
                 text.push_str("\n\n");
                 text.push_str(&note);
             }
@@ -7155,10 +7158,13 @@ mod tests {
     /// changes, and it does not say this.
     #[test]
     fn a_profile_that_names_settings_is_reported_and_not_applied() {
-        let note = profile_settings_note(&[
-            ("enabled".to_string(), "true".to_string()),
-            ("rate_hz".to_string(), "60.0".to_string()),
-        ])
+        let note = profile_settings_note(
+            &[
+                ("enabled".to_string(), "true".to_string()),
+                ("rate_hz".to_string(), "60.0".to_string()),
+            ],
+            "359320",
+        )
         .expect("a profile that asks for settings has something to say");
         assert!(note.contains("enabled = true"), "{note}");
         assert!(note.contains("rate_hz = 60.0"), "{note}");
@@ -7166,10 +7172,13 @@ mod tests {
             note.contains("has not applied"),
             "it says it did not do it: {note}"
         );
-        assert!(note.contains("tobii games set"), "and what does: {note}");
+        assert!(
+            note.contains("tobii games profile apply 359320"),
+            "and what does, all of them at once: {note}"
+        );
 
         assert_eq!(
-            profile_settings_note(&[]),
+            profile_settings_note(&[], "359320"),
             None,
             "a profile that asks for nothing gets no heading over an empty list"
         );

@@ -538,9 +538,13 @@ tobii games set head_yaw_invert true       # mirror the axis
 
 `curve` is `linear`, `smoothstep` or `power:N`. With N above 1, small
 movements stay small, which also hides tremor. Movement past `input_max`
-saturates at `output_max`. The curves apply to every output (opentrack, the
-Wine bridge and the virtual joystick alike) and to the Extended View term as
-well as the head's own. The defaults pass every axis through unchanged **except
+saturates at `output_max`. `tobii games set` and `tobii games profile apply`
+take N from 0.1 to 10 and keep the deadzone below `input_max`, because past
+either limit a movement out of the deadzone jumps straight to full output (or,
+far above ten, an axis hardly moves at all); a file that already says otherwise
+still loads as it is. The curves apply to every output (opentrack, the Wine
+bridge and the virtual joystick alike) and to the Extended View term as well
+as the head's own. The defaults pass every axis through unchanged **except
 x, which is mirrored** (`head_x_invert` is `true`), so that a lean to the right
 moves the in-game head to the right rather than the left. If x comes out
 backwards in your game, or your opentrack profile already mirrors it, set

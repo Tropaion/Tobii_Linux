@@ -429,7 +429,7 @@ pub struct Profile {
     /// `OutputConfig::apply_key`, which is the one place that decides what a
     /// key means and whether a value parses — and `tobii-output` depends on
     /// this crate, so this crate cannot ask it. A caller applies these through
-    /// `apply_key` and reports the pairs it rejected; a second opinion here
+    /// `OutputConfig::apply_all` and reports what it refused; a second opinion here
     /// would be a second list to drift out of step with the first, which is
     /// the mistake `OutputConfig::keys` already carries a comment about.
     pub settings: Vec<(String, String)>,

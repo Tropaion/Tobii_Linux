@@ -70,6 +70,13 @@ impl Curve {
         }
     }
 
+    /// The exponents `tobii games set` and a profile may set. Near zero, any
+    /// movement out of the deadzone is full output at once; far above ten, an
+    /// axis does not move until its very end. [`Curve::parse`] still takes any
+    /// positive exponent, so a file written by an older version loads as it
+    /// was (see `OutputConfig::apply_all`).
+    pub const POWER_RANGE: std::ops::RangeInclusive<f64> = 0.1..=10.0;
+
     /// Parse the config-file spelling: `linear`, `smoothstep`, or `power:1.5`.
     pub fn parse(s: &str) -> Option<Curve> {
         let s = s.trim();
@@ -612,6 +619,8 @@ mod tests {
         }
         assert_eq!(Curve::parse("  linear "), Some(Curve::Linear));
         assert_eq!(Curve::parse("power:2"), Some(Curve::Power(2.0)));
+        assert_eq!(Curve::parse("power:0.1"), Some(Curve::Power(0.1)));
+        assert_eq!(Curve::parse("power:10"), Some(Curve::Power(10.0)));
         for bad in [
             "",
             "quadratic",
@@ -619,6 +628,8 @@ mod tests {
             "power:abc",
             "power:0",
             "power:-1",
+            "power:NaN",
+            "power:inf",
         ] {
             assert_eq!(Curve::parse(bad), None, "`{bad}` must be rejected");
         }

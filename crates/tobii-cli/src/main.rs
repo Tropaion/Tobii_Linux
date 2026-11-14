@@ -2002,17 +2002,33 @@ fn games_set(
     key: &str,
     value: &str,
 ) -> Result<(), String> {
-    if cfg.apply_key(key, value) {
-        return Ok(());
-    }
-    // `OutputConfig::keys()` is the one list. It is hand-written and pinned by
-    // a test to exactly what `to_toml` emits — scraping a second list out of
-    // `to_toml` here, which is what this did at first, was itself the
-    // duplication it claimed to be avoiding.
-    Err(format!(
-        "{key} = {value:?} was not accepted.\nvalid keys: {}",
-        tobii_output::games::OutputConfig::keys().join(", ")
-    ))
+    use tobii_output::fusion::Curve;
+    use tobii_output::games::{OutputConfig, Problem, Refusal};
+    cfg.apply_all(&[(key, value)]).map_err(|r| match r {
+        // `OutputConfig::keys()` is the one list, pinned by a test to exactly
+        // what `to_toml` writes.
+        Refusal::Unusable(_) if !OutputConfig::keys().contains(&key) => format!(
+            "{key} is not a setting.\nvalid keys: {}",
+            OutputConfig::keys().join(", ")
+        ),
+        Refusal::Unusable(_) if key.ends_with("_curve") => format!(
+            "{key} = {value:?} is not a curve: one is linear, smoothstep or power:N, with N \
+             from {} to {}.",
+            Curve::POWER_RANGE.start(),
+            Curve::POWER_RANGE.end()
+        ),
+        Refusal::Unusable(_) => format!("{key} = {value:?} is not a value {key} takes."),
+        Refusal::Problems(ref ps) => {
+            // Here and not in the problem's own words: one key at a time is
+            // the one way of setting where the order matters.
+            let hint = if ps.iter().any(|p| matches!(p, Problem::Misordered { .. })) {
+                "\nTo move both, set the one that keeps them apart first."
+            } else {
+                ""
+            };
+            format!("{key} = {value:?} was not accepted. {r}{hint}")
+        }
+    })
 }
 
 /// Ask the running hub to recentre the head-tracking view.
@@ -2057,10 +2073,10 @@ fn recentre_cmd() -> CmdResult {
 
 /// `tobii games` — show the game-output settings; `tobii games set K V` — change one.
 ///
-/// Writes through [`OutputConfig::apply_key`], the same function the file
-/// parser uses, so the CLI cannot accept a spelling the file would reject or
-/// vice versa. That is the whole reason this command is thin: the validation
-/// lives with the config, not here.
+/// Writes through `OutputConfig::apply_all`, which reads each value with the
+/// same `apply_key` the file parser uses, so the CLI cannot accept a spelling
+/// the file would reject. That is the whole reason this command is thin: the
+/// validation lives with the config, not here.
 fn games_cmd(sub: Option<&str>, args: &[String]) -> CmdResult {
     use tobii_output::games::{load_output_config, save_output_config};
 
@@ -2383,22 +2399,6 @@ fn captured_settings(cfg: &tobii_output::games::OutputConfig) -> Vec<(String, St
     out
 }
 
-/// The `key = value` pairs in `settings` that `OutputConfig::apply_key` will
-/// not take, formatted one per line.
-///
-/// A profile is a hand-edited file, so `enabeld = true` is a thing that
-/// happens. `apply_key` is the one place that decides what a key means, and
-/// `tobii-output` depends on `tobii-config`, so `tobii-config` cannot ask it —
-/// which makes this the first place that can.
-fn unusable_settings(settings: &[(String, String)]) -> Vec<String> {
-    let mut probe = tobii_output::games::OutputConfig::default();
-    settings
-        .iter()
-        .filter(|(k, v)| !probe.apply_key(k, v))
-        .map(|(k, v)| format!("  {k} = {v:?}"))
-        .collect()
-}
-
 /// How a check's `path` is joined onto a prefix, as both report lines say it.
 ///
 /// Until 2026-09-28 both said *"under the Proton prefix"*, which is a
@@ -2596,11 +2596,15 @@ fn profile_list(out: &mut String, dir: &std::path::Path, builtin: &[(&str, &str)
 ///
 /// Knowledge, not measurement. Nothing here opens a file belonging to the
 /// game, so nothing it prints may read as a result — see [`left_for_you`].
+///
+/// What `apply` would refuse is asked of `cfg`, the config it would apply to,
+/// so the two cannot disagree.
 fn profile_show(
     out: &mut String,
     dir: &std::path::Path,
     builtin: &[(&str, &str)],
     game: &GameRef,
+    cfg: &tobii_output::games::OutputConfig,
 ) -> Result<(), String> {
     use tobii_config::profiles;
     out.push_str(&format!("{}\n", game.heading()));
@@ -2635,14 +2639,9 @@ fn profile_show(
         for (k, v) in &p.settings {
             out.push_str(&format!("  {k} = {v}\n"));
         }
-        let bad = unusable_settings(&p.settings);
-        if !bad.is_empty() {
+        if let Err(r) = cfg.clone().apply_all(&p.settings) {
             out.push_str(&format!(
-                "\n{} of those would be refused — a key this program does not have,\n  \
-                 or a value it cannot read. `apply` refuses the whole profile\n  \
-                 rather than half of it:\n{}\n",
-                bad.len(),
-                bad.join("\n")
+                "\n`apply` would refuse the whole profile rather than half of it. {r}\n"
             ));
         }
     }
@@ -2900,10 +2899,11 @@ fn profile_forget(
 /// the way that game wants it, and the next game's profile will overwrite
 /// that. The report says so rather than leaving it to be discovered.
 ///
-/// It is **all or nothing**. A pair `apply_key` refuses stops the whole
-/// profile and writes nothing. Applying the half it understood is exactly how
-/// somebody ends up told to change a setting a newer profile had already
-/// marked as not needed.
+/// It is **all or nothing** (`OutputConfig::apply_all`). A pair this program
+/// cannot use, or one that would leave a deadzone at full output or an
+/// exponent out of range, stops the whole profile and writes nothing.
+/// Applying the half it understood is exactly how somebody ends up told to
+/// change a setting a newer profile had already marked as not needed.
 ///
 /// It **touches no file belonging to the game**, and it does not install the
 /// bridge. Both are named as things still to do, with the command for the one
@@ -2930,33 +2930,20 @@ fn profile_apply(
     };
     out.push_str(&format!("profile: {}\n", loaded.origin));
     let p = &loaded.profile;
-    let bad = unusable_settings(&p.settings);
-    if !bad.is_empty() {
+    if let Err(r) = cfg.apply_all(&p.settings) {
+        use tobii_output::games::{OutputConfig, Refusal};
+        let keys = if matches!(r, Refusal::Unusable(_)) {
+            format!("\nvalid keys: {}", OutputConfig::keys().join(", "))
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "{}\nhas {} setting{} this program cannot use:\n{}\nvalid keys: {}\n\
-             Nothing was applied: half a profile is worse than none of it.",
-            loaded.origin,
-            bad.len(),
-            if bad.len() == 1 { "" } else { "s" },
-            bad.join("\n"),
-            tobii_output::games::OutputConfig::keys().join(", ")
+            "{}\n{r}{keys}\nNothing was applied: half a profile is worse than none of it.",
+            loaded.origin
         ));
     }
     let changed = !p.settings.is_empty();
     if changed {
-        for (k, v) in &p.settings {
-            if !cfg.apply_key(k, v) {
-                // Unreachable: `unusable_settings` put every pair through this
-                // same function a moment ago and found none it refused. If
-                // that ever stops being true, stop here — the caller saves
-                // nothing on an error, so a config half-changed by a bug never
-                // reaches the disk.
-                return Err(format!(
-                    "{k} = {v:?} was refused after being accepted a moment earlier; \
-                     nothing was written"
-                ));
-            }
-        }
         out.push_str(&format!(
             "\napplied {} setting{} to {}.\n  \
              These are this program's settings and there is one set of them: they\n  \
@@ -3491,8 +3478,10 @@ fn profile_cmd(args: &[String]) -> CmdResult {
             profile_list(&mut out, &dir, profiles::BUILTIN);
             Ok(())
         }
-        (Some("show"), Some(w)) => steam_appid_for(&home_for_steam()?, w)
-            .and_then(|g| profile_show(&mut out, &dir, profiles::BUILTIN, &g)),
+        (Some("show"), Some(w)) => steam_appid_for(&home_for_steam()?, w).and_then(|g| {
+            let cfg = tobii_output::games::load_output_config();
+            profile_show(&mut out, &dir, profiles::BUILTIN, &g, &cfg)
+        }),
         (Some("save"), Some(w)) => steam_appid_for(&home_for_steam()?, w).and_then(|g| {
             profile_save(
                 &mut out,
@@ -4618,6 +4607,8 @@ mod tests {
                 "auto_centre" => "true",
                 k if k.ends_with("_curve") => "linear",
                 k if k.ends_with("_invert") => "true",
+                // Below the "3" its input_max gets, or that would be refused.
+                k if k.contains("_deadzone") => "1",
                 _ => "3",
             };
             assert!(
@@ -4642,6 +4633,41 @@ mod tests {
         let before = cfg.clone();
         assert!(games_set(&mut cfg, "rate_hz", "not-a-number").is_err());
         assert_eq!(cfg, before, "a refused set must change nothing");
+    }
+
+    /// A deadzone at its axis's full-output point is refused, naming both
+    /// keys; an axis already misordered by hand does not block other keys.
+    #[test]
+    fn games_set_refuses_a_deadzone_at_or_past_full_output() {
+        use tobii_output::games::OutputConfig;
+        let mut cfg = OutputConfig::default();
+        games_set(&mut cfg, "head_yaw_input_max", "30").expect("an ordinary value");
+        let before = cfg.clone();
+        let err = games_set(&mut cfg, "head_yaw_deadzone", "30").expect_err("must refuse");
+        assert!(
+            err.contains("head_yaw_deadzone") && err.contains("head_yaw_input_max"),
+            "{err}"
+        );
+        assert_eq!(cfg, before, "a refused set must change nothing");
+        let err = games_set(&mut cfg, "ev_pitch_input_max_deg", "1").expect_err("must refuse");
+        assert!(err.contains("ev_pitch_deadzone_deg"), "{err}");
+        // A curve says what one is, and an exponent out of range says so.
+        let err = games_set(&mut cfg, "head_yaw_curve", "cubic").expect_err("must refuse");
+        assert!(err.contains("power:N, with N from 0.1 to 10"), "{err}");
+        let err = games_set(&mut cfg, "head_yaw_curve", "power:12").expect_err("must refuse");
+        assert!(err.contains("not from 0.1 to 10"), "{err}");
+        assert_eq!(cfg, before, "a refused set must change nothing");
+
+        // Misordered in the file by hand: still loads, and other keys still set.
+        let mut hand =
+            OutputConfig::from_toml("[games]\nhead_x_deadzone = 50\nhead_x_input_max = 20\n");
+        let x = hand.head_curves.axes[3];
+        assert_eq!(
+            (x.deadzone_deg, x.input_max_deg),
+            (50.0, 20.0),
+            "premise: the file loads as written"
+        );
+        games_set(&mut hand, "rate_hz", "60").expect("an unrelated key is not blocked");
     }
 
     /// `tobii headpose` shipped in v0.1.0 as plain head pose to opentrack. The
@@ -4936,7 +4962,14 @@ mod tests {
         let dir = scratch("absent-vs-unreadable");
 
         let mut out = String::new();
-        profile_show(&mut out, &dir, &[], &game("359320", Some("Elite"))).expect("absent is fine");
+        profile_show(
+            &mut out,
+            &dir,
+            &[],
+            &game("359320", Some("Elite")),
+            &Default::default(),
+        )
+        .expect("absent is fine");
         assert!(out.contains("no profile"), "{out}");
         assert!(
             out.contains(&dir.join("359320.toml").display().to_string()),
@@ -4945,8 +4978,14 @@ mod tests {
 
         write_profile(&dir, "359320", "version = 1\nnonsense = 3\n");
         let mut out = String::new();
-        let err = profile_show(&mut out, &dir, &[], &game("359320", Some("Elite")))
-            .expect_err("a file it cannot read is not 'nothing configured'");
+        let err = profile_show(
+            &mut out,
+            &dir,
+            &[],
+            &game("359320", Some("Elite")),
+            &Default::default(),
+        )
+        .expect_err("a file it cannot read is not 'nothing configured'");
         assert!(
             err.contains("line 2"),
             "the line to open an editor at: {err}"
@@ -4977,7 +5016,14 @@ mod tests {
              tell = \"Turn Free Look on.\"\n",
         );
         let mut out = String::new();
-        profile_show(&mut out, &dir, &[], &game("359320", Some("Elite"))).expect("show");
+        profile_show(
+            &mut out,
+            &dir,
+            &[],
+            &game("359320", Some("Elite")),
+            &Default::default(),
+        )
+        .expect("show");
         for needle in [
             "drive_c/Bindings",
             "HeadlookMode",
@@ -5010,7 +5056,14 @@ mod tests {
              tell = \"Turn it on.\"\n",
         );
         let mut out = String::new();
-        profile_show(&mut out, &dir, &[], &game("359320", None)).expect("show");
+        profile_show(
+            &mut out,
+            &dir,
+            &[],
+            &game("359320", None),
+            &Default::default(),
+        )
+        .expect("show");
         assert!(
             out.contains("something-newer"),
             "the format has to be named: {out}"
@@ -5044,6 +5097,26 @@ mod tests {
             err.contains("rate_hz"),
             "and list the keys that are valid: {err}"
         );
+        assert_eq!(cfg, before, "nothing may have been applied");
+    }
+
+    /// Every pair valid on its own, the two together a deadzone at its axis's
+    /// full-output point: refused whole, for the same reason as above.
+    #[test]
+    fn apply_refuses_a_profile_that_misorders_an_axis_and_changes_nothing() {
+        use tobii_output::games::OutputConfig;
+        let dir = scratch("apply-misordered");
+        write_profile(
+            &dir,
+            "359320",
+            "version = 1\n[settings]\nrate_hz = 90.0\nhead_yaw_deadzone = 40\nhead_yaw_input_max = 30\n",
+        );
+        let mut cfg = OutputConfig::default();
+        let before = cfg.clone();
+        let mut out = String::new();
+        let err = profile_apply(&mut out, &dir, &[], &game("359320", None), &mut cfg)
+            .expect_err("a misordered axis stops the profile");
+        assert!(err.contains("head_yaw_deadzone"), "{err}");
         assert_eq!(cfg, before, "nothing may have been applied");
     }
 
@@ -5959,7 +6032,14 @@ mod tests {
             ),
         );
         let mut shown = String::new();
-        profile_show(&mut shown, &dir, &[], &game("359320", Some("Elite"))).expect("show");
+        profile_show(
+            &mut shown,
+            &dir,
+            &[],
+            &game("359320", Some("Elite")),
+            &Default::default(),
+        )
+        .expect("show");
 
         let mut added = String::new();
         profile_check_add(

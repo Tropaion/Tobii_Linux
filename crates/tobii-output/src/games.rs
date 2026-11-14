@@ -398,7 +398,9 @@ impl OutputConfig {
              #                 you look at the middle of the screen.\n\
              # head_<axis>_* shapes yaw/pitch/roll (degrees) and x/y/z (mm):\n\
              #                 input_max maps to output_max, curve is \"linear\",\n\
-             #                 \"smoothstep\" or \"power:N\" (N > 1 = gentle centre);\n\
+             #                 \"smoothstep\" or \"power:N\" (N from 0.1 to 10,\n\
+             #                 above 1 = gentle centre); deadzone stays below\n\
+             #                 input_max;\n\
              #                 head_<axis>_invert = true mirrors that axis.\n\
              # filter_max_rot_speed_deg_s / filter_max_move_speed_mm_s cap how\n\
              #                 fast the output may move: lower = no jumps.\n\
@@ -725,6 +727,73 @@ impl OutputConfig {
         true
     }
 
+    /// Apply every pair, or none of them.
+    ///
+    /// Refused whole when [`OutputConfig::apply_key`] does not take a pair, or
+    /// when the pairs leave a [`Problem`] the config did not already have (see
+    /// `Problem::already`). A file that already has one still loads as it is —
+    /// `from_toml` takes what `apply_key` takes, and [`AxisResponse::shape`]
+    /// copes — so a setting from an older version is kept rather than
+    /// dropped, and it does not block other settings.
+    pub fn apply_all<K: AsRef<str>, V: AsRef<str>>(
+        &mut self,
+        pairs: &[(K, V)],
+    ) -> Result<(), Refusal> {
+        let mut next = self.clone();
+        let unusable: Vec<(String, String)> = pairs
+            .iter()
+            .filter(|(k, v)| !next.apply_key(k.as_ref(), v.as_ref()))
+            .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+            .collect();
+        if !unusable.is_empty() {
+            return Err(Refusal::Unusable(unusable));
+        }
+        let had = self.problems();
+        let made: Vec<Problem> = next
+            .problems()
+            .into_iter()
+            .filter(|p| !had.iter().any(|h| p.already(h)))
+            .collect();
+        if !made.is_empty() {
+            return Err(Refusal::Problems(made));
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// Every [`Problem`] this config has.
+    fn problems(&self) -> Vec<Problem> {
+        let head = AXIS_NAMES
+            .iter()
+            .zip(&self.head_curves.axes)
+            .map(|(n, a)| (format!("head_{n}"), "", a));
+        let ev = [
+            ("yaw", &self.extended_view.yaw),
+            ("pitch", &self.extended_view.pitch),
+        ]
+        .into_iter()
+        .map(|(n, a)| (format!("ev_{n}"), "_deg", a));
+        let mut out = Vec::new();
+        for (axis, unit, a) in head.chain(ev) {
+            if a.deadzone_deg >= a.input_max_deg {
+                out.push(Problem::Misordered {
+                    deadzone: format!("{axis}_deadzone{unit}"),
+                    input_max: format!("{axis}_input_max{unit}"),
+                    values: (a.deadzone_deg, a.input_max_deg),
+                });
+            }
+            if let Curve::Power(p) = a.curve {
+                if !Curve::POWER_RANGE.contains(&p) {
+                    out.push(Problem::Exponent {
+                        key: format!("{axis}_curve"),
+                        power: p,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Every settable key, for `tobii games` output and error messages.
     ///
     /// A hand-written list, guarded by
@@ -800,6 +869,91 @@ impl OutputConfig {
             "head_z_curve",
             "head_z_invert",
         ]
+    }
+}
+
+/// Why [`OutputConfig::apply_all`] applied nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Refusal {
+    /// Pairs [`OutputConfig::apply_key`] does not take: a key this program
+    /// does not have, or a value it cannot read.
+    Unusable(Vec<(String, String)>),
+    /// What the pairs would have made wrong.
+    Problems(Vec<Problem>),
+}
+
+impl std::fmt::Display for Refusal {
+    /// A sentence, then one indented line per pair or problem.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (what, lines): (String, Vec<String>) = match self {
+            Refusal::Unusable(pairs) => (
+                format!(
+                    "It has {} setting{} this program cannot use — a key it does not have, or a \
+                     value it cannot read:",
+                    pairs.len(),
+                    if pairs.len() == 1 { "" } else { "s" }
+                ),
+                pairs.iter().map(|(k, v)| format!("{k} = {v:?}")).collect(),
+            ),
+            Refusal::Problems(ps) => (
+                "It would leave:".to_string(),
+                ps.iter().map(ToString::to_string).collect(),
+            ),
+        };
+        write!(f, "{what}\n  {}", lines.join("\n  "))
+    }
+}
+
+/// A setting nothing should make, though a file that already has one loads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Problem {
+    /// An axis's deadzone at or past its full-output point: any movement out
+    /// of the deadzone would be full output at once.
+    Misordered {
+        deadzone: String,
+        input_max: String,
+        values: (f64, f64),
+    },
+    /// A `power:N` curve outside [`Curve::POWER_RANGE`]: near zero, the same
+    /// jump to full output; far above ten, an axis that does not move until
+    /// its very end.
+    Exponent { key: String, power: f64 },
+}
+
+impl Problem {
+    /// Whether this is `had`, a problem the config already had: a deadzone
+    /// already past full output may move, so somebody can walk it back; an
+    /// exponent already out of range may only stay as it is.
+    fn already(&self, had: &Problem) -> bool {
+        match (self, had) {
+            (Problem::Misordered { deadzone: a, .. }, Problem::Misordered { deadzone: b, .. }) => {
+                a == b
+            }
+            _ => self == had,
+        }
+    }
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Problem::Misordered {
+                deadzone,
+                input_max,
+                values: (dz, max),
+            } => write!(
+                f,
+                "{deadzone} ({dz}) at or past {input_max} ({max}), so any movement out of the \
+                 deadzone would be full output at once"
+            ),
+            // `{:?}`, which writes 1e-300 as that and not as 300 digits.
+            Problem::Exponent { key, power } => write!(
+                f,
+                "{key} at power:{power:?}, which is not from {:?} to {:?}",
+                Curve::POWER_RANGE.start(),
+                Curve::POWER_RANGE.end()
+            ),
+        }
     }
 }
 
@@ -1119,6 +1273,49 @@ mod tests {
     fn a_quoted_value_keeps_a_hash_inside_it() {
         let c = OutputConfig::from_toml("[games]\nopentrack = \"host#1:4242\"\n");
         assert_eq!(c.opentrack.as_deref(), Some("host#1:4242"));
+    }
+
+    /// All or nothing: one pair it cannot use, or one that makes a deadzone
+    /// reach full output or an exponent leave its range, and nothing is
+    /// applied — while a file that already says so loads as it is, and does
+    /// not block other settings.
+    #[test]
+    fn apply_all_applies_every_pair_or_none() {
+        let mut c = OutputConfig::default();
+        let before = c.clone();
+        let r = c.apply_all(&[("rate_hz", "90"), ("enabeld", "true")]);
+        assert_eq!(
+            r,
+            Err(Refusal::Unusable(vec![("enabeld".into(), "true".into())]))
+        );
+        for bad in [("head_yaw_deadzone", "500"), ("head_yaw_curve", "power:12")] {
+            let r = c.apply_all(&[("rate_hz", "90"), bad]);
+            let Err(Refusal::Problems(ps)) = &r else {
+                panic!("{bad:?} is refused: {r:?}");
+            };
+            assert!(ps[0].to_string().starts_with(bad.0), "{}", ps[0]);
+        }
+        assert_eq!(c, before, "a refused batch changes nothing");
+
+        c.apply_all(&[("rate_hz", "90"), ("head_yaw_deadzone", "2")])
+            .expect("a good batch applies");
+        assert_eq!((c.rate_hz, c.head_curves.axes[0].deadzone_deg), (90.0, 2.0));
+
+        let mut old = OutputConfig::from_toml(
+            "[games]\nhead_yaw_curve = \"power:12\"\nhead_x_deadzone = 50\nhead_x_input_max = 20\n",
+        );
+        assert_eq!(
+            old.head_curves.axes[0].curve,
+            Curve::Power(12.0),
+            "kept on load"
+        );
+        old.apply_all(&[("rate_hz", "60"), ("head_x_input_max", "40")])
+            .expect("what is already wrong blocks nothing, and can be moved toward right");
+        let r = old.apply_all(&[("head_yaw_curve", "power:1e-300")]);
+        let Err(Refusal::Problems(ps)) = &r else {
+            panic!("an exponent already out of range cannot be made worse: {r:?}");
+        };
+        assert!(ps[0].to_string().contains("power:1e-300,"), "{}", ps[0]);
     }
 
     /// The list and the file must name the same set. Adding a field to
