@@ -116,8 +116,16 @@ fn write_in_place(path: &Path, bytes: &[u8], owner_writable: bool) -> io::Result
     let kept = std::fs::metadata(path).ok().map(|m| {
         let mut p = m.permissions();
         if owner_writable {
-            use std::os::unix::fs::PermissionsExt;
-            p.set_mode(p.mode() | 0o200);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                p.set_mode(p.mode() | 0o200);
+            }
+            // The Wine bridge builds this crate for Windows, whose one
+            // read-only flag has no owner to give the write to.
+            #[cfg(not(unix))]
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
         }
         p
     });
