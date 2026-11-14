@@ -484,6 +484,93 @@ fn an_autostart_entry_for_a_deleted_usr_bin_hub_is_removed() {
     assert_eq!(location(&p, "/usr/bin").verdict, Verdict::NothingThere);
 }
 
+/// The recentre shortcut in COSMIC's file is judged like the menu entry, by
+/// the `tobii` it runs: it goes with that program, the user's own shortcuts in
+/// the same file stay, and a shortcut running a copy that stays is kept.
+#[test]
+fn the_recentre_shortcut_goes_with_the_tobii_it_runs() {
+    const CUSTOM: &str = "/home/u/.config/cosmic/com.system76.CosmicSettings.Shortcuts/v1/custom";
+    let theirs = "(modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\")";
+    let file = |command: &str| {
+        format!(
+            "{{\n    {theirs},\n    (modifiers: [Ctrl], key: \"F9\", description: Some(\"{}\")): \
+             Spawn(\"{command}\"),\n}}",
+            cosmic_shortcut::DESCRIPTION
+        )
+    };
+
+    let t = Tree::new("cosmic-shortcut");
+    v030_install(&t);
+    t.put(CUSTOM, &file(&format!("{BIN}/tobii recentre")));
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    let sc = p.cosmic_shortcut.clone().expect("it goes");
+    assert_eq!(sc.file, Path::new(CUSTOM));
+    assert!(sc.why.contains("being removed"), "{}", sc.why);
+    let out = execute(&p);
+    assert!(out.failed.is_empty(), "{:?}", out.failed);
+    let left = std::fs::read_to_string(t.real(CUSTOM)).unwrap();
+    assert!(!left.contains(cosmic_shortcut::DESCRIPTION), "{left}");
+    assert!(
+        left.contains(theirs),
+        "the user's own shortcut stays: {left}"
+    );
+
+    // It runs a packaged copy, which stays: kept, and said why.
+    let t = Tree::new("cosmic-shortcut-kept");
+    v030_install(&t);
+    t.bin("/usr/bin/tobii", "tobii 0.3.0");
+    t.put(CUSTOM, &file("/usr/bin/tobii recentre"));
+    let p = plan_in(&t, &user(), &Options::default(), &pacman_owns_usr_bin);
+    assert_eq!(p.cosmic_shortcut, None, "{p:#?}");
+    assert!(why_kept(&p, CUSTOM).contains("/usr/bin/tobii"), "{p:#?}");
+
+    // Judged at the plan, decided again at the end: re-bound to a copy that
+    // stays while the question was open, it is left.
+    let t = Tree::new("cosmic-shortcut-rebound");
+    v030_install(&t);
+    t.put(CUSTOM, &file(&format!("{BIN}/tobii recentre")));
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    assert!(p.cosmic_shortcut.is_some(), "premise: it was to go");
+    t.put(CUSTOM, &file("/usr/bin/tobii recentre"));
+    let out = execute(&p);
+    let left = std::fs::read_to_string(t.real(CUSTOM)).unwrap();
+    assert!(left.contains(cosmic_shortcut::DESCRIPTION), "{left}");
+    assert!(
+        out.notes.iter().any(|n| n.contains("changed since")),
+        "{:?}",
+        out.notes
+    );
+
+    // Ours, with a command that cannot be read: kept, and said so.
+    let t = Tree::new("cosmic-shortcut-unreadable");
+    v030_install(&t);
+    t.put(CUSTOM, &file("tobii \\\\n recentre"));
+    let p = plan_in(&t, &user(), &Options::default(), &unowned);
+    assert_eq!(p.cosmic_shortcut, None, "{p:#?}");
+    assert!(why_kept(&p, CUSTOM).contains("cannot be told"), "{p:#?}");
+}
+
+/// What `shell_word` writes reads back as the words it quoted, and what it
+/// never writes is not guessed at.
+#[test]
+fn shell_words_reads_what_shell_word_writes() {
+    use tobii_update::install::shell_word;
+    for path in [
+        "/home/a/.local/bin/tobii",
+        "/home/a/My Games/tobii",
+        "/x/it's/tobii",
+    ] {
+        let line = format!("{} recentre", shell_word(path));
+        assert_eq!(
+            shell_words(&line),
+            Some(vec![path.to_string(), "recentre".to_string()]),
+            "{line}"
+        );
+    }
+    assert_eq!(shell_words("\"/a b/tobii\" recentre"), None);
+    assert_eq!(shell_words("'/open/quote recentre"), None);
+}
+
 /// Removing an entry that a remaining install uses would silently switch its
 /// start-at-login off.
 #[test]

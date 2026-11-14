@@ -1578,7 +1578,11 @@ nobody else took a reference is not one anybody can rely on.
 asserts the page re-reads it. `tests/hub_lifetime.rs` censuses the hub's
 *whole* tree the same way, and `tests/head_model_dialogs.rs` the head-model
 card's two dialogs after every way out of each, the last of them a quit with a
-pitch measurement running. Headlessly, `hub_wants_tracker` pins the claim
+pitch measurement running. `tests/tuning_window.rs` does the same for the
+Tuning window, against a configuration directory of its own, and asserts what
+it writes and when, what it reads back, and that every tooltip in it is in the
+help window; `tests/recentre_key.rs` that the COSMIC recentre-key button
+follows COSMIC's shortcut file when something else changes it. Headlessly, `hub_wants_tracker` pins the claim
 condition, because a window in a nested compositor may never be active and a
 display test watching the reason list would pass with the tab condition
 deleted.
@@ -1586,12 +1590,12 @@ deleted.
 **What is not:**
 
 - **None of it runs in CI.** `ci.yml`, `release.yml` and `scripts/package.sh`
-  all run `cargo test --workspace --locked`, which compiles the ten ignored
+  all run `cargo test --workspace --locked`, which compiles the twelve ignored
   tests and skips every one. `clippy --all-targets` keeps them from rotting
   syntactically, so nobody gets a warning; they simply never run.
   `scripts/display-tests.sh` is the one command that does run them, and it is
   run by a person. This is the same gap §11.3h recorded for the help window,
-  now carrying nine files instead of one.
+  now carrying eleven files instead of one.
 - **The tab strip's appearance is unasserted.** That the selected tab merges
   into the page it stands on is CSS — a negative bottom margin landing on a
   border — and the tests assert the *structure* it depends on (the strip and

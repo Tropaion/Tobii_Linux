@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use tobii_config::{autostart, paths};
+use tobii_config::{autostart, cosmic_shortcut, paths};
 use tobii_update::install::{
     is_build_tree, is_private_group, shell_word as sh_quote, Ownership, BINARIES, OVERFLOW_UID,
 };
@@ -414,6 +414,9 @@ pub struct Plan {
     /// removes the bridge from a Wine prefix.
     pub running: Option<PathBuf>,
     pub manifests: Vec<ManifestEdit>,
+    /// The recentre shortcut in COSMIC's custom-shortcut file, when it goes.
+    /// See [`ShortcutRemoval`].
+    pub cosmic_shortcut: Option<ShortcutRemoval>,
     /// `remove_dir`, in order, each only if empty by then.
     pub rmdirs: Vec<PathBuf>,
     /// `hicolor` directories whose existing icon cache needs refreshing.
@@ -434,6 +437,7 @@ impl Plan {
         self.remove.is_empty()
             && self.self_exe.is_none()
             && self.manifests.is_empty()
+            && self.cosmic_shortcut.is_none()
             && self.rmdirs.is_empty()
     }
 
@@ -1316,6 +1320,12 @@ fn exec_target(fs: &Fs, text: &str, path: &[PathBuf]) -> ExecTarget {
                 .into(),
         );
     };
+    target_of(fs, &args, path)
+}
+
+/// What a command line runs: its first word — past an `env NAME=value` — as an
+/// absolute path, or looked up on `path`.
+fn target_of(fs: &Fs, args: &[String], path: &[PathBuf]) -> ExecTarget {
     let mut words = args.iter().map(String::as_str);
     let mut prog = words.next().unwrap_or_default();
     if Path::new(prog).file_name().is_some_and(|n| n == "env") {
@@ -1358,6 +1368,39 @@ fn exec_target(fs: &Fs, text: &str, path: &[PathBuf]) -> ExecTarget {
     }
 }
 
+/// The words of a command line written by `tobii_update::install::shell_word`
+/// and spaces: bare words and single-quoted ones, `'\''` included. `None` for
+/// anything else — a double quote, any other backslash, an open quote — which
+/// is not read here rather than read wrong.
+fn shell_words(s: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => words.extend(word.take()),
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => w.push(c),
+                    }
+                }
+            }
+            // `'\''`: a quote closed, an escaped quote, a quote opened again.
+            '\\' if chars.as_str().starts_with('\'') => {
+                chars.next();
+                word.get_or_insert_with(String::new).push('\'');
+            }
+            '"' | '\\' => return None,
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Some(words)
+}
+
 enum Decision {
     Absent,
     Remove(String),
@@ -1382,14 +1425,45 @@ fn entry_decision(
     if !fs.exists(entry) {
         return Decision::Absent;
     }
-    let unknown = |why: &str| {
-        Decision::Keep(format!(
-            "{why}, so whether it runs a copy that stays cannot be told — left as it is"
-        ))
-    };
     let Some(text) = fs.read(entry) else {
-        return unknown("it could not be read");
+        return undecidable("it could not be read");
     };
+    decision_for(fs, exec_target(fs, &text, path), removing, what)
+}
+
+/// Kept, because what it runs cannot be told: a guess of "gone" is the one
+/// that switches something off.
+fn undecidable(why: &str) -> Decision {
+    Decision::Keep(undecidable_why(why))
+}
+
+/// [`undecidable`]'s reason.
+fn undecidable_why(why: &str) -> String {
+    format!("{why}, so whether it runs a copy that stays cannot be told — left as it is")
+}
+
+/// The recentre shortcut in COSMIC's custom shortcuts, judged by the `tobii`
+/// it runs as the menu entry is (see [`tobii_config::cosmic_shortcut`]). Only
+/// that one entry is taken out of the file, and only if, when it comes to it,
+/// those programs are really gone and the entry still runs what was judged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShortcutRemoval {
+    pub file: PathBuf,
+    pub why: String,
+    /// What the entry ran when it was judged.
+    pub command: String,
+    /// The programs it runs, every one of them going.
+    pub programs: Vec<PathBuf>,
+}
+
+/// Whether something of ours that runs `target` goes: [`entry_decision`]'s
+/// rule, for anything that names a program.
+fn decision_for(
+    fs: &Fs,
+    target: ExecTarget,
+    removing: &dyn Fn(&Path) -> bool,
+    what: &str,
+) -> Decision {
     let stays = |prog: &Path| {
         Decision::Keep(format!(
             "it runs {}, which is not being removed — deleting it would silently switch {what} \
@@ -1397,14 +1471,14 @@ fn entry_decision(
             prog.display()
         ))
     };
-    match exec_target(fs, &text, path) {
-        ExecTarget::Unknown(why) => unknown(&why),
+    match target {
+        ExecTarget::Unknown(why) => undecidable(&why),
         ExecTarget::Path(prog) => match fs.presence(&prog) {
             Presence::Gone => Decision::Remove(format!(
                 "it runs {}, which no longer exists",
                 prog.display()
             )),
-            Presence::Unknown(e) => unknown(&format!(
+            Presence::Unknown(e) => undecidable(&format!(
                 "it runs {}, which cannot be looked at ({e})",
                 prog.display()
             )),
@@ -1421,7 +1495,7 @@ fn entry_decision(
                 // run, and that one stays.
                 stays(stay)
             } else if hits.is_empty() {
-                unknown(&format!(
+                undecidable(&format!(
                     "it runs a bare `{name}`, which is not on this PATH (the session that starts \
                      it may have another)"
                 ))
@@ -2057,6 +2131,54 @@ fn plan_with_fs(env: &Env, opts: &Options, fs: Fs, probes: &Probes, procs: &[Pro
             "start-at-login",
         );
         p.settle_entry(autostart_entry, "the start-at-login entry", d);
+        let custom = cosmic_shortcut::custom_path_in(&config_home);
+        let what = "the recentre shortcut";
+        match fs.read(&custom) {
+            None if fs.exists(&custom) => p.keep(
+                custom,
+                format!(
+                    "{what}, if it is in there — {}",
+                    undecidable_why("the file could not be read")
+                ),
+            ),
+            None => {}
+            Some(text) => match cosmic_shortcut::our_command(&text) {
+                Some(command) => {
+                    let target = match shell_words(&command) {
+                        Some(args) => target_of(&fs, &args, &env.path),
+                        None => ExecTarget::Unknown(format!(
+                            "its command `{}` is not read here",
+                            sanitize(&command)
+                        )),
+                    };
+                    let programs = match &target {
+                        ExecTarget::Path(prog) => vec![prog.clone()],
+                        ExecTarget::Bare { hits, .. } => hits.clone(),
+                        ExecTarget::Unknown(_) => Vec::new(),
+                    };
+                    match decision_for(&fs, target, &is_removed, what) {
+                        Decision::Remove(why) => {
+                            p.cosmic_shortcut = Some(ShortcutRemoval {
+                                file: custom,
+                                why,
+                                command,
+                                programs,
+                            })
+                        }
+                        Decision::Keep(why) => p.keep(custom, format!("{what} in it — {why}")),
+                        Decision::Absent => {}
+                    }
+                }
+                None if cosmic_shortcut::holds_ours(&text) => p.keep(
+                    custom,
+                    format!(
+                        "{what} in it — {}",
+                        undecidable_why("its command could not be read")
+                    ),
+                ),
+                None => {}
+            },
+        }
         let adir = autostart::dir_in(&config_home);
         for name in fs.list(&adir).unwrap_or_default() {
             if autostart::is_scratch_name(&name) {
@@ -2370,6 +2492,12 @@ pub fn execute(plan: &Plan) -> Outcome {
     // with it. Whether it is going is decided here, before the manifest is
     // edited, so that its line can go if it is.
     let self_going = plan.self_exe.as_deref().filter(|_| out.failed.is_empty());
+    if let Some(sc) = &plan.cosmic_shortcut {
+        apply_shortcut(&fs, sc, self_going, &mut out);
+    }
+    // Again, after the shortcut: a removal of it that failed keeps the running
+    // tobii, and then its manifest line has to stay too.
+    let self_going = self_going.filter(|_| out.failed.is_empty());
     for m in &plan.manifests {
         apply_manifest(&fs, m, self_going, &mut out);
     }
@@ -2411,6 +2539,44 @@ pub fn execute(plan: &Plan) -> Outcome {
     out
 }
 
+/// Take the recentre shortcut out of COSMIC's file — decided again here, the
+/// way [`apply_manifest`] is: only when every program it runs is really gone
+/// (or is the running `tobii`, about to go), and only while the entry still
+/// runs what the plan judged. A removal that failed, or a key re-bound to a
+/// copy that stays while the question was open, leaves it, and says so.
+fn apply_shortcut(fs: &Fs, sc: &ShortcutRemoval, self_going: Option<&Path>, out: &mut Outcome) {
+    // Along each program's chain of links, as the plan judged it.
+    let gone = sc.programs.iter().all(|p| {
+        fs.link_chain(p)
+            .iter()
+            .any(|n| self_going == Some(n.as_path()) || !fs.exists(n))
+    });
+    let unchanged = fs
+        .read(&sc.file)
+        .and_then(|t| cosmic_shortcut::our_command(&t))
+        .is_some_and(|c| c == sc.command);
+    if !(gone && unchanged) {
+        out.notes.push(format!(
+            "left the recentre shortcut in {}: {}",
+            sc.file.display(),
+            if unchanged {
+                "the tobii it runs is still there"
+            } else {
+                "it changed since it was looked at"
+            }
+        ));
+        return;
+    }
+    match cosmic_shortcut::remove_at(&fs.at(&sc.file)) {
+        Ok(true) => out.notes.push(format!(
+            "took the recentre shortcut out of {}",
+            sc.file.display()
+        )),
+        Ok(false) => {}
+        Err(e) => out.failed.push((sc.file.clone(), e.to_string())),
+    }
+}
+
 /// Drop the manifest lines for directories this run emptied.
 ///
 /// Decided again here, against what is really left: a line only goes when
@@ -2445,6 +2611,8 @@ fn apply_manifest(fs: &Fs, m: &ManifestEdit, self_going: Option<&Path>, out: &mu
     if meaningful {
         let mut body = kept.join("\n");
         body.push('\n');
+        // Through a symlink, if the manifest is one and its target can be
+        // written; `write_atomic` replaces a link it cannot write through.
         match tobii_config::write_atomic(&real, body.as_bytes()) {
             Ok(()) => out.notes.push(format!("updated {}", m.file.display())),
             Err(e) => out.failed.push((m.file.clone(), e.to_string())),
@@ -2825,6 +2993,14 @@ pub fn render(plan: &Plan, opts: &Options) -> String {
             if m.then_empty {
                 let _ = writeln!(o, "  {}   (nothing left in it)", m.file.display());
             }
+        }
+        if let Some(sc) = &plan.cosmic_shortcut {
+            let _ = writeln!(
+                o,
+                "  the recentre shortcut in {}   ({}; your other shortcuts there stay)",
+                sc.file.display(),
+                sc.why
+            );
         }
         for d in &plan.rmdirs {
             let _ = writeln!(o, "  {}/   (only if empty by then)", d.display());

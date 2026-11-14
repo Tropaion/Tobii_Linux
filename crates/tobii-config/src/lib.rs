@@ -16,6 +16,7 @@
 /// The XDG autostart entry, shared by the hub and `tobii uninstall`.
 pub mod autostart;
 mod calibration_state;
+pub mod cosmic_shortcut;
 /// Games this machine has that Steam does not list: a name and a Wine prefix.
 ///
 /// Linux-only, and that is load-bearing rather than tidy. This module writes

@@ -61,7 +61,40 @@ fn calibration_meta_path() -> PathBuf {
 /// a truncated file that [`read_opt`] cannot tell from a good one — this
 /// matters both for the calibration blob (re-applied to the device on every
 /// connect) and for its metadata sidecar.
+///
+/// **A symlink is written through, not replaced**, and the file keeps its
+/// permissions. A settings file kept in a dotfiles repository and linked into
+/// place stays linked, and one somebody made private stays private — a plain
+/// rename would put a new file with the default mode where the link was. That
+/// matters most for the one file written here that this program does not own,
+/// COSMIC's shortcuts ([`crate::cosmic_shortcut`]).
+///
+/// A link into somewhere that cannot be written — a Nix store, which home
+/// managers link settings from — is replaced instead, as it always was:
+/// writing through it would turn a save that worked into one that fails.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let target = through_links(path);
+    if target == path {
+        return write_in_place(path, bytes, false);
+    }
+    match write_in_place(&target, bytes, false) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            // The target's mode, made writable by its owner: a store's
+            // read-only file left a copy an editor would refuse to save over.
+            write_in_place(path, bytes, true)
+        }
+        done => done,
+    }
+}
+
+/// [`write_atomic`] at `path` itself, whatever it is, keeping the mode of what
+/// is there — made writable by its owner when `owner_writable`.
+fn write_in_place(path: &Path, bytes: &[u8], owner_writable: bool) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -80,9 +113,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // Any failure here removes the temp file: the rename path below already
     // cleans up after itself, and leaving debris only on the write path would
     // be an inconsistency nobody would think to look for.
+    let kept = std::fs::metadata(path).ok().map(|m| {
+        let mut p = m.permissions();
+        if owner_writable {
+            use std::os::unix::fs::PermissionsExt;
+            p.set_mode(p.mode() | 0o200);
+        }
+        p
+    });
+    // A temp left by a write that was cut short may carry a read-only mode
+    // copied from its file, which `create` cannot open again.
+    let _ = std::fs::remove_file(&tmp);
     let written = (|| {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;
+        // Before the bytes, so a private file's contents are never readable
+        // under the default mode, even briefly.
+        if let Some(p) = kept {
+            f.set_permissions(p)?;
+        }
         f.write_all(bytes)?;
         f.sync_all()
     })();
@@ -108,6 +157,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where `path` leads once every symlink along the way is followed — a
+/// dangling one included, so a link to a file not yet made is written through
+/// too. `path` itself when it is not a link.
+fn through_links(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    // The kernel's own limit on a chain of links, so a loop ends.
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&p) else {
+            break;
+        };
+        // `join` puts an absolute target in place of the directory.
+        p = match p.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
+    p
 }
 
 /// Read `path` into bytes. `Ok(None)` if the file does not exist.
@@ -574,6 +642,99 @@ mod tests {
             mode: "full".into(),
             display_fingerprint: 0,
         }
+    }
+
+    /// A linked file stays linked and written through, a dangling link is
+    /// written through to the file it names, and a private file stays private.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_goes_through_a_symlink_and_keeps_the_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = scratch("atomic-link");
+        let real = dir.join("dotfiles").join("custom");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("custom");
+        symlink("dotfiles/custom", &link).unwrap();
+
+        write_atomic(&link, b"new").expect("write");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is still a link"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "and the file is still private");
+
+        let dangling = dir.join("later");
+        symlink(dir.join("dotfiles").join("later"), &dangling).unwrap();
+        write_atomic(&dangling, b"made").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("dotfiles").join("later")).unwrap(),
+            "made"
+        );
+        assert!(std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// A link into somewhere that cannot be written is replaced, as it always
+    /// was, rather than turned into a save that fails; and a read-only temp
+    /// left by a write that was cut short does not block the next one.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_link_target_and_a_stale_temp_do_not_block_a_save() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = scratch("atomic-ro");
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("games.toml"), "old").unwrap();
+        // As a Nix store has them.
+        std::fs::set_permissions(
+            store.join("games.toml"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let link = dir.join("games.toml");
+        symlink(store.join("games.toml"), &link).unwrap();
+        // Root writes into a 0555 directory anyway, and then there is nothing
+        // to fall back from (CI runs as root).
+        let refuses = std::fs::write(store.join("probe"), "").is_err();
+        write_atomic(&link, b"new").expect("a save that worked before still works");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+        if refuses {
+            assert!(
+                !std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the link was replaced"
+            );
+            let mode = std::fs::metadata(&link).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o644,
+                "by the store's file, made writable by its owner"
+            );
+            assert_eq!(
+                std::fs::read_to_string(store.join("games.toml")).unwrap(),
+                "old"
+            );
+        }
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let file = dir.join("custom");
+        let mut stale = file.as_os_str().to_owned();
+        stale.push(paths::ATOMIC_TMP_SUFFIX);
+        std::fs::write(&stale, "half").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o444)).unwrap();
+        write_atomic(&file, b"whole").expect("the stale temp does not block the write");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "whole");
     }
 
     #[test]

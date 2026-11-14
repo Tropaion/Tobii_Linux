@@ -448,6 +448,23 @@ fn shortcut_row(recentring: Recentring) -> gtk::Box {
         label.set_max_width_chars(12);
     }
     show_key(&set);
+    // Relabelled whenever COSMIC's file changes — COSMIC Settings writes it
+    // too — and not only after a key is set here. The monitors hold the button
+    // weakly and are cancelled when the button goes. With COSMIC's directory not
+    // made yet, GLib looks for it every few seconds instead (measured: a
+    // change showed within six; `tests/recentre_key.rs` covers the directory
+    // being there).
+    let weak = set.downgrade();
+    let watch = crate::watch_file(&crate::shortcut::custom_path(), move || {
+        if let Some(b) = weak.upgrade() {
+            show_key(&b);
+        }
+    });
+    set.connect_destroy(move |_| {
+        for m in &watch {
+            m.cancel();
+        }
+    });
     set.connect_clicked(move |b| capture_key(b, recentring.clone()));
     row.append(&set);
     row.set_tooltip_text(Some(SHORTCUT_TOOLTIP));
@@ -540,7 +557,10 @@ fn capture_key(anchor: &gtk::Button, recentring: Recentring) {
             } else {
                 Some(crate::shortcut::Binding::new(&mods, &name))
             };
-            let result = crate::shortcut::set(binding.as_ref());
+            let result = match &binding {
+                Some(b) => crate::shortcut::set(b),
+                None => crate::shortcut::remove(),
+            };
             // From the file, whatever happened: it may also have changed in
             // COSMIC Settings since the label was set.
             if let Some(anchor) = anchor.upgrade() {
