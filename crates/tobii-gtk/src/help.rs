@@ -43,7 +43,7 @@
 //! means naming the presets FROM `games::STRENGTHS`, the constant the radios
 //! are labelled from, rather than retyping them here. Not done yet.
 //! The topic list beside it is the second half of the same
-//! idea — nine topics is few enough that a list is not a necessity for finding
+//! idea — a dozen topics is few enough that a list is not a necessity for finding
 //! anything, but it makes the shape of the whole window visible at a glance,
 //! which is what tells you whether your question is in here at all.
 //!
@@ -325,6 +325,25 @@ pub fn topics() -> Vec<Topic> {
                 refusals = refusals,
             ),
         ),
+        // The Tuning window's sliders say what they do in a tooltip and
+        // nowhere else, so this is where a keyboard or touch user reads it.
+        topic(
+            "Tuning window",
+            format!(
+                "Tuning, on Head tracking for games, opens a window with a response curve for \
+                 each axis, the smoothing and auto-centre, and how far gaze steers the camera. \
+                 Each control writes one of the keys `tobii games set` writes — a moment after \
+                 you move it, and again when the window loses focus or closes — and the window \
+                 shows a change made elsewhere, on this card or with `tobii games set`, as \
+                 soon as it is made. While it is open the tracker stays on, for the dot that \
+                 shows where your head is on the curve.\n\n{sliders}",
+                sliders = crate::tuning::TIPS
+                    .iter()
+                    .map(|t| format!("{} — {}.", t.name, t.text))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        ),
         // The four paragraphs below were bolted onto the topic above while the
         // only door to them was a button on that card. The door is a tab now,
         // and a topic of its own is what a tab gets.
@@ -567,7 +586,7 @@ fn all_terms_in(hay: &str, query: &str) -> bool {
 /// Takes the list rather than building its own. It returns an INDEX into that
 /// list, and it is called on every keystroke: a second copy built in here is a
 /// second thing that has to stay in the same order as the rows, the pages and
-/// the filter, and rebuilding all nine topics — every one of which interpolates
+/// the filter, and rebuilding every topic — each of which interpolates
 /// somebody else's strings — to answer one keypress is work for nothing.
 pub fn best_match(all: &[Topic], query: &str) -> Option<usize> {
     let hits: Vec<usize> = (0..all.len())
@@ -1256,6 +1275,8 @@ mod tests {
             crate::games::SHORTCUT_ELSEWHERE_TOOLTIP.to_string(),
             crate::games::TUNING_TOOLTIP.to_string(),
         ];
+        // And every slider of the Tuning window, which has no other words.
+        want.extend(crate::tuning::TIPS.iter().map(|t| t.text.to_string()));
         // And the reasons the Recentre button greys itself out, which the
         // pointer user reads in the row's tooltip and nobody else could.
         for (reasons, tracking, composing) in [
@@ -1580,7 +1601,8 @@ mod tests {
 
     /// The topics are the hub's own order, so a topic sits where its card sits.
     ///
-    /// "Games" goes after the six cards and before the cogwheel, which is where
+    /// "Tuning window" follows the card whose button opens it. "Games" goes
+    /// after the six cards and before the cogwheel, which is where
     /// the tab it documents sits: to the right of everything on tab 1 and left
     /// of the settings that are not on a tab at all. The order is also what
     /// [`super::best_match`] falls back to, so moving this row moves which
@@ -1599,6 +1621,7 @@ mod tests {
                 "Head tracking",
                 "Preview my gaze",
                 "Head tracking for games",
+                "Tuning window",
                 "Games",
                 "Settings, behind the cogwheel",
                 "Keyboard",
@@ -1796,7 +1819,7 @@ mod tests {
     ///
     /// This is the one case where "the first topic the filter left standing" is
     /// visibly wrong, and it is the case a user is most likely to produce: they
-    /// can see the nine headings in the sidebar, so they type one. Both words of
+    /// can see the headings in the sidebar, so they type one. Both words of
     /// "Change screen" appear in two other bodies, and without the tie-break
     /// the pane would open on "Improve my calibration".
     #[test]

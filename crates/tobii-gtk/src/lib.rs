@@ -501,7 +501,11 @@ pub fn status_text(status: &device::ConnStatus) -> &'static str {
 /// the hub was minimised or unfocused. Measured: both flows' windows were still
 /// alive, and still claiming, six seconds after closing. `window-removed` fires
 /// on the close itself, whoever else still holds a reference.
-fn hold_while_open(demand: &device::Demand, win: &impl IsA<gtk::Window>, reason: &'static str) {
+pub(crate) fn hold_while_open(
+    demand: &device::Demand,
+    win: &impl IsA<gtk::Window>,
+    reason: &'static str,
+) {
     let win = win.as_ref();
     let guard = RefCell::new(Some(demand.hold(reason)));
     // Every caller passes a window built with `.application(app)`. One that is
@@ -1033,6 +1037,62 @@ pub(crate) fn add_escape_to_close(win: &impl IsA<gtk::Window>) {
         }
     });
     win.add_controller(keys);
+}
+
+/// Watch the file at `path`, and the one a symlink there leads to when it is
+/// one, and run `f` each time a change to it is complete. Empty when GIO
+/// cannot watch it. (`write_atomic` follows a link the same way.)
+///
+/// Both, because a link is written two ways: through, which lands in its
+/// target's directory, and over, which replaces it with a file of its own —
+/// COSMIC's writer renames onto the path, and so does `write_atomic` when it
+/// cannot write through. Completed changes only: one save is several events
+/// (created empty, written, closed, renamed into place), and `f` reads the
+/// file.
+pub(crate) fn watch_file(
+    path: &std::path::Path,
+    f: impl Fn() + 'static,
+) -> Vec<gtk::gio::FileMonitor> {
+    use gtk::gio::FileMonitorEvent as E;
+    let f = Rc::new(f);
+    let mut paths = vec![path.to_path_buf()];
+    // A link — dangling included — and where its chain ends. Only for a link
+    // itself: under a linked directory the one watch already sees the file.
+    let mut end = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&end) else {
+            break;
+        };
+        end = match end.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
+    if end != path {
+        paths.push(end);
+    }
+    paths
+        .into_iter()
+        .filter_map(|p| {
+            let m = gtk::gio::File::for_path(p)
+                .monitor_file(
+                    gtk::gio::FileMonitorFlags::WATCH_MOVES,
+                    gtk::gio::Cancellable::NONE,
+                )
+                .ok()?;
+            let f = f.clone();
+            m.connect_changed(move |_, _, _, event| {
+                let partial = matches!(
+                    event,
+                    E::Created | E::Changed | E::AttributeChanged | E::PreUnmount | E::Unmounted
+                );
+                if !partial {
+                    f();
+                }
+            });
+            Some(m)
+        })
+        .collect()
 }
 
 /// Make `win` a dialog of `parent`: kept above it, and one of the

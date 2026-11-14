@@ -1851,7 +1851,7 @@ fn the_help_window_opens_closes_frees_itself_and_covers_every_rack_tooltip() {
     // The case this catches: a query that matched nothing leaves the previously
     // selected row selected, so clearing the box picks that same row again and
     // `row-selected` — which fires on a CHANGE — stays silent. The window then
-    // sits on "Nothing found" with all nine topics listed beside it, which is a
+    // sits on "Nothing found" with every topic listed beside it, which is a
     // worse state than the one the no-match page exists to prevent.
     assert!(
         !seen.cleared_page.is_empty() && seen.cleared_page != tobii_gtk::help::NO_MATCH_PAGE,

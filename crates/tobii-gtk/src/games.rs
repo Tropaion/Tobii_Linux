@@ -106,13 +106,14 @@ fn waking_for_joystick(cfg: &OutputConfig) -> bool {
 
 /// Which preset a config's values correspond to, if any.
 ///
-/// Matched on yaw alone: it is the axis the presets differ most on, and a
-/// config hand-tuned past recognition should leave every preset unselected
-/// rather than have one silently claim it.
+/// Matched on both reaches: a config hand-tuned past recognition — the Tuning
+/// window sets the two apart — should leave every preset unselected rather
+/// than have one silently claim it.
 pub fn strength_index(cfg: &OutputConfig) -> Option<usize> {
-    STRENGTHS
-        .iter()
-        .position(|(_, yaw, _)| (cfg.extended_view.yaw.output_max_deg - yaw).abs() < 0.01)
+    let ev = &cfg.extended_view;
+    STRENGTHS.iter().position(|(_, yaw, pitch)| {
+        (ev.yaw.output_max_deg - yaw).abs() < 0.01 && (ev.pitch.output_max_deg - pitch).abs() < 0.01
+    })
 }
 
 /// What the status line should say, given what is actually set up.
@@ -624,6 +625,12 @@ pub struct GamesRow {
     /// reads `games.toml` itself is a second reader of the same file with its
     /// own idea of what it says.
     composing: Rc<Cell<bool>>,
+    /// Set while [`GamesRow::refresh`] puts the controls back in step with the
+    /// file, so their handlers do not write what was just read. A strength
+    /// radio's handler writes both reaches, so a refresh that selected one
+    /// because the file's sideways reach matched it overwrote the vertical
+    /// reach the Tuning window had set.
+    seeding: Rc<Cell<bool>>,
 }
 
 impl GamesRow {
@@ -672,6 +679,7 @@ impl GamesRow {
             buttons.push(cb);
         }
 
+        let seeding = Rc::new(Cell::new(false));
         // The status line, put back in step after every write. `tracker_on` is
         // false because a save handler has no way to know: the 33 ms hub tick
         // calls `GamesRow::refresh` with the truth immediately afterwards.
@@ -693,18 +701,20 @@ impl GamesRow {
         };
 
         {
-            let refresh = refresh.clone();
+            let (refresh, seeding) = (refresh.clone(), seeding.clone());
             sw.connect_state_set(move |_, on| {
-                edit_config("game-output setting", |cfg| cfg.enabled = on);
-                refresh();
+                if !seeding.get() {
+                    edit_config("game-output setting", |cfg| cfg.enabled = on);
+                    refresh();
+                }
                 glib::Propagation::Proceed
             });
         }
 
         for (i, cb) in buttons.iter().enumerate() {
-            let refresh = refresh.clone();
+            let (refresh, seeding) = (refresh.clone(), seeding.clone());
             cb.connect_toggled(move |c| {
-                if !c.is_active() {
+                if !c.is_active() || seeding.get() {
                     return;
                 }
                 let (_, yaw, pitch) = STRENGTHS[i];
@@ -725,8 +735,11 @@ impl GamesRow {
         joy.set_tooltip_text(Some(JOYSTICK_TOOLTIP));
         joy_row.set_tooltip_text(Some(JOYSTICK_TOOLTIP));
         {
-            let refresh = refresh.clone();
+            let (refresh, seeding) = (refresh.clone(), seeding.clone());
             joy.connect_toggled(move |c| {
+                if seeding.get() {
+                    return;
+                }
                 let on = c.is_active();
                 edit_config("virtual-joystick setting", |cfg| cfg.joystick = on);
                 refresh();
@@ -741,8 +754,11 @@ impl GamesRow {
         auto_centre.set_tooltip_text(Some(AUTO_CENTRE_TOOLTIP));
         auto_row.set_tooltip_text(Some(AUTO_CENTRE_TOOLTIP));
         {
-            let refresh = refresh.clone();
+            let (refresh, seeding) = (refresh.clone(), seeding.clone());
             auto_centre.connect_toggled(move |c| {
+                if seeding.get() {
+                    return;
+                }
                 let on = c.is_active();
                 edit_config("auto-centre setting", |cfg| cfg.auto_centre.enabled = on);
                 refresh();
@@ -831,7 +847,10 @@ impl GamesRow {
         // row it cost the card 18px of height.
         let tune = crate::widget::button("Tuning…");
         tune.set_tooltip_text(Some(TUNING_TOOLTIP));
-        tune.connect_clicked(move |b| crate::tuning::open(b, live.clone()));
+        {
+            let demand = demand.clone();
+            tune.connect_clicked(move |b| crate::tuning::open(b, live.clone(), &demand));
+        }
         controls.append(&auto_row);
         let keys = shortcut_row(recentring.clone());
         keys.append(&tune);
@@ -852,6 +871,7 @@ impl GamesRow {
             demand,
             tracker_on,
             composing,
+            seeding,
         };
         row.refresh(false);
         row
@@ -866,10 +886,10 @@ impl GamesRow {
     pub fn refresh(&self, tracker_on: bool) {
         let cfg = load_output_config();
 
-        // Compared before writing, which is what makes this safe to call from
-        // the 33 ms hub tick: GTK emits `state-set` and `toggled` only on an
-        // actual change, so an equal write is silent and cannot re-enter the
-        // save handlers that are listening to these very widgets.
+        // Compared before writing, so the 33 ms tick changes nothing that is
+        // already right, and `seeding` around it, so a change it does make is
+        // not written back to the file it came from.
+        self.seeding.set(true);
         if self.enabled.is_active() != cfg.enabled {
             self.enabled.set_active(cfg.enabled);
         }
@@ -879,13 +899,16 @@ impl GamesRow {
         if self.auto_centre.is_active() != cfg.auto_centre.enabled {
             self.auto_centre.set_active(cfg.auto_centre.enabled);
         }
-        if let Some(i) = strength_index(&cfg) {
-            if let Some(b) = self.strength.get(i) {
-                if !b.is_active() {
-                    b.set_active(true);
-                }
+        // None selected when no preset is what the file says — the Tuning
+        // window sets the reaches apart — and not the last one that was: a
+        // preset left selected could not be clicked to set it again.
+        let preset = strength_index(&cfg);
+        for (i, b) in self.strength.iter().enumerate() {
+            if b.is_active() != (preset == Some(i)) {
+                b.set_active(preset == Some(i));
             }
         }
+        self.seeding.set(false);
 
         // The tooltip makes the same promise as the status line at the foot
         // of the same card, so it is re-derived from the same file on the same
@@ -1276,5 +1299,12 @@ mod tests {
             "a hand-tuned config must leave every preset unselected rather than \
              have one claim it"
         );
+        // The Tuning window sets the two reaches apart, and a preset's handler
+        // writes both: claimed on the sideways reach alone, the hub's refresh
+        // overwrote the vertical one.
+        let (_, yaw, _) = STRENGTHS[0];
+        odd.extended_view.yaw.output_max_deg = yaw;
+        odd.extended_view.pitch.output_max_deg = 33.3;
+        assert_eq!(strength_index(&odd), None, "the vertical reach counts too");
     }
 }
