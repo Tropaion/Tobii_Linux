@@ -111,7 +111,6 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
         let (seen, pending, pending_c) = (seen.clone(), pending.clone(), pending_c.clone());
         app.connect_activate(move |app| {
             tobii_gtk::load_css();
-            tobii_gtk::apply_text_scale(1.0);
             // The same action the cogwheel's Quit uses, so what is torn down
             // here is what is torn down in the field. A bare `app.quit()` ends
             // the loop without running the hub's close handler at all.

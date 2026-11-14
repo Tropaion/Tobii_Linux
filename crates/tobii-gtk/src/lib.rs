@@ -345,6 +345,7 @@ pub fn run() -> glib::ExitCode {
     // already handled a host restarting.
     app.connect_startup(|app| {
         load_css();
+        apply_text_scale(tobii_config::text_scale());
         // Not in accuracy mode. That runs as a SECOND process (NON_UNIQUE,
         // above), so publishing from it puts a second identical icon in the
         // panel — and clicking that one activates the diagnostic's own
@@ -878,11 +879,17 @@ fn control_column() -> gtk::Box {
     c
 }
 
-/// Install this app's stylesheet on the default display.
+/// Install this app's stylesheet on the default display, at text scale 1.0.
 ///
 /// Public so a dialog can be rendered outside the hub for a visual check —
 /// GTK's own `render_texture` gives an honest picture of a widget tree without
 /// a compositor screenshot, which is how this dialog's width bug was found.
+///
+/// At 1.0 and not at the user's saved scale, which the program's startup
+/// applies on top: every display test calls this, and while it applied the
+/// saved scale itself, each one that printed geometry had to remember to undo
+/// it. Two did not, and their numbers went into comments as 1.0 numbers when
+/// they were this machine's 1.2.
 pub fn load_css() {
     hint_font_metrics();
     if let Some(display) = gtk::gdk::Display::default() {
@@ -892,7 +899,19 @@ pub fn load_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
-    apply_text_scale(tobii_config::text_scale());
+    apply_text_scale(1.0);
+}
+
+thread_local! {
+    /// The scale [`apply_text_scale`] last applied, which is what the cogwheel's
+    /// text-size control shows and steps from. Not the saved one, for two
+    /// reasons. Under [`load_css`] alone — every display test — the two differ,
+    /// and a control reading the file would show 120% over text drawn at 100%,
+    /// and step on from there. And the save is best-effort: with a read-only
+    /// config directory it fails, and a control that re-read the file stayed
+    /// stuck one step from where it started while the text on screen had
+    /// actually changed.
+    static APPLIED_TEXT_SCALE: Cell<f64> = const { Cell::new(1.0) };
 }
 
 /// Re-render the stylesheet at `scale` and apply it live.
@@ -903,6 +922,7 @@ pub fn load_css() {
 /// them makes the UI grow unevenly, which looks like a bug rather than a
 /// setting.
 pub fn apply_text_scale(scale: f64) {
+    APPLIED_TEXT_SCALE.with(|s| s.set(scale));
     css_provider().load_from_string(&scaled_css(CSS, scale));
     // The window has to grow with the text, or the last card is simply cut off
     // — which reads as the setting being broken rather than as a window that
@@ -1643,11 +1663,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // that padding and the tab strip above it. `page_chrome` below measures it
     // off the widgets rather than repeating the stylesheet's numbers here.
     //
-    // **At text scale 1.0, and the test pins it there**, because this machine's
-    // saved scale is 1.2 and `load_css` applies it: the same pair measured
-    // without pinning comes out 1241 x 801 and 1241 x 749, which is where the
-    // "1241px" recorded elsewhere in this tree as a scale-1.0 number came from.
-    // It is a 1.2 number. Pin the scale or the answer is somebody's settings.
+    // **At text scale 1.0**, which is what a test gets (see `load_css`); this
+    // machine's saved scale is 1.2. The same pair measured at 1.2 comes out
+    // 1241 x 801 and 1241 x 749, which is where the "1241px" recorded
+    // elsewhere in this tree as a scale-1.0 number came from. Measure at 1.0
+    // or the answer is somebody's settings.
     //
     // Both at the same natural width, and that is the load-bearing half: the
     // width every user opens at is `three_col_min` plus the margins, the games
@@ -3091,23 +3111,12 @@ fn text_size_row() -> gtk::Box {
             plus.set_sensitive(scale < tobii_config::TEXT_SCALE_MAX - f64::EPSILON);
         }
     };
-    let saved = tobii_config::text_scale();
-    refresh(saved);
+    refresh(APPLIED_TEXT_SCALE.with(Cell::get));
 
-    // The live value, held here rather than re-read from disk on every press.
-    //
-    // Reading it back meant the buttons only moved if the previous press had
-    // been SAVED: with a read-only config directory the save fails, the next
-    // press re-reads the old value, and the control appears stuck at one step
-    // from where it started — while the text on screen had actually changed.
-    // The save is best-effort; the setting is not.
-    let current = std::rc::Rc::new(Cell::new(saved));
     let bump = {
         let refresh = refresh.clone();
-        let current = current.clone();
         move |by: f64| {
-            let next = stepped(current.get(), by);
-            current.set(next);
+            let next = stepped(APPLIED_TEXT_SCALE.with(Cell::get), by);
             // Applied before it is saved: the change is visible instantly, and
             // a read-only config directory costs the user the persistence
             // rather than the feature.

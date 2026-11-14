@@ -243,10 +243,6 @@ fn run(app_id: &str, hold: bool) -> Seen {
         let (seen, keep, pending) = (seen.clone(), keep.clone(), pending.clone());
         app.connect_activate(move |app| {
             tobii_gtk::load_css();
-            // Pinned, because the geometry this prints is compared against a
-            // number recorded in `lib.rs` at text scale 1.0, and `load_css`
-            // above applies whatever scale this machine's user has chosen.
-            tobii_gtk::apply_text_scale(1.0);
             // The same action the cogwheel's Quit and `tobii uninstall` use, so
             // what is torn down here is what is torn down in the field. A bare
             // `app.quit()` ends the loop without running the hub's close
