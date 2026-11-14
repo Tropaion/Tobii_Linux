@@ -297,7 +297,7 @@ because the reasoning is worth more than the tidiness.
   run outside unit tests. The banner's state after an install attempt — *What's
   new* usable again, and *Quit* once the install finds this copy replaced while
   it ran — is covered by a display test that is ignored by default:
-  `cargo test -p tobii-gtk --lib -- --ignored a_finished_install`.
+  `scripts/display-tests.sh lib`.
 - **A group member without sudo is sent to an administrator, and the command
   they are given is refused.** Another account's files in a group-writable
   folder the user does not own get the `--system` *Download*, where a plain
@@ -691,7 +691,7 @@ fault.
   asserts the config directory holds `games.toml` and no second file. The GTK
   wiring itself, which is still unreachable without a display, is covered by
   `crates/tobii-gtk/tests/keep_awake_switch.rs`, `#[ignore]`d and run with
-  `cargo test -p tobii-gtk --test keep_awake_switch -- --ignored`: it builds a
+  `scripts/display-tests.sh keep_awake_switch`: it builds a
   real hub, rewrites `games.toml` underneath it the way `tobii games set
   keep_awake true` does, and checks that the switch and the ALWAYS ON badge
   follow within the hub's tick; that the file is **byte identical** afterwards,

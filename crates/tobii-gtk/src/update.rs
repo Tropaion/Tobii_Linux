@@ -1374,8 +1374,7 @@ mod tests {
     /// After an install ends, whichever way, "What's new" and Later work again;
     /// a copy found replaced while it ran turns the button into Quit.
     ///
-    /// Needs a display: `cargo test -p tobii-gtk --lib -- --ignored
-    /// a_finished_install`.
+    /// Needs a display: `scripts/display-tests.sh lib`.
     #[test]
     #[ignore = "needs a display"]
     fn a_finished_install_gives_back_whats_new_and_a_replaced_copy_gets_quit() {

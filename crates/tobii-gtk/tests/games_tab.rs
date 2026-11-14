@@ -3,13 +3,9 @@
 //!
 //! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     cargo test -p tobii-gtk --test games_tab -- --ignored
+//!     scripts/display-tests.sh games_tab
 //!
-//! and run it in a **nested** compositor rather than on the session display:
-//!
-//!     kwin_wayland --virtual --width 1600 --height 1200 --socket wl-gs &
-//!     WAYLAND_DISPLAY=wl-gs GDK_BACKEND=wayland cargo test -p tobii-gtk \
-//!         --test games_tab -- --ignored
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! No tracker is needed. Nothing the user has saved is touched: no button that
 //! writes anything is pressed, the installer is never started, and after this

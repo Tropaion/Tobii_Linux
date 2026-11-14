@@ -2,9 +2,11 @@
 //! badge are the same bit as `tobii games set keep_awake` — in both directions,
 //! and while the hub is open.
 //!
-//! Needs a display, so it is ignored by default:
+//! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     cargo test -p tobii-gtk --test keep_awake_switch -- --ignored
+//!     scripts/display-tests.sh keep_awake_switch
+//!
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! No tracker is needed: what is asserted is what the hub reads out of
 //! `games.toml` and what it writes back into it.

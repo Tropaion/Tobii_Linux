@@ -2,7 +2,9 @@
 //!
 //! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     cargo test -p tobii-gtk --test help_window -- --ignored
+//!     scripts/display-tests.sh help_window
+//!
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! No tracker is needed: nothing here reads gaze, and the one device fact the
 //! test asserts — that opening a window of text takes no claim on the tracker —

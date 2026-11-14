@@ -2,11 +2,9 @@
 //!
 //! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     kwin_wayland --virtual --width 1600 --height 1200 --socket wl-hl &
-//!     WAYLAND_DISPLAY=wl-hl GDK_BACKEND=wayland cargo test -p tobii-gtk \
-//!         --test hub_lifetime -- --ignored
+//!     scripts/display-tests.sh hub_lifetime
 //!
-//! or through `scripts/display-tests.sh`, which does both.
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! # What this is for, and why it is not `tests/games_tab.rs`
 //!

@@ -3,10 +3,9 @@
 //!
 //! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     cargo test -p tobii-gtk --test games_filter -- --ignored
+//!     scripts/display-tests.sh games_filter
 //!
-//! in a **nested** compositor rather than on the session display, or through
-//! `scripts/display-tests.sh`, which does both.
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! Nothing the person running it has saved is touched: `XDG_CONFIG_HOME` is
 //! redirected to a directory of this test's own before anything reads a path,

@@ -2,13 +2,9 @@
 //!
 //! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     cargo test -p tobii-gtk --test games_tab_refreshes -- --ignored
+//!     scripts/display-tests.sh games_tab_refreshes
 //!
-//! and run it in a **nested** compositor rather than on the session display:
-//!
-//!     kwin_wayland --virtual --width 1600 --height 1200 --socket wl-gr &
-//!     WAYLAND_DISPLAY=wl-gr GDK_BACKEND=wayland cargo test -p tobii-gtk \
-//!         --test games_tab_refreshes -- --ignored
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! No tracker is needed, and nothing the person running this has saved is
 //! touched: `XDG_CONFIG_HOME` is redirected to a directory of this test's own

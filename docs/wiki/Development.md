@@ -121,14 +121,24 @@ CI runs as root with no display, which is why the display tests are
 
 ```sh
 scripts/display-tests.sh            # all of them
-scripts/display-tests.sh games_tab  # one
+scripts/display-tests.sh games_tab  # one file in tests/
+scripts/display-tests.sh lib        # the ones inside src/
 ```
 
 That starts a nested `kwin_wayland --virtual` with a socket of its own and
-runs the eight files against it. **Never the session's compositor**: they
-present windows, take focus and drive keys. A socket per run matters —
-`keep_awake_switch` failed for a week against a shared one and passes against
-a fresh one.
+runs every ignored test in `tobii-gtk` against it — each one is a display
+test: the eight files in `tests/` and one in `src/update.rs`. **Never the
+session's compositor**: they present windows, take focus and drive keys. A
+socket per run matters — `keep_awake_switch` failed for a week against a
+shared one and passes against a fresh one.
+
+Nor a bare `kwin_wayland --virtual` started by hand. Nested is not isolated: it
+writes the session's own `~/.config/kwinrc` and `kwinoutputconfig.json`, and
+its lock screen starts a second document portal that takes the session's down
+with it, so Flatpak apps lose file access until `systemctl --user start
+xdg-document-portal.service`. The script gives KWin a home, settings and D-Bus
+session of its own and starts it with `--no-lockscreen`; the comment there has
+the details.
 
 `kwin_wayland` specifically, and not Weston or Xvfb: the gaze overlay is a
 `wlr-layer-shell` surface, and since the hub greys that switch out where the

@@ -2,7 +2,9 @@
 //!
 //! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     cargo test -p tobii-gtk --test flows_release_the_tracker -- --ignored
+//!     scripts/display-tests.sh flows_release_the_tracker
+//!
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! No tracker is needed: what is asserted is the device thread's list of claim
 //! reasons, which is state, not hardware. Nothing the user has saved is touched —

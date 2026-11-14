@@ -3,9 +3,11 @@
 //! banner's Quit find it in — and with a calibration flow open, which is a state
 //! `tobii uninstall` can find it in at any moment.
 //!
-//! Needs a display, so it is ignored by default:
+//! Needs a display, so it is ignored by default (CI has none). Run it with:
 //!
-//!     cargo test -p tobii-gtk --test quit_action -- --ignored
+//!     scripts/display-tests.sh quit_action
+//!
+//! which starts a nested KWin that cannot touch your session; see the script.
 //!
 //! No tracker is needed: what is asserted is that the run loop returns, the
 //! device thread's list of claims before the quit and at shutdown, and that the
