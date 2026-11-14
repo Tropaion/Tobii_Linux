@@ -3887,6 +3887,9 @@ fn headpose(args: &[String]) -> CmdResult {
                         tobii_output::pipeline::SuppliedPose {
                             pose,
                             rotation_at: fresh.map_or(at, |(_, measured)| *measured),
+                            // `fuse_pose` hands back the eye geometry, pitch
+                            // 0, when the model has nothing fresh.
+                            measured_pitch: fresh.is_some(),
                         }
                     });
                     let frame = pipeline.offer(&sample, pose_in, &cfg, corners, at);

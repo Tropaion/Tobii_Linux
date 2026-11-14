@@ -832,7 +832,13 @@ pub fn device_tick<T: Transport>(
                         crate::outputs::pose_is_fresh(s.head_pose_at, now)
                             .then(|| s.head_pose.zip(s.head_pose_at))
                             .flatten()
-                            .map(|(pose, rotation_at)| SuppliedPose { pose, rotation_at })
+                            // With a worker, the pose is the model's — its
+                            // pitch measured; without one, the eye geometry's.
+                            .map(|(pose, rotation_at)| SuppliedPose {
+                                pose,
+                                rotation_at,
+                                measured_pitch: head.is_some(),
+                            })
                     };
                     // Routed from HERE, on the sample that produced it, rather
                     // than from a timer re-reading the state mutex: a poll
@@ -1707,6 +1713,12 @@ fn device_session(
                         // Dropping the old worker closes its channel, so its
                         // thread ends after the frame it is on.
                         head = HeadWorker::spawn(thread_state.clone());
+                        // The pose published so far is the eye geometry's or
+                        // the old worker's — its last frame finishes while the
+                        // new model loads — and with a worker, game output
+                        // takes what is published as the model's
+                        // (`measured_pitch`): it is not fresh any more.
+                        thread_state.lock().unwrap().head_pose_at = None;
                         // Every change to the pitch zero arrives this way (a
                         // saved calibration, a model installed or removed), and
                         // a recentre's pitch was measured against the old one.

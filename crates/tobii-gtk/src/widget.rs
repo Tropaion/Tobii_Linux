@@ -535,8 +535,8 @@ mod tests {
         assert_eq!(readout_groups(&seen, None, true)[0][0].value, "good");
     }
 
-    /// Side by side, the taller group sets the height. Five values stacked was
-    /// what made the panel too long.
+    /// The joystick block reads each axis as a signed share of full
+    /// deflection, and "off" with no joystick at all.
     #[test]
     fn the_joystick_rows_show_signed_deflection_and_say_off_when_absent() {
         use tobii_output::sinks::uinput_joystick::{AXIS_CENTRE, AXIS_MAX};
@@ -555,6 +555,8 @@ mod tests {
         assert_eq!(right[1].value, "+50%");
     }
 
+    /// Side by side, the taller group sets the height. Five values stacked was
+    /// what made the panel too long.
     #[test]
     fn the_readout_is_three_rows_tall_not_five() {
         let [placement, facing] = readout_groups(&EyeView::none(), None, true);

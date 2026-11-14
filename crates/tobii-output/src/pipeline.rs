@@ -224,6 +224,11 @@ pub struct SuppliedPose {
     /// When the rotation in `pose` was measured. The same instant on two
     /// frames is the same measurement on both.
     pub rotation_at: Instant,
+    /// Whether `pose.pitch_deg` is the model's measurement. False for the eye
+    /// geometry, whose pitch is a fixed 0 — which a front end supplies too,
+    /// with no model or with a stale one, so being supplied says nothing about
+    /// pitch on its own.
+    pub measured_pitch: bool,
 }
 
 /// One rotation recentre in flight: the poses seen since it started.
@@ -242,6 +247,28 @@ struct RecentreRun {
     /// The normalised gaze points behind `gaze_deg`, for the
     /// [`RECENTRE_GAZE_BOX`] check.
     gaze_xy: [Vec<f64>; 2],
+    /// Whether the window's rotation is measured with the model's pitch
+    /// (`true`) or the eye geometry's fixed 0. It starts on the geometry and
+    /// starts over on the model when a pose of it arrives (see
+    /// [`FramePipeline::offer`]); rotations of the other kind are left out. A
+    /// window that spanned a model dropping out read the jump between the two
+    /// as a head that moved some 20°, and refused.
+    measured_pitch: bool,
+}
+
+impl RecentreRun {
+    fn new(started: Instant, measured_pitch: bool) -> RecentreRun {
+        RecentreRun {
+            started,
+            yaw_deg: Vec::new(),
+            pitch_deg: Vec::new(),
+            roll_deg: Vec::new(),
+            pos_mm: [Vec::new(), Vec::new(), Vec::new()],
+            gaze_deg: [Vec::new(), Vec::new()],
+            gaze_xy: [Vec::new(), Vec::new()],
+            measured_pitch,
+        }
+    }
 }
 
 /// The state carried between frames.
@@ -347,7 +374,10 @@ pub struct FramePipeline {
     ///
     /// Because it is measured against that zero, it is dropped whenever the
     /// zero changes: see [`FramePipeline::forget_pitch_reference`]. The
-    /// geometric path measures no pitch, so a recentre there takes 0.
+    /// geometric path measures no pitch, so a recentre there takes 0, and the
+    /// reference is subtracted from the model's pitch only: the geometric
+    /// path's 0 is level already, and a frame that fell back to it while the
+    /// model was stale went out as −`pitch_ref`.
     pitch_ref: Option<f64>,
     /// The gaze direction that reads as "looking straight ahead" for Extended
     /// View: raw yaw and pitch, in degrees from the screen centre, set by a
@@ -438,15 +468,7 @@ impl FramePipeline {
     /// while one is in flight restarts the window rather than queueing, because
     /// two presses of the same button mean "start from now", not "do it twice".
     pub fn begin_recentre(&mut self, now: Instant) {
-        self.recentre = Some(RecentreRun {
-            started: now,
-            yaw_deg: Vec::new(),
-            pitch_deg: Vec::new(),
-            roll_deg: Vec::new(),
-            pos_mm: [Vec::new(), Vec::new(), Vec::new()],
-            gaze_deg: [Vec::new(), Vec::new()],
-            gaze_xy: [Vec::new(), Vec::new()],
-        });
+        self.recentre = Some(RecentreRun::new(now, false));
     }
 
     /// Whether a settle window is running, so a front end can say "hold still".
@@ -499,7 +521,15 @@ impl FramePipeline {
     /// screen edge into the reference for good. It is also the head term
     /// before `rot_ref` is subtracted, which is what makes a second recentre
     /// *replace* the first rather than measure the residual of it.
-    fn rereference(&mut self, head: HeadPose, rotation_held: bool, now: Instant) -> HeadPose {
+    ///
+    /// `measured_pitch` says whether `head`'s pitch is the model's.
+    fn rereference(
+        &mut self,
+        head: HeadPose,
+        rotation_held: bool,
+        measured_pitch: bool,
+        now: Instant,
+    ) -> HeadPose {
         if let Some(run) = self.recentre.as_mut() {
             // The window measures rotation, so it takes only frames that
             // measured one — and there are two ways to be handed the same
@@ -529,7 +559,11 @@ impl FramePipeline {
             // for it, and a median taken over one is not a median. Dropping
             // either kind also costs the run those frames, so a window full of
             // them is refused for having too few poses — which is the truth.
+            //
+            // And only rotations of the kind of pitch the window measures —
+            // position is the eye origins' in either.
             if !rotation_held
+                && run.measured_pitch == measured_pitch
                 && head.yaw_deg.is_finite()
                 && head.pitch_deg.is_finite()
                 && head.roll_deg.is_finite()
@@ -543,13 +577,16 @@ impl FramePipeline {
                     v.push(x);
                 }
             }
-            // The window-close check sits outside that gate on purpose: a run
-            // whose second runs out during an outage must still be able to
-            // close, or it would hang until the next two-eye frame.
-            if now.saturating_duration_since(run.started) >= RECENTRE_WINDOW {
-                let run = self.recentre.take().expect("checked just above");
-                self.last_recentre = Some(self.settle(run));
-            }
+        }
+        // The window-close check sits outside both gates on purpose: a run
+        // whose second runs out during an outage, or after the model dropped
+        // out, must still close, or it would hang until the next frame it
+        // would have taken.
+        if let Some(run) = self
+            .recentre
+            .take_if(|r| now.saturating_duration_since(r.started) >= RECENTRE_WINDOW)
+        {
+            self.last_recentre = Some(self.settle(run));
         }
         let head = match self.rot_ref {
             Some([yaw, roll]) => HeadPose {
@@ -559,7 +596,7 @@ impl FramePipeline {
             },
             None => head,
         };
-        match self.pitch_ref {
+        match self.pitch_ref.filter(|_| measured_pitch) {
             Some(pitch) => HeadPose {
                 pitch_deg: head.pitch_deg - pitch,
                 ..head
@@ -597,7 +634,11 @@ impl FramePipeline {
             return RecentreOutcome::Moved { spread_deg };
         }
         self.rot_ref = Some([yaw_deg, roll_deg]);
-        self.pitch_ref = Some(pitch_deg);
+        // Only a window of the model's pitch says where level is; one of the
+        // eye geometry's fixed 0 leaves the model's levelling as it was.
+        if run.measured_pitch {
+            self.pitch_ref = Some(pitch_deg);
+        }
         // Position: re-take the neutral at the median of the window, so
         // translation reads zero too. The samples are relative to the neutral
         // in use, so the median is the correction to it.
@@ -805,6 +846,18 @@ impl FramePipeline {
         // by more than three to one — into the window unchallenged.
         let rotation_held =
             reconstructed || pose_in.is_some_and(|p| self.last_rotation_at == Some(p.rotation_at));
+        // Which kind of pitch this frame carries, and so which kind a
+        // recentre in flight measures: the first frame's, or the model's once
+        // the model is back — a window kept on the eye geometry would throw
+        // every model frame away and then wipe the model's levelling.
+        let measured_pitch = pose_in.is_some_and(|p| p.measured_pitch);
+        if let Some(run) = self
+            .recentre
+            .as_mut()
+            .filter(|r| measured_pitch && !r.measured_pitch)
+        {
+            *run = RecentreRun::new(now, true);
+        }
         if let Some(p) = pose_in {
             self.last_rotation_at = Some(p.rotation_at);
         }
@@ -875,7 +928,7 @@ impl FramePipeline {
                 });
             self.last_frame_at = Some(now);
             let head = centred;
-            let centred = self.rereference(centred, rotation_held, now);
+            let centred = self.rereference(centred, rotation_held, measured_pitch, now);
             // After this frame's reference has been applied, so a change shows
             // from the next frame on and never as a step inside this one.
             self.auto_centre(cfg, head, gaze, rotation_held, dt_s);
@@ -1046,6 +1099,7 @@ mod tests {
     /// repeat one and the frame is carrying a rotation it has already counted.
     fn supplied(pose: HeadPose, at: Instant) -> Option<SuppliedPose> {
         Some(SuppliedPose {
+            measured_pitch: true,
             pose,
             rotation_at: at,
         })
@@ -2013,6 +2067,102 @@ mod tests {
             "yaw and roll are not the pitch zero's to drop"
         );
         assert!(after.yaw_deg.abs() < 0.5, "yaw still referenced: {after:?}");
+    }
+
+    /// The model goes stale and the geometric path takes over: its pitch is
+    /// level at 0 already, so the model's pitch reference is not subtracted
+    /// from it — that sent −22° for a level head. A window that spans the
+    /// switch measures the source it started on, rather than reading the jump
+    /// between the two as a head that moved.
+    #[test]
+    fn the_geometric_fallback_neither_takes_the_pitch_reference_nor_spoils_a_window() {
+        let c = cfg(false);
+        let mut p = FramePipeline::new(&c);
+        let sample = head_at(OFF_AXIS_YAW_DEG, 0.0);
+        let model = HeadPose {
+            yaw_deg: OFF_AXIS_YAW_DEG,
+            pitch_deg: 22.0,
+            ..Default::default()
+        };
+        let mut at = Instant::now();
+        // Half the window from the model, the rest from the geometric path.
+        p.begin_recentre(at);
+        for i in 0..WINDOW_FRAMES * 2 {
+            let pose = if i < WINDOW_FRAMES / 2 {
+                supplied(model, at)
+            } else {
+                None
+            };
+            p.offer(&sample, pose, &c, None, at);
+            at += CADENCE;
+        }
+        match p.take_recentre() {
+            Some(RecentreOutcome::Applied { pitch_deg, .. }) => assert!(
+                (pitch_deg - 22.0).abs() < 0.5,
+                "measured on the model's frames: {pitch_deg}"
+            ),
+            other => panic!("the switch is not a head that moved, got {other:?}"),
+        }
+        // The eye geometry, as the pipeline's own fallback and as a front end
+        // hands it over when its model has nothing fresh.
+        let geometric = |at| {
+            Some(SuppliedPose {
+                pose: HeadPose {
+                    pitch_deg: 0.0,
+                    ..model
+                },
+                rotation_at: at,
+                measured_pitch: false,
+            })
+        };
+        for fallback in [None, geometric(at)] {
+            let mut after = None;
+            for _ in 0..200 {
+                at += CADENCE;
+                let pose = fallback.map(|f| SuppliedPose {
+                    rotation_at: at,
+                    ..f
+                });
+                after = p.offer(&sample, pose, &c, None, at).pose;
+            }
+            let after = after.expect("a pose");
+            assert!(
+                after.pitch_deg.abs() < 0.5,
+                "the eye geometry's level 0 went out shifted by the model's reference: {after:?}"
+            );
+        }
+
+        // A window that starts on the eye geometry and sees the model come
+        // back measures on the model; one that never sees it leaves the
+        // model's levelling as it was.
+        p.begin_recentre(at);
+        for i in 0..WINDOW_FRAMES * 3 {
+            let pose = if i < 5 {
+                geometric(at)
+            } else {
+                supplied(model, at)
+            };
+            p.offer(&sample, pose, &c, None, at);
+            at += CADENCE;
+        }
+        assert!(
+            matches!(p.take_recentre(), Some(RecentreOutcome::Applied { pitch_deg, .. }) if (pitch_deg - 22.0).abs() < 0.5),
+            "the model came back, and the window measured on it"
+        );
+        p.begin_recentre(at);
+        for _ in 0..WINDOW_FRAMES * 2 {
+            p.offer(&sample, geometric(at), &c, None, at);
+            at += CADENCE;
+        }
+        assert!(matches!(
+            p.take_recentre(),
+            Some(RecentreOutcome::Applied { .. })
+        ));
+        let level = p.offer(&sample, supplied(model, at), &c, None, at).pose;
+        assert!(
+            level.is_some_and(|l| l.pitch_deg.abs() < 0.5),
+            "a window of the eye geometry wiped the model's levelling: {level:?}"
+        );
     }
 
     /// The zero changes while a recentre is still measuring. The window has

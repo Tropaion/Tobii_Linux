@@ -1424,6 +1424,7 @@ mod tests {
                 Some(tobii_output::pipeline::SuppliedPose {
                     pose,
                     rotation_at: at,
+                    measured_pitch: true,
                 }),
                 at,
             );
