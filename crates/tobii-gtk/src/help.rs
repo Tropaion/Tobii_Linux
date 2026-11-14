@@ -302,15 +302,15 @@ pub fn topics() -> Vec<Topic> {
                  Strength — {strength}.\n\n\
                  Virtual joystick — {joystick}\n\n\
                  Recentre view — {recentre}\n\n\
-                 Auto-centre — {auto_centre}\n\n\
-                 Recentre key — {shortcut} {shortcut_elsewhere}\n\n\
-                 Tuning — {tuning}\n\n\
-                 It is greyed out when it cannot be taken, and the row's tooltip \
-                 says why. A reason reads like one of these:\n{refusals}\n\n\
+                 Recentre view is greyed out when it cannot be taken, and the \
+                 row's tooltip says why. A reason reads like one of these:\n{refusals}\n\n\
                  More than one thing can be holding the tracker at once, and then \
                  the tooltip names them all in the same sentence rather than one \
                  at a time — so what you read there may be a longer sentence than \
                  any of these four.\n\n\
+                 Auto-centre — {auto_centre}\n\n\
+                 Recentre key — {shortcut} {shortcut_elsewhere}\n\n\
+                 Tuning — {tuning}\n\n\
                  Every control on this card is global: there is no such thing as \
                  the joystick for one game. What one particular game needs is the \
                  Games tab.",

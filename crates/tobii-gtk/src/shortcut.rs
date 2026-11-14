@@ -12,7 +12,8 @@
 //! So on COSMIC the hub writes one entry there — the chosen key combination
 //! running `tobii recentre`, which asks this hub to recentre over its socket
 //! exactly as the button does. COSMIC fires it whatever has focus, and picks a
-//! change up without a restart. Everywhere else the hub says which command to
+//! change up without a restart. Everywhere else the hub cannot set the key, so
+//! its Copy button puts [`recentre_command`] on the clipboard, for the user to
 //! bind in the desktop's own keyboard settings.
 //!
 //! # Editing a file this program does not own
@@ -142,13 +143,22 @@ fn taken_paths() -> Vec<PathBuf> {
 /// The command the shortcut runs: the `tobii` beside this hub's executable when
 /// there is one — so a hub run from a build tree binds its own build — and the
 /// one on `PATH` otherwise.
+///
+/// Shell-quoted ([`crate::sh_quote`]), because it is pasted into a desktop's
+/// shortcut settings by hand (the hub's Copy button) as well as written into
+/// COSMIC's file, and a space in the path split it in two.
 pub fn recentre_command() -> String {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|d| d.join("tobii")))
         .filter(|p| p.is_file());
-    match beside {
-        Some(p) => format!("{} recentre", p.display()),
+    command_for(beside.as_deref())
+}
+
+/// [`recentre_command`] for the `tobii` at `tobii`, or for the one on `PATH`.
+fn command_for(tobii: Option<&Path>) -> String {
+    match tobii {
+        Some(p) => format!("{} recentre", crate::sh_quote(&p.to_string_lossy())),
         None => "tobii recentre".to_string(),
     }
 }
@@ -201,12 +211,12 @@ enum Lex {
 /// Every byte of `text`, classified, and whether the text ended outside any
 /// string or block comment.
 ///
-/// One scanner for both readers in this file ([`split_entries`] and
-/// [`value_span`]), so they cannot disagree about where a comment is. They
-/// did: `value_span` knew only `//`, took the one inside `/* see https://x.org
-/// */` for a line comment, and put the separating comma inside the block
-/// comment. Block comments nest, as in Rust; a file that only parses if they
-/// do not is left unclosed here, and so refused rather than misread.
+/// One scanner for every reader of comments in this file, so they cannot
+/// disagree about where a comment is. They did: `value_span` knew only `//`,
+/// took the one inside `/* see https://x.org */` for a line comment, and put
+/// the separating comma inside the block comment. Block comments nest, as in
+/// Rust; a file that only parses if they do not is left unclosed here, and so
+/// refused rather than misread.
 fn lex(text: &str) -> (Vec<Lex>, bool) {
     let b = text.as_bytes();
     let mut kinds = Vec::with_capacity(b.len());
@@ -255,8 +265,22 @@ fn lex(text: &str) -> (Vec<Lex>, bool) {
     (kinds, !in_str && block == 0)
 }
 
+/// `entry` with its comments blanked out, for the readers that look for words
+/// in it: what a comment says is not part of the entry. A comment swallows the
+/// comma after it, so a commented-out copy of ours in front of one of the
+/// user's own shortcuts is split off as one entry with it, and read with the
+/// comment in, the user's shortcut looked like ours — and was deleted with it.
+fn code_of(entry: &str) -> String {
+    let (kinds, _) = lex(entry);
+    entry
+        .char_indices()
+        .map(|(i, c)| if kinds[i] == Lex::Comment { ' ' } else { c })
+        .collect()
+}
+
 /// The binding written in one entry's key, if it can be read.
 fn entry_binding(entry: &str) -> Option<Binding> {
+    let entry = &code_of(entry);
     let m = entry.find("modifiers:")?;
     let open = m + entry[m..].find('[')?;
     let close = open + entry[open..].find(']')?;
@@ -272,15 +296,7 @@ fn entry_binding(entry: &str) -> Option<Binding> {
 }
 
 fn is_ours(entry: &str) -> bool {
-    entry.contains(&format!("\"{DESCRIPTION}\""))
-}
-
-/// The recentre binding currently in `text`, if there is one.
-pub fn current_in(text: &str) -> Option<Binding> {
-    split_entries(text)?
-        .into_iter()
-        .find(|e| is_ours(e))
-        .and_then(entry_binding)
+    code_of(entry).contains(&format!("\"{DESCRIPTION}\""))
 }
 
 /// `text` with the recentre entry replaced by `binding` running `command`, or
@@ -289,14 +305,16 @@ pub fn with_binding(
     text: &str,
     binding: Option<&Binding>,
     command: &str,
-) -> Result<String, String> {
+) -> Result<String, SetError> {
     let entries = if text.trim().is_empty() {
         Vec::new()
     } else {
         split_entries(text).ok_or_else(|| {
-            "COSMIC's custom-shortcut file is not in a format this program can edit safely, \
-             so it was left alone — set the shortcut in COSMIC Settings instead"
-                .to_string()
+            SetError::File(
+                "COSMIC's custom-shortcut file is not in a format this program can edit \
+                 safely, so it was left alone — change the shortcut in COSMIC Settings instead"
+                    .to_string(),
+            )
         })?
     };
     let mut out: Vec<String> = Vec::new();
@@ -316,10 +334,10 @@ pub fn with_binding(
         }
         if let (Some(b), Some(theirs)) = (binding, entry_binding(e)) {
             if *b == theirs {
-                return Err(format!(
+                return Err(SetError::Key(format!(
                     "{} is already one of your custom shortcuts in COSMIC",
                     b.display()
-                ));
+                )));
             }
         }
         out.push(e.to_string());
@@ -388,48 +406,128 @@ fn taken_by_cosmic(b: &Binding) -> bool {
     })
 }
 
-/// The recentre binding on this machine, if one is set.
-pub fn current() -> Option<Binding> {
-    let text = std::fs::read_to_string(custom_path()?).ok()?;
-    current_in(&text)
+/// The recentre shortcut as COSMIC's file has it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Current {
+    /// Bound, to this.
+    Key(Binding),
+    /// Not bound: no file, or nothing of ours in it.
+    Unbound,
+    /// Not known: the file cannot be read or taken apart, or ours is in it
+    /// with a key this program cannot read back. Said apart from `Unbound`,
+    /// because "none" would be a claim, and a key may well be bound.
+    Unknown,
+}
+
+/// The recentre shortcut on this machine.
+pub fn current() -> Current {
+    custom_path()
+        .and_then(|p| read_custom(&p).ok())
+        .map_or(Current::Unknown, |text| current_of(&text))
+}
+
+/// [`current`] for the file's text.
+fn current_of(text: &str) -> Current {
+    if text.trim().is_empty() {
+        return Current::Unbound;
+    }
+    let Some(entries) = split_entries(text) else {
+        return Current::Unknown;
+    };
+    match entries.into_iter().find(|e| is_ours(e)) {
+        None => Current::Unbound,
+        Some(e) => entry_binding(e).map_or(Current::Unknown, Current::Key),
+    }
+}
+
+/// COSMIC's custom-shortcut file, or nothing when there is none yet.
+fn read_custom(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        read => read,
+    }
+}
+
+/// Why a key could not be set or removed, by what would help.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetError {
+    /// This key: another one may well work.
+    Key(String),
+    /// COSMIC's file, or the way to it: every key would fail the same way.
+    File(String),
+}
+
+impl std::fmt::Display for SetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetError::Key(s) | SetError::File(s) => f.write_str(s),
+        }
+    }
 }
 
 /// Write `binding` (or remove the shortcut, for `None`) into COSMIC's file.
-pub fn set(binding: Option<&Binding>) -> Result<(), String> {
-    let path = custom_path().ok_or("no home directory to find COSMIC's settings in")?;
+///
+/// `Ok(false)` when there was nothing to do: a removal with no shortcut of ours
+/// in the file, which leaves the file alone — or does not create it.
+pub fn set(binding: Option<&Binding>) -> Result<bool, SetError> {
+    let path = custom_path().ok_or_else(|| {
+        SetError::File("no home directory to find COSMIC's settings in".to_string())
+    })?;
     if let Some(b) = binding {
         if b.steals_typing() {
-            return Err(format!(
+            return Err(SetError::Key(format!(
                 "{} would stop that key typing anywhere — add Ctrl, Alt or Super, \
                  or use a key like F9 or Pause",
                 b.display()
-            ));
+            )));
         }
         if taken_by_cosmic(b) {
-            return Err(format!("{} is already a COSMIC shortcut", b.display()));
+            return Err(SetError::Key(format!(
+                "{} is already a COSMIC shortcut",
+                b.display()
+            )));
         }
     }
     write_into(&path, binding, &recentre_command())
 }
 
-fn write_into(path: &Path, binding: Option<&Binding>, command: &str) -> Result<(), String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
-    };
+fn write_into(path: &Path, binding: Option<&Binding>, command: &str) -> Result<bool, SetError> {
+    let text = read_custom(path)
+        .map_err(|e| SetError::File(format!("could not read {}: {e}", path.display())))?;
+    // After `with_binding`, so that a file this program cannot take apart is
+    // refused rather than passed over as having nothing of ours in it.
     let new = with_binding(&text, binding, command)?;
+    if binding.is_none() && current_of(&text) == Current::Unbound {
+        return Ok(false);
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            .map_err(|e| SetError::File(format!("could not create {}: {e}", dir.display())))?;
     }
     tobii_config::write_atomic(path, new.as_bytes())
-        .map_err(|e| format!("could not write {}: {e}", path.display()))
+        .map(|()| true)
+        .map_err(|e| SetError::File(format!("could not write {}: {e}", path.display())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The command is pasted into a desktop's shortcut settings and run by
+    /// COSMIC through `sh -c`, so a path with a space in it must stay one word,
+    /// and an ordinary one is left as it is.
+    #[test]
+    fn the_recentre_command_is_one_shell_word_per_path() {
+        assert_eq!(
+            command_for(Some(Path::new("/home/a/.local/bin/tobii"))),
+            "/home/a/.local/bin/tobii recentre"
+        );
+        assert_eq!(
+            command_for(Some(Path::new("/home/a/My Games/tobii"))),
+            "'/home/a/My Games/tobii' recentre"
+        );
+        assert_eq!(command_for(None), "tobii recentre");
+    }
 
     /// The shape COSMIC Settings writes: pretty RON, one struct per key,
     /// spread over several lines.
@@ -463,7 +561,7 @@ mod tests {
     #[test]
     fn an_empty_or_missing_file_gets_just_our_entry() {
         let out = with_binding("", Some(&ctrl_shift_r()), "/x/tobii recentre").unwrap();
-        assert_eq!(current_in(&out), Some(ctrl_shift_r()));
+        assert_eq!(current_of(&out), Current::Key(ctrl_shift_r()));
         assert!(out.contains(r#"Spawn("/x/tobii recentre")"#), "{out}");
         assert_eq!(split_entries(&out).unwrap().len(), 1);
     }
@@ -478,14 +576,14 @@ mod tests {
         for theirs in split_entries(THEIRS).unwrap() {
             assert!(twice.contains(theirs), "lost or altered: {theirs}");
         }
-        assert_eq!(current_in(&twice), Some(f9));
+        assert_eq!(current_of(&twice), Current::Key(f9));
     }
 
     #[test]
     fn clearing_removes_only_ours() {
         let set = with_binding(THEIRS, Some(&ctrl_shift_r()), "tobii recentre").unwrap();
         let cleared = with_binding(&set, None, "tobii recentre").unwrap();
-        assert_eq!(current_in(&cleared), None);
+        assert_eq!(current_of(&cleared), Current::Unbound);
         assert_eq!(split_entries(&cleared).unwrap().len(), 2);
     }
 
@@ -493,12 +591,18 @@ mod tests {
     fn a_combination_already_in_the_file_is_refused() {
         let super_t = Binding::new(&["Super"], "t");
         let err = with_binding(THEIRS, Some(&super_t), "tobii recentre").unwrap_err();
-        assert!(err.contains("Super+T"), "{err}");
+        assert!(
+            matches!(&err, SetError::Key(m) if m.contains("Super+T")),
+            "{err}"
+        );
     }
 
     #[test]
     fn a_file_that_is_not_a_map_is_left_alone() {
-        assert!(with_binding("garbage ( [", Some(&ctrl_shift_r()), "x").is_err());
+        assert!(matches!(
+            with_binding("garbage ( [", Some(&ctrl_shift_r()), "x"),
+            Err(SetError::File(_))
+        ));
     }
 
     #[test]
@@ -585,7 +689,7 @@ mod tests {
         let es = split_entries(&out).expect("still a map");
         assert_eq!(es.len(), 2, "two entries, separately: {out}");
         assert_eq!(entry_binding(es[0]), Some(Binding::new(&["Super"], "t")));
-        assert_eq!(current_in(&out), Some(ctrl_shift_r()), "{out}");
+        assert_eq!(current_of(&out), Current::Key(ctrl_shift_r()), "{out}");
         assert!(
             out.contains("Spawn(\"cosmic-term\"), // my terminal\n"),
             "the comma goes before the comment, which is kept: {out}"
@@ -603,7 +707,7 @@ mod tests {
             again.contains("// my terminal"),
             "a re-bind keeps it too: {again}"
         );
-        assert_eq!(current_in(&again), Some(ctrl_shift_r()), "{again}");
+        assert_eq!(current_of(&again), Current::Key(ctrl_shift_r()), "{again}");
 
         // A trailing note with nothing after it gets no comma of its own.
         let note =
@@ -630,7 +734,7 @@ mod tests {
         );
         let es = split_entries(&out).expect("still a map");
         assert_eq!(es.len(), 2, "two entries, separately: {out}");
-        assert_eq!(current_in(&out), Some(ctrl_shift_r()), "{out}");
+        assert_eq!(current_of(&out), Current::Key(ctrl_shift_r()), "{out}");
 
         // A comma and brackets inside a block comment split nothing.
         let noted = "{\n    /* mine, (all) of [these] */ (modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\"),\n}";
@@ -643,7 +747,7 @@ mod tests {
         let ours_noted = out.replacen("(modifiers: [Ctrl", "/* recentre */ (modifiers: [Ctrl", 1);
         let back = with_binding(&ours_noted, None, "tobii recentre").unwrap();
         assert!(back.contains("/* recentre */"), "{back}");
-        assert_eq!(current_in(&back), None, "{back}");
+        assert_eq!(current_of(&back), Current::Unbound, "{back}");
 
         // Unclosed: not a format this can edit, so it is refused, not guessed.
         assert_eq!(split_entries("{ /* never closed }"), None);
@@ -653,11 +757,62 @@ mod tests {
     fn a_write_round_trips_through_a_real_file() {
         let dir = std::env::temp_dir().join(format!("tobii-shortcut-{}", std::process::id()));
         let path = dir.join("v1").join("custom");
-        write_into(&path, Some(&ctrl_shift_r()), "tobii recentre").unwrap();
+        // A failed earlier run with the same pid leaves its file behind.
+        let _ = std::fs::remove_dir_all(&dir);
+        // Removing what was never there writes nothing, not even the file.
+        assert_eq!(write_into(&path, None, "tobii recentre"), Ok(false));
+        assert!(!path.exists());
+        assert_eq!(
+            write_into(&path, Some(&ctrl_shift_r()), "tobii recentre"),
+            Ok(true)
+        );
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(current_in(&text), Some(ctrl_shift_r()));
-        write_into(&path, None, "tobii recentre").unwrap();
-        assert_eq!(current_in(&std::fs::read_to_string(&path).unwrap()), None);
+        assert_eq!(current_of(&text), Current::Key(ctrl_shift_r()));
+        assert_eq!(write_into(&path, None, "tobii recentre"), Ok(true));
+        assert_eq!(
+            current_of(&std::fs::read_to_string(&path).unwrap()),
+            Current::Unbound
+        );
+        assert_eq!(write_into(&path, None, "tobii recentre"), Ok(false));
+        // A file this program cannot take apart is refused, not passed over as
+        // having nothing of ours in it: it may well have.
+        std::fs::write(&path, "{ not ron at all").unwrap();
+        assert!(write_into(&path, None, "tobii recentre").is_err());
+        // Ours, with a key this program cannot read back: there is no binding
+        // to show, and there is still an entry to remove.
+        let unreadable = format!(
+            "{{\n    (key: \"r\", description: Some(\"{DESCRIPTION}\")): Spawn(\"x\"),\n}}"
+        );
+        std::fs::write(&path, &unreadable).unwrap();
+        assert_eq!(current_of(&unreadable), Current::Unknown);
+        assert_eq!(write_into(&path, None, "tobii recentre"), Ok(true));
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(DESCRIPTION));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A commented-out copy of ours swallows the comma after it, so it is
+    /// split off as one entry with the user's next shortcut. Neither removing
+    /// ours nor setting a key may take the user's shortcut with it, and the
+    /// key in the comment is not a binding.
+    #[test]
+    fn a_commented_out_copy_of_ours_is_not_ours() {
+        let text = format!(
+            "{{\n    // (modifiers: [Ctrl, Shift], key: \"r\", description: Some(\"{DESCRIPTION}\")): Spawn(\"tobii recentre\"),\n    (modifiers: [Super], key: \"t\"): Spawn(\"cosmic-term\"),\n}}"
+        );
+        assert_eq!(current_of(&text), Current::Unbound);
+        let removed = with_binding(&text, None, "tobii recentre").unwrap();
+        assert!(removed.contains("cosmic-term"), "{removed}");
+        let set = with_binding(&text, Some(&ctrl_shift_r()), "tobii recentre").unwrap();
+        assert!(set.contains("cosmic-term"), "{set}");
+        assert_eq!(current_of(&set), Current::Key(ctrl_shift_r()));
+        // And a comment that only mentions it is left where it is.
+        let note = format!("{{\n    // \"{DESCRIPTION}\" was on F9\n}}");
+        assert!(with_binding(&note, None, "tobii recentre")
+            .unwrap()
+            .contains("was on F9"));
+        assert_eq!(current_of(&note), Current::Unbound);
+        assert_eq!(current_of("{ not ron at all"), Current::Unknown);
     }
 }

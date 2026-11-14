@@ -1,7 +1,8 @@
 //! The hub's "Head tracking for games" row.
 //!
 //! A switch for whether game output runs at all, three named strengths for how
-//! hard gaze steers the camera, and a status line.
+//! hard gaze steers the camera, the virtual joystick, Recentre view,
+//! Auto-centre, the recentre key and the Tuning window, and a status line.
 //!
 //! # The status line is the point
 //!
@@ -51,8 +52,9 @@ pub(crate) const STRENGTHS: [(&str, f64, f64); 3] = [
 /// The question the three names answer, since the names alone do not say what
 /// they are three strengths OF.
 ///
-/// A tooltip rather than a caption because the card has just been cut to two
-/// rows and a status line on purpose, and a caption is a fourth line of card.
+/// A tooltip rather than a caption because the card's prose was cut to its
+/// controls and a status line on purpose, and a caption is one more line of
+/// card.
 /// It goes on the box around the three, which is what a pointer anywhere in
 /// that row resolves to: none of the radios or their labels carry one of their
 /// own, so the query walks up to it.
@@ -285,13 +287,19 @@ pub(crate) const AUTO_CENTRE_TOOLTIP: &str =
 /// The recentre-key row, on COSMIC.
 pub(crate) const SHORTCUT_TOOLTIP: &str =
     "A COSMIC keyboard shortcut that recentres the view, even while a game has \
-     focus. It appears in COSMIC Settings › Keyboard › Custom shortcuts, where it \
-     can also be changed.";
+     focus. The button shows the key, or Unknown… when COSMIC's shortcut file \
+     cannot be read; press it, then the new key combination, or Backspace to \
+     remove the key. It appears in COSMIC Settings › Keyboard › Custom \
+     shortcuts, where it can also be changed.";
 
 /// The recentre-key row, everywhere else.
 pub(crate) const SHORTCUT_ELSEWHERE_TOOLTIP: &str =
-    "The hub can only set this key for you on COSMIC. On other desktops, add a \
-     custom keyboard shortcut that runs `tobii recentre`.";
+    "The hub can set this key for you only on COSMIC. On other desktops, the \
+     Copy button puts the command that recentres on the clipboard \u{2014} \
+     `tobii recentre`, with the full path of the `tobii` beside the hub when \
+     there is one: add it as a custom shortcut in your desktop's keyboard \
+     settings. The copy lasts while the hub runs, unless a clipboard manager \
+     keeps it.";
 
 /// The Tuning… button.
 pub(crate) const TUNING_TOOLTIP: &str =
@@ -375,76 +383,103 @@ fn check_row(text: &str) -> (CheckButton, gtk::Box) {
     (cb, row)
 }
 
-/// The recentre shortcut row: what is bound, and the buttons to change it.
+/// The recentre shortcut row: the label and one button, whose job depends on
+/// the desktop. On COSMIC the button shows the bound key and changes it.
+/// Everywhere else it copies the command to bind.
 ///
 /// See [`crate::shortcut`] for why this writes a COSMIC custom shortcut rather
-/// than grabbing a key, and why it cannot be offered elsewhere.
+/// than grabbing a key, and why it cannot be set from here on other desktops.
 fn shortcut_row(recentring: Recentring) -> gtk::Box {
     let row = gtk::Box::new(Orientation::Horizontal, 8);
     let name = Label::new(Some("Recentre key"));
     name.set_valign(Align::Center);
-    let value = Label::new(None);
-    value.add_css_class("readout-value");
-    value.set_valign(Align::Center);
-    value.set_hexpand(true);
-    value.set_halign(Align::Start);
     row.append(&name);
-    row.append(&value);
 
+    // One line, and no wider than the card's top row, on both desktops: the
+    // Tuning… button follows the one button here straight on. Both rows used
+    // to be wider, measured 2026-11-13 in a nested KWin:
+    //
+    // * Off COSMIC, the sentence "bind `tobii recentre` in your desktop's
+    //   keyboard settings" wrapped between this label and Tuning…: about four
+    //   lines at text scale 1.0 and six at 1.2, which made the card 299px tall
+    //   against 271px with room to spare at 1.0, and 377px against 292px at
+    //   1.2 (the `CARD` lines `tests/help_window.rs` prints). What it said is
+    //   in the tooltip and the help window; the button does what a sentence
+    //   could not, putting the command where it can be pasted. "Copy" and not
+    //   "Copy command": with the longer label this row was the widest on the
+    //   card above 1.0 (372px at 1.2 against the 326px a card has at
+    //   `COLUMN_WIDTH`) and opened the whole hub 46px wider at 1.2. With
+    //   "Copy" it stays under the top row at every scale (292 against 325 at
+    //   1.2, 357 against 377 at 1.6).
+    // * On COSMIC, the bound key as a label, then Set key… and Clear: wider
+    //   than the column, so it widened the whole hub (`crate::build_hub` has
+    //   the numbers). The key is the button's own label now, and Backspace in
+    //   the capture window removes it, which is how GNOME's keyboard settings
+    //   take a shortcut away. A bare Backspace could never be bound anyway: it
+    //   would stop the key typing.
+    //
+    // The messages this row reports stay under the status line's 44
+    // characters, so they do not wrap the card a line either — all but
+    // "recentre key set to …" with a long key, which wraps for the few seconds
+    // it shows.
     if !crate::shortcut::is_cosmic() {
-        value.set_text("bind `tobii recentre` in your desktop's keyboard settings");
-        value.set_wrap(true);
+        let copy = crate::widget::button("Copy");
+        copy.connect_clicked(move |b| {
+            b.clipboard().set_text(&crate::shortcut::recentre_command());
+            recentring.report(
+                "copied — add it as a keyboard shortcut".to_string(),
+                Instant::now(),
+            );
+        });
+        row.append(&copy);
         row.set_tooltip_text(Some(SHORTCUT_ELSEWHERE_TOOLTIP));
         return row;
     }
 
-    let show = {
-        let value = value.clone();
-        move || {
-            value.set_text(
-                &crate::shortcut::current()
-                    .map(|b| b.display())
-                    .unwrap_or_else(|| "none".to_string()),
-            );
-        }
-    };
-    show();
-    row.set_tooltip_text(Some(SHORTCUT_TOOLTIP));
-
-    let set = crate::widget::button("Set key…");
-    let clear = crate::widget::button("Clear");
-    {
-        let show = show.clone();
-        let recentring = recentring.clone();
-        clear.connect_clicked(move |_| {
-            let msg = match crate::shortcut::set(None) {
-                Ok(()) => "recentre key removed".to_string(),
-                Err(e) => e,
-            };
-            recentring.report(msg, Instant::now());
-            show();
-        });
+    let set = crate::widget::button("");
+    // Bounded, because this label is whatever key the user chose, and a long
+    // one puts back the width this row was cut down to save: measured with
+    // Super+Ctrl+Alt+Shift+F12, the hub opened 50px wider at 1.0 without these
+    // two lines, and at its usual width with them, at 1.0 and 1.2. The status
+    // line says the whole key when it is set.
+    if let Some(label) = set.child().and_downcast::<Label>() {
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        label.set_max_width_chars(12);
     }
-    set.connect_clicked(move |b| {
-        capture_key(b, show.clone(), recentring.clone());
-    });
+    show_key(&set);
+    set.connect_clicked(move |b| capture_key(b, recentring.clone()));
     row.append(&set);
-    row.append(&clear);
+    row.set_tooltip_text(Some(SHORTCUT_TOOLTIP));
     row
 }
 
-/// A small window that takes the next key combination pressed and binds it.
-fn capture_key(anchor: &gtk::Button, show: impl Fn() + Clone + 'static, recentring: Recentring) {
+/// Label the COSMIC row's button with the key bound now, read back from
+/// COSMIC's file.
+fn show_key(button: &gtk::Button) {
+    use crate::shortcut::Current;
+    let text = match crate::shortcut::current() {
+        Current::Key(b) => b.display(),
+        Current::Unbound => "Set key…".to_string(),
+        // Not "Set key…", which would say there is none.
+        Current::Unknown => "Unknown…".to_string(),
+    };
+    crate::widget::set_button_text(button, &text);
+}
+
+/// A small window that takes the next key combination pressed and binds it,
+/// then relabels `anchor`, the button that opened it.
+fn capture_key(anchor: &gtk::Button, recentring: Recentring) {
     let win = gtk::Window::new();
     win.set_title(Some("Recentre key"));
     win.set_modal(true);
     win.set_resizable(false);
     if let Some(root) = anchor.root().and_then(|r| r.downcast::<gtk::Window>().ok()) {
         win.set_transient_for(Some(&root));
+        win.set_destroy_with_parent(true);
     }
     let msg = Label::new(Some(
         "Press the key combination that should recentre the view.\n\
-         Esc cancels.",
+         Esc cancels; Backspace removes the key.",
     ));
     msg.set_wrap(true);
     msg.set_max_width_chars(40);
@@ -457,9 +492,17 @@ fn capture_key(anchor: &gtk::Button, show: impl Fn() + Clone + 'static, recentri
 
     let keys = gtk::EventControllerKey::new();
     {
-        let win = win.clone();
-        keys.connect_key_pressed(move |_, key, _, state| {
+        // The window is taken from the controller, not captured: the
+        // controller belongs to the window, so a captured window is a cycle
+        // that keeps it alive after every close (see
+        // `crate::add_escape_to_close`). The hub's button is held weakly, as
+        // it carries a handler of its own and this window is not what keeps it.
+        let anchor = anchor.downgrade();
+        keys.connect_key_pressed(move |ctl, key, _, state| {
             use gtk::gdk::{Key, ModifierType};
+            let Some(win) = ctl.widget().and_downcast::<gtk::Window>() else {
+                return glib::Propagation::Proceed;
+            };
             let name = key
                 .to_lower()
                 .name()
@@ -493,17 +536,34 @@ fn capture_key(anchor: &gtk::Button, show: impl Fn() + Clone + 'static, recentri
                 win.close();
                 return glib::Propagation::Stop;
             }
-            let binding = crate::shortcut::Binding::new(&mods, &name);
-            match crate::shortcut::set(Some(&binding)) {
-                Ok(()) => {
-                    recentring.report(
-                        format!("recentre key set to {}", binding.display()),
-                        Instant::now(),
-                    );
-                    show();
+            // Backspace on its own removes the key; see `shortcut_row`.
+            let binding = if key == Key::BackSpace && mods.is_empty() {
+                None
+            } else {
+                Some(crate::shortcut::Binding::new(&mods, &name))
+            };
+            let result = crate::shortcut::set(binding.as_ref());
+            // From the file, whatever happened: it may also have changed in
+            // COSMIC Settings since the label was set.
+            if let Some(anchor) = anchor.upgrade() {
+                show_key(&anchor);
+            }
+            match result {
+                Ok(written) => {
+                    let done = match &binding {
+                        Some(b) => format!("recentre key set to {}", b.display()),
+                        None if written => "recentre key removed".to_string(),
+                        None => "no recentre key to remove".to_string(),
+                    };
+                    recentring.report(done, Instant::now());
                     win.close();
                 }
-                Err(e) => msg.set_text(&format!("{e}.\n\nTry another, or press Esc.")),
+                // Another key is worth trying only when it was the key that
+                // was refused; a file this program cannot use refuses them all.
+                Err(e @ crate::shortcut::SetError::Key(_)) => msg.set_text(&format!(
+                    "{e}.\n\nTry another, or press Esc. Backspace removes the key."
+                )),
+                Err(e) => msg.set_text(&format!("{e}.\n\nPress Esc.")),
             }
             glib::Propagation::Stop
         });
@@ -727,9 +787,10 @@ impl GamesRow {
             });
         }
 
-        // There is no third row, and the one that was here is worth a note
-        // because the measurement it carried is still the reason this card is
-        // shaped as it is.
+        // The third row that used to be here is gone (the two under `second`
+        // came later, with PR #3), and it is worth a note because the
+        // measurement it carried is still the reason this card is shaped as it
+        // is.
         //
         // It held "Set up a game…", the only door to the game-setup modal, on a
         // row of its own — because `second` is already a checkbox, its label
@@ -742,7 +803,7 @@ impl GamesRow {
         // on its own row, 1373px with it appended to `second`** — 132px, for
         // every user, including the ones who never pressed it. That pair was
         // recorded as being at text scale 1.0 and was not: this machine's saved
-        // scale is 1.2 and `load_css` applies it. At a pinned 1.0 the first of
+        // scale is 1.2 and `load_css` applied it then. At a pinned 1.0 the first of
         // the two is 1189px. The 132px difference is the fact; the absolute
         // numbers were somebody's settings.
         //
@@ -757,7 +818,8 @@ impl GamesRow {
         //
         // Re-take it by printing `hub.measure(Orientation::Horizontal, -1)` and
         // the window's `default_height` from a timeout inside
-        // `tests/games_tab.rs`, which pins the scale for exactly this reason.
+        // `tests/games_tab.rs`, which measures at text scale 1.0 for exactly
+        // this reason (see `crate::load_css`).
         let controls = gtk::Box::new(Orientation::Vertical, 8);
         let top = gtk::Box::new(Orientation::Horizontal, 16);
         top.append(&sw);

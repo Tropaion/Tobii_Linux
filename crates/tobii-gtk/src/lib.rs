@@ -1629,11 +1629,11 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // wizards, the two things the tracker measures, and the two places the
     // result goes.
     //
-    // The grouping is also what makes them the same height, and that is not a
-    // coincidence — it was chosen from the measured cards (180/141/161/120/
-    // 213/222) so no column runs away with the row. The obvious grouping put
-    // both game sections together at 447 against 293, and a row is as tall as
-    // its tallest column.
+    // The grouping is also what was meant to keep them close in height — it
+    // was chosen from the measured cards (180/141/161/120/213/222) so no column
+    // ran away with the row. One does now; see the end of this comment. The
+    // obvious grouping put both game sections together at 447 against 293, and
+    // a row is as tall as its tallest column.
     //
     // They pack from the top and every gap is `CARD_GAP`. Stretching the gaps
     // to level the bottoms — which is what this did while the columns were
@@ -1658,6 +1658,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     //   two tabs, that row deleted                              1189 x 725
     //   the tabs moved out of the header onto a tab page        1223 x 794
     //
+    // and re-taken the same way on 2026-11-14, after PR #3 put an auto-centre
+    // row and a recentre-key row on the games card. The key row is built per
+    // desktop, so there are two "before" lines:
+    //
+    //   PR #3's rows, not on COSMIC (a sentence that wrapped)   1223 x 904
+    //   PR #3's rows, on COSMIC (the key, Set key… and Clear)   1286 x 876
+    //   that row cut to one button on both desktops             1223 x 876
+    //
     // The third row is the tab page's own border and padding, which the window
     // has to be wide enough for — 34px of width, and 69px of height between
     // that padding and the tab strip above it. `page_chrome` below measures it
@@ -1681,11 +1689,14 @@ pub fn build_hub(app: &Application, session: device::Session) -> Option<Applicat
     // `widget::button` plus the `controls` spacing, out of the column that was
     // the tallest of the three, so the whole rack row comes down with it.
     //
-    // The grouping itself is unchanged and still holds. It was chosen from the
-    // measured cards (142/142/96/194/94/204 at `1abb857`, where the obvious
-    // grouping put both game sections together at 447 against 293), and taking
-    // a row off the games card only improves the balance it was chosen for —
-    // the column that was the tallest is now the shortest.
+    // The grouping itself is unchanged (the cards were 142/142/96/194/94/204
+    // at `1abb857`). Taking the setup row off the games card made its column
+    // the shortest; PR #3's two rows made it the tallest again, and it still
+    // is with the recentre-key row one button tall: on 2026-11-14 the `CARD`
+    // lines `tests/help_window.rs` prints at 1.0 put it at 90 + 271 against
+    // 132 + 132 and 89 + 178. So it sets the rack's height, which is why the
+    // 28px the wrapping sentence cost came off the window whole. Re-take those
+    // lines before relying on the balance.
     let col_calib = control_column();
     col_calib.append(&section(
         "Improve my calibration",
