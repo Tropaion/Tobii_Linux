@@ -418,9 +418,29 @@ pub fn banner() -> gtk::Box {
         let _ = tx.send((found, placed));
     });
 
-    let widgets = (row.clone(), text.clone(), notes_btn, update_btn, dismiss);
+    // Weak, all five. This poll is still pending at quit whenever the check
+    // has not answered by then — against GitHub it takes over a second — and a
+    // source that never runs again never drops its closure, so strong
+    // references here kept the whole banner alive past the end of the program.
+    // `tests/hub_lifetime.rs` is what found it.
+    let row_w = row.downgrade();
+    let banner_w = Banner {
+        text,
+        notes: notes_btn,
+        action: update_btn,
+        dismiss,
+    }
+    .downgrade();
     glib::timeout_add_local(Duration::from_millis(400), move || {
-        let (row, text, notes_btn, update_btn, dismiss) = &widgets;
+        let (Some(row), Some(banner)) = (row_w.upgrade(), banner_w.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        let Banner {
+            text,
+            notes: notes_btn,
+            action: update_btn,
+            ..
+        } = &banner;
         let (found, placed) = match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
             // The worker went away without answering: nothing to show, and
@@ -463,12 +483,6 @@ pub fn banner() -> gtk::Box {
                 row.set_visible(true);
             }
             Ok(Check::Newer(release)) => {
-                let banner = Banner {
-                    text: text.clone(),
-                    notes: notes_btn.clone(),
-                    action: update_btn.clone(),
-                    dismiss: dismiss.clone(),
-                };
                 // Decided in `tobii_update::install::action_for`, where every
                 // case is tested. Logged, because "which button did it show,
                 // and why" is the first question about any update report.
@@ -540,7 +554,6 @@ pub fn banner() -> gtk::Box {
 /// A click handler owns everything it touches, and past two levels of callback
 /// — press, choose a folder, then poll a worker — passing them one by one is
 /// four clones per level and a parameter list nothing can read.
-#[derive(Clone)]
 struct Banner {
     text: Label,
     notes: gtk::Button,
@@ -549,6 +562,39 @@ struct Banner {
     /// that holds the closure.
     action: gtk::Button,
     dismiss: gtk::Button,
+}
+
+impl Banner {
+    /// The same four, held weakly, for a poll's closure: a source still pending
+    /// at quit never runs again and never drops what it holds — see the check's
+    /// poll in [`banner`].
+    fn downgrade(&self) -> WeakBanner {
+        WeakBanner {
+            text: self.text.downgrade(),
+            notes: self.notes.downgrade(),
+            action: self.action.downgrade(),
+            dismiss: self.dismiss.downgrade(),
+        }
+    }
+}
+
+/// [`Banner`], weakly. See [`Banner::downgrade`].
+struct WeakBanner {
+    text: glib::WeakRef<Label>,
+    notes: glib::WeakRef<gtk::Button>,
+    action: glib::WeakRef<gtk::Button>,
+    dismiss: glib::WeakRef<gtk::Button>,
+}
+
+impl WeakBanner {
+    fn upgrade(&self) -> Option<Banner> {
+        Some(Banner {
+            text: self.text.upgrade()?,
+            notes: self.notes.upgrade()?,
+            action: self.action.upgrade()?,
+            dismiss: self.dismiss.upgrade()?,
+        })
+    }
 }
 
 /// The "What's new" button, which both banner variants have and which does the
@@ -616,8 +662,13 @@ fn wire(b: &Banner, release: Release) {
         let guard = std::cell::RefCell::new(guard);
         let release_hold = move || drop(guard.borrow_mut().take());
         let quits = quits.clone();
+        // Weakly, and the poll carries on without them if they are gone: it is
+        // the install's end, not the banner's, that releases the hold.
+        let b = b.downgrade();
         glib::timeout_add_local(Duration::from_millis(150), move || {
-            while let Ok(step) = prx.try_recv() {
+            let b = b.upgrade();
+            // Drained either way; only the latest step is worth drawing.
+            if let (Some(b), Some(step)) = (&b, prx.try_iter().last()) {
                 b.text.set_text(&installing(&step));
             }
             let outcome = match rx.try_recv() {
@@ -626,7 +677,9 @@ fn wire(b: &Banner, release: Release) {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
             };
             release_hold();
-            quits.set(install_finished(&b, &version, outcome));
+            if let Some(b) = &b {
+                quits.set(install_finished(b, &version, outcome));
+            }
             glib::ControlFlow::Break
         });
     });
@@ -789,9 +842,14 @@ fn start_download(
         ));
     });
 
-    let b = b.clone();
+    // Weakly: see `Banner::downgrade`. With the banner gone there is nobody to
+    // report to, and the worker finishes or fails on its own.
+    let b = b.downgrade();
     glib::timeout_add_local(Duration::from_millis(150), move || {
-        while let Ok(step) = prx.try_recv() {
+        let Some(b) = b.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if let Some(step) = prx.try_iter().last() {
             b.text.set_text(&downloading(&step));
         }
         match rx.try_recv() {

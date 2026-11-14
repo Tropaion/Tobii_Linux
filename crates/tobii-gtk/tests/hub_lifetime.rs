@@ -250,11 +250,13 @@ fn the_whole_hub_frees_itself_when_the_program_quits() {
     assert_eq!(
         (s.widgets_alive, s.controllers_alive),
         (0, 0),
-        "{} of {} widgets and {} of {} event controllers outlived the program. That is a \
-         reference cycle between two parts of one subtree — a handler holding a widget that \
-         holds the handler — which GTK never breaks. The rule this tree keeps is: labels and \
-         plain boxes strongly, every widget that carries a handler through `downgrade()`. \
-         What survived: {:#?}\n{s:#?}",
+        "{} of {} widgets and {} of {} event controllers outlived the program. That is \
+         either a reference cycle between two parts of one subtree — a handler holding a \
+         widget that holds the handler — which GTK never breaks, or a GLib timeout or idle \
+         source still pending at quit, which never runs again and so never drops what its \
+         closure holds. The rule this tree keeps is: labels and plain boxes strongly, every \
+         widget that carries a handler through `downgrade()`, and nothing strongly in a \
+         source's closure. What survived: {:#?}\n{s:#?}",
         s.widgets_alive,
         s.widgets,
         s.controllers_alive,
